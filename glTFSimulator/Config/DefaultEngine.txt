@@ -1,0 +1,4 @@
+//Add this into DefaultEngine.ini
+
+[CoreRedirects]
++PackageRedirects=(MatchSubstring=true, OldName="/Script/V3DSimulator",NewName="/Script/glTFSimulator")

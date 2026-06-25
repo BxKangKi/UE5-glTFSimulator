@@ -1,0 +1,1 @@
+sh "/Users/Shared/Epic Games/UE_5.7/Engine/Build/BatchFiles/Mac/GenerateProjectFiles.sh" "/Users/bxkangki/Documents/GitHub/UE5-glTFSimulator/glTFSimulator/glTFSimulator.uproject"
