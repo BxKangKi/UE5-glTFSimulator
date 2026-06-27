@@ -11,10 +11,12 @@
 #include "Components/CapsuleComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Dom/JsonObject.h"
+#include "GameFramework/CharacterMovementComponent.h"
 #include "GameFramework/PlayerController.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
 #include "GameFramework/SpringArmComponent.h"
+#include "Interface/WaterInteract.h"
 #include "PhysicalMaterials/PhysicalMaterial.h"
 #include "ProceduralMeshComponent.h"
 #include "glTFRuntimeAsset.h"
@@ -23,6 +25,7 @@
 #include "Materials/MaterialInterface.h"
 #include "Misc/Paths.h"
 #include "World/RuntimeBuoyancyComponent.h"
+#include "World/WaterActor.h"
 
 
 static TMap<EglTFRuntimeMaterialType, UMaterialInterface*> BuildRuntimeVehicleLitMaterialOverrides()
@@ -79,6 +82,74 @@ struct FRuntimeVehicleWheelVisual
         FglTFRuntimeNode Node;
         FTransform Transform = FTransform::Identity;
 };
+
+static void GetRuntimeVehicleExitPawnCapsuleSize(const APawn* PawnToExit, float& OutRadius, float& OutHalfHeight)
+{
+    OutRadius = 34.0f;
+    OutHalfHeight = 88.0f;
+
+    if (const ACharacter* CharacterToExit = Cast<ACharacter>(PawnToExit))
+    {
+        if (const UCapsuleComponent* Capsule = CharacterToExit->GetCapsuleComponent())
+        {
+            OutRadius = FMath::Max(1.0f, Capsule->GetScaledCapsuleRadius());
+            OutHalfHeight = FMath::Max(OutRadius + 1.0f, Capsule->GetScaledCapsuleHalfHeight());
+        }
+        return;
+    }
+
+    if (IsValid(PawnToExit))
+    {
+        const FBox PawnBounds = PawnToExit->GetComponentsBoundingBox(true);
+        if (PawnBounds.IsValid)
+        {
+            const FVector Extent = PawnBounds.GetExtent();
+            OutRadius = FMath::Max(20.0f, FMath::Max(Extent.X, Extent.Y));
+            OutHalfHeight = FMath::Max(OutRadius + 1.0f, Extent.Z);
+        }
+    }
+}
+
+static bool IsRuntimeVehicleExitLocationInWater(const UObject* WorldContextObject, const FVector& ActorLocation, float CapsuleHalfHeight, float& OutWaterLevel)
+{
+    float DetectedWaterLevel = OutWaterLevel;
+    const float SafeHalfHeight = FMath::Max(1.0f, CapsuleHalfHeight);
+
+    // Probe both the actor origin and the capsule bottom. The origin is useful for deep water,
+    // while the bottom catches shallow water where the center may sit slightly above the surface.
+    const bool bInWater = AWaterActor::FindWaterLevelAtLocation(WorldContextObject, ActorLocation, DetectedWaterLevel)
+        || AWaterActor::FindWaterLevelAtLocation(WorldContextObject, ActorLocation - FVector::UpVector * SafeHalfHeight, DetectedWaterLevel);
+
+    if (bInWater)
+    {
+        OutWaterLevel = DetectedWaterLevel;
+    }
+    return bInWater;
+}
+
+static void ApplyRuntimeVehicleWaterExitState(APawn* RestoredPawn, float WaterLevel)
+{
+    if (!IsValid(RestoredPawn))
+    {
+        return;
+    }
+
+    // Directly refresh the water interaction because the pawn was hidden and collision-disabled
+    // while seated in the vehicle, so overlap events can be stale or missing on the exit frame.
+    if (IWaterInteract* WaterInteract = Cast<IWaterInteract>(RestoredPawn))
+    {
+        WaterInteract->EnterWater(WaterLevel);
+    }
+
+    if (ACharacter* Character = Cast<ACharacter>(RestoredPawn))
+    {
+        if (UCharacterMovementComponent* Movement = Character->GetCharacterMovement())
+        {
+            Movement->StopMovementImmediately();
+            Movement->SetMovementMode(MOVE_Swimming);
+        }
+    }
+}
 
 ARuntimeVehiclePawn::ARuntimeVehiclePawn()
 {
@@ -586,9 +657,16 @@ void ARuntimeVehiclePawn::ExitVehicle()
         FRotator SafeExitRotation = RestoreRotation;
         if (!FindSafeExitTransform(StoredPawn, SafeExitLocation, SafeExitRotation))
         {
-            UE_LOG(LogTemp, Warning, TEXT("RuntimeVehiclePawn: no walkable exit location found within one vehicle length. Staying in vehicle."));
+            UE_LOG(LogTemp, Warning, TEXT("RuntimeVehiclePawn: no ground or water exit location found within one vehicle length. Staying in vehicle."));
             return;
         }
+
+        float ExitCapsuleRadius = 34.0f;
+        float ExitCapsuleHalfHeight = 88.0f;
+        GetRuntimeVehicleExitPawnCapsuleSize(StoredPawn.Get(), ExitCapsuleRadius, ExitCapsuleHalfHeight);
+
+        float ExitWaterLevel = 0.0f;
+        const bool bExitIntoWater = IsRuntimeVehicleExitLocationInWater(this, SafeExitLocation, ExitCapsuleHalfHeight, ExitWaterLevel);
 
         StoredPawn->DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
         StoredPawn->SetActorLocationAndRotation(SafeExitLocation, SafeExitRotation, false, nullptr, ETeleportType::TeleportPhysics);
@@ -596,6 +674,15 @@ void ARuntimeVehiclePawn::ExitVehicle()
         StoredPawn->SetActorEnableCollision(true);
         OccupyingController->Possess(StoredPawn);
         RestoreStoredPawnCamera(OccupyingController, StoredPawn);
+
+        if (bExitIntoWater)
+        {
+            ApplyRuntimeVehicleWaterExitState(StoredPawn.Get(), ExitWaterLevel);
+        }
+
+        // After collision is re-enabled, resync overlaps so water volumes can notify any
+        // water-aware components that were hidden while the pawn was seated in the vehicle.
+        AWaterActor::CheckOverlappingWater(StoredPawn.Get());
 
         if (APlayerCharacterController* RuntimeController = Cast<APlayerCharacterController>(OccupyingController))
         {
@@ -632,24 +719,7 @@ bool ARuntimeVehiclePawn::FindSafeExitTransform(APawn* PawnToExit, FVector& OutL
 
     float CapsuleRadius = 34.0f;
     float CapsuleHalfHeight = 88.0f;
-    if (const ACharacter* CharacterToExit = Cast<ACharacter>(PawnToExit))
-    {
-        if (const UCapsuleComponent* Capsule = CharacterToExit->GetCapsuleComponent())
-        {
-            CapsuleRadius = FMath::Max(1.0f, Capsule->GetScaledCapsuleRadius());
-            CapsuleHalfHeight = FMath::Max(CapsuleRadius + 1.0f, Capsule->GetScaledCapsuleHalfHeight());
-        }
-    }
-    else
-    {
-        const FBox PawnBounds = PawnToExit->GetComponentsBoundingBox(true);
-        if (PawnBounds.IsValid)
-        {
-            const FVector Extent = PawnBounds.GetExtent();
-            CapsuleRadius = FMath::Max(20.0f, FMath::Max(Extent.X, Extent.Y));
-            CapsuleHalfHeight = FMath::Max(CapsuleRadius + 1.0f, Extent.Z);
-        }
-    }
+    GetRuntimeVehicleExitPawnCapsuleSize(PawnToExit, CapsuleRadius, CapsuleHalfHeight);
 
     FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(RuntimeVehicleExitTrace), false, this);
     QueryParams.AddIgnoredActor(this);
@@ -750,6 +820,47 @@ bool ARuntimeVehiclePawn::FindSafeExitTransform(APawn* PawnToExit, FVector& OutL
         if (World->SweepSingleByChannel(FloorSweep, SweepStart, SweepEnd, CandidateRotation, ECC_Pawn, CapsuleShape, QueryParams)
             && FloorSweep.bBlockingHit
             && FloorSweep.ImpactNormal.Z < RequiredWalkableZ)
+        {
+            continue;
+        }
+
+        OutLocation = CandidateActorLocation;
+        return true;
+    }
+
+    float VehicleWaterLevel = 0.0f;
+    bool bVehicleInWater = false;
+    if (IsValid(BuoyancyComponent) && BuoyancyComponent->IsInWater())
+    {
+        VehicleWaterLevel = BuoyancyComponent->GetWaterLevel();
+        bVehicleInWater = true;
+    }
+
+    const FVector VehicleBottomLocation = VehicleLocation - FVector::UpVector * FMath::Max(BodyExtent.Z, CapsuleHalfHeight * 0.5f);
+    bVehicleInWater = AWaterActor::FindWaterLevelAtLocation(this, VehicleLocation, VehicleWaterLevel)
+        || AWaterActor::FindWaterLevelAtLocation(this, VehicleBottomLocation, VehicleWaterLevel)
+        || bVehicleInWater;
+
+    if (!bVehicleInWater)
+    {
+        return false;
+    }
+
+    // No walkable floor was found. If the vehicle is submerged, falling back to a water
+    // exit lets the player leave the car and swim instead of being trapped by the ground-only search.
+    const float ExitSubmergeDepth = FMath::Clamp(CapsuleHalfHeight * 0.30f, 24.0f, 64.0f);
+    for (const FExitCandidate& Candidate : Candidates)
+    {
+        float CandidateWaterLevel = VehicleWaterLevel;
+        FVector CandidateActorLocation(Candidate.Location.X, Candidate.Location.Y, CandidateWaterLevel - ExitSubmergeDepth);
+        if (!IsRuntimeVehicleExitLocationInWater(this, CandidateActorLocation, CapsuleHalfHeight, CandidateWaterLevel))
+        {
+            continue;
+        }
+
+        CandidateActorLocation.Z = CandidateWaterLevel - ExitSubmergeDepth;
+        const FQuat CandidateRotation = OutRotation.Quaternion();
+        if (World->OverlapBlockingTestByChannel(CandidateActorLocation, CandidateRotation, ECC_Pawn, CapsuleShape, QueryParams))
         {
             continue;
         }

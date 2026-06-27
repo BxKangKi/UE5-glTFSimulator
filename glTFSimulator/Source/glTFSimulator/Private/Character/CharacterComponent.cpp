@@ -886,6 +886,10 @@ FCharacterRagdollEnvironmentState UCharacterComponent::UpdateRagdollEnvironmentS
     State.bMovementWasFalling = IsValid(Movement) && Movement->IsFalling();
     State.bMovementWasOnGround = IsValid(Movement) && Movement->IsMovingOnGround();
 
+    float OwnerDirectWaterLevel = State.WaterLevel;
+    const bool bOwnerHasVerifiedWaterState = AWaterActor::FindWaterLevelAtLocation(this, OwnerCharacter->GetActorLocation(), OwnerDirectWaterLevel)
+        || AWaterActor::FindWaterLevelAtLocation(this, OwnerCharacter->GetBottomLocation(), OwnerDirectWaterLevel);
+
     const bool bUsingStoredLandFallback = bLandRagdollRecoveryOverridesWater
         && !bIsRagdoll
         && RagdollEnvironmentState.bIsValid
@@ -998,7 +1002,21 @@ FCharacterRagdollEnvironmentState UCharacterComponent::UpdateRagdollEnvironmentS
     const bool bCommittedToWaterRecovery = !bForceLandRagdollRecoveryOnce
         && !bLandRagdollRecoveryOverridesWater
         && !bIsRagdoll
+        && bOwnerHasVerifiedWaterState
         && (bRagdollRecoveryWantsSwimming || (bRagdollInWater && RagdollWeight > 0.0f) || RagdollRecoverySwimLockTime > 0.0f);
+
+    if (State.bIsOnGround && !bOwnerHasVerifiedWaterState && !bCommittedToWaterRecovery)
+    {
+        // A dry, ground-supported ragdoll must recover as land even if a stale flying/water
+        // sequence left the capsule in MOVE_Swimming or a broad water bounds check touches a probe.
+        State.bTreatWaterAsGround = true;
+        State.bForcedLandRecovery = true;
+        State.bRagdollMeaningfullySubmerged = false;
+        State.bShouldRecoverInWater = false;
+        State.bShouldDelayDeactivation = false;
+        return StoreAndReturn(State);
+    }
+
     const bool bStableWaterRecoveryEvidence = State.bRagdollMeaningfullySubmerged || bCommittedToWaterRecovery;
     const bool bShallowEnoughForLandRecovery = !State.bRagdollMeaningfullySubmerged
         && State.RagdollMaxSubmersionDepth <= FMath::Max(0.0f, RagdollTreatWaterAsGroundMaxDepth);
