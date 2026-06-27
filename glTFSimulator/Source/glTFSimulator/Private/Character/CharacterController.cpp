@@ -281,6 +281,18 @@ void ACharacterController::Tick(float DeltaSeconds)
 
     if (!Component->IsRagdollActive() && Component->IsRagdollDamage())
     {
+        float DirectWaterLevel = WaterLevel;
+        if (!FindDirectWaterLevel(DirectWaterLevel))
+        {
+            // Fall-damage ragdoll is starting from dry air/ground.  Drop stale water state
+            // before ActiveRagdoll() snapshots bRagdollInWater.
+            ClearDryWaterState(DirectWaterLevel, false);
+        }
+        else
+        {
+            WaterLevel = DirectWaterLevel;
+        }
+
         Component->SetRagdollActive(true);
     }
     SubSystem->SetPlayerLocation(GetActorLocation());
@@ -289,6 +301,18 @@ void ACharacterController::Tick(float DeltaSeconds)
 void ACharacterController::EnterWater(const float Level)
 {
     bWaterStateFromOverlap = true;
+    WaterLevel = Level;
+
+    const bool bCurrentlySwimming = IsValid(Movement) && Movement->MovementMode == MOVE_Swimming;
+    if (IsValid(Component.Get()) && !Component->ShouldUseDirectWaterState(Level, bCurrentlySwimming))
+    {
+        // Touching only the top of the water volume is not enough to enter Swimming.
+        // Keep the overlap memory, because the next direct probe can still enable water
+        // once the capsule is actually immersed past the enter threshold.
+        CharacterStateBit &= ~STATE_WATER;
+        return;
+    }
+
     SetWaterState(true, Level);
 }
 
@@ -302,6 +326,59 @@ void ACharacterController::ExitWater(const float Level)
     else
     {
         WaterLevel = Level;
+    }
+}
+
+bool ACharacterController::FindDirectWaterLevel(float& OutLevel) const
+{
+    // This is the authoritative non-ragdoll water check.  Do not trust STATE_WATER here,
+    // because Fly -> Fall toggles can leave that bit alive after the overlap has already ended.
+    float DetectedLevel = OutLevel;
+    const FVector ActorLocation = GetActorLocation();
+    const float CapsuleHalfHeight = GetCapsuleComponent() ? GetCapsuleComponent()->GetScaledCapsuleHalfHeight() : 0.0f;
+    const FVector BottomLocation(ActorLocation.X, ActorLocation.Y, ActorLocation.Z - CapsuleHalfHeight);
+
+    const bool bActorPointInWater = AWaterActor::FindWaterLevelAtLocation(this, ActorLocation, DetectedLevel);
+    const bool bBottomPointInWater = AWaterActor::FindWaterLevelAtLocation(this, BottomLocation, DetectedLevel);
+    if (bActorPointInWater || bBottomPointInWater)
+    {
+        OutLevel = DetectedLevel;
+        const bool bCurrentlySwimming = IsValid(Movement)
+            && Movement->MovementMode == MOVE_Swimming
+            && !Movement->IsFlying();
+        return !IsValid(Component.Get()) || Component->ShouldUseDirectWaterState(DetectedLevel, bCurrentlySwimming);
+    }
+
+    return false;
+}
+
+void ACharacterController::ClearDryWaterState(float Level, bool bUpdateMovementMode)
+{
+    // A dry movement probe wins over stale overlap/state bits.  This is especially important
+    // before fall-damage ragdoll starts, because ActiveRagdoll() can otherwise preserve
+    // a previous swimming intent and classify a dry ground impact as water recovery.
+    bWaterStateFromOverlap = false;
+    bWaterStateForcedByRagdoll = false;
+    CharacterStateBit &= ~STATE_WATER;
+    WaterLevel = Level;
+
+    if (IsValid(Component.Get()))
+    {
+        Component->SetRagdollWaterState(false, true);
+    }
+
+    if (IsValid(SkeletalMeshBuoyancyComponent))
+    {
+        SkeletalMeshBuoyancyComponent->ExitWater(Level);
+    }
+
+    if (bUpdateMovementMode && IsValid(Movement) && Movement->MovementMode == MOVE_Swimming)
+    {
+        // Drying out at the surface should not zero horizontal momentum; otherwise Fly-off
+        // or surface exit feels like the character gets stuck in slow swimming for a frame.
+        const FVector PreservedVelocity = Movement->Velocity;
+        Movement->SetMovementMode(Movement->IsMovingOnGround() ? MOVE_Walking : MOVE_Falling);
+        Movement->Velocity = FVector(PreservedVelocity.X, PreservedVelocity.Y, FMath::Min(PreservedVelocity.Z, 0.0f));
     }
 }
 
@@ -412,28 +489,45 @@ void ACharacterController::Flying()
 
     const bool bWasFlying = Movement->IsFlying();
     Movement->StopMovementImmediately();
+
+    float DirectWaterLevel = WaterLevel;
+    const bool bDirectlyInWater = FindDirectWaterLevel(DirectWaterLevel);
+
     if (bWasFlying)
     {
-        float CurrentWaterLevel = WaterLevel;
-        const bool bStillInWater = UCharacterFunctionLibrary::IsStateActive(CharacterStateBit, STATE_WATER)
-            || AWaterActor::FindWaterLevelAtLocation(this, GetActorLocation(), CurrentWaterLevel)
-            || AWaterActor::FindWaterLevelAtLocation(this, GetBottomLocation(), CurrentWaterLevel);
+        CharacterStateBit &= ~STATE_FLYING;
 
-        if (bStillInWater)
+        if (bDirectlyInWater)
         {
-            WaterLevel = CurrentWaterLevel;
+            WaterLevel = DirectWaterLevel;
             CharacterStateBit |= STATE_WATER;
+            bWaterStateFromOverlap = true;
+            bWaterStateForcedByRagdoll = false;
             Movement->SetMovementMode(MOVE_Swimming);
         }
         else
         {
-            CharacterStateBit &= ~STATE_WATER;
+            // Leaving Fly over dry ground/air must not reuse an old STATE_WATER bit.
+            ClearDryWaterState(DirectWaterLevel, false);
             Movement->SetMovementMode(MOVE_Falling);
         }
-        CharacterStateBit &= ~STATE_FLYING;
     }
     else
     {
+        if (!bDirectlyInWater)
+        {
+            // Starting Fly from dry space also clears stale swimming intent, so the next
+            // Fly-off -> Fall -> Ragdoll chain cannot inherit water recovery.
+            ClearDryWaterState(DirectWaterLevel, false);
+        }
+        else
+        {
+            WaterLevel = DirectWaterLevel;
+            CharacterStateBit |= STATE_WATER;
+            bWaterStateFromOverlap = true;
+            bWaterStateForcedByRagdoll = false;
+        }
+
         Movement->SetMovementMode(MOVE_Flying);
         CharacterStateBit |= STATE_FLYING;
     }
@@ -442,6 +536,20 @@ void ACharacterController::Flying()
 void ACharacterController::ToggleRagdoll()
 {
     const bool bNewState = !Component->IsRagdollActive();
+    if (bNewState)
+    {
+        float DirectWaterLevel = WaterLevel;
+        if (!FindDirectWaterLevel(DirectWaterLevel))
+        {
+            // Manual ragdoll uses the same dry guard as fall-damage ragdoll.
+            ClearDryWaterState(DirectWaterLevel, false);
+        }
+        else
+        {
+            WaterLevel = DirectWaterLevel;
+        }
+    }
+
     Component->SetRagdollActive(bNewState);
 }
 
@@ -462,12 +570,21 @@ void ACharacterController::SetWaterState(bool bValue, float Level, bool bForceRa
     }
 
     const bool bRagdollTransitionActive = IsValid(Component.Get()) && Component->IsRagdollTransitionInProgress();
+    const bool bRagdollAcceptsWater = !bRagdollTransitionActive
+        || (IsValid(Component.Get())
+            && !Component->ShouldTreatRagdollWaterAsGround()
+            && (Component->ShouldRecoverRagdollInWaterFromEnvironment() || Component->IsRecoveringRagdollInWater() || Component->ShouldKeepSwimmingAfterWaterRagdoll()));
+
     if (IsValid(Component.Get()) && (bStateChanged || bLevelChanged || bForceRagdollWaterState || bRagdollTransitionActive))
     {
-        Component->SetRagdollWaterState(bValue, bForceRagdollWaterState);
+        // During ragdoll, an overlap bit alone is not enough to enter water state.  The filtered
+        // ragdoll environment snapshot must agree first, otherwise SetRagdollWaterState(true)
+        // would immediately force MOVE_Swimming from a stale Fly/Fall water flag.
+        const bool bComponentInWater = bValue && bRagdollAcceptsWater;
+        Component->SetRagdollWaterState(bComponentInWater, bForceRagdollWaterState || (bValue && bRagdollTransitionActive && !bRagdollAcceptsWater));
     }
 
-    if (bValue && IsValid(Movement) && bRagdollTransitionActive)
+    if (bValue && IsValid(Movement) && bRagdollTransitionActive && bRagdollAcceptsWater)
     {
         Movement->StopMovementImmediately();
         if (Movement->MovementMode != MOVE_Swimming)
@@ -508,8 +625,7 @@ bool ACharacterController::RefreshWaterStateForRagdollRecovery(bool bRagdollBody
 
     if (!bRagdollBodyInWater && !bUseRagdollProbeOnly)
     {
-        bActorPointInWater = AWaterActor::FindWaterLevelAtLocation(this, GetActorLocation(), EffectiveLevel)
-            || AWaterActor::FindWaterLevelAtLocation(this, GetBottomLocation(), EffectiveLevel);
+        bActorPointInWater = FindDirectWaterLevel(EffectiveLevel);
     }
 
     // Direct ragdoll recovery must be decided by the current ragdoll body/bone positions, not by
@@ -554,15 +670,39 @@ void ACharacterController::SyncRagdollWaterStateFromPhysics()
 
     if (!bRagdollLikeState)
     {
-        if (bWaterStateFromOverlap && !UCharacterFunctionLibrary::IsStateActive(CharacterStateBit, STATE_WATER))
+        const bool bKeepPostRagdollSwimming = Component->ShouldKeepSwimmingAfterWaterRagdoll();
+        const bool bHasAnyWaterState = bWaterStateFromOverlap
+            || bWaterStateForcedByRagdoll
+            || UCharacterFunctionLibrary::IsStateActive(CharacterStateBit, STATE_WATER)
+            || (IsValid(Movement) && Movement->MovementMode == MOVE_Swimming);
+
+        if (!bKeepPostRagdollSwimming && (!IsValid(Movement) || !Movement->IsFlying()))
         {
-            SetWaterState(true, WaterLevel, true);
+            float DirectWaterLevel = WaterLevel;
+            const bool bDirectWaterIsDeepEnough = FindDirectWaterLevel(DirectWaterLevel);
+            if (bDirectWaterIsDeepEnough)
+            {
+                WaterLevel = DirectWaterLevel;
+                bWaterStateFromOverlap = true;
+                if (!UCharacterFunctionLibrary::IsStateActive(CharacterStateBit, STATE_WATER))
+                {
+                    SetWaterState(true, WaterLevel, true);
+                }
+            }
+            else if (bHasAnyWaterState)
+            {
+                // A shallow surface touch, including Fly-off with only the capsule bottom in water,
+                // is treated as dry movement.  Hysteresis inside FindDirectWaterLevel keeps real
+                // swimmers from flickering out at the surface.
+                ClearDryWaterState(DirectWaterLevel, true);
+                return;
+            }
         }
-        if (Component->ShouldKeepSwimmingAfterWaterRagdoll())
+
+        if (bKeepPostRagdollSwimming)
         {
             float LockWaterLevel = WaterLevel;
-            const bool bLockStillInWater = AWaterActor::FindWaterLevelAtLocation(this, GetActorLocation(), LockWaterLevel)
-                || AWaterActor::FindWaterLevelAtLocation(this, GetBottomLocation(), LockWaterLevel);
+            const bool bLockStillInWater = FindDirectWaterLevel(LockWaterLevel);
 
             if (bLockStillInWater)
             {
@@ -584,8 +724,7 @@ void ACharacterController::SyncRagdollWaterStateFromPhysics()
         if (bWaterStateForcedByRagdoll)
         {
             float ActorWaterLevel = WaterLevel;
-            const bool bActorStillInWater = AWaterActor::FindWaterLevelAtLocation(this, GetActorLocation(), ActorWaterLevel)
-                || AWaterActor::FindWaterLevelAtLocation(this, GetBottomLocation(), ActorWaterLevel);
+            const bool bActorStillInWater = FindDirectWaterLevel(ActorWaterLevel);
 
             if (bActorStillInWater)
             {

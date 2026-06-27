@@ -119,6 +119,8 @@ private:
     UPROPERTY()
     TObjectPtr<UGameManagerSubSystem> SubSystem;
     void SetWaterState(bool bValue, float Level, bool bForceRagdollWaterState = false);
+    bool FindDirectWaterLevel(float& OutLevel) const;
+    void ClearDryWaterState(float Level, bool bUpdateMovementMode);
     void SyncRagdollWaterStateFromPhysics();
     int32 CharacterStateBit = 0;
     FVector RawMoveInput;

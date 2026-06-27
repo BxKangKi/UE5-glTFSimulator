@@ -22,6 +22,8 @@ class ACharacterController;
 class UCharacterMovementComponent;
 class USpringArmComponent;
 class USkeletalMeshComponent;
+struct FTraceDatum;
+struct FTraceHandle;
 
 USTRUCT(BlueprintType)
 struct GLTFSIMULATOR_API FCharacterRagdollEnvironmentState
@@ -179,6 +181,18 @@ public:
     UFUNCTION(BlueprintCallable)
     void ClearRagdollSwimmingRecoveryLock(bool bKeepCurrentWaterState = true);
 
+    /**
+     * Returns water depth against the swim-surface reference.
+     * The head bone is preferred when it exists; otherwise a capsule-derived head-height fallback is used.
+     */
+    float GetDirectWaterImmersionDepth(float InWaterLevel) const;
+
+    /** Computes swim enter, visible ceiling, and surface-correction depths from the current capsule size. */
+    void GetCapsuleSwimmingDepths(float& OutEnterDepth, float& OutExitDepth, float& OutSurfaceLockDepth) const;
+
+    /** Uses hysteresis so shallow surface touches do not immediately enter Swimming, but real swimming does not flicker off. */
+    bool ShouldUseDirectWaterState(float InWaterLevel, bool bCurrentlySwimming) const;
+
     /** Refreshes the ragdoll/recovery water flags immediately before animation variables are read. */
     bool RefreshRagdollWaterStateForAnimation();
 
@@ -213,6 +227,27 @@ private:
     FVector ImpactVelocity = FVector::ZeroVector;
     FVector CurrentSpeed = FVector::ZeroVector;
     FVector PrevVelocity = FVector::ZeroVector;
+
+    /** Smoothed head/capsule water depth used only for surface-ceiling lock hysteresis. */
+    float SmoothedSurfaceReferenceDepth = 0.0f;
+
+    /** True after SmoothedSurfaceReferenceDepth has received its first valid sample. */
+    bool bHasSmoothedSurfaceReferenceDepth = false;
+
+    /** Latched while the head is at the visible surface ceiling, so animation bobbing cannot re-enable upward input every other frame. */
+    bool bSwimmingSurfaceCeilingLocked = false;
+
+    /** Head/capsule reference must be this far below the surface before normal movement enters Swimming. */
+    UPROPERTY(EditAnywhere, Category="Movement|Swimming", meta=(ClampMin="0.0"))
+    float SwimWaterEnterDepthRadiusRatio = 0.55f;
+
+    /** Visible head/capsule ceiling above the water surface; upward input is blocked only after this line. */
+    UPROPERTY(EditAnywhere, Category="Movement|Swimming", meta=(ClampMin="0.0"))
+    float SwimWaterExitDepthRadiusRatio = 0.22f;
+
+    /** Near-surface correction band kept for existing swimmers so ceiling overshoot can be pulled back smoothly. */
+    UPROPERTY(EditAnywhere, Category="Movement|Swimming", meta=(ClampMin="0.0"))
+    float SwimSurfaceLockDepthRadiusRatio = 0.90f;
 
     UPROPERTY(EditAnywhere, Category="Ragdoll|Recovery", meta=(ClampMin="1.0"))
     float RagdollGetUpSpeedThreshold = 350.0f;
@@ -312,6 +347,12 @@ private:
     bool bHasRagdollPrePhysicsActorRotation = false;
     float PendingWaterRagdollDeactivationLevel = 0.0f;
     uint64 RagdollEnvironmentStateFrame = 0;
+    uint32 RagdollReleaseGroundTraceRequestId = 0;
+    int32 PendingRagdollReleaseGroundTraceCount = 0;
+    bool bRagdollReleaseGroundTraceInFlight = false;
+    bool bRagdollReleaseGroundTraceHitWalkable = false;
+    bool bUseAsyncRagdollReleaseGroundResult = false;
+    bool bAsyncRagdollReleaseGroundResult = false;
 
     UPROPERTY(Transient)
     FCharacterRagdollEnvironmentState RagdollEnvironmentState;
@@ -324,13 +365,20 @@ private:
     FRotator ActorTargetRotation;
 
     void ProcessRagdollCheck();
+    void ClearRagdollWaterIntent(bool bClearSwimLock = true);
+    void SetMovementModeAfterRagdollRecovery(UCharacterMovementComponent* CharacterMovement, const FCharacterRagdollEnvironmentState& RecoveryEnvironmentState) const;
     void ResetRagdollRecoveryState(bool bKeepWaterIntent);
+    bool TryGetHeadWaterReferenceLocation(FVector& OutLocation) const;
+    float GetDirectWaterCapsuleImmersionDepth(float InWaterLevel) const;
     bool IsRagdollLikeState() const { return bIsRagdoll || bGettingUp || RagdollWeight > 0.0f || bPendingWaterRagdollDeactivation; }
     bool RefreshRagdollWaterDetection(float* OutDetectedWaterLevel = nullptr);
-    FCharacterRagdollEnvironmentState UpdateRagdollEnvironmentStateForRelease(float InitialWaterLevel = 0.0f);
+    FCharacterRagdollEnvironmentState UpdateRagdollEnvironmentStateForRelease(float InitialWaterLevel = 0.0f, bool bUseGroundOverride = false, bool bGroundOverride = false);
     bool ApplyRagdollReleaseEnvironmentStateToOwner(ACharacterController *InOwner, FCharacterRagdollEnvironmentState &ReleaseEnvironmentState);
     bool IsRagdollTouchingWalkableGround(float TraceDistance = 42.0f, bool bCoreOnly = false) const;
-    bool ShouldDelayWaterRagdollDeactivation(float WaterLevel) const;
+    void RequestAsyncRagdollReleaseGroundTrace();
+    void OnAsyncRagdollReleaseGroundTraceCompleted(const FTraceHandle& TraceHandle, FTraceDatum& TraceDatum);
+    void FinishAsyncRagdollReleaseGroundTrace(bool bWalkableGround);
+    bool ShouldDelayWaterRagdollDeactivation(float WaterLevel, bool bKnownWalkableGround) const;
     FVector GetRagdollRecoveryActorLocationFromHips(const FVector& HipsLocation, bool bWaterRecovery) const;
     bool ShouldUseRagdollWaterRecoveryForState(const FCharacterRagdollEnvironmentState& State) const;
     void BeginPendingWaterRagdollDeactivation(float WaterLevel);
