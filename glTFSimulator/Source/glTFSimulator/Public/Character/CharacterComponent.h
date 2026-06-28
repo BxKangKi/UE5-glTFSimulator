@@ -16,7 +16,10 @@
 #define STATE_FLYING (1 << 4)
 #define STATET_FLOATING (1 << 5)
 
-#define MAX_RAGDOLL_WEIGHT 3.0f
+namespace RuntimeCharacterConstants
+{
+    static constexpr float MaxRagdollWeight = 3.0f;
+}
 
 class ACharacterController;
 class UCharacterMovementComponent;
@@ -24,6 +27,7 @@ class USpringArmComponent;
 class USkeletalMeshComponent;
 struct FTraceDatum;
 struct FTraceHandle;
+struct FHitResult;
 
 USTRUCT(BlueprintType)
 struct GLTFSIMULATOR_API FCharacterRagdollEnvironmentState
@@ -109,6 +113,18 @@ public:
     UFUNCTION(BlueprintCallable)
     void ResetMovementState();
 
+    /** Clears only the transient water-surface clamp without stopping all movement. */
+    void ClearSwimmingSurfaceConstraintState();
+
+    /** Clears any cached waterline reference while a new mesh is still loading. */
+    void InvalidateWaterReferenceForPendingMeshLoad();
+
+    /** Schedules waterline reference sampling after the final mesh has loaded and produced bone transforms. */
+    void RequestWaterReferenceRefreshAfterMeshLoad();
+
+    /** Re-samples BONE_HEAD from the loaded mesh, then stores a stable capsule-local water reference. */
+    void RefreshWaterReferenceOffsetFromHead();
+
     UFUNCTION(BlueprintCallable)
     void SetRagdollWaterState(bool bInWater, bool bForce = false);
 
@@ -182,16 +198,23 @@ public:
     void ClearRagdollSwimmingRecoveryLock(bool bKeepCurrentWaterState = true);
 
     /**
-     * Returns water depth against the swim-surface reference.
-     * The head bone is preferred when it exists; otherwise a capsule-derived head-height fallback is used.
+     * Returns water depth against the cached head/fallback point.
+     * The head bone is sampled once after mesh load so animation bobbing cannot flicker Swimming.
      */
     float GetDirectWaterImmersionDepth(float InWaterLevel) const;
 
-    /** Computes swim enter, visible ceiling, and surface-correction depths from the current capsule size. */
+    /** Builds the stable cached head/fallback point from the capsule-local offset. */
+    bool TryGetStableWaterReferenceLocation(FVector& OutLocation) const;
+    bool TryGetWaterReferenceOrCapsuleFallbackLocation(FVector& OutLocation) const;
+
+    /** Computes swim enter, ceiling padding, and surface-correction depths from fixed native ratios and capsule size. */
     void GetCapsuleSwimmingDepths(float& OutEnterDepth, float& OutExitDepth, float& OutSurfaceLockDepth) const;
 
     /** Uses hysteresis so shallow surface touches do not immediately enter Swimming, but real swimming does not flicker off. */
     bool ShouldUseDirectWaterState(float InWaterLevel, bool bCurrentlySwimming) const;
+
+    /** Returns true when a raised, self-ignored trace finds walkable support close to the capsule. */
+    bool IsCharacterSupportedByWalkableGround(float ExtraDownDistance = 24.0f) const;
 
     /** Refreshes the ragdoll/recovery water flags immediately before animation variables are read. */
     bool RefreshRagdollWaterStateForAnimation();
@@ -228,91 +251,24 @@ private:
     FVector CurrentSpeed = FVector::ZeroVector;
     FVector PrevVelocity = FVector::ZeroVector;
 
-    /** Smoothed head/capsule water depth used only for surface-ceiling lock hysteresis. */
-    float SmoothedSurfaceReferenceDepth = 0.0f;
+    /** Stable capsule-local head/fallback offset sampled only after the final runtime mesh has loaded. */
+    FVector WaterReferenceOffsetFromCapsule = FVector::ZeroVector;
 
-    /** True after SmoothedSurfaceReferenceDepth has received its first valid sample. */
-    bool bHasSmoothedSurfaceReferenceDepth = false;
+    /** True after WaterReferenceOffsetFromCapsule has been initialized from loaded-mesh head/capsule fallback data. */
+    bool bHasWaterReferenceOffsetFromCapsule = false;
 
-    /** Latched while the head is at the visible surface ceiling, so animation bobbing cannot re-enable upward input every other frame. */
+    /** True only after the final mesh-load completion path authorizes waterline sampling. */
+    bool bWaterReferenceMeshLoadComplete = false;
+
+    /** Latched while the stable head reference is at the visible surface ceiling, so held upward input cannot punch through the cap. */
     bool bSwimmingSurfaceCeilingLocked = false;
 
-    /** Head/capsule reference must be this far below the surface before normal movement enters Swimming. */
-    UPROPERTY(EditAnywhere, Category="Movement|Swimming", meta=(ClampMin="0.0"))
-    float SwimWaterEnterDepthRadiusRatio = 0.55f;
+    // Swimming surface thresholds are fixed native constants in CharacterComponent.cpp.
+    // They are intentionally not UPROPERTY values because they are gameplay invariants
+    // derived from capsule size, not per-character tuning knobs.
 
-    /** Visible head/capsule ceiling above the water surface; upward input is blocked only after this line. */
-    UPROPERTY(EditAnywhere, Category="Movement|Swimming", meta=(ClampMin="0.0"))
-    float SwimWaterExitDepthRadiusRatio = 0.22f;
-
-    /** Near-surface correction band kept for existing swimmers so ceiling overshoot can be pulled back smoothly. */
-    UPROPERTY(EditAnywhere, Category="Movement|Swimming", meta=(ClampMin="0.0"))
-    float SwimSurfaceLockDepthRadiusRatio = 0.90f;
-
-    UPROPERTY(EditAnywhere, Category="Ragdoll|Recovery", meta=(ClampMin="1.0"))
-    float RagdollGetUpSpeedThreshold = 350.0f;
-
-    UPROPERTY(EditAnywhere, Category="Ragdoll|Recovery", meta=(ClampMin="1.0"))
-    float RagdollWaterGetUpSpeedThreshold = 320.0f;
-
-    UPROPERTY(EditAnywhere, Category="Ragdoll|Recovery", meta=(ClampMin="0.0"))
-    float RagdollMinimumActiveTime = 2.0f;
-
-    UPROPERTY(EditAnywhere, Category="Ragdoll|Recovery", meta=(ClampMin="0.0"))
-    float RagdollLowSpeedConfirmTime = 1.0f;
-
-    UPROPERTY(EditAnywhere, Category="Ragdoll|Recovery", meta=(ClampMin="0.0"))
-    float RagdollWaterLowSpeedConfirmTime = 0.75f;
-
-    UPROPERTY(EditAnywhere, Category="Ragdoll|Recovery", meta=(ClampMin="0.1"))
-    float RagdollRecoveryBlendDuration = 3.0f;
-
-    UPROPERTY(EditAnywhere, Category="Ragdoll|Recovery", meta=(ClampMin="0.1"))
-    float WaterRagdollTransformBlendDuration = 3.0f;
-
-    /** In-water ragdoll recovery should not inherit the tumbling body yaw directly. Keep the actor yaw stable while the mesh blends back. */
-    UPROPERTY(EditAnywhere, Category="Ragdoll|Recovery", meta=(ClampMin="0.0"))
-    float WaterRagdollStableYawBlendSpeed = 7.5f;
-
-    UPROPERTY(EditAnywhere, Category="Ragdoll|Recovery", meta=(ClampMin="0.0"))
-    float WaterRagdollSwimLockAfterRecovery = 0.35f;
-
-    UPROPERTY(EditAnywhere, Category="Ragdoll|Recovery", meta=(ClampMin="0.0"))
-    float WaterRecoveryTransformSnapDistance = 0.0f;
-
-    /** Extra vertical offset applied when rebuilding the actor/capsule origin from the ragdoll hips during underwater recovery. Positive values raise the origin. */
-    UPROPERTY(EditAnywhere, Category="Ragdoll|Recovery", meta=(ClampMin="-100.0", ClampMax="100.0"))
-    float WaterRagdollRecoveryActorZOffset = 0.0f;
-
-    /** The rebuilt actor/capsule origin is allowed to start this far below the water surface before underwater recovery begins. Lower values make the origin recover higher. */
-    UPROPERTY(EditAnywhere, Category="Ragdoll|Recovery", meta=(ClampMin="0.0"))
-    float WaterRagdollReleaseDepthBelowSurface = 38.0f;
-
-    UPROPERTY(EditAnywhere, Category="Ragdoll|Recovery", meta=(ClampMin="0.0"))
-    float WaterRagdollReleaseSinkSpeed = 35.0f;
-
-    UPROPERTY(EditAnywhere, Category="Ragdoll|Recovery", meta=(ClampMin="0.0"))
-    float WaterRagdollReleaseSinkForce = 9000.0f;
-
-    /** Water recovery wins over land recovery when the core ragdoll probes are this far below the surface. */
-    UPROPERTY(EditAnywhere, Category="Ragdoll|Recovery", meta=(ClampMin="0.0"))
-    float RagdollWaterRecoveryCoreDepth = 24.0f;
-
-    /** Average probe depth needed to consider the ragdoll genuinely underwater. */
-    UPROPERTY(EditAnywhere, Category="Ragdoll|Recovery", meta=(ClampMin="0.0"))
-    float RagdollWaterRecoveryAverageDepth = 10.0f;
-
-    /** Ground recovery is allowed in water only while the ragdoll is shallower than this. */
-    UPROPERTY(EditAnywhere, Category="Ragdoll|Recovery", meta=(ClampMin="0.0"))
-    float RagdollTreatWaterAsGroundMaxDepth = 14.0f;
-
-    /** Extra depth margin that filters one-frame water-surface noise during the final release decision. */
-    UPROPERTY(EditAnywhere, Category="Ragdoll|Recovery", meta=(ClampMin="0.0"))
-    float RagdollWaterReleaseHysteresisDepth = 6.0f;
-
-    /** Minimum core probes that must be underwater before a shallow/no-ground release may choose swimming. */
-    UPROPERTY(EditAnywhere, Category="Ragdoll|Recovery", meta=(ClampMin="1", ClampMax="8"))
-    int32 RagdollWaterReleaseMinCoreProbes = 2;
+    // Ragdoll/water recovery tuning is fixed in CharacterComponent.cpp as native constants.
+    // These values are gameplay invariants, not per-character Blueprint knobs.
 
     float RagdollResistance = 1000.0f;
     float WaterOffset = 0.0f;
@@ -370,6 +326,14 @@ private:
     void ResetRagdollRecoveryState(bool bKeepWaterIntent);
     bool TryGetHeadWaterReferenceLocation(FVector& OutLocation) const;
     float GetDirectWaterCapsuleImmersionDepth(float InWaterLevel) const;
+    float GetStableHeadEmergenceHeight() const;
+    float GetSwimEntryReferenceDepth() const;
+    bool IsCapsuleAtLeastHalfSubmerged(float InWaterLevel) const;
+    bool HasStableHeadReachedShoreExitLine(float DirectImmersionDepth) const;
+    float GetGroundedWaterSwimOverrideDepth() const;
+    float GetGroundedWaterWalkSpeedMultiplier(float InWaterLevel) const;
+    bool TraceCharacterWalkableGroundFromAbove(FHitResult& OutHit, float ExtraDownDistance = 0.0f) const;
+    bool IsGroundSupportBlockingDirectWater(float InWaterLevel, float DirectImmersionDepth, bool bCurrentlySwimming) const;
     bool IsRagdollLikeState() const { return bIsRagdoll || bGettingUp || RagdollWeight > 0.0f || bPendingWaterRagdollDeactivation; }
     bool RefreshRagdollWaterDetection(float* OutDetectedWaterLevel = nullptr);
     FCharacterRagdollEnvironmentState UpdateRagdollEnvironmentStateForRelease(float InitialWaterLevel = 0.0f, bool bUseGroundOverride = false, bool bGroundOverride = false);

@@ -17,6 +17,20 @@
 #include "System/MacroLibrary.h"
 #include "Components/PrimitiveComponent.h"
 
+namespace RuntimeCharacterController
+{
+    static const FVector MeshDefaultRelativeLocation(0.0f, 0.0f, -90.0f);
+    static const FRotator MeshDefaultRelativeRotation(0.0f, 270.0f, 0.0f);
+
+    constexpr float DefaultThirdPersonArmLength = 350.0f;
+    constexpr float WaterLevelChangeToleranceCm = 1.0f;
+    constexpr float MinPhysicsObjectImpactSpeed = 90.0f;
+    constexpr float PhysicsObjectImpactVelocityScale = 0.65f;
+    constexpr float MaxPhysicsObjectImpactVelocityChange = 1400.0f;
+    constexpr float PhysicsObjectImpactUpwardRatio = 0.10f;
+    constexpr float MaxPhysicsObjectImpactUpwardVelocity = 220.0f;
+    constexpr float PhysicsObjectImpactCooldownSeconds = 0.08f;
+}
 
 ACharacterController::ACharacterController()
 {
@@ -108,7 +122,7 @@ void ACharacterController::BeginPlay()
         UE_LOG(LogTemp, Warning, TEXT("Input Mapping Context is not assigned in the editor."));
     }
     bIsLoaded = false;
-    SavedThirdPersonArmLength = SpringArm->TargetArmLength > 1.0f ? SpringArm->TargetArmLength : 350.0f;
+    SavedThirdPersonArmLength = SpringArm->TargetArmLength > 1.0f ? SpringArm->TargetArmLength : RuntimeCharacterController::DefaultThirdPersonArmLength;
     SavedThirdPersonSocketOffset = SpringArm->SocketOffset;
     // Initialize Component
     Movement = GetCharacterMovement();
@@ -133,6 +147,13 @@ void ACharacterController::BeginPlay()
 
 void ACharacterController::Load(const FString &Path)
 {
+    if (IsValid(Component.Get()))
+    {
+        // A new async mesh invalidates the previous waterline reference. The new
+        // BONE_HEAD/capsule offset will be committed only after OnLoadCompleted.
+        Component->InvalidateWaterReferenceForPendingMeshLoad();
+    }
+
     // 1. Create the async load action and pass WorldContextObject, Owner, and Path.
     UCharacterLoadAsyncAction *LoadAction = UCharacterLoadAsyncAction::LoadCharacterAsync(this, this, Path);
     if (LoadAction)
@@ -158,6 +179,14 @@ void ACharacterController::OnLoadCompleted(bool Result)
         UE_LOG(LogTemp, Warning, TEXT("Character glTF load failed. Falling back to the default mesh so world/runtime loading can continue."));
     }
 
+    if (IsValid(Component.Get()))
+    {
+        // Waterline reference sampling is intentionally delayed until the final
+        // loaded mesh has produced valid bone transforms. Do not cache BONE_HEAD
+        // or a capsule fallback from CharacterComponent::BeginPlay.
+        Component->RequestWaterReferenceRefreshAfterMeshLoad();
+    }
+
     // bIsLoaded is used by WorldManager as a load-completion gate. Treat the
     // default-mesh fallback as a completed load; otherwise LoadPlayerAsync loops
     // forever and RuntimeGameplayManager never starts.
@@ -179,7 +208,7 @@ void ACharacterController::HandleCapsulePhysicsHit(UPrimitiveComponent* HitCompo
 
     UWorld* World = GetWorld();
     const double Now = World ? World->GetTimeSeconds() : 0.0;
-    if (LastPhysicsObjectImpactTime >= 0.0 && Now - LastPhysicsObjectImpactTime < PhysicsObjectImpactCooldownSeconds)
+    if (LastPhysicsObjectImpactTime >= 0.0 && Now - LastPhysicsObjectImpactTime < RuntimeCharacterController::PhysicsObjectImpactCooldownSeconds)
     {
         return;
     }
@@ -217,15 +246,15 @@ void ACharacterController::HandleCapsulePhysicsHit(UPrimitiveComponent* HitCompo
     const float ImpulseSpeed = NormalImpulse.Size() / ReferenceCharacterMassKg;
     float ImpactSpeed = FMath::Max(RelativeImpactSpeed, ImpulseSpeed);
 
-    if (ImpactSpeed < MinPhysicsObjectImpactSpeed)
+    if (ImpactSpeed < RuntimeCharacterController::MinPhysicsObjectImpactSpeed)
     {
         return;
     }
 
-    ImpactSpeed = FMath::Clamp(ImpactSpeed * PhysicsObjectImpactVelocityScale, 0.0f, MaxPhysicsObjectImpactVelocityChange);
+    ImpactSpeed = FMath::Clamp(ImpactSpeed * RuntimeCharacterController::PhysicsObjectImpactVelocityScale, 0.0f, RuntimeCharacterController::MaxPhysicsObjectImpactVelocityChange);
 
     FVector VelocityDelta = HorizontalDirection * ImpactSpeed;
-    const float UpwardVelocity = FMath::Clamp(ImpactSpeed * PhysicsObjectImpactUpwardRatio, 0.0f, MaxPhysicsObjectImpactUpwardVelocity);
+    const float UpwardVelocity = FMath::Clamp(ImpactSpeed * RuntimeCharacterController::PhysicsObjectImpactUpwardRatio, 0.0f, RuntimeCharacterController::MaxPhysicsObjectImpactUpwardVelocity);
     if (UpwardVelocity > 0.0f)
     {
         VelocityDelta.Z = UpwardVelocity;
@@ -273,8 +302,8 @@ void ACharacterController::Tick(float DeltaSeconds)
                 {
                     MeshComp->AttachToComponent(Capsule, FAttachmentTransformRules::KeepRelativeTransform);
                 }
-                MeshComp->SetRelativeLocation(FVector(0.0f, 0.0f, -90.0f));
-                MeshComp->SetRelativeRotation(FRotator(0.0f, 270.0f, 0.0f));
+                MeshComp->SetRelativeLocation(RuntimeCharacterController::MeshDefaultRelativeLocation);
+                MeshComp->SetRelativeRotation(RuntimeCharacterController::MeshDefaultRelativeRotation);
             }
         }
     }
@@ -300,11 +329,39 @@ void ACharacterController::Tick(float DeltaSeconds)
 
 void ACharacterController::EnterWater(const float Level)
 {
+    // Component overlap can stay true while only the capsule radius touches the water box.
+    // For normal character swimming, the capsule center column must be inside the water
+    // BoxComponent.  Otherwise moving out through the side of the box can leave stale
+    // overlap/state bits that keep MOVE_Swimming alive.
+    float DirectWaterLevel = Level;
+    if (!FindDirectWaterLevel(DirectWaterLevel))
+    {
+        bWaterStateFromOverlap = false;
+        if (!bWaterStateForcedByRagdoll)
+        {
+            ClearDryWaterState(Level, true);
+        }
+        return;
+    }
+
     bWaterStateFromOverlap = true;
-    WaterLevel = Level;
+    WaterLevel = DirectWaterLevel;
+
+    if (IsValid(Movement) && Movement->IsFlying())
+    {
+        // Flying is an explicit player override.  Keep the latest water level for
+        // Fly-off rechecks, but do not re-enter STATE_WATER while the mode is Flying.
+        CharacterStateBit &= ~STATE_WATER;
+        bWaterStateForcedByRagdoll = false;
+        if (IsValid(Component.Get()))
+        {
+            Component->ClearSwimmingSurfaceConstraintState();
+        }
+        return;
+    }
 
     const bool bCurrentlySwimming = IsValid(Movement) && Movement->MovementMode == MOVE_Swimming;
-    if (IsValid(Component.Get()) && !Component->ShouldUseDirectWaterState(Level, bCurrentlySwimming))
+    if (IsValid(Component.Get()) && !Component->ShouldUseDirectWaterState(DirectWaterLevel, bCurrentlySwimming))
     {
         // Touching only the top of the water volume is not enough to enter Swimming.
         // Keep the overlap memory, because the next direct probe can still enable water
@@ -313,7 +370,7 @@ void ACharacterController::EnterWater(const float Level)
         return;
     }
 
-    SetWaterState(true, Level);
+    SetWaterState(true, DirectWaterLevel);
 }
 
 void ACharacterController::ExitWater(const float Level)
@@ -338,8 +395,8 @@ bool ACharacterController::FindDirectWaterLevel(float& OutLevel) const
     const float CapsuleHalfHeight = GetCapsuleComponent() ? GetCapsuleComponent()->GetScaledCapsuleHalfHeight() : 0.0f;
     const FVector BottomLocation(ActorLocation.X, ActorLocation.Y, ActorLocation.Z - CapsuleHalfHeight);
 
-    const bool bActorPointInWater = AWaterActor::FindWaterLevelAtLocation(this, ActorLocation, DetectedLevel);
-    const bool bBottomPointInWater = AWaterActor::FindWaterLevelAtLocation(this, BottomLocation, DetectedLevel);
+    const bool bActorPointInWater = AWaterActor::FindWaterLevelAtLocationStrict(this, ActorLocation, DetectedLevel);
+    const bool bBottomPointInWater = AWaterActor::FindWaterLevelAtLocationStrict(this, BottomLocation, DetectedLevel);
     if (bActorPointInWater || bBottomPointInWater)
     {
         OutLevel = DetectedLevel;
@@ -377,7 +434,9 @@ void ACharacterController::ClearDryWaterState(float Level, bool bUpdateMovementM
         // Drying out at the surface should not zero horizontal momentum; otherwise Fly-off
         // or surface exit feels like the character gets stuck in slow swimming for a frame.
         const FVector PreservedVelocity = Movement->Velocity;
-        Movement->SetMovementMode(Movement->IsMovingOnGround() ? MOVE_Walking : MOVE_Falling);
+        const bool bHasWalkableSupport = Movement->IsMovingOnGround()
+            || (IsValid(Component.Get()) && Component->IsCharacterSupportedByWalkableGround());
+        Movement->SetMovementMode(bHasWalkableSupport ? MOVE_Walking : MOVE_Falling);
         Movement->Velocity = FVector(PreservedVelocity.X, PreservedVelocity.Y, FMath::Min(PreservedVelocity.Z, 0.0f));
     }
 }
@@ -489,6 +548,10 @@ void ACharacterController::Flying()
 
     const bool bWasFlying = Movement->IsFlying();
     Movement->StopMovementImmediately();
+    if (IsValid(Component.Get()))
+    {
+        Component->ClearSwimmingSurfaceConstraintState();
+    }
 
     float DirectWaterLevel = WaterLevel;
     const bool bDirectlyInWater = FindDirectWaterLevel(DirectWaterLevel);
@@ -503,29 +566,36 @@ void ACharacterController::Flying()
             CharacterStateBit |= STATE_WATER;
             bWaterStateFromOverlap = true;
             bWaterStateForcedByRagdoll = false;
+            if (IsValid(SkeletalMeshBuoyancyComponent))
+            {
+                SkeletalMeshBuoyancyComponent->EnterWater(WaterLevel);
+            }
             Movement->SetMovementMode(MOVE_Swimming);
         }
         else
         {
             // Leaving Fly over dry ground/air must not reuse an old STATE_WATER bit.
+            // If a raised self-ignored ground probe already sees support, land directly
+            // in Walking instead of spending a frame in slow water/fall control.
             ClearDryWaterState(DirectWaterLevel, false);
-            Movement->SetMovementMode(MOVE_Falling);
+            const bool bHasWalkableSupport = Movement->IsMovingOnGround()
+                || (IsValid(Component.Get()) && Component->IsCharacterSupportedByWalkableGround());
+            Movement->SetMovementMode(bHasWalkableSupport ? MOVE_Walking : MOVE_Falling);
         }
     }
     else
     {
-        if (!bDirectlyInWater)
+        // Starting Fly always leaves swim control immediately.  The direct water
+        // probe is kept only to refresh WaterLevel; Fly-off performs a fresh check
+        // and will choose Swimming again only when the character is actually deep enough.
+        WaterLevel = DirectWaterLevel;
+
+        CharacterStateBit &= ~STATE_WATER;
+        bWaterStateFromOverlap = false;
+        bWaterStateForcedByRagdoll = false;
+        if (IsValid(SkeletalMeshBuoyancyComponent))
         {
-            // Starting Fly from dry space also clears stale swimming intent, so the next
-            // Fly-off -> Fall -> Ragdoll chain cannot inherit water recovery.
-            ClearDryWaterState(DirectWaterLevel, false);
-        }
-        else
-        {
-            WaterLevel = DirectWaterLevel;
-            CharacterStateBit |= STATE_WATER;
-            bWaterStateFromOverlap = true;
-            bWaterStateForcedByRagdoll = false;
+            SkeletalMeshBuoyancyComponent->ExitWater(WaterLevel);
         }
 
         Movement->SetMovementMode(MOVE_Flying);
@@ -557,7 +627,7 @@ void ACharacterController::SetWaterState(bool bValue, float Level, bool bForceRa
 {
     const bool bWasInWater = UCharacterFunctionLibrary::IsStateActive(CharacterStateBit, STATE_WATER);
     const bool bStateChanged = bWasInWater != bValue;
-    const bool bLevelChanged = !FMath::IsNearlyEqual(WaterLevel, Level, 1.0f);
+    const bool bLevelChanged = !FMath::IsNearlyEqual(WaterLevel, Level, RuntimeCharacterController::WaterLevelChangeToleranceCm);
     WaterLevel = Level;
 
     if (bValue)
@@ -751,7 +821,7 @@ void ACharacterController::SyncRagdollWaterStateFromPhysics()
         const float DetectedWaterLevel = RagdollWaterState.WaterLevel;
         const bool bWasForcedByRagdoll = bWaterStateForcedByRagdoll;
         bWaterStateForcedByRagdoll = true;
-        if (!bWasForcedByRagdoll || !UCharacterFunctionLibrary::IsStateActive(CharacterStateBit, STATE_WATER) || !FMath::IsNearlyEqual(WaterLevel, DetectedWaterLevel, 1.0f))
+        if (!bWasForcedByRagdoll || !UCharacterFunctionLibrary::IsStateActive(CharacterStateBit, STATE_WATER) || !FMath::IsNearlyEqual(WaterLevel, DetectedWaterLevel, RuntimeCharacterController::WaterLevelChangeToleranceCm))
         {
             SetWaterState(true, DetectedWaterLevel);
         }

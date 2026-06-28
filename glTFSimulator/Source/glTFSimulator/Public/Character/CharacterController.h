@@ -90,27 +90,8 @@ protected:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Physics Impact")
     bool bReceivePhysicsObjectImpacts = true;
 
-    /** Minimum relative speed, in cm/s, before a physics object can push the player. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Physics Impact", meta=(ClampMin="0.0"))
-    float MinPhysicsObjectImpactSpeed = 90.0f;
-
-    /** Scales the received velocity change. Higher values make impacts shove the character harder. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Physics Impact", meta=(ClampMin="0.0"))
-    float PhysicsObjectImpactVelocityScale = 0.65f;
-
-    /** Maximum velocity change, in cm/s, applied by a single physics hit. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Physics Impact", meta=(ClampMin="1.0"))
-    float MaxPhysicsObjectImpactVelocityChange = 1400.0f;
-
-    /** Small upward component so heavy objects feel like they jolt the player instead of only sliding them. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Physics Impact", meta=(ClampMin="0.0", ClampMax="1.0"))
-    float PhysicsObjectImpactUpwardRatio = 0.10f;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Physics Impact", meta=(ClampMin="0.0"))
-    float MaxPhysicsObjectImpactUpwardVelocity = 220.0f;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Physics Impact", meta=(ClampMin="0.0"))
-    float PhysicsObjectImpactCooldownSeconds = 0.08f;
+    // Physics impact tuning values are fixed native constants in CharacterController.cpp.
+    // Only the feature toggle remains user-editable.
     UFUNCTION()
     void OnLoadCompleted(bool Result);
 private:

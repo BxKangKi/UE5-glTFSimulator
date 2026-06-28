@@ -560,3 +560,29 @@ float CausticsFadeOut(float Z, float MinZ, float MaxZ, float3 ObjPos)
     Z = abs(ObjPos.z - Z);
     return saturate(InvLerp(MaxZ, MinZ, Z)) * saturate(InvLerp(0.0, MinZ, Z));
 }
+
+float2 AltasUV(float GridSize, float Index, float2 UV, float TexSize)
+{
+    float2 CellSize = 1.0 / GridSize;
+
+    float SafeIndex = floor(Index + 0.5);
+
+    float2 Offset;
+    Offset.x = fmod(SafeIndex, GridSize);
+    Offset.y = floor(SafeIndex / GridSize);
+
+    float2 TiledUV = frac(UV);
+
+    // 실제 아틀라스 텍스처 해상도로 바꿔주세요.
+    // 예: 1024x1024 텍스처면 float2(1024.0, 1024.0)
+    float2 AtlasSize = float2(TexSize, TexSize);
+
+    // 안쪽으로 밀 픽셀 수
+    float InsetPixels = 4.0;
+    float2 Inset = InsetPixels / AtlasSize;
+
+    float2 CellMin = Offset * CellSize + Inset;
+    float2 CellMax = (Offset + 1.0) * CellSize - Inset;
+
+    return lerp(CellMin, CellMax, TiledUV);
+}

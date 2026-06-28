@@ -36,6 +36,13 @@ public:
      */
     static bool FindWaterLevelAtLocation(const UObject *WorldContextObject, const FVector &WorldLocation, float &OutLevel);
 
+    /**
+     * Strict water-volume query for controlled characters. Unlike the loose ragdoll
+     * probe above, this does not allow horizontal tolerance, so swimming is cleared
+     * as soon as the character reference leaves the water box side.
+     */
+    static bool FindWaterLevelAtLocationStrict(const UObject *WorldContextObject, const FVector &WorldLocation, float &OutLevel);
+
     UPROPERTY(EditDefaultsOnly, Category = "Materials")
     TObjectPtr<UMaterialInterface> DecalMaterial;
 

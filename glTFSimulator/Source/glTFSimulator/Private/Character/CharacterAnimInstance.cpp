@@ -8,8 +8,14 @@
 #include "Character/CharacterController.h"
 #include "Character/CharacterComponent.h"
 
-#define MIN_DIVING_VELOCITY 1000.0f
-#define GET_UP_DELAY 0.2f
+namespace RuntimeCharacterAnim
+{
+    constexpr float MinDivingVelocity = 1000.0f;
+    constexpr float GetUpDelay = 0.2f;
+    constexpr float SwimVerticalSpeedInterpRate = 7.0f;
+    constexpr float SwimVerticalSpeedReturnInterpRate = 9.0f;
+    constexpr float SwimVerticalSpeedDeadZone = 0.01f;
+}
 
 void UCharacterAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
 {
@@ -70,7 +76,7 @@ void UCharacterAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
     // AnimBP now handles water recovery explicitly. Keep GetUp true underwater too,
     // while bIsSwimming/bIsFalling above keep the transition out of the falling branch.
     bIsGettingUp = Component->IsGettingUp();
-    bGetUpTrigger = bIsGettingUp && Component->GetRagdollWeight() < (MAX_RAGDOLL_WEIGHT - GET_UP_DELAY);
+    bGetUpTrigger = bIsGettingUp && Component->GetRagdollWeight() < (RuntimeCharacterConstants::MaxRagdollWeight - RuntimeCharacterAnim::GetUpDelay);
     IsLieOnBack = Component->IsLieOnBack() ? 1.0f: 0.0f;
     CapturedMeshLocation = Component->GetCapturedMeshLocation();
     CapturedMeshRotation = Component->GetCapturedMeshRotation();
@@ -79,22 +85,33 @@ void UCharacterAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
     // Built-in IsNearlyZero keeps this branch cheap and readable.
     bShouldMove = (!CurrentAccel.IsNearlyZero() && Speed > 3.0f);
 
-    // 7. Vertical swim ratio with a guarded divide.
+    // 7. Vertical swim ratio with temporal smoothing.
+    // Surface correction can clamp Velocity.Z instantly, but the animation graph
+    // should see a continuous up/down value so swim poses do not pop on sharp input
+    // changes, ceiling hits, or mode transitions.
     const float MaxSwim = Movement->MaxSwimSpeed;
-    // A direct zero check is faster than a generic safe-divide helper.
-    UpSpeed = (MaxSwim > KINDA_SMALL_NUMBER)
-                  ? FMath::Clamp(Velocity.Z / MaxSwim, -0.9f, 0.9f)
-                  : 0.0f;
+    const float TargetUpSpeed = (bIsSwimming && MaxSwim > KINDA_SMALL_NUMBER)
+        ? FMath::Clamp(Velocity.Z / MaxSwim, -0.9f, 0.9f)
+        : 0.0f;
+    const float UpSpeedInterpRate = bIsSwimming
+        ? RuntimeCharacterAnim::SwimVerticalSpeedInterpRate
+        : RuntimeCharacterAnim::SwimVerticalSpeedReturnInterpRate;
+    UpSpeed = FMath::FInterpTo(UpSpeed, TargetUpSpeed, DeltaSeconds, UpSpeedInterpRate);
+    if (FMath::Abs(UpSpeed) < RuntimeCharacterAnim::SwimVerticalSpeedDeadZone
+        && FMath::Abs(TargetUpSpeed) < RuntimeCharacterAnim::SwimVerticalSpeedDeadZone)
+    {
+        UpSpeed = 0.0f;
+    }
 
     // 8. Diving state and ground trace.
     // Keep owner lookup inside the branch so normal animation frames do no extra work.
 
-    if (!bWaterRagdollState && bIsSwimming && Velocity.Z < -MIN_DIVING_VELOCITY)
+    if (!bWaterRagdollState && bIsSwimming && Velocity.Z < -RuntimeCharacterAnim::MinDivingVelocity)
     {
         // Use the already-known movement location as the trace start.
         const FVector Start = Movement->GetActorLocation();
         // End is derived from current downward speed so fast dives trace farther.
-        const FVector End = Start + (FVector::UpVector * -(Velocity.Z * DeltaSeconds + MIN_DIVING_VELOCITY));
+        const FVector End = Start + (FVector::UpVector * -(Velocity.Z * DeltaSeconds + RuntimeCharacterAnim::MinDivingVelocity));
 
         // Cache CharacterOwner once for the raycast.
         if (ACharacter *Owner = Movement->GetCharacterOwner())

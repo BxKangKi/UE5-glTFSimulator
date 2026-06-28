@@ -140,6 +140,79 @@ void AWaterActor::CheckOverlappingWater(AActor *Target)
     }
 }
 
+bool AWaterActor::FindWaterLevelAtLocationStrict(const UObject *WorldContextObject, const FVector &WorldLocation, float &OutLevel)
+{
+    const UWorld *ConstWorld = WorldContextObject ? WorldContextObject->GetWorld() : nullptr;
+    UWorld *World = const_cast<UWorld *>(ConstWorld);
+    if (!World)
+    {
+        return false;
+    }
+
+    bool bFound = false;
+    float BestLevel = OutLevel;
+    constexpr float SurfaceTolerance = 5.0f;
+    constexpr float LowerBoundsTolerance = 2.0f;
+
+    for (TActorIterator<AWaterActor> It(World); It; ++It)
+    {
+        AWaterActor *WaterActor = *It;
+        if (!IsValid(WaterActor))
+        {
+            continue;
+        }
+
+        const UBoxComponent *WaterCollision = WaterActor->Collision.Get();
+        const float WaterLevel = WaterActor->Level;
+        bool bInsideBoxColumn = false;
+        bool bInsideVerticalRange = false;
+
+        if (WaterCollision)
+        {
+            // Strict means the tested point itself must be inside the actual BoxComponent
+            // column.  Do not use the world AABB here: with a rotated/scaled box or a
+            // capsule merely touching the side, the AABB can report water even after
+            // the character has visually left the water volume.
+            const FVector LocalPoint = WaterCollision->GetComponentTransform().InverseTransformPosition(WorldLocation);
+            const FVector LocalExtent = WaterCollision->GetUnscaledBoxExtent();
+
+            bInsideBoxColumn = FMath::Abs(LocalPoint.X) <= LocalExtent.X
+                && FMath::Abs(LocalPoint.Y) <= LocalExtent.Y;
+            bInsideVerticalRange = LocalPoint.Z >= -LocalExtent.Z - LowerBoundsTolerance
+                && WorldLocation.Z <= WaterLevel + SurfaceTolerance;
+        }
+        else
+        {
+            const FBox Bounds = WaterActor->GetComponentsBoundingBox(true);
+            if (!Bounds.IsValid)
+            {
+                continue;
+            }
+
+            bInsideBoxColumn = WorldLocation.X >= Bounds.Min.X
+                && WorldLocation.X <= Bounds.Max.X
+                && WorldLocation.Y >= Bounds.Min.Y
+                && WorldLocation.Y <= Bounds.Max.Y;
+            bInsideVerticalRange = WorldLocation.Z >= Bounds.Min.Z - LowerBoundsTolerance
+                && WorldLocation.Z <= WaterLevel + SurfaceTolerance;
+        }
+
+        if (!bInsideBoxColumn || !bInsideVerticalRange)
+        {
+            continue;
+        }
+
+        BestLevel = bFound ? FMath::Max(BestLevel, WaterLevel) : WaterLevel;
+        bFound = true;
+    }
+
+    if (bFound)
+    {
+        OutLevel = BestLevel;
+    }
+    return bFound;
+}
+
 bool AWaterActor::FindWaterLevelAtLocation(const UObject *WorldContextObject, const FVector &WorldLocation, float &OutLevel)
 {
     const UWorld *ConstWorld = WorldContextObject ? WorldContextObject->GetWorld() : nullptr;
