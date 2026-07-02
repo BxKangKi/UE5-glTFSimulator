@@ -149,6 +149,8 @@ void ACharacterController::Load(const FString &Path)
 {
     bIsLoaded = false;
 
+    PrepareForRuntimeMeshReload();
+
     if (IsValid(Component.Get()))
     {
         // A new async mesh invalidates the previous waterline reference. The new
@@ -156,7 +158,7 @@ void ACharacterController::Load(const FString &Path)
         Component->InvalidateWaterReferenceForPendingMeshLoad();
     }
 
-    // 1. Create the async load action and pass WorldContextObject, Owner, and Path.
+    // 1. Create a fresh glTFRuntime asset load action and pass WorldContextObject, Owner, and Path.
     UCharacterLoadAsyncAction *LoadAction = UCharacterLoadAsyncAction::LoadCharacterAsync(this, this, Path);
     if (LoadAction)
     {
@@ -166,6 +168,10 @@ void ACharacterController::Load(const FString &Path)
         // 3. Start async loading
         // Activate() runs glTF loading, BoneMap loading, and mesh creation in order.
         LoadAction->Activate();
+    }
+    else
+    {
+        RestoreAfterRuntimeMeshReload();
     }
 }
 
@@ -181,6 +187,8 @@ void ACharacterController::OnLoadCompleted(bool Result)
         UE_LOG(LogTemp, Warning, TEXT("Character glTF load failed. Falling back to the default mesh so world/runtime loading can continue."));
     }
 
+    RestoreAfterRuntimeMeshReload();
+
     if (IsValid(Component.Get()))
     {
         // Waterline reference sampling is intentionally delayed until the final
@@ -192,6 +200,83 @@ void ACharacterController::OnLoadCompleted(bool Result)
     // bIsLoaded is used by glTFStreamSubSystem as a player load-completion gate. Treat the
     // default-mesh fallback as a completed load; otherwise main-world startup can never finish.
     bIsLoaded = true;
+}
+
+void ACharacterController::PrepareForRuntimeMeshReload()
+{
+    USkeletalMeshComponent* MeshComp = GetMesh();
+    if (!IsValid(MeshComp))
+    {
+        return;
+    }
+
+    // Runtime player meshes are generated from glTFRuntime and can temporarily have a
+    // different USkeleton/bone layout while the async load is still in progress. Disable
+    // the AnimBP/ControlRig graph before the swap so worker-thread CacheBones cannot build
+    // mappings against a half-replaced runtime mesh.
+    if (!bHasSavedRuntimeAnimationState)
+    {
+        SavedRuntimeAnimationMode = MeshComp->GetAnimationMode();
+        SavedRuntimeAnimClass = MeshComp->GetAnimClass();
+        bHasSavedRuntimeAnimationState = true;
+    }
+
+    MeshComp->bPauseAnims = true;
+    MeshComp->SetComponentTickEnabled(false);
+    MeshComp->SetAllBodiesSimulatePhysics(false);
+    MeshComp->SetSimulatePhysics(false);
+    MeshComp->PutAllRigidBodiesToSleep();
+    MeshComp->SetAnimationMode(EAnimationMode::AnimationSingleNode);
+}
+
+void ACharacterController::RestoreAfterRuntimeMeshReload()
+{
+    USkeletalMeshComponent* MeshComp = GetMesh();
+    if (!IsValid(MeshComp))
+    {
+        return;
+    }
+
+    if (bHasSavedRuntimeAnimationState)
+    {
+        if (SavedRuntimeAnimationMode == EAnimationMode::AnimationBlueprint && SavedRuntimeAnimClass)
+        {
+            MeshComp->SetAnimInstanceClass(SavedRuntimeAnimClass);
+        }
+        else
+        {
+            MeshComp->SetAnimationMode(SavedRuntimeAnimationMode.GetValue());
+        }
+        bHasSavedRuntimeAnimationState = false;
+    }
+
+    MeshComp->SetComponentTickEnabled(true);
+    MeshComp->bPauseAnims = false;
+    MeshComp->RecreatePhysicsState();
+}
+
+void ACharacterController::PrepareForRuntimePawnReplacement()
+{
+    Activate(false);
+    PrepareForRuntimeMeshReload();
+
+    USkeletalMeshComponent* MeshComp = GetMesh();
+    if (IsValid(MeshComp))
+    {
+        // Do not restore the animation graph on a pawn that is about to be destroyed.
+        // This keeps ControlRig/PoseDriver from evaluating while the PlayerController is
+        // being moved to the freshly spawned runtime character.
+        MeshComp->bPauseAnims = true;
+        MeshComp->SetComponentTickEnabled(false);
+        MeshComp->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+        MeshComp->SetGenerateOverlapEvents(false);
+    }
+
+    if (UCapsuleComponent* Capsule = GetCapsuleComponent())
+    {
+        Capsule->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+        Capsule->SetGenerateOverlapEvents(false);
+    }
 }
 
 

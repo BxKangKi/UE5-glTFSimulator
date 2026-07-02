@@ -12,6 +12,7 @@ class AActor;
 class AglTFStreamActor;
 class UAssetManageSubSystem;
 class ACharacterController;
+class APlayerController;
 
 UCLASS()
 class GLTFSIMULATOR_API UglTFStreamSubSystem : public UGameInstanceSubsystem
@@ -63,6 +64,9 @@ private:
     bool bWaitingForPlayerLoad = false;
     bool bPlayerActivated = false;
     FString WaitingPath;
+    TWeakObjectPtr<ACharacterController> ActivePlayerCharacter;
+    TWeakObjectPtr<ACharacterController> PendingPlayerCharacter;
+    TWeakObjectPtr<ACharacterController> PreviousPlayerCharacter;
 
     FTimerHandle TimerHandle_ProcessPath;
     FTimerHandle TimerHandle_WaitActor;
@@ -77,6 +81,9 @@ private:
     void WaitForPlayerActorAsync();
     void WaitForPlayerLoadAsync();
     void RequestLoadPlayerAtIndex(int32 PlayerPathIndex, bool bIsInitialLoad);
+    ACharacterController* SpawnReplacementPlayerCharacterForLoad(const FString& PlayerPath);
+    bool CommitPendingPlayerCharacter();
+    void DestroyPreviousPlayerCharacter();
     bool ResolveInitialPlayerIndex();
     ACharacterController* GetPlayerCharacter() const;
     void DeactivatePlayerCharacter();

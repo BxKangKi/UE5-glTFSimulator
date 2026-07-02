@@ -8,6 +8,8 @@
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
+#include "GameFramework/PlayerController.h"
+#include "Kismet/GameplayStatics.h"
 #include "HAL/FileManager.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
@@ -70,6 +72,9 @@ void UglTFStreamSubSystem::StartMainWorldStreaming(AActor* InOwnerActor, TSubcla
     CurrentPlayerPathIndex = INDEX_NONE;
     CurrentPlayerPath.Reset();
     WaitingPath.Reset();
+    ActivePlayerCharacter.Reset();
+    PendingPlayerCharacter.Reset();
+    PreviousPlayerCharacter.Reset();
     CompletedInitialPaths.Empty();
     MissingFilePaths.Empty();
     ModelMetadataMap.Empty();
@@ -106,6 +111,7 @@ void UglTFStreamSubSystem::StopMainWorldStreaming()
         }
     }
     SpawnActorMap.Empty();
+    DestroyPreviousPlayerCharacter();
     DeactivatePlayerCharacter();
     GlbFilePaths.Empty();
     PlayerGlbFilePaths.Empty();
@@ -116,6 +122,9 @@ void UglTFStreamSubSystem::StopMainWorldStreaming()
     MissingFilePaths.Empty();
     ModelMetadataMap.Empty();
     WaitingPath.Reset();
+    ActivePlayerCharacter.Reset();
+    PendingPlayerCharacter.Reset();
+    PreviousPlayerCharacter.Reset();
     CurrentPathIndex = 0;
     CurrentPlayerPathIndex = INDEX_NONE;
     bInitialPathScanComplete = false;
@@ -532,7 +541,7 @@ void UglTFStreamSubSystem::RequestLoadPlayerAtIndex(int32 PlayerPathIndex, bool 
         return;
     }
 
-    ACharacterController* Ctrl = GetPlayerCharacter();
+    ACharacterController* Ctrl = SpawnReplacementPlayerCharacterForLoad(PlayerPath);
     if (!IsValid(Ctrl))
     {
         CurrentPlayerPathIndex = PlayerPathIndex;
@@ -550,8 +559,129 @@ void UglTFStreamSubSystem::RequestLoadPlayerAtIndex(int32 PlayerPathIndex, bool 
     Ctrl->bIsLoaded = false;
     Ctrl->Load(PlayerPath);
 
-    WriteLogAsync(FString::Printf(TEXT("Player character load requested. Index=%d Path=%s"), CurrentPlayerPathIndex, *CurrentPlayerPath));
+    WriteLogAsync(FString::Printf(TEXT("Player character respawn/load requested. Index=%d Path=%s"), CurrentPlayerPathIndex, *CurrentPlayerPath));
     ScheduleWaitForPlayerLoad();
+}
+
+ACharacterController* UglTFStreamSubSystem::SpawnReplacementPlayerCharacterForLoad(const FString& PlayerPath)
+{
+    if (!IsValid(OwnerActor))
+    {
+        return nullptr;
+    }
+
+    UWorld* World = OwnerActor->GetWorld();
+    if (!World)
+    {
+        return nullptr;
+    }
+
+    APlayerController* PlayerController = UGameplayStatics::GetPlayerController(OwnerActor, 0);
+    ACharacterController* CurrentCharacter = GetPlayerCharacter();
+    if (!IsValid(CurrentCharacter) && PlayerController)
+    {
+        CurrentCharacter = Cast<ACharacterController>(PlayerController->GetPawn());
+    }
+
+    if (IsValid(PendingPlayerCharacter.Get()))
+    {
+        PendingPlayerCharacter->PrepareForRuntimePawnReplacement();
+        PendingPlayerCharacter->Destroy();
+        PendingPlayerCharacter.Reset();
+    }
+
+    TSubclassOf<ACharacterController> CharacterClass = IsValid(CurrentCharacter) ? CurrentCharacter->GetClass() : ACharacterController::StaticClass();
+    if (!CharacterClass)
+    {
+        WriteLogAsync(FString::Printf(TEXT("Player respawn failed: no valid CharacterClass for %s"), *PlayerPath));
+        return nullptr;
+    }
+
+    const FVector SpawnLocation = IsValid(CurrentCharacter) ? CurrentCharacter->GetActorLocation() : GetPlayerLocation();
+    const FRotator SpawnRotation = IsValid(CurrentCharacter) ? CurrentCharacter->GetActorRotation() : FRotator::ZeroRotator;
+    FTransform SpawnTransform(SpawnRotation, SpawnLocation);
+
+    FActorSpawnParameters SpawnParams;
+    SpawnParams.Owner = OwnerActor;
+    SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+
+    ACharacterController* NewCharacter = World->SpawnActor<ACharacterController>(CharacterClass, SpawnTransform, SpawnParams);
+    if (!IsValid(NewCharacter))
+    {
+        WriteLogAsync(FString::Printf(TEXT("Player respawn failed: SpawnActor returned null. Path=%s"), *PlayerPath));
+        return nullptr;
+    }
+
+    NewCharacter->SetActorHiddenInGame(true);
+    NewCharacter->SetActorEnableCollision(false);
+    NewCharacter->Activate(false);
+    NewCharacter->bIsLoaded = false;
+    NewCharacter->PrepareForRuntimeMeshReload();
+
+    PreviousPlayerCharacter = CurrentCharacter;
+    PendingPlayerCharacter = NewCharacter;
+
+    if (UGameManagerSubSystem* GameSystem = UGameManagerSubSystem::GetSubSystem(OwnerActor))
+    {
+        GameSystem->SetPlayerActor(NewCharacter);
+        GameSystem->SetPlayerLocation(SpawnLocation);
+    }
+
+    WriteLogAsync(FString::Printf(TEXT("Replacement player pawn spawned for runtime GLB load. Old=%s New=%s Path=%s"),
+        IsValid(CurrentCharacter) ? *CurrentCharacter->GetName() : TEXT("None"),
+        *NewCharacter->GetName(),
+        *PlayerPath));
+
+    return NewCharacter;
+}
+
+bool UglTFStreamSubSystem::CommitPendingPlayerCharacter()
+{
+    ACharacterController* NewCharacter = PendingPlayerCharacter.Get();
+    if (!IsValid(NewCharacter))
+    {
+        NewCharacter = GetPlayerCharacter();
+    }
+
+    if (!IsValid(NewCharacter))
+    {
+        return false;
+    }
+
+    APlayerController* PlayerController = UGameplayStatics::GetPlayerController(OwnerActor, 0);
+    if (PlayerController && PlayerController->GetPawn() != NewCharacter)
+    {
+        PlayerController->Possess(NewCharacter);
+    }
+
+    NewCharacter->SetActorHiddenInGame(false);
+    NewCharacter->SetActorEnableCollision(true);
+    NewCharacter->Activate(false);
+
+    if (UGameManagerSubSystem* GameSystem = UGameManagerSubSystem::GetSubSystem(OwnerActor))
+    {
+        GameSystem->SetPlayerActor(NewCharacter);
+        GameSystem->SetPlayerLocation(NewCharacter->GetActorLocation());
+    }
+
+    ActivePlayerCharacter = NewCharacter;
+    PendingPlayerCharacter.Reset();
+    DestroyPreviousPlayerCharacter();
+    return true;
+}
+
+void UglTFStreamSubSystem::DestroyPreviousPlayerCharacter()
+{
+    ACharacterController* OldCharacter = PreviousPlayerCharacter.Get();
+    ACharacterController* ActiveCharacter = ActivePlayerCharacter.Get();
+
+    if (IsValid(OldCharacter) && OldCharacter != ActiveCharacter)
+    {
+        OldCharacter->PrepareForRuntimePawnReplacement();
+        OldCharacter->Destroy();
+    }
+
+    PreviousPlayerCharacter.Reset();
 }
 
 void UglTFStreamSubSystem::WaitForPlayerLoadAsync()
@@ -561,7 +691,12 @@ void UglTFStreamSubSystem::WaitForPlayerLoadAsync()
         return;
     }
 
-    ACharacterController* Ctrl = GetPlayerCharacter();
+    ACharacterController* Ctrl = PendingPlayerCharacter.Get();
+    if (!IsValid(Ctrl))
+    {
+        Ctrl = GetPlayerCharacter();
+    }
+
     if (!IsValid(Ctrl))
     {
         ScheduleWaitForPlayerActor();
@@ -571,6 +706,12 @@ void UglTFStreamSubSystem::WaitForPlayerLoadAsync()
     if (!Ctrl->bIsLoaded)
     {
         ScheduleWaitForPlayerLoad();
+        return;
+    }
+
+    if (!CommitPendingPlayerCharacter())
+    {
+        ScheduleWaitForPlayerActor();
         return;
     }
 
@@ -616,6 +757,16 @@ bool UglTFStreamSubSystem::CycleNextPlayerCharacter()
 
 ACharacterController* UglTFStreamSubSystem::GetPlayerCharacter() const
 {
+    if (IsValid(PendingPlayerCharacter.Get()))
+    {
+        return PendingPlayerCharacter.Get();
+    }
+
+    if (IsValid(ActivePlayerCharacter.Get()))
+    {
+        return ActivePlayerCharacter.Get();
+    }
+
     if (UGameManagerSubSystem* GameSystem = UGameManagerSubSystem::GetSubSystem(OwnerActor))
     {
         return GameSystem->GetPlayerActor<ACharacterController>();
@@ -633,9 +784,19 @@ void UglTFStreamSubSystem::DeactivatePlayerCharacter()
 
     Ctrl->Activate(false);
     Ctrl->bIsLoaded = false;
+
     if (USkeletalMeshComponent* MeshComponent = Ctrl->GetMesh())
     {
-        MeshComponent->SetSkinnedAssetAndUpdate(nullptr, true);
+        // Never clear the player skeletal mesh to nullptr during world exit or character
+        // streaming. AnimBP/ControlRig can still be evaluating on worker threads and may
+        // crash if the mesh suddenly has no bone container. Runtime character memory is
+        // released by swapping to the next freshly generated glTFRuntime skeletal mesh or
+        // by destroying the owning actor/world, not by installing an empty mesh.
+        MeshComponent->SetAllBodiesSimulatePhysics(false);
+        MeshComponent->SetSimulatePhysics(false);
+        MeshComponent->PutAllRigidBodiesToSleep();
+        MeshComponent->bPauseAnims = false;
+        MeshComponent->SetComponentTickEnabled(true);
     }
 }
 

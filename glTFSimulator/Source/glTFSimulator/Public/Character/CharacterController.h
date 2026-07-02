@@ -5,6 +5,8 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Character.h"
+#include "Components/SkeletalMeshComponent.h"
+#include "Animation/AnimInstance.h"
 #include "Character/CharacterDefaultAsset.h"
 #include "Interface/WaterInteract.h"
 #include "CharacterController.generated.h"
@@ -16,6 +18,7 @@ class UGameManagerSubSystem;
 class UCameraComponent;
 class URuntimeBuoyancyComponent;
 class UPrimitiveComponent;
+class UAnimInstance;
 
 UCLASS()
 class GLTFSIMULATOR_API ACharacterController : public ACharacter, public IWaterInteract
@@ -29,6 +32,9 @@ public:
     UFUNCTION()
     void Activate(bool bValue);
     void Load(const FString &Path);
+    void PrepareForRuntimeMeshReload();
+    void RestoreAfterRuntimeMeshReload();
+    void PrepareForRuntimePawnReplacement();
     // --- Input Interface ---
     UFUNCTION(BlueprintCallable)
     void MovementInput(const float X, const float Y);
@@ -110,6 +116,10 @@ private:
     bool bFirstPersonMode = false;
     bool bWaterStateFromOverlap = false;
     bool bWaterStateForcedByRagdoll = false;
+    bool bHasSavedRuntimeAnimationState = false;
+    TEnumAsByte<EAnimationMode::Type> SavedRuntimeAnimationMode;
+    UPROPERTY()
+    TSubclassOf<UAnimInstance> SavedRuntimeAnimClass;
     float SavedThirdPersonArmLength = 350.0f;
     FVector SavedThirdPersonSocketOffset = FVector::ZeroVector;
     void OnFootstepTraceCompleted(const FTraceHandle &TraceHandle, FTraceDatum &TraceDatum);

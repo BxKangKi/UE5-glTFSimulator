@@ -20,6 +20,8 @@ UCharacterLoadAsyncAction *UCharacterLoadAsyncAction::LoadCharacterAsync(UObject
 
 void UCharacterLoadAsyncAction::Activate()
 {
+    CurrentLoadedAsset = nullptr;
+
     if (!OwnerCharacter.IsValid() || !UFileFunctionLibrary::CheckFile(FilePath))
     {
         OnCompleted.Broadcast(false);
@@ -31,6 +33,8 @@ void UCharacterLoadAsyncAction::Activate()
 
 void UCharacterLoadAsyncAction::LoadAssetAsync()
 {
+    // Character changes must rebuild the full runtime character path every time:
+    // fresh glTFRuntimeAsset -> bone map -> skeletal mesh -> generated/merged PhysicsAsset.
     FglTFRuntimeHttpResponse AssetLoadedDelegate;
     AssetLoadedDelegate.BindDynamic(this, &UCharacterLoadAsyncAction::OnglTFAssetLoaded);
     FglTFRuntimeConfig Config;
