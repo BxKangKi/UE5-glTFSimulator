@@ -98,7 +98,7 @@ void UGameSettings::UpdateSettings(UPostProcessComponent *PostProcess)
     UGameUserSettings *Settings = GEngine->GetGameUserSettings();
     if (Settings)
     {
-        // 0~3 (또는 0~4): Low~Epic(또는 Cinematic)[web:7][web:13]
+        // 0-3 (or 0-4): Low through Epic (or Cinematic).
         Settings->SetShadowQuality(ShadowQuality);
         Settings->SetTextureQuality(TextureQuality);
         Settings->SetViewDistanceQuality(ViewDistanceQuality);
@@ -109,7 +109,7 @@ void UGameSettings::UpdateSettings(UPostProcessComponent *PostProcess)
         Settings->SetGlobalIlluminationQuality(GlobalIlluminationQuality);
         Settings->SetReflectionQuality(ReflectionQuality);
         Settings->SetVisualEffectQuality(EffectsQuality);
-        // 해상도/윈도우 모드까지 같이 바꾸고 싶다면
+        // Use this path if resolution or window mode should be changed together.
         // Settings->SetScreenResolution(FIntPoint(1920, 1080));
         // Settings->SetFullscreenMode(EWindowMode::WindowedFullscreen);
 

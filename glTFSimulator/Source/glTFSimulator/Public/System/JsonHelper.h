@@ -11,13 +11,13 @@ struct FJsonHelper
 {
     static TArray<FString> GetAllKeysFromJsonObject(const TSharedPtr<FJsonObject> &JsonObject);
 
-    // 1. FVector -> JSON Object에 주입
+    // 1. Write an FVector into a JSON object.
     static void SetVector(const TSharedRef<FJsonObject> &Json, const FVector &Vector, const FString &KeyPrefix = TEXT(""));
 
-    // 2. JSON Object -> FVector 추출
+    // 2. Read an FVector from a JSON object.
     static void TryGetVector(const TSharedPtr<FJsonObject> &Json, FVector &OutVector, const FString &KeyPrefix = TEXT(""));
 
-    // 3. TArray 내 아이템들을 JSON 배열로 직렬화 (템플릿 + 레퍼런스/포인터 전달용 람다)
+    // 3. Serialize TArray items into a JSON array using template/lambda helpers.
     template<typename T>
     static void SetArray(const TSharedRef<FJsonObject>& Json, const FString& Key, const TArray<T>& Array, TFunctionRef<TSharedRef<FJsonObject>(const T&)> SerializeFunc)
     {
@@ -29,7 +29,7 @@ struct FJsonHelper
         Json->SetArrayField(Key, JsonArray);
     }
 
-    // 4. JSON 배열을 TArray 객체로 역직렬화
+    // 4. Deserialize a JSON array into a TArray.
     template<typename T>
     static void TryGetArray(const TSharedPtr<FJsonObject>& Json, const FString& Key, TArray<T>& OutArray, TFunctionRef<bool(const TSharedPtr<FJsonObject>&, T&)> DeserializeFunc)
     {
@@ -38,7 +38,7 @@ struct FJsonHelper
         const TArray<TSharedPtr<FJsonValue>>* JsonArrayPtr = nullptr;
         if (Json->TryGetArrayField(Key, JsonArrayPtr) && JsonArrayPtr)
         {
-            OutArray.Empty(JsonArrayPtr->Num()); // 메모리 미리 할당 최적화
+            OutArray.Empty(JsonArrayPtr->Num()); // Reserve memory up front for efficiency.
             for (const TSharedPtr<FJsonValue>& Value : *JsonArrayPtr)
             {
                 if (Value.IsValid() && Value->Type == EJson::Object)
@@ -53,7 +53,7 @@ struct FJsonHelper
         }
     }
 
-        // 5. TMap<FName, T> -> JSON Object 직렬화
+        // 5. Serialize TMap<FName, T> into a JSON object.
     template<typename T>
     static void SetMap(const TSharedRef<FJsonObject>& Json, const FString& Key, const TMap<FName, T>& Map, TFunctionRef<TSharedRef<FJsonObject>(const T&)> SerializeFunc)
     {
@@ -61,14 +61,14 @@ struct FJsonHelper
         
         for (const TPair<FName, T>& KVP : Map)
         {
-            // FName을 String Key로 변환하여 오브젝트에 주입
+            // Convert FName to a string key before writing it into the object.
             MapJsonObj->SetObjectField(KVP.Key.ToString(), SerializeFunc(KVP.Value));
         }
         
         Json->SetObjectField(Key, MapJsonObj);
     }
 
-    // 6. JSON Object -> TMap<FName, T> 역직렬화
+    // 6. Deserialize a JSON object into TMap<FName, T>.
     template<typename T>
     static void TryGetMap(const TSharedPtr<FJsonObject>& Json, const FString& Key, TMap<FName, T>& OutMap, TFunctionRef<bool(const TSharedPtr<FJsonObject>&, T&)> DeserializeFunc)
     {
@@ -77,9 +77,9 @@ struct FJsonHelper
         const TSharedPtr<FJsonObject>* MapJsonObjPtr = nullptr;
         if (Json->TryGetObjectField(Key, MapJsonObjPtr) && MapJsonObjPtr && MapJsonObjPtr->IsValid())
         {
-            OutMap.Empty((*MapJsonObjPtr)->Values.Num()); // 메모리 예약 최적화
+            OutMap.Empty((*MapJsonObjPtr)->Values.Num()); // Reserve map storage for efficiency.
             
-            // JSON 내부의 모든 Key-Value 쌍을 순회
+            // Iterate over every key-value pair in the JSON object.
             for (const TPair<FString, TSharedPtr<FJsonValue>>& KVP : (*MapJsonObjPtr)->Values)
             {
                 if (KVP.Value.IsValid() && KVP.Value->Type == EJson::Object)
@@ -87,7 +87,7 @@ struct FJsonHelper
                     T Item;
                     if (DeserializeFunc(KVP.Value->AsObject(), Item))
                     {
-                        // String Key를 FName으로 되돌려 TMap에 추가
+                        // Convert the string key back to FName before adding it to the map.
                         OutMap.Add(FName(*KVP.Key), Item);
                     }
                 }
@@ -96,10 +96,10 @@ struct FJsonHelper
     }
 
     /**
-     * Enum 값을 JSON 오브젝트에 문자열로 저장합니다.
-     * @param JsonObject 저장할 대상 JSON 오브젝트
-     * @param FieldName JSON 키값
-     * @param Value 저장할 Enum 값
+     * Stores an enum value in a JSON object as a string.
+     * @param JsonObject Target JSON object to write to.
+     * @param FieldName JSON key name.
+     * @param Value Enum value to store.
      */
     template <typename TEnum>
     static void SetEnumField(TSharedPtr<FJsonObject> JsonObject, const FString &FieldName, TEnum Value)
@@ -110,18 +110,18 @@ struct FJsonHelper
         const UEnum *EnumPtr = StaticEnum<TEnum>();
         if (EnumPtr)
         {
-            // GetNameStringByValue는 "EMyEnum::Value"에서 앞부분을 뗀 "Value" 문자열만 반환합니다.
+            // GetNameStringByValue returns only "Value" instead of the fully qualified "EMyEnum::Value".
             FString EnumString = EnumPtr->GetNameStringByValue(static_cast<int64>(Value));
             JsonObject->SetStringField(FieldName, EnumString);
         }
     }
 
     /**
-     * JSON 오브젝트에서 문자열을 읽어 Enum 값으로 변환합니다.
-     * @param JsonObject 읽어올 대상 JSON 오브젝트
-     * @param FieldName JSON 키값
-     * @param OutValue 변환된 Enum 값을 받아올 참조 변수
-     * @return 성공 여부 (필드가 없거나 변환 실패 시 false)
+     * Reads a string from a JSON object and converts it to an enum value.
+     * @param JsonObject Source JSON object to read from.
+     * @param FieldName JSON key name.
+     * @param OutValue Output reference that receives the converted enum value.
+     * @return True on success; false if the field is missing or conversion fails.
      */
     template <typename TEnum>
     static bool TryGetEnumField(const TSharedPtr<FJsonObject> &JsonObject, const FString &FieldName, TEnum &OutValue)
@@ -137,10 +137,10 @@ struct FJsonHelper
             const UEnum *EnumPtr = StaticEnum<TEnum>();
             if (EnumPtr)
             {
-                // 완전한 형태(EItemType::Weapon)와 짧은 형태(Weapon) 모두 검색하기 위해 FName으로 컨버팅
+                // Convert to FName so both full and short enum forms can be searched.
                 int64 Value = EnumPtr->GetValueByName(FName(*StringValue));
 
-                // 찾지 못했다면 범위 내에서 네임스페이스를 붙여서 재시도
+                // If the short form is not found, retry with scoped enum names.
                 if (Value == INDEX_NONE)
                 {
                     FString FullEnumName = FString::Printf(TEXT("%s::%s"), *EnumPtr->GetName(), *StringValue);

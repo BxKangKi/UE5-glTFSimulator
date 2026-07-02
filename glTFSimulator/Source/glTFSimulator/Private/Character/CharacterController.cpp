@@ -5,19 +5,21 @@
 #include "Character/CharacterComponent.h"
 #include "Character/CharacterFunctionLibrary.h"
 #include "Character/InputFunctionLibrary.h"
+#include "Character/PlayerCharacterController.h"
 #include "GameFramework/SpringArmComponent.h"
 #include "System/GameManagerSubSystem.h"
 #include "Components/CapsuleComponent.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Camera/CameraComponent.h"
 #include "GameFramework/CharacterMovementComponent.h"
+#include "GameFramework/PlayerController.h"
 #include "Character/CharacterLoadAsyncAction.h"
 #include "World/WaterActor.h"
-#include "World/RuntimeBuoyancyComponent.h"
+#include "World/BuoyancyComponent.h"
 #include "System/MacroLibrary.h"
 #include "Components/PrimitiveComponent.h"
 
-namespace RuntimeCharacterController
+namespace CharacterControllerTuning
 {
     static const FVector MeshDefaultRelativeLocation(0.0f, 0.0f, -90.0f);
     static const FRotator MeshDefaultRelativeRotation(0.0f, 270.0f, 0.0f);
@@ -45,7 +47,7 @@ ACharacterController::ACharacterController()
     FollowCamera->SetupAttachment(SpringArm);
     FollowCamera->bUsePawnControlRotation = false;
 
-    SkeletalMeshBuoyancyComponent = CreateDefaultSubobject<URuntimeBuoyancyComponent>(TEXT("SkeletalMeshBuoyancy"));
+    SkeletalMeshBuoyancyComponent = CreateDefaultSubobject<UBuoyancyComponent>(TEXT("SkeletalMeshBuoyancy"));
     if (SkeletalMeshBuoyancyComponent)
     {
         if (USkeletalMeshComponent* MeshComponent = GetMesh())
@@ -53,7 +55,7 @@ ACharacterController::ACharacterController()
             SkeletalMeshBuoyancyComponent->SetTargetComponentName(MeshComponent->GetFName());
         }
 
-        FRuntimeBuoyancyPhysicsSettings CharacterBuoyancyPhysics;
+        FBuoyancyPhysicsSettings CharacterBuoyancyPhysics;
         CharacterBuoyancyPhysics.BuoyancyAccelerationScale = 0.992f;
         CharacterBuoyancyPhysics.WaterLinearDragCoefficient = 2.35f;
         CharacterBuoyancyPhysics.WaterQuadraticDragCoefficient = 0.00175f;
@@ -78,8 +80,8 @@ ACharacterController::ACharacterController()
         CharacterBuoyancyPhysics.MaxAngularSpeed = 4.8f;
         SkeletalMeshBuoyancyComponent->SetCommonPhysicsSettings(CharacterBuoyancyPhysics);
 
-        FRuntimeSkeletalBuoyancySettings SkeletalBuoyancySettings = SkeletalMeshBuoyancyComponent->GetSkeletalMeshSettings();
-        for (FRuntimeSkeletalBuoyancyBoneRule& Rule : SkeletalBuoyancySettings.BoneRules)
+        FSkeletalBuoyancySettings SkeletalBuoyancySettings = SkeletalMeshBuoyancyComponent->GetSkeletalMeshSettings();
+        for (FSkeletalBuoyancyBoneRule& Rule : SkeletalBuoyancySettings.BoneRules)
         {
             if (Rule.RuleName == FName(TEXT("DistalLimbs")))
             {
@@ -122,7 +124,7 @@ void ACharacterController::BeginPlay()
         UE_LOG(LogTemp, Warning, TEXT("Input Mapping Context is not assigned in the editor."));
     }
     bIsLoaded = false;
-    SavedThirdPersonArmLength = SpringArm->TargetArmLength > 1.0f ? SpringArm->TargetArmLength : RuntimeCharacterController::DefaultThirdPersonArmLength;
+    SavedThirdPersonArmLength = SpringArm->TargetArmLength > 1.0f ? SpringArm->TargetArmLength : CharacterControllerTuning::DefaultThirdPersonArmLength;
     SavedThirdPersonSocketOffset = SpringArm->SocketOffset;
     // Initialize Component
     Movement = GetCharacterMovement();
@@ -149,7 +151,7 @@ void ACharacterController::Load(const FString &Path)
 {
     bIsLoaded = false;
 
-    PrepareForRuntimeMeshReload();
+    PrepareForMeshReload();
 
     if (IsValid(Component.Get()))
     {
@@ -171,7 +173,7 @@ void ACharacterController::Load(const FString &Path)
     }
     else
     {
-        RestoreAfterRuntimeMeshReload();
+        RestoreAfterMeshReload();
     }
 }
 
@@ -187,7 +189,7 @@ void ACharacterController::OnLoadCompleted(bool Result)
         UE_LOG(LogTemp, Warning, TEXT("Character glTF load failed. Falling back to the default mesh so world/runtime loading can continue."));
     }
 
-    RestoreAfterRuntimeMeshReload();
+    RestoreAfterMeshReload();
 
     if (IsValid(Component.Get()))
     {
@@ -202,7 +204,7 @@ void ACharacterController::OnLoadCompleted(bool Result)
     bIsLoaded = true;
 }
 
-void ACharacterController::PrepareForRuntimeMeshReload()
+void ACharacterController::PrepareForMeshReload()
 {
     USkeletalMeshComponent* MeshComp = GetMesh();
     if (!IsValid(MeshComp))
@@ -210,15 +212,15 @@ void ACharacterController::PrepareForRuntimeMeshReload()
         return;
     }
 
-    // Runtime player meshes are generated from glTFRuntime and can temporarily have a
+    // Dynamically loaded player meshes are generated from glTFRuntime and can temporarily have a
     // different USkeleton/bone layout while the async load is still in progress. Disable
     // the AnimBP/ControlRig graph before the swap so worker-thread CacheBones cannot build
     // mappings against a half-replaced runtime mesh.
-    if (!bHasSavedRuntimeAnimationState)
+    if (!bHasSavedAnimationState)
     {
-        SavedRuntimeAnimationMode = MeshComp->GetAnimationMode();
-        SavedRuntimeAnimClass = MeshComp->GetAnimClass();
-        bHasSavedRuntimeAnimationState = true;
+        SavedAnimationMode = MeshComp->GetAnimationMode();
+        SavedAnimClass = MeshComp->GetAnimClass();
+        bHasSavedAnimationState = true;
     }
 
     MeshComp->bPauseAnims = true;
@@ -229,7 +231,7 @@ void ACharacterController::PrepareForRuntimeMeshReload()
     MeshComp->SetAnimationMode(EAnimationMode::AnimationSingleNode);
 }
 
-void ACharacterController::RestoreAfterRuntimeMeshReload()
+void ACharacterController::RestoreAfterMeshReload()
 {
     USkeletalMeshComponent* MeshComp = GetMesh();
     if (!IsValid(MeshComp))
@@ -237,17 +239,17 @@ void ACharacterController::RestoreAfterRuntimeMeshReload()
         return;
     }
 
-    if (bHasSavedRuntimeAnimationState)
+    if (bHasSavedAnimationState)
     {
-        if (SavedRuntimeAnimationMode == EAnimationMode::AnimationBlueprint && SavedRuntimeAnimClass)
+        if (SavedAnimationMode == EAnimationMode::AnimationBlueprint && SavedAnimClass)
         {
-            MeshComp->SetAnimInstanceClass(SavedRuntimeAnimClass);
+            MeshComp->SetAnimInstanceClass(SavedAnimClass);
         }
         else
         {
-            MeshComp->SetAnimationMode(SavedRuntimeAnimationMode.GetValue());
+            MeshComp->SetAnimationMode(SavedAnimationMode.GetValue());
         }
-        bHasSavedRuntimeAnimationState = false;
+        bHasSavedAnimationState = false;
     }
 
     MeshComp->SetComponentTickEnabled(true);
@@ -255,10 +257,10 @@ void ACharacterController::RestoreAfterRuntimeMeshReload()
     MeshComp->RecreatePhysicsState();
 }
 
-void ACharacterController::PrepareForRuntimePawnReplacement()
+void ACharacterController::PrepareForPawnReplacement()
 {
     Activate(false);
-    PrepareForRuntimeMeshReload();
+    PrepareForMeshReload();
 
     USkeletalMeshComponent* MeshComp = GetMesh();
     if (IsValid(MeshComp))
@@ -280,6 +282,78 @@ void ACharacterController::PrepareForRuntimePawnReplacement()
 }
 
 
+
+void ACharacterController::RestoreControlAfterRagdollRecovery()
+{
+    // Ragdoll recovery disables movement for several frames while the mesh is being reattached.
+    // Always restore the authoritative movement/input/collision state in one place so a missed
+    // animation frame, water-state transition, or repeated deactivate request cannot leave the pawn unresponsive.
+    bIsMoveable = true;
+    SetActorHiddenInGame(false);
+    SetActorEnableCollision(true);
+
+    if (UCapsuleComponent* Capsule = GetCapsuleComponent())
+    {
+        Capsule->SetActive(true);
+        Capsule->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+        Capsule->SetGenerateOverlapEvents(true);
+    }
+
+    if (USkeletalMeshComponent* MeshComp = GetMesh())
+    {
+        UCharacterFunctionLibrary::DisableRagdollPhysicsButKeepSecondary(*MeshComp);
+        MeshComp->SetSimulatePhysics(false);
+        MeshComp->PutAllRigidBodiesToSleep();
+        MeshComp->SetComponentTickEnabled(true);
+        MeshComp->bPauseAnims = false;
+        MeshComp->SetVisibility(true, true);
+
+        if (UCapsuleComponent* Capsule = GetCapsuleComponent())
+        {
+            if (MeshComp->GetAttachParent() != Capsule)
+            {
+                MeshComp->AttachToComponent(Capsule, FAttachmentTransformRules::KeepWorldTransform);
+            }
+            MeshComp->SetRelativeLocation(CharacterControllerTuning::MeshDefaultRelativeLocation);
+            MeshComp->SetRelativeRotation(CharacterControllerTuning::MeshDefaultRelativeRotation);
+        }
+    }
+
+    if (IsValid(Movement))
+    {
+        Movement->SetActive(true);
+        Movement->Activate(true);
+        Movement->ConsumeInputVector();
+        Movement->StopMovementImmediately();
+        Movement->bOrientRotationToMovement = false;
+
+        if (Movement->MovementMode == MOVE_None)
+        {
+            const bool bHasWalkableSupport = Movement->IsMovingOnGround()
+                || (IsValid(Component.Get()) && Component->IsCharacterSupportedByWalkableGround());
+            Movement->SetMovementMode(bHasWalkableSupport ? MOVE_Walking : MOVE_Falling);
+        }
+    }
+
+    CharacterStateBit &= ~(STATE_JUMPING | STATE_SPRINT | STATE_CROUCH);
+    RawMoveInput = FVector::ZeroVector;
+    StopJumping();
+    UnCrouch();
+
+    if (APlayerController* PlayerController = Cast<APlayerController>(GetController()))
+    {
+        PlayerController->SetIgnoreMoveInput(false);
+        PlayerController->SetIgnoreLookInput(false);
+        PlayerController->SetViewTarget(this);
+
+        if (APlayerCharacterController* PlayerCharacterController = Cast<APlayerCharacterController>(PlayerController))
+        {
+            PlayerCharacterController->ApplyGameInputMode();
+            PlayerCharacterController->ClearLatchedMovementInput();
+        }
+    }
+}
+
 void ACharacterController::HandleCapsulePhysicsHit(UPrimitiveComponent* HitComponent, AActor* OtherActor, UPrimitiveComponent* OtherComp, FVector NormalImpulse, const FHitResult& Hit)
 {
     if (!bReceivePhysicsObjectImpacts || !IsValid(OtherActor) || OtherActor == this || !IsValid(OtherComp) || !IsValid(Movement) || !IsValid(Component.Get()))
@@ -294,7 +368,7 @@ void ACharacterController::HandleCapsulePhysicsHit(UPrimitiveComponent* HitCompo
 
     UWorld* World = GetWorld();
     const double Now = World ? World->GetTimeSeconds() : 0.0;
-    if (LastPhysicsObjectImpactTime >= 0.0 && Now - LastPhysicsObjectImpactTime < RuntimeCharacterController::PhysicsObjectImpactCooldownSeconds)
+    if (LastPhysicsObjectImpactTime >= 0.0 && Now - LastPhysicsObjectImpactTime < CharacterControllerTuning::PhysicsObjectImpactCooldownSeconds)
     {
         return;
     }
@@ -332,15 +406,15 @@ void ACharacterController::HandleCapsulePhysicsHit(UPrimitiveComponent* HitCompo
     const float ImpulseSpeed = NormalImpulse.Size() / ReferenceCharacterMassKg;
     float ImpactSpeed = FMath::Max(RelativeImpactSpeed, ImpulseSpeed);
 
-    if (ImpactSpeed < RuntimeCharacterController::MinPhysicsObjectImpactSpeed)
+    if (ImpactSpeed < CharacterControllerTuning::MinPhysicsObjectImpactSpeed)
     {
         return;
     }
 
-    ImpactSpeed = FMath::Clamp(ImpactSpeed * RuntimeCharacterController::PhysicsObjectImpactVelocityScale, 0.0f, RuntimeCharacterController::MaxPhysicsObjectImpactVelocityChange);
+    ImpactSpeed = FMath::Clamp(ImpactSpeed * CharacterControllerTuning::PhysicsObjectImpactVelocityScale, 0.0f, CharacterControllerTuning::MaxPhysicsObjectImpactVelocityChange);
 
     FVector VelocityDelta = HorizontalDirection * ImpactSpeed;
-    const float UpwardVelocity = FMath::Clamp(ImpactSpeed * RuntimeCharacterController::PhysicsObjectImpactUpwardRatio, 0.0f, RuntimeCharacterController::MaxPhysicsObjectImpactUpwardVelocity);
+    const float UpwardVelocity = FMath::Clamp(ImpactSpeed * CharacterControllerTuning::PhysicsObjectImpactUpwardRatio, 0.0f, CharacterControllerTuning::MaxPhysicsObjectImpactUpwardVelocity);
     if (UpwardVelocity > 0.0f)
     {
         VelocityDelta.Z = UpwardVelocity;
@@ -388,8 +462,8 @@ void ACharacterController::Tick(float DeltaSeconds)
                 {
                     MeshComp->AttachToComponent(Capsule, FAttachmentTransformRules::KeepRelativeTransform);
                 }
-                MeshComp->SetRelativeLocation(RuntimeCharacterController::MeshDefaultRelativeLocation);
-                MeshComp->SetRelativeRotation(RuntimeCharacterController::MeshDefaultRelativeRotation);
+                MeshComp->SetRelativeLocation(CharacterControllerTuning::MeshDefaultRelativeLocation);
+                MeshComp->SetRelativeRotation(CharacterControllerTuning::MeshDefaultRelativeRotation);
             }
         }
     }
@@ -713,7 +787,7 @@ void ACharacterController::SetWaterState(bool bValue, float Level, bool bForceRa
 {
     const bool bWasInWater = UCharacterFunctionLibrary::IsStateActive(CharacterStateBit, STATE_WATER);
     const bool bStateChanged = bWasInWater != bValue;
-    const bool bLevelChanged = !FMath::IsNearlyEqual(WaterLevel, Level, RuntimeCharacterController::WaterLevelChangeToleranceCm);
+    const bool bLevelChanged = !FMath::IsNearlyEqual(WaterLevel, Level, CharacterControllerTuning::WaterLevelChangeToleranceCm);
     WaterLevel = Level;
 
     if (bValue)
@@ -907,7 +981,7 @@ void ACharacterController::SyncRagdollWaterStateFromPhysics()
         const float DetectedWaterLevel = RagdollWaterState.WaterLevel;
         const bool bWasForcedByRagdoll = bWaterStateForcedByRagdoll;
         bWaterStateForcedByRagdoll = true;
-        if (!bWasForcedByRagdoll || !UCharacterFunctionLibrary::IsStateActive(CharacterStateBit, STATE_WATER) || !FMath::IsNearlyEqual(WaterLevel, DetectedWaterLevel, RuntimeCharacterController::WaterLevelChangeToleranceCm))
+        if (!bWasForcedByRagdoll || !UCharacterFunctionLibrary::IsStateActive(CharacterStateBit, STATE_WATER) || !FMath::IsNearlyEqual(WaterLevel, DetectedWaterLevel, CharacterControllerTuning::WaterLevelChangeToleranceCm))
         {
             SetWaterState(true, DetectedWaterLevel);
         }

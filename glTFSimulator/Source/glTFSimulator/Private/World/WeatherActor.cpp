@@ -7,7 +7,7 @@
 #include "NiagaraComponent.h"
 #include "Components/SceneCaptureComponent2D.h"
 #include "Kismet/KismetSystemLibrary.h"
-#include "World/UpdateRainAsync.h" // 해당 비동기 액션 헤더
+#include "World/UpdateRainAsync.h" // Header for the async rain update action.
 
 AWeatherActor::AWeatherActor()
 {
@@ -30,17 +30,17 @@ AWeatherActor::AWeatherActor()
 
 void AWeatherActor::BeginPlay()
 {
-    // 1. OnBeginPlay (상위 클래스 함수 호출)
+    // 1. Call the parent BeginPlay implementation.
     Super::BeginPlay();
     Param = FName("Matrix");
     MaxDistance = 1048576.0f;
-    // 2. LocationOffset 설정 (0, 0, 1500)
+    // 2. Set LocationOffset to (0, 0, 1500).
     LocationOffset = FVector(0.0f, 0.0f, 1500.0f);
     if (!IsValid(SubSystem))
     {
         SubSystem = UGameManagerSubSystem::GetSubSystem(this);
     }
-    // 3. Async Tick 시작
+    // 3. Start the async tick loop.
     AsyncTick();
 }
 
@@ -56,8 +56,8 @@ void AWeatherActor::Tick(float DeltaSeconds)
 
 void AWeatherActor::AsyncTick()
 {
-    // 블루프린트의 UpdateRainAsync 노드 호출 로직
-    // 보통 UBlueprintAsyncActionBase는 Static 함수인 "UpdateRainAsync"를 통해 생성됩니다.
+    // Logic equivalent to calling the Blueprint UpdateRainAsync node.
+    // UBlueprintAsyncActionBase objects are usually created through the static UpdateRainAsync function.
     UUpdateRainAsync* RainAction = UUpdateRainAsync::UpdateRainAsync(
         this, 
         SceneCapture, 
@@ -68,16 +68,16 @@ void AWeatherActor::AsyncTick()
 
     if (RainAction)
     {
-        // 블루프린트의 "Completed" 핀을 델리게이트로 연결
+        // Bind the Blueprint Completed pin to the delegate.
         RainAction->Completed.AddDynamic(this, &AWeatherActor::OnRainUpdateCompleted);
-        // 액션 활성화
+        // Activate the async action.
         RainAction->Activate();
     }
 }
 
 void AWeatherActor::OnRainUpdateCompleted()
 {
-    // 블루프린트의 "DelayUntilNextTick" 후 다시 "Async Tick" 호출하는 루프 구현
-    // C++에서는 다음 프레임에 함수를 예약 실행하거나 Timer를 사용합니다.
+    // Implements the loop that calls Async Tick again after Blueprint DelayUntilNextTick.
+    // In C++, schedule the next call for the following frame or use a timer.
     GetWorld()->GetTimerManager().SetTimerForNextTick(this, &AWeatherActor::AsyncTick);
 }

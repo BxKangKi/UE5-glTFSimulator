@@ -10,7 +10,7 @@ FString FStringHelper::GetTextBeforeChar(const FString &Input, char Delim)
     {
         return Input.Left(Index);
     }
-    return Input; // 구분자가 없으면 전체 반환
+    return Input; // Return the full string when the delimiter is missing.
 }
 
 FString FStringHelper::GetTextAfterChar(const FString &Input, char Delim)
@@ -18,9 +18,9 @@ FString FStringHelper::GetTextAfterChar(const FString &Input, char Delim)
     int32 Index = 0;
     if (Input.FindChar(Delim, Index))
     {
-        return Input.Mid(Index + 1); // Delim 다음부터 반환
+        return Input.Mid(Index + 1); // Return the substring after Delim.
     }
-    return FString(); // 구분자가 없으면 빈 문자열 반환
+    return FString(); // Return an empty string when the delimiter is missing.
 }
 
 FString FStringHelper::FindFirstStringWithPrefix(const TArray<FString> &KeyArray, const FString &Prefix)

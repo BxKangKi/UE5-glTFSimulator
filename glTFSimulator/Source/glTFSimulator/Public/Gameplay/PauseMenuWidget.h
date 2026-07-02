@@ -4,7 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
-#include "RuntimePauseMenuWidget.generated.h"
+#include "PauseMenuWidget.generated.h"
 
 class UButton;
 class UTextBlock;
@@ -17,33 +17,33 @@ class UTextBlock;
  * or call the BlueprintCallable functions from your own UI events.
  */
 UCLASS(Blueprintable, BlueprintType)
-class GLTFSIMULATOR_API URuntimePauseMenuWidget : public UUserWidget
+class GLTFSIMULATOR_API UPauseMenuWidget : public UUserWidget
 {
     GENERATED_BODY()
 
 public:
     virtual void NativeConstruct() override;
 
-    UFUNCTION(BlueprintCallable, Category="Runtime Pause")
+    UFUNCTION(BlueprintCallable, Category="Pause")
     void ContinueFromUI();
 
-    UFUNCTION(BlueprintCallable, Category="Runtime Pause")
+    UFUNCTION(BlueprintCallable, Category="Pause")
     void OpenSettingsFromUI();
 
-    UFUNCTION(BlueprintCallable, Category="Runtime Pause")
+    UFUNCTION(BlueprintCallable, Category="Pause")
     void ExitFromUI();
 
 protected:
-    UPROPERTY(BlueprintReadOnly, meta=(BindWidgetOptional), Category="Runtime Pause|Widgets")
+    UPROPERTY(BlueprintReadOnly, meta=(BindWidgetOptional), Category="Pause|Widgets")
     TObjectPtr<UTextBlock> TitleText;
 
-    UPROPERTY(BlueprintReadOnly, meta=(BindWidgetOptional), Category="Runtime Pause|Widgets")
+    UPROPERTY(BlueprintReadOnly, meta=(BindWidgetOptional), Category="Pause|Widgets")
     TObjectPtr<UButton> ContinueButton;
 
-    UPROPERTY(BlueprintReadOnly, meta=(BindWidgetOptional), Category="Runtime Pause|Widgets")
+    UPROPERTY(BlueprintReadOnly, meta=(BindWidgetOptional), Category="Pause|Widgets")
     TObjectPtr<UButton> SettingsButton;
 
-    UPROPERTY(BlueprintReadOnly, meta=(BindWidgetOptional), Category="Runtime Pause|Widgets")
+    UPROPERTY(BlueprintReadOnly, meta=(BindWidgetOptional), Category="Pause|Widgets")
     TObjectPtr<UButton> ExitButton;
 
 private:

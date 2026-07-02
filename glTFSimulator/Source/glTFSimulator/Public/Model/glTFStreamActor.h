@@ -5,7 +5,7 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
-#include "Model/RuntimeData.h"
+#include "Model/Data.h"
 #include "Model/StreamDefaultAsset.h"
 #include "glTFRuntimeParser.h"
 #include "glTFStreamActor.generated.h"
@@ -13,7 +13,7 @@
 class UBoxComponent;
 class UInstancedStaticMeshComponent;
 class UglTFRuntimeAsset;
-class UTexture2DArray;
+class UTexture;
 struct FLoadAsyncWrapper;
 struct FStreamAsyncWrapper;
 
@@ -21,7 +21,7 @@ enum class EGLTFStreamAssetPhase : uint8
 {
     None,
     SizeScan,
-    Runtime
+    Streaming
 };
 
 UCLASS()
@@ -43,10 +43,10 @@ public:
     FString GetFilePath() const { return FilePath; }
 
     UFUNCTION(BlueprintCallable)
-    UglTFRuntimeAsset* GetAsset() const { return glTFRuntimeAsset; }
+    UglTFRuntimeAsset* GetAsset() const { return glTFAsset; }
 
     bool HasModelMetadata() const { return bHasModelMetadata; }
-    const FRuntimeModelData& GetModelMetadata() const { return ModelMetadata; }
+    const FModelData& GetModelMetadata() const { return ModelMetadata; }
 
     UFUNCTION(BlueprintCallable)
     TMap<FName, FModelNodeData> GetAllNodeMap() const { return AllNodeMap; }
@@ -59,7 +59,7 @@ public:
     const TSet<FName>& GetLoadedNodesRef() const { return LoadedNodes; }
     const TMap<FName, TObjectPtr<UInstancedStaticMeshComponent>>& GetInstanceMapRef() const { return InstanceMap; }
     const TMap<FName, TObjectPtr<UBoxComponent>>& GetUnloadBoxMapRef() const { return UnloadBoxMap; }
-    const TMap<FName, FRuntimeComponentGroup>& GetDynamicComponentMapRef() const { return DynamicComponentMap; }
+    const TMap<FName, FComponentGroup>& GetDynamicComponentMapRef() const { return DynamicComponentMap; }
     UMaterialInterface* GetDecalLight() const { return DecalLight; }
 
     UFUNCTION(BlueprintCallable)
@@ -73,6 +73,10 @@ public:
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite)
     FStreamDefaultAsset Default;
+
+    /** Optional texture used by custom terrain materials. Leave empty to use the original glTF material textures. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite)
+    TObjectPtr<UTexture> TerrainTextureOverride;
 
     UPROPERTY(EditAnywhere, BlueprintReadOnly)
     TObjectPtr<UMaterialInterface> DecalLight;
@@ -104,10 +108,7 @@ protected:
 
 private:
     UPROPERTY()
-    TObjectPtr<UglTFRuntimeAsset> glTFRuntimeAsset;
-
-    UPROPERTY(Transient)
-    TObjectPtr<UTexture2DArray> RuntimeTerrainTextureArray;
+    TObjectPtr<UglTFRuntimeAsset> glTFAsset;
 
     UPROPERTY()
     TMap<FName, FModelNodeData> AllNodeMap;
@@ -125,10 +126,10 @@ private:
     TMap<FName, TObjectPtr<UBoxComponent>> UnloadBoxMap;
 
     UPROPERTY()
-    TMap<FName, FRuntimeComponentGroup> DynamicComponentMap;
+    TMap<FName, FComponentGroup> DynamicComponentMap;
 
     UPROPERTY()
-    FRuntimeModelData ModelMetadata;
+    FModelData ModelMetadata;
 
     FString FilePath;
     bool bHasModelMetadata = false;
@@ -139,11 +140,11 @@ private:
     void LoadAssetAsync(EGLTFStreamAssetPhase Phase);
     void StartSizeScan(UglTFRuntimeAsset* Asset);
     void ReleaseAsset(UglTFRuntimeAsset* Asset);
-    void ReleaseRuntimeResources();
-    void StartRuntimeStreaming();
+    void ReleaseStreamingResources();
+    void StartStreaming();
     void AsyncTick();
     void UpdateProperties(const FStreamAsyncWrapper& Collection);
-    void ApplyTerrainTextureArrayToLoadedMaterials();
+    void ApplyTerrainTextureOverrideToLoadedMaterials();
     bool IsTerrainMaterial(const UMaterialInterface* Material) const;
     bool IsPlayerInsideModelRange() const;
     void WriteLogAsync(const FString& Message) const;

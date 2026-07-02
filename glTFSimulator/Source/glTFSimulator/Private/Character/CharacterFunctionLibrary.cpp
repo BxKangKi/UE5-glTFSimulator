@@ -37,7 +37,7 @@ FTransform UCharacterFunctionLibrary::GetBoneDeltaTransform(const USkeletalMesh 
 }
 
 
-static bool IsRuntimeSecondaryPhysicsBone(const USkeletalMeshComponent &SkeletalMesh, const FName &BoneName)
+static bool IsSecondaryPhysicsBone(const USkeletalMeshComponent &SkeletalMesh, const FName &BoneName)
 {
     FName CurrentBone = BoneName;
     while (CurrentBone != NAME_None)
@@ -95,7 +95,7 @@ bool UCharacterFunctionLibrary::HasNonSecondarySimulatingPhysicsBodies(USkeletal
 
         // Only pay the parent-chain check for bodies that are actually simulating.
         // In normal gameplay most bones are kinematic, so this removes a large per-tick cost.
-        if (!IsRuntimeSecondaryPhysicsBone(SkeletalMesh, BoneName))
+        if (!IsSecondaryPhysicsBone(SkeletalMesh, BoneName))
         {
             return true;
         }

@@ -4,7 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
-#include "RuntimeWeaponActor.generated.h"
+#include "WeaponActor.generated.h"
 
 class UglTFRuntimeAsset;
 class UStaticMeshComponent;
@@ -13,7 +13,7 @@ class USceneComponent;
 class UCameraComponent;
 
 USTRUCT(BlueprintType)
-struct FRuntimeWeaponConfig
+struct FWeaponConfig
 {
     GENERATED_BODY()
 
@@ -34,20 +34,20 @@ struct FRuntimeWeaponConfig
 };
 
 UCLASS(BlueprintType)
-class GLTFSIMULATOR_API ARuntimeWeaponActor : public AActor
+class GLTFSIMULATOR_API AWeaponActor : public AActor
 {
     GENERATED_BODY()
 
 public:
-    ARuntimeWeaponActor();
+    AWeaponActor();
 
-    UFUNCTION(BlueprintCallable, Category="Runtime Weapon")
+    UFUNCTION(BlueprintCallable, Category="Weapon")
     bool EquipFromFile(const FString& InFilePath, USceneComponent* AttachTarget);
 
-    UFUNCTION(BlueprintCallable, Category="Runtime Weapon")
+    UFUNCTION(BlueprintCallable, Category="Weapon")
     void Fire(AController* InstigatorController);
 
-    UFUNCTION(BlueprintPure, Category="Runtime Weapon")
+    UFUNCTION(BlueprintPure, Category="Weapon")
     FString GetSourceFilePath() const { return SourceFilePath; }
 
 protected:
@@ -58,7 +58,7 @@ private:
     TObjectPtr<USceneComponent> Root;
 
     UPROPERTY()
-    TObjectPtr<UglTFRuntimeAsset> RuntimeAsset;
+    TObjectPtr<UglTFRuntimeAsset> GltfAsset;
 
     UPROPERTY()
     TArray<TObjectPtr<UStaticMeshComponent>> MeshComponents;
@@ -69,7 +69,7 @@ private:
     UPROPERTY()
     FString SourceFilePath;
 
-    FRuntimeWeaponConfig Config;
+    FWeaponConfig Config;
     double LastFireTime = -1000.0;
 
     bool LoadConfigJson(const FString& JsonPath);

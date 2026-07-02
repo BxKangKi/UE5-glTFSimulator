@@ -5,17 +5,18 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/PlayerController.h"
-#include "Runtime/RuntimeCreatorHUDWidget.h"
+#include "Gameplay/CreatorHUDWidget.h"
+#include "System/GameManagerActor.h"
 #include "PlayerCharacterController.generated.h"
 
-class ARuntimeGameplayManager;
+class AGameManagerActor;
 class UGameManagerSubSystem;
 class UInputAction;
 class UInputMappingContext;
 struct FInputActionValue;
 class UUserWidget;
-class URuntimePauseMenuWidget;
-class URuntimeSettingsMenuWidget;
+class UPauseMenuWidget;
+class USettingsMenuWidget;
 
 USTRUCT(BlueprintType)
 struct GLTFSIMULATOR_API FPlayerInputMappingContextConfig
@@ -36,7 +37,7 @@ public:
  * Project-level PlayerController input router.
  *
  * Character movement, camera input, vehicle input, and pause can be received from
- * Enhanced Input InputAction assets. Runtime tool selection, prefab/weapon selection,
+ * Enhanced Input InputAction assets. Gameplay tool selection, prefab/weapon selection,
  * snap, and scene saving are intentionally handled by a Blueprint UserWidget
  * instead of separate InputAction fields. World placement uses mouse
  * input: left pressed/released drives click-vs-hold editing, right click finishes vertex editing.
@@ -49,7 +50,7 @@ class GLTFSIMULATOR_API APlayerCharacterController : public APlayerController
 public:
     APlayerCharacterController();
 
-    /** 2D axis. X = right/left, Y = forward/back. Also drives the runtime vehicle when possessed. */
+    /** 2D axis. X = right/left, Y = forward/back. Also drives the vehicle when possessed. */
     UFUNCTION(BlueprintCallable, Category="Input|Character")
     void Input_Move(const FVector2D& MoveValue);
 
@@ -81,54 +82,54 @@ public:
     UFUNCTION(BlueprintCallable, Category="Input|Character")
     void Input_RagdollPressed();
 
-    /** Replaces the old RuntimeGameplayManager LeftMouseButton pressed path. */
-    UFUNCTION(BlueprintCallable, Category="Input|Runtime Mouse")
-    void Input_RuntimePrimaryPressed();
+    /** Replaces the old GameManager LeftMouseButton pressed path. */
+    UFUNCTION(BlueprintCallable, Category="Input|Mouse")
+    void Input_PrimaryPressed();
 
     /** LeftMouseButton released. Required for click-vs-hold vertex editing. */
-    UFUNCTION(BlueprintCallable, Category="Input|Runtime Mouse")
-    void Input_RuntimePrimaryReleased();
+    UFUNCTION(BlueprintCallable, Category="Input|Mouse")
+    void Input_PrimaryReleased();
 
-    /** Replaces the old RuntimeGameplayManager RightMouseButton BindKey path. */
-    UFUNCTION(BlueprintCallable, Category="Input|Runtime Mouse")
-    void Input_RuntimeSecondaryPressed();
+    /** Replaces the old GameManager RightMouseButton BindKey path. */
+    UFUNCTION(BlueprintCallable, Category="Input|Mouse")
+    void Input_SecondaryPressed();
 
-    /** Replaces the old RuntimeGameplayManager F BindKey path. */
-    UFUNCTION(BlueprintCallable, Category="Input|Runtime Vehicle")
-    void Input_RuntimeInteractPressed();
+    /** Replaces the old GameManager F BindKey path. */
+    UFUNCTION(BlueprintCallable, Category="Input|Vehicle")
+    void Input_InteractPressed();
 
-    /** Replaces the old RuntimeGameplayManager V BindKey path. */
+    /** Replaces the old GameManager V BindKey path. */
     UFUNCTION(BlueprintCallable, Category="Input|Character")
-    void Input_RuntimeToggleFirstPersonPressed();
+    void Input_ToggleFirstPersonPressed();
 
     /** U key or assigned InputAction. Cycles through player GLB files managed by glTFStreamSubSystem. */
     UFUNCTION(BlueprintCallable, Category="Input|Character")
     void Input_ChangeCharacterPressed();
 
     /** Mouse wheel / Axis1D. Positive wheel selects the previous toolbar slot, negative selects the next slot. */
-    UFUNCTION(BlueprintCallable, Category="Input|Runtime Toolbar")
-    void Input_RuntimeToolbarScroll(float ScrollValue);
+    UFUNCTION(BlueprintCallable, Category="Input|Toolbar")
+    void Input_ToolbarScroll(float ScrollValue);
 
     /** E key or assigned InputAction. Opens/closes the full item list window for your BP UserWidget. */
-    UFUNCTION(BlueprintCallable, Category="Input|Runtime Toolbar")
-    void Input_RuntimeToggleItemListPressed();
+    UFUNCTION(BlueprintCallable, Category="Input|Toolbar")
+    void Input_ToggleItemListPressed();
 
-    /** Assigned snap InputAction or fallback G. Toggles runtime grid snap while editing/placing. */
-    UFUNCTION(BlueprintCallable, Category="Input|Runtime Toolbar")
-    void Input_RuntimeSnapPressed();
+    /** Assigned snap InputAction or fallback G. Toggles grid snap while editing/placing. */
+    UFUNCTION(BlueprintCallable, Category="Input|Toolbar")
+    void Input_SnapPressed();
 
     /** Optional 2D vehicle axis. X = steering, Y = throttle. */
-    UFUNCTION(BlueprintCallable, Category="Input|Runtime Vehicle")
-    void Input_RuntimeVehicleMove(const FVector2D& MoveValue);
+    UFUNCTION(BlueprintCallable, Category="Input|Vehicle")
+    void Input_VehicleMove(const FVector2D& MoveValue);
 
-    UFUNCTION(BlueprintCallable, Category="Input|Runtime Vehicle")
-    void Input_RuntimeVehicleThrottle(float Throttle);
+    UFUNCTION(BlueprintCallable, Category="Input|Vehicle")
+    void Input_VehicleThrottle(float Throttle);
 
-    UFUNCTION(BlueprintCallable, Category="Input|Runtime Vehicle")
-    void Input_RuntimeVehicleSteering(float Steering);
+    UFUNCTION(BlueprintCallable, Category="Input|Vehicle")
+    void Input_VehicleSteering(float Steering);
 
-    UFUNCTION(BlueprintCallable, Category="Input|Runtime Vehicle")
-    void Input_RuntimeVehicleStop();
+    UFUNCTION(BlueprintCallable, Category="Input|Vehicle")
+    void Input_VehicleStop();
 
     UFUNCTION(BlueprintCallable, Category="Input|Character")
     void ClearLatchedMovementInput();
@@ -157,16 +158,16 @@ public:
 
     /** Human-readable status showing which controller, mapping contexts, and action bindings are active. */
     UFUNCTION(BlueprintPure, Category="Input|Enhanced Input")
-    FString GetRuntimeInputSetupStatus() const;
+    FString GetInputSetupStatus() const;
 
     UFUNCTION(BlueprintCallable, Category="Input|Enhanced Input")
-    void PrintRuntimeInputSetupStatus() const;
+    void PrintInputSetupStatus() const;
 
     UFUNCTION(BlueprintPure, Category="Input|Enhanced Input")
-    FString GetRuntimeInputFixVersion() const;
+    FString GetInputFixVersion() const;
 
-    UFUNCTION(BlueprintCallable, Category="Runtime Gameplay")
-    ARuntimeGameplayManager* GetRuntimeGameplayManager();
+    UFUNCTION(BlueprintCallable, Category="Gameplay")
+    UGameManagerSubSystem* GetGameManager();
 
 protected:
     virtual void BeginPlay() override;
@@ -177,10 +178,10 @@ protected:
 public:
     /** Backward-compatible single IMC slot. Assign your main IMC here in a Blueprint child. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Mapping", meta=(DisplayName="Primary Input Mapping Context"))
-    TObjectPtr<UInputMappingContext> RuntimeInputMappingContext;
+    TObjectPtr<UInputMappingContext> InputMappingContext;
 
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Mapping", meta=(DisplayName="Primary Input Mapping Priority"))
-    int32 RuntimeInputMappingPriority = 50;
+    int32 InputMappingPriority = 50;
 
     /** Optional extra IMCs. Useful when Character, Vehicle, and System actions are separated. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Mapping")
@@ -208,91 +209,91 @@ public:
     bool bBindFallbackKeysOnlyForUnassignedInputActions = true;
 
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Fallback Keys")
-    bool bAutoSpawnRuntimeGameplayManager = true;
+    bool bAutoSpawnGameManager = true;
 
-    /** BP subclass of ARuntimeGameplayManager to spawn when no manager is placed in the level. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Runtime Gameplay")
-    TSubclassOf<ARuntimeGameplayManager> RuntimeGameplayManagerClass;
+    /** BP subclass of AGameManagerActor to spawn when no manager is placed in the level. */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Gameplay")
+    TSubclassOf<AGameManagerActor> GameManagerActorClass;
 
-    /** Optional WBP subclass of URuntimeCreatorHUDWidget. Nothing is created when this is empty. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Runtime Creator HUD")
-    TSubclassOf<URuntimeCreatorHUDWidget> RuntimeCreatorHUDWidgetClass;
+    /** Optional WBP subclass of UCreatorHUDWidget. Nothing is created when this is empty. */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Creator HUD")
+    TSubclassOf<UCreatorHUDWidget> CreatorHUDWidgetClass;
 
     /** Disabled by default because the Creator HUD is now expected to be created explicitly by your own WBP/Blueprint flow. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Runtime Creator HUD")
-    bool bAutoCreateRuntimeCreatorHUD = false;
+    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Creator HUD")
+    bool bAutoCreateCreatorHUD = false;
 
     /** ZOrder used when the explicitly created Creator HUD is added to the viewport. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Runtime Creator HUD")
-    int32 RuntimeCreatorHUDZOrder = 5;
+    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Creator HUD")
+    int32 CreatorHUDZOrder = 5;
 
     /** Creates the explicitly assigned Creator HUD widget if it is missing, then adds it to the viewport. */
-    UFUNCTION(BlueprintCallable, Category="Runtime Creator HUD")
-    UUserWidget* CreateRuntimeCreatorHUD();
+    UFUNCTION(BlueprintCallable, Category="Creator HUD")
+    UUserWidget* CreateCreatorHUD();
 
     /** Removes the stored Creator HUD instance from the viewport. */
-    UFUNCTION(BlueprintCallable, Category="Runtime Creator HUD")
-    void RemoveRuntimeCreatorHUD();
+    UFUNCTION(BlueprintCallable, Category="Creator HUD")
+    void RemoveCreatorHUD();
 
     /** Returns the current Creator HUD instance, if one exists. */
-    UFUNCTION(BlueprintPure, Category="Runtime Creator HUD")
-    UUserWidget* GetRuntimeCreatorHUDWidget() const { return RuntimeCreatorHUDWidget.Get(); }
+    UFUNCTION(BlueprintPure, Category="Creator HUD")
+    UUserWidget* GetCreatorHUDWidget() const { return CreatorHUDWidget.Get(); }
 
-    /** Optional WBP subclass of URuntimePauseMenuWidget. Nothing is created when this is empty. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Runtime Pause")
-    TSubclassOf<URuntimePauseMenuWidget> PauseMenuWidgetClass;
+    /** Optional WBP subclass of UPauseMenuWidget. Nothing is created when this is empty. */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Pause")
+    TSubclassOf<UPauseMenuWidget> PauseMenuWidgetClass;
 
-    /** Optional WBP subclass of URuntimeSettingsMenuWidget. Nothing is created when this is empty. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Runtime Pause")
-    TSubclassOf<URuntimeSettingsMenuWidget> SettingsMenuWidgetClass;
+    /** Optional WBP subclass of USettingsMenuWidget. Nothing is created when this is empty. */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Pause")
+    TSubclassOf<USettingsMenuWidget> SettingsMenuWidgetClass;
 
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Runtime Pause")
+    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Pause")
     int32 PauseMenuZOrder = 100;
 
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Runtime Pause")
+    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Pause")
     int32 SettingsMenuZOrder = 110;
 
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Runtime Pause")
+    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Pause")
     FName ExitLevelName = TEXT("StartWorld");
 
-    UFUNCTION(BlueprintCallable, Category="Runtime Pause")
+    UFUNCTION(BlueprintCallable, Category="Pause")
     UUserWidget* CreatePauseMenu();
 
-    UFUNCTION(BlueprintCallable, Category="Runtime Pause")
+    UFUNCTION(BlueprintCallable, Category="Pause")
     UUserWidget* CreateSettingsMenu();
 
-    UFUNCTION(BlueprintCallable, Category="Runtime Pause")
+    UFUNCTION(BlueprintCallable, Category="Pause")
     void OpenPauseMenu();
 
-    UFUNCTION(BlueprintCallable, Category="Runtime Pause")
+    UFUNCTION(BlueprintCallable, Category="Pause")
     void ClosePauseMenu(bool bResumeGame = true);
 
-    UFUNCTION(BlueprintCallable, Category="Runtime Pause")
+    UFUNCTION(BlueprintCallable, Category="Pause")
     void ShowSettingsMenuFromPause();
 
-    UFUNCTION(BlueprintCallable, Category="Runtime Pause")
+    UFUNCTION(BlueprintCallable, Category="Pause")
     void ReturnToPauseMenuFromSettings();
 
-    UFUNCTION(BlueprintCallable, Category="Runtime Pause")
+    UFUNCTION(BlueprintCallable, Category="Pause")
     void ExitToStartWorldFromPauseMenu();
 
-    UFUNCTION(BlueprintPure, Category="Runtime Pause")
+    UFUNCTION(BlueprintPure, Category="Pause")
     UUserWidget* GetPauseMenuWidget() const { return PauseMenuWidget.Get(); }
 
-    UFUNCTION(BlueprintPure, Category="Runtime Pause")
+    UFUNCTION(BlueprintPure, Category="Pause")
     UUserWidget* GetSettingsMenuWidget() const { return SettingsMenuWidget.Get(); }
 
-    /** Left/right mouse support for runtime placement. Tool selection and save are handled by UI buttons. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Runtime Mouse")
-    bool bBindRuntimeMouseButtons = true;
+    /** Left/right mouse support for gameplay placement. Tool selection and save are handled by UI buttons. */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Mouse")
+    bool bBindMouseButtons = true;
 
     /** Writes a clear Output Log message so you can verify that the rebuilt C++ class is actually running. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Diagnostics")
-    bool bLogRuntimeInputSetup = true;
+    bool bLogInputSetup = true;
 
     /** Also displays the diagnostic message on screen. Disabled by default to avoid the green startup message. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Diagnostics")
-    bool bShowRuntimeInputSetupOnScreen = false;
+    bool bShowInputSetupOnScreen = false;
 
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Character Actions")
     TObjectPtr<UInputAction> MoveAction;
@@ -318,41 +319,41 @@ public:
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Character Actions")
     float LookSensitivity = 1.0f;
 
-    /** Optional action for entering/exiting runtime vehicles. Tool buttons remain UI-only. */
+    /** Optional action for entering/exiting vehicles. Tool buttons remain UI-only. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Vehicle Actions", meta=(DisplayName="Vehicle Enter/Exit Action"))
-    TObjectPtr<UInputAction> RuntimeInteractAction;
+    TObjectPtr<UInputAction> InteractAction;
 
     /** Optional action for camera/character first-person toggle. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Character Actions", meta=(DisplayName="Toggle First Person Action"))
-    TObjectPtr<UInputAction> RuntimeToggleFirstPersonAction;
+    TObjectPtr<UInputAction> ToggleFirstPersonAction;
 
-    /** Optional action for cycling the runtime player character mesh, usually U. */
+    /** Optional action for cycling the streamed player character mesh, usually U. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Character Actions", meta=(DisplayName="Change Character Action"))
     TObjectPtr<UInputAction> ChangeCharacterAction;
 
     /** Axis1D action for Minecraft-style 7-slot toolbar scroll. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Creator Toolbar", meta=(DisplayName="Toolbar Scroll Action"))
-    TObjectPtr<UInputAction> RuntimeToolbarScrollAction;
+    TObjectPtr<UInputAction> ToolbarScrollAction;
 
     /** Boolean action for opening/closing the full item list window, usually E. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Creator Toolbar", meta=(DisplayName="Toggle Item List Action"))
-    TObjectPtr<UInputAction> RuntimeToggleItemListAction;
+    TObjectPtr<UInputAction> ToggleItemListAction;
 
-    /** Boolean action for toggling grid snap while creating/editing runtime objects. */
+    /** Boolean action for toggling grid snap while creating/editing created objects. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Creator Toolbar", meta=(DisplayName="Snap Toggle Action"))
-    TObjectPtr<UInputAction> RuntimeSnapAction;
+    TObjectPtr<UInputAction> SnapAction;
 
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Vehicle Actions")
-    TObjectPtr<UInputAction> RuntimeVehicleMoveAction;
+    TObjectPtr<UInputAction> VehicleMoveAction;
 
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Vehicle Actions")
-    TObjectPtr<UInputAction> RuntimeVehicleThrottleAction;
+    TObjectPtr<UInputAction> VehicleThrottleAction;
 
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Vehicle Actions")
-    TObjectPtr<UInputAction> RuntimeVehicleSteeringAction;
+    TObjectPtr<UInputAction> VehicleSteeringAction;
 
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Vehicle Actions")
-    TObjectPtr<UInputAction> RuntimeVehicleStopAction;
+    TObjectPtr<UInputAction> VehicleStopAction;
 
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Input|Enhanced Input|System")
     TObjectPtr<UInputAction> PauseAction;
@@ -394,7 +395,7 @@ private:
     void StopFallbackMovement();
     void FallbackLookYaw(float Value);
     void FallbackLookPitch(float Value);
-    bool ConsumeRuntimeInput(double& LastInputTime);
+    bool ConsumeInputDebounce(double& LastInputTime);
 
     void HandleMoveTriggered(const FInputActionValue& Value);
     void HandleMoveCompleted(const FInputActionValue& Value);
@@ -409,21 +410,21 @@ private:
 
     bool bPrevGamePaused = false;
     bool bIsDebug = false;
-    bool bRuntimeUIInputMode = false;
+    bool bUIInputMode = false;
     bool bFallbackMoveForward = false;
     bool bFallbackMoveBackward = false;
     bool bFallbackMoveRight = false;
     bool bFallbackMoveLeft = false;
     bool bEnhancedInputComponentWasAvailable = false;
     bool bAnyInputMappingContextApplied = false;
-    double LastRuntimePrimaryInputTime = -1.0;
-    double LastRuntimeSecondaryInputTime = -1.0;
-    double LastRuntimeInteractInputTime = -1.0;
-    double LastRuntimeToggleFirstPersonInputTime = -1.0;
-    double LastRuntimeChangeCharacterInputTime = -1.0;
-    double LastRuntimeToggleItemListInputTime = -1.0;
-    double LastRuntimeSnapInputTime = -1.0;
-    double LastRuntimeDebugInputTime = -1.0;
+    double LastPrimaryInputTime = -1.0;
+    double LastSecondaryInputTime = -1.0;
+    double LastInteractInputTime = -1.0;
+    double LastToggleFirstPersonInputTime = -1.0;
+    double LastChangeCharacterInputTime = -1.0;
+    double LastToggleItemListInputTime = -1.0;
+    double LastSnapInputTime = -1.0;
+    double LastDebugInputTime = -1.0;
 
     UPROPERTY()
     TObjectPtr<UGameManagerSubSystem> SubSystem;
@@ -431,8 +432,8 @@ private:
 
     /** Auto-created Creator HUD instance. Kept as UUserWidget so WBP subclasses are supported. */
     UPROPERTY()
-    TObjectPtr<UUserWidget> RuntimeCreatorHUDWidget;
+    TObjectPtr<UUserWidget> CreatorHUDWidget;
 
     UPROPERTY()
-    TObjectPtr<ARuntimeGameplayManager> CachedRuntimeGameplayManager;
+    TObjectPtr<AGameManagerActor> CachedGameManagerActor;
 };

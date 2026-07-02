@@ -3,7 +3,7 @@
 
 bool UGameSystemViewportClient::InputKey(const FInputKeyEventArgs &EventArgs)
 {
-	// F11키가 눌렸을 때 (Pressed)
+	// Handles the F11 key press.
 	if (EventArgs.Key == EKeys::F11 && EventArgs.Event == IE_Pressed)
 	{
 		UGameManagerSubSystem::ToggleFullscreen();

@@ -11,7 +11,7 @@
 
 class UDynamicPointLightComponent;
 
-/** 스레드 세이프하게 거리 연산을 처리하기 위한 경량 구조체 (DoD 구조) */
+/** Lightweight data-oriented structure for thread-safe distance calculations. */
 struct FLightOptimizationData
 {
     FVector Position;
@@ -22,11 +22,11 @@ struct FLightOptimizationData
     TWeakObjectPtr<UDecalComponent> DecalComponent;
     TWeakObjectPtr<UMaterialInterface> TargetDecalMaterial;
 
-    // 스레드에서 쓸 계산 결과 캐싱 전용 플래그
+    // Cached calculation flag used by worker threads.
     bool bTargetLightVisibility = true;
     bool bTargetDecalVisibility = false;
 
-    // 무분별한 SetVisibility 호출을 막기 위한 현재 상태 캐싱
+    // Cached visibility state used to avoid redundant SetVisibility calls.
     bool bCurrentLightVisibility = true;
     bool bCurrentDecalVisibility = false;
 };
@@ -40,7 +40,7 @@ public:
     virtual void Initialize(FSubsystemCollectionBase &Collection) override;
     virtual void Deinitialize() override;
 
-    // FTickableGameObject 인터페이스 구현
+    // FTickableGameObject interface implementation.
     virtual void Tick(float DeltaTime) override;
     virtual ETickableTickType GetTickableTickType() const override { return ETickableTickType::Conditional; }
     virtual bool IsTickable() const override { return !IsTemplate(); }
@@ -51,6 +51,6 @@ public:
 private:
     TArray<FLightOptimizationData> ManagedLights;
 
-    // 디칼 컴포넌트를 지연 생성하기 위한 내부 헬퍼
+    // Internal helper for lazy decal component creation.
     UDecalComponent *CreateDecalComponent(UDynamicPointLightComponent *LightComp, UMaterialInterface *Material);
 };

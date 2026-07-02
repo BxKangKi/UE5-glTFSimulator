@@ -29,7 +29,7 @@ struct FActorHelper
         const ECollisionEnabled::Type &Collision = ECollisionEnabled::QueryAndPhysics,
         const ECollisionResponse &Response = ECR_Block)
     {
-        // T가 UStaticMeshComponent를 상속받았는지 컴파일 타임에 체크
+        // Compile-time check that T derives from UStaticMeshComponent.
         static_assert(TIsDerivedFrom<T, UStaticMeshComponent>::Value, "T must be a UStaticMeshComponent");
         if (!IsValid(Actor))
             return nullptr;

@@ -5,7 +5,7 @@
 
 #include "CoreMinimal.h"
 #include "Kismet/BlueprintAsyncActionBase.h"
-#include "Model/RuntimeData.h"
+#include "Model/Data.h"
 #include "glTFRuntimeAsset.h"
 #include "Components/BoxComponent.h"
 #include "StreamAsyncAction.generated.h"
@@ -61,11 +61,11 @@ private:
     UPROPERTY()
     TMap<FName, TObjectPtr<UInstancedStaticMeshComponent>> InstanceMap;
 
-    // [해결] UPROPERTY()를 완전히 제외하여 중첩 컨테이너 UHT 빌드 차단 에러 우회
+    // Excluded from UPROPERTY to avoid UHT nested-container build errors.
     UPROPERTY()
-    TMap<FName, FRuntimeComponentGroup> DynamicComponentMap;
+    TMap<FName, FComponentGroup> DynamicComponentMap;
 
-    // UnloadBox를 FName 기반으로 별도 관리하는 TMap 추가
+    // Uses a separate FName-keyed map to manage unload boxes.
     UPROPERTY()
     TMap<FName, TObjectPtr<UBoxComponent>> UnloadBoxMap;
 
@@ -107,7 +107,7 @@ private:
     void ProcessUnloadNode(const FName &Name);
     bool ProcessLoadNode(const FName &Name);
 
-    void SpawnRuntimeComponents(const FName &NodeName, const FModelNodeData &NodeInfo, const FRuntimeMeshData &Data);
-    void DestroyRuntimeComponents(const FName &NodeName);
+    void SpawnStreamComponents(const FName &NodeName, const FModelNodeData &NodeInfo, const FMeshData &Data);
+    void DestroyStreamComponents(const FName &NodeName);
     void BroadcastProgress();
 };

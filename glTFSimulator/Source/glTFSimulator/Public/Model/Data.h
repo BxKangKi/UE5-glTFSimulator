@@ -5,7 +5,7 @@
 
 #include "CoreMinimal.h"
 #include "Dom/JsonObject.h"
-#include "RuntimeData.generated.h"
+#include "Data.generated.h"
 
 class UInstancedStaticMeshComponent;
 class UBoxComponent;
@@ -38,7 +38,7 @@ struct FModelCollider
 };
 
 USTRUCT(BlueprintType)
-struct FRuntimeLightData
+struct FLightData
 {
     GENERATED_BODY()
 
@@ -63,7 +63,7 @@ struct FRuntimeLightData
 };
 
 USTRUCT(BlueprintType)
-struct FRuntimeMeshData
+struct FMeshData
 {
     GENERATED_BODY()
 
@@ -80,14 +80,14 @@ struct FRuntimeMeshData
     TArray<FModelCollider> Colliders;
 
     UPROPERTY()
-    TArray<FRuntimeLightData> Lights;
+    TArray<FLightData> Lights;
 
     TSharedRef<FJsonObject> Serialization() const;
     bool Deserialization(const TSharedPtr<FJsonObject> &Json);
 };
 
 USTRUCT(BlueprintType)
-struct FRuntimeModelData
+struct FModelData
 {
     GENERATED_BODY()
 
@@ -98,7 +98,7 @@ struct FRuntimeModelData
     FVector Size = FVector::ZeroVector;
 
     UPROPERTY()
-    TMap<FName, FRuntimeMeshData> MeshData;
+    TMap<FName, FMeshData> MeshData;
 
     TSharedRef<FJsonObject> Serialization() const;
     bool Deserialization(const TSharedPtr<FJsonObject> &Json);
@@ -122,7 +122,7 @@ struct FModelMeshData
     int32 LOD3 = INDEX_NONE;
 
     UPROPERTY()
-    FRuntimeMeshData Data;
+    FMeshData Data;
 
     UPROPERTY()
     FVector Size = FVector::ZeroVector;
@@ -155,12 +155,12 @@ struct FLoadAsyncWrapper
     TMap<FName, FModelMeshData> MeshMap;
 
     UPROPERTY()
-    FRuntimeModelData ModelData;
+    FModelData ModelData;
 };
 
-// [수정] 박스 컴포넌트까지 통합하여 관리하도록 그룹 구조체 확장
+// Component group now also owns box components.
 USTRUCT()
-struct FRuntimeComponentGroup
+struct FComponentGroup
 {
     GENERATED_BODY()
 
@@ -184,5 +184,5 @@ struct FStreamAsyncWrapper
     UPROPERTY()
     TMap<FName, TObjectPtr<UBoxComponent>> UnloadBoxMap;
     UPROPERTY()
-    TMap<FName, FRuntimeComponentGroup> DynamicComponentMap;
+    TMap<FName, FComponentGroup> DynamicComponentMap;
 };

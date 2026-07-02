@@ -16,7 +16,7 @@ class UCharacterComponent;
 class USpringArmComponent;
 class UGameManagerSubSystem;
 class UCameraComponent;
-class URuntimeBuoyancyComponent;
+class UBuoyancyComponent;
 class UPrimitiveComponent;
 class UAnimInstance;
 
@@ -32,9 +32,10 @@ public:
     UFUNCTION()
     void Activate(bool bValue);
     void Load(const FString &Path);
-    void PrepareForRuntimeMeshReload();
-    void RestoreAfterRuntimeMeshReload();
-    void PrepareForRuntimePawnReplacement();
+    void PrepareForMeshReload();
+    void RestoreAfterMeshReload();
+    void PrepareForPawnReplacement();
+    void RestoreControlAfterRagdollRecovery();
     // --- Input Interface ---
     UFUNCTION(BlueprintCallable)
     void MovementInput(const float X, const float Y);
@@ -90,7 +91,7 @@ protected:
 
     /** Applies buoyancy to the targeted skeletal mesh while its bodies simulate in water. */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly)
-    TObjectPtr<URuntimeBuoyancyComponent> SkeletalMeshBuoyancyComponent;
+    TObjectPtr<UBuoyancyComponent> SkeletalMeshBuoyancyComponent;
 
     /** If true, non-ragdoll players receive velocity impulses from moving simulated physics objects. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Physics Impact")
@@ -116,10 +117,10 @@ private:
     bool bFirstPersonMode = false;
     bool bWaterStateFromOverlap = false;
     bool bWaterStateForcedByRagdoll = false;
-    bool bHasSavedRuntimeAnimationState = false;
-    TEnumAsByte<EAnimationMode::Type> SavedRuntimeAnimationMode;
+    bool bHasSavedAnimationState = false;
+    TEnumAsByte<EAnimationMode::Type> SavedAnimationMode;
     UPROPERTY()
-    TSubclassOf<UAnimInstance> SavedRuntimeAnimClass;
+    TSubclassOf<UAnimInstance> SavedAnimClass;
     float SavedThirdPersonArmLength = 350.0f;
     FVector SavedThirdPersonSocketOffset = FVector::ZeroVector;
     void OnFootstepTraceCompleted(const FTraceHandle &TraceHandle, FTraceDatum &TraceDatum);

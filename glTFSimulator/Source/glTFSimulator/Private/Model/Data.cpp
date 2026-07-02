@@ -1,7 +1,7 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
-#include "Model/RuntimeData.h"
+#include "Model/Data.h"
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Components/BoxComponent.h"
 #include "System/StringHelper.h"
@@ -33,10 +33,10 @@ bool FModelCollider::Deserialization(const TSharedPtr<FJsonObject> &Json)
 }
 
 // ==========================================
-// FRuntimeLightData
+// FLightData
 // ==========================================
 
-TSharedRef<FJsonObject> FRuntimeLightData::Serialization() const
+TSharedRef<FJsonObject> FLightData::Serialization() const
 {
     TSharedRef<FJsonObject> Json = MakeShared<FJsonObject>();
     FJsonHelper::SetVector(Json, Location);
@@ -50,7 +50,7 @@ TSharedRef<FJsonObject> FRuntimeLightData::Serialization() const
     return Json;
 }
 
-bool FRuntimeLightData::Deserialization(const TSharedPtr<FJsonObject> &Json)
+bool FLightData::Deserialization(const TSharedPtr<FJsonObject> &Json)
 {
     if (!Json.IsValid())
         return false;
@@ -66,27 +66,27 @@ bool FRuntimeLightData::Deserialization(const TSharedPtr<FJsonObject> &Json)
 }
 
 // ==========================================
-// FRuntimeMeshData
+// FMeshData
 // ==========================================
 
-TSharedRef<FJsonObject> FRuntimeMeshData::Serialization() const
+TSharedRef<FJsonObject> FMeshData::Serialization() const
 {
     TSharedRef<FJsonObject> Json = MakeShared<FJsonObject>();
     Json->SetBoolField(TEXT("ComplexCollision"), bComplexCollision);
     Json->SetBoolField(TEXT("SimpleCollision"), bSimpleCollision);
     Json->SetBoolField(TEXT("IsEntity"), bIsEntity);
 
-    // TArray 구조체 직렬화 자동화 적용 (람다 캡처 이용)
+    // Automates TArray struct serialization using a lambda capture.
     FJsonHelper::SetArray<FModelCollider>(Json, TEXT("Colliders"), Colliders, [](const FModelCollider &Item)
                                           { return Item.Serialization(); });
 
-    FJsonHelper::SetArray<FRuntimeLightData>(Json, TEXT("Lights"), Lights, [](const FRuntimeLightData &Item)
+    FJsonHelper::SetArray<FLightData>(Json, TEXT("Lights"), Lights, [](const FLightData &Item)
                                              { return Item.Serialization(); });
 
     return Json;
 }
 
-bool FRuntimeMeshData::Deserialization(const TSharedPtr<FJsonObject> &Json)
+bool FMeshData::Deserialization(const TSharedPtr<FJsonObject> &Json)
 {
     if (!Json.IsValid())
         return false;
@@ -95,34 +95,34 @@ bool FRuntimeMeshData::Deserialization(const TSharedPtr<FJsonObject> &Json)
     Json->TryGetBoolField(TEXT("SimpleCollision"), bSimpleCollision);
     Json->TryGetBoolField(TEXT("IsEntity"), bIsEntity);
 
-    // TArray 구조체 역직렬화 자동화 적용
+    // Automates TArray struct deserialization.
     FJsonHelper::TryGetArray<FModelCollider>(Json, TEXT("Colliders"), Colliders, [](const TSharedPtr<FJsonObject> &Obj, FModelCollider &OutItem)
                                              { return OutItem.Deserialization(Obj); });
 
-    FJsonHelper::TryGetArray<FRuntimeLightData>(Json, TEXT("Lights"), Lights, [](const TSharedPtr<FJsonObject> &Obj, FRuntimeLightData &OutItem)
+    FJsonHelper::TryGetArray<FLightData>(Json, TEXT("Lights"), Lights, [](const TSharedPtr<FJsonObject> &Obj, FLightData &OutItem)
                                                 { return OutItem.Deserialization(Obj); });
 
     return true;
 }
 
 // ==========================================
-// FRuntimeModelData
+// FModelData
 // ==========================================
 
-TSharedRef<FJsonObject> FRuntimeModelData::Serialization() const
+TSharedRef<FJsonObject> FModelData::Serialization() const
 {
     TSharedRef<FJsonObject> Json = MakeShared<FJsonObject>();
     FJsonHelper::SetVector(Json, Center);
     FJsonHelper::SetVector(Json, Size, TEXT("Size"));
 
-    // TMap 구조체 직렬화 자동화 적용 (이제 중복 루프 없이 한 줄로 처리됩니다)
-    FJsonHelper::SetMap<FRuntimeMeshData>(Json, TEXT("MeshData"), MeshData, [](const FRuntimeMeshData &Item)
+    // Automates TMap struct serialization without duplicate loops.
+    FJsonHelper::SetMap<FMeshData>(Json, TEXT("MeshData"), MeshData, [](const FMeshData &Item)
                                           { return Item.Serialization(); });
 
     return Json;
 }
 
-bool FRuntimeModelData::Deserialization(const TSharedPtr<FJsonObject> &Json)
+bool FModelData::Deserialization(const TSharedPtr<FJsonObject> &Json)
 {
     if (!Json.IsValid())
         return false;
@@ -131,8 +131,8 @@ bool FRuntimeModelData::Deserialization(const TSharedPtr<FJsonObject> &Json)
     FJsonHelper::TryGetVector(Json, Center);
     FJsonHelper::TryGetVector(Json, Size, TEXT("Size"));
 
-    // TMap 구조체 역직렬화 자동화 적용 (JSON의 Key가 FName으로 안전하게 복원됩니다)
-    FJsonHelper::TryGetMap<FRuntimeMeshData>(Json, TEXT("MeshData"), MeshData, [](const TSharedPtr<FJsonObject> &Obj, FRuntimeMeshData &OutItem)
+    // Automates TMap struct deserialization while safely restoring JSON keys as FName values.
+    FJsonHelper::TryGetMap<FMeshData>(Json, TEXT("MeshData"), MeshData, [](const TSharedPtr<FJsonObject> &Obj, FMeshData &OutItem)
                                              { return OutItem.Deserialization(Obj); });
 
     return true;

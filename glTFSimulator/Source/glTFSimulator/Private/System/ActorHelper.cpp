@@ -20,12 +20,12 @@ UBoxComponent *FActorHelper::AddBoxComponent(AActor *Actor, const FTransform &Tr
         return nullptr;
     UBoxComponent *BoxCollider = NewObject<UBoxComponent>(Actor);
     Actor->AddInstanceComponent(BoxCollider);
-    // 박스 콜라이더를 루트 컴포넌트에 붙임
+    // Attach the box collider to the root component.
     BoxCollider->SetupAttachment(Actor->GetRootComponent());
     BoxCollider->SetWorldTransform(Transform);
-    // 콜라이더 크기 설정 (예: 100x100x100)
+    // Set the collider size, for example 100x100x100.
     BoxCollider->InitBoxExtent(Size);
-    // 콜라이더 활성화 설정
+    // Enable the collider.
     BoxCollider->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
     BoxCollider->SetCollisionProfileName(Profile);
     BoxCollider->RegisterComponent();

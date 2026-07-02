@@ -8,7 +8,7 @@
 #include "Components/LightComponent.h"
 #include "Components/ShapeComponent.h"
 #include "Engine/Texture2D.h"
-#include "Engine/Texture2DArray.h"
+#include "Engine/Texture.h"
 #include "glTFRuntimeFunctionLibrary.h"
 #include "HAL/FileManager.h"
 #include "IImageWrapper.h"
@@ -54,7 +54,7 @@ void AglTFStreamActor::BeginPlay()
     InstanceMap.Empty();
     UnloadBoxMap.Empty();
     DynamicComponentMap.Empty();
-    ModelMetadata = FRuntimeModelData();
+    ModelMetadata = FModelData();
     bHasModelMetadata = false;
 
     LoadAssetAsync(EGLTFStreamAssetPhase::SizeScan);
@@ -64,9 +64,9 @@ void AglTFStreamActor::Destroyed()
 {
     Super::Destroyed();
     bIsDestroyed = true;
-    ReleaseRuntimeResources();
-    ReleaseAsset(glTFRuntimeAsset.Get());
-    glTFRuntimeAsset = nullptr;
+    ReleaseStreamingResources();
+    ReleaseAsset(glTFAsset.Get());
+    glTFAsset = nullptr;
 }
 
 void AglTFStreamActor::LoadAssetAsync(EGLTFStreamAssetPhase Phase)
@@ -101,11 +101,11 @@ void AglTFStreamActor::OnAssetLoaded(UglTFRuntimeAsset* Asset)
         case EGLTFStreamAssetPhase::SizeScan:
             StartSizeScan(Asset);
             return;
-        case EGLTFStreamAssetPhase::Runtime:
-            glTFRuntimeAsset = Asset;
+        case EGLTFStreamAssetPhase::Streaming:
+            glTFAsset = Asset;
             LoadingStatus = AllNodeMap.Num() == 0 ? 1.0f:
             0.5f;
-            StartRuntimeStreaming();
+            StartStreaming();
             return;
         default:
             break;
@@ -181,14 +181,14 @@ void AglTFStreamActor::OnChunksLoaded(const FLoadAsyncWrapper& MapWrapper)
     // ULoadAsyncAction already clears its local asset pointer after calculating bounds.
     if (IsPlayerInsideModelRange())
     {
-        LoadAssetAsync(EGLTFStreamAssetPhase::Runtime);
+        LoadAssetAsync(EGLTFStreamAssetPhase::Streaming);
     }
     else
     {
         bIsLoaded = true;
         bAsyncLoading = false;
         LoadingStatus = 1.0f;
-        WriteLogAsync(FString::Printf(TEXT("Runtime GLB load skipped because player is outside model range: %s"), *FilePath));
+        WriteLogAsync(FString::Printf(TEXT("Streaming GLB load skipped because player is outside model range: %s"), *FilePath));
     }
 }
 
@@ -201,7 +201,7 @@ void AglTFStreamActor::ReleaseAsset(UglTFRuntimeAsset* Asset)
     }
 }
 
-void AglTFStreamActor::ReleaseRuntimeResources()
+void AglTFStreamActor::ReleaseStreamingResources()
 {
     UAssetManageSubSystem* AssetManager = UAssetManageSubSystem::Get(this);
     for (TPair<FName, TObjectPtr<UInstancedStaticMeshComponent>>& Pair : InstanceMap)
@@ -230,7 +230,7 @@ void AglTFStreamActor::ReleaseRuntimeResources()
     }
     UnloadBoxMap.Empty();
 
-    for (TPair<FName, FRuntimeComponentGroup>& Pair : DynamicComponentMap)
+    for (TPair<FName, FComponentGroup>& Pair : DynamicComponentMap)
     {
         for (UShapeComponent* Collider : Pair.Value.Colliders)
         {
@@ -280,11 +280,10 @@ bool AglTFStreamActor::IsPlayerInsideModelRange() const
 
 void AglTFStreamActor::WriteLogAsync(const FString& Message) const
 {
-    const FString Line = FString::Printf(TEXT("[%s][glTFStreamActor] %s"), *FDateTime::Now().ToString(), *Message);
-    UFileFunctionLibrary::AppendLineToFileAsync(Line, PATH_LOG);
+    UFileFunctionLibrary::WriteSimulatorLogAsync(TEXT("glTFStreamActor"), Message);
 }
 
-void AglTFStreamActor::StartRuntimeStreaming()
+void AglTFStreamActor::StartStreaming()
 {
     if (AllNodeMap.Num() == 0)
     {
@@ -303,29 +302,60 @@ FglTFRuntimeStaticMeshConfig AglTFStreamActor::BuildStreamingStaticMeshConfig()
     Config.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
     Config.CollisionComplexity = ECollisionTraceFlag::CTF_UseComplexAsSimple;
 
+    // Never inject null override materials. A null override can replace a valid glTF material and make textures disappear.
     TMap<EglTFRuntimeMaterialType, UMaterialInterface*> UberMaterialsOverrideMap;
-    UberMaterialsOverrideMap.Add(EglTFRuntimeMaterialType::Opaque, Default.Opaque);
-    UberMaterialsOverrideMap.Add(EglTFRuntimeMaterialType::Translucent, Default.Translucent);
-    UberMaterialsOverrideMap.Add(EglTFRuntimeMaterialType::TwoSided, Default.TwoSided);
-    UberMaterialsOverrideMap.Add(EglTFRuntimeMaterialType::TwoSidedTranslucent, Default.TranslucentTwoSided);
-    UberMaterialsOverrideMap.Add(EglTFRuntimeMaterialType::Masked, Default.Opaque);
-    UberMaterialsOverrideMap.Add(EglTFRuntimeMaterialType::TwoSidedMasked, Default.TwoSided);
+    auto AddUberOverrideIfValid = [&UberMaterialsOverrideMap](EglTFRuntimeMaterialType Type, UMaterialInterface* Material)
+    {
+        if (IsValid(Material))
+        {
+            UberMaterialsOverrideMap.Add(Type, Material);
+        }
+    };
+
+    AddUberOverrideIfValid(EglTFRuntimeMaterialType::Opaque, Default.Opaque.Get());
+    AddUberOverrideIfValid(EglTFRuntimeMaterialType::Translucent, Default.Translucent.Get());
+    AddUberOverrideIfValid(EglTFRuntimeMaterialType::TwoSided, Default.TwoSided.Get());
+    AddUberOverrideIfValid(EglTFRuntimeMaterialType::TwoSidedTranslucent, Default.TranslucentTwoSided.Get());
+    AddUberOverrideIfValid(EglTFRuntimeMaterialType::Masked, Default.Opaque.Get());
+    AddUberOverrideIfValid(EglTFRuntimeMaterialType::TwoSidedMasked, Default.TwoSided.Get());
 
     Config.MaterialsConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
-    Config.MaterialsConfig.UberMaterialsOverrideMap = UberMaterialsOverrideMap;
-    Config.MaterialsConfig.UnlitOverrideMap = UberMaterialsOverrideMap;
+    if (UberMaterialsOverrideMap.Num() > 0)
+    {
+        Config.MaterialsConfig.UberMaterialsOverrideMap = UberMaterialsOverrideMap;
+        Config.MaterialsConfig.UnlitOverrideMap = UberMaterialsOverrideMap;
+    }
 
     TMap<FString, UMaterialInterface*> MaterialsOverrideByNameMap;
-    MaterialsOverrideByNameMap.Add(TEXT("glass"), Default.Glass);
-    MaterialsOverrideByNameMap.Add(TEXT("tinted_glass"), Default.TintedGlass);
-    MaterialsOverrideByNameMap.Add(TEXT("terrain"), Default.Terrain);
-    MaterialsOverrideByNameMap.Add(TEXT("Terrain"), Default.Terrain);
-    Config.MaterialsConfig.MaterialsOverrideByNameMap = MaterialsOverrideByNameMap;
-    Config.MaterialsConfig.bMaterialsOverrideMapInjectParams = true;
+    if (IsValid(Default.Glass.Get()))
+    {
+        MaterialsOverrideByNameMap.Add(TEXT("glass"), Default.Glass.Get());
+    }
+    if (IsValid(Default.TintedGlass.Get()))
+    {
+        MaterialsOverrideByNameMap.Add(TEXT("tinted_glass"), Default.TintedGlass.Get());
+    }
+    if (IsValid(Default.Terrain.Get()))
+    {
+        MaterialsOverrideByNameMap.Add(TEXT("terrain"), Default.Terrain.Get());
+        MaterialsOverrideByNameMap.Add(TEXT("Terrain"), Default.Terrain.Get());
+    }
+    if (MaterialsOverrideByNameMap.Num() > 0)
+    {
+        Config.MaterialsConfig.MaterialsOverrideByNameMap = MaterialsOverrideByNameMap;
+        Config.MaterialsConfig.bMaterialsOverrideMapInjectParams = true;
+    }
+
+    if (IsValid(TerrainTextureOverride.Get()))
+    {
+        // StreamAsyncAction injects this texture only for terrain-like meshes so normal glTF textures keep their source maps.
+        Config.MaterialsConfig.CustomTextureParams.Add(TEXT("TerrainTextures"), TerrainTextureOverride.Get());
+    }
+
     Config.MaterialsConfig.bGeneratesMipMaps = true;
     Config.MaterialsConfig.SpecularFactor = 0.0f;
-    Config.MaterialsConfig.ImagesConfig.MaxWidth = 768;
-    Config.MaterialsConfig.ImagesConfig.MaxHeight = 768;
+    Config.MaterialsConfig.ImagesConfig.MaxWidth = 2048;
+    Config.MaterialsConfig.ImagesConfig.MaxHeight = 2048;
     Config.MaterialsConfig.ImagesConfig.bCompressMips = true;
     Config.MaterialsConfig.ImagesConfig.bStreaming = true;
     Config.MaterialsConfig.bLoadMipMaps = true;
@@ -344,7 +374,7 @@ void AglTFStreamActor::AsyncTick()
         return;
     }
 
-    if (!IsValid(glTFRuntimeAsset))
+    if (!IsValid(glTFAsset))
     {
         bAsyncLoading = false;
         return;
@@ -417,9 +447,9 @@ bool AglTFStreamActor::IsTerrainMaterial(const UMaterialInterface* Material) con
     return false;
 }
 
-void AglTFStreamActor::ApplyTerrainTextureArrayToLoadedMaterials()
+void AglTFStreamActor::ApplyTerrainTextureOverrideToLoadedMaterials()
 {
-    if (!RuntimeTerrainTextureArray)
+    if (!IsValid(TerrainTextureOverride.Get()))
     {
         return;
     }
@@ -459,8 +489,8 @@ void AglTFStreamActor::ApplyTerrainTextureArrayToLoadedMaterials()
 
             if (DynamicMaterial)
             {
-                DynamicMaterial->SetTextureParameterValue(TEXT("baseColor"), RuntimeTerrainTextureArray);
-                DynamicMaterial->SetTextureParameterValue(TEXT("BaseColor"), RuntimeTerrainTextureArray);
+                DynamicMaterial->SetTextureParameterValue(TEXT("baseColor"), TerrainTextureOverride.Get());
+                DynamicMaterial->SetTextureParameterValue(TEXT("BaseColor"), TerrainTextureOverride.Get());
             }
         }
     }
@@ -474,7 +504,7 @@ void AglTFStreamActor::OnStreamAsyncCompleted(const FStreamAsyncWrapper& MapWrap
     }
 
     UpdateProperties(MapWrapper);
-    ApplyTerrainTextureArrayToLoadedMaterials();
+    ApplyTerrainTextureOverrideToLoadedMaterials();
 
     bIsLoaded = true;
     bAsyncLoading = false;

@@ -56,7 +56,7 @@ void AWaterActor::BeginPlay()
     UMaterialInstanceDynamic *PostProcessMID = UMaterialInstanceDynamic::Create(UnderWaterMaterial, this);
     if (PostProcessMID)
     {
-        // 2. 포스트 프로세스 컴포넌트의 Blendables 배열에 추가 (가중치 1.0)
+        // 2. Add this to the post-process component Blendables array with weight 1.0.
         PostProcess->AddOrUpdateBlendable(PostProcessMID, 1.0f);
         PostProcessMID->SetScalarParameterValue(FName("WaterLevel"), Level);
     }
@@ -117,21 +117,21 @@ void AWaterActor::SetCurrentLevel()
 
 void AWaterActor::CheckOverlappingWater(AActor *Target)
 {
-    // 1. AWaterActor 포인터를 담을 배열 생성
+    // 1. Create an array that stores AWaterActor pointers.
     TArray<AActor *> OverlappingActors;
-    // 2. Class Filter를 AWaterActor로 명시 (블루프린트의 ClassFilter 핀 수정과 동일)
+    // 2. Set the class filter to AWaterActor, matching the Blueprint ClassFilter pin.
     TSubclassOf<AActor> ClassFilter = AWaterActor::StaticClass();
-    // 3. 필터링된 액터들만 가져오기
+    // 3. Collect only the filtered actors.
     Target->GetOverlappingActors(OverlappingActors, ClassFilter);
     // 4. ForEachLoop
     for (AActor *OverlappedActor : OverlappingActors)
     {
         if (OverlappedActor)
         {
-            // 1. AActor를 AWaterActor로 형변환(Cast) 합니다.
+            // 1. Cast the AActor to AWaterActor.
             AWaterActor *WaterActor = Cast<AWaterActor>(OverlappedActor);
 
-            // 2. 형변환에 성공했다면 (즉, 해당 액터가 AWaterActor라면) 함수를 호출합니다.
+            // 2. If the cast succeeds, call the water update function.
             if (WaterActor)
             {
                 WaterActor->WaterTrigger(Target, true);

@@ -2,38 +2,27 @@
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
 #include "World/WorldManager.h"
-#include "System/GameManagerSubSystem.h"
-#include "System/ActorHelper.h"
-#include "System/FileFunctionLibrary.h"
-#include "System/MacroLibrary.h"
-#include "World/WorldData.h"
-#include "Model/glTFStreamActor.h"
-#include "Model/glTFStreamSubSystem.h"
-#include "Components/PostProcessComponent.h"
-#include "Character/PlayerCharacterController.h"
+
 #include "Components/DirectionalLightComponent.h"
-#include "Components/StaticMeshComponent.h"
+#include "Components/ExponentialHeightFogComponent.h"
+#include "Components/PostProcessComponent.h"
+#include "Components/SceneComponent.h"
 #include "Components/SkyAtmosphereComponent.h"
 #include "Components/SkyLightComponent.h"
-#include "Setting/GameSettings.h"
-#include "Engine/World.h"
-#include "TimerManager.h"
-#include "Kismet/KismetSystemLibrary.h"
-#include "World/SkyUpdateAsyncAction.h"
-#include "Blueprint/UserWidget.h"
-#include "Kismet/GameplayStatics.h"
+#include "Components/StaticMeshComponent.h"
 #include "Components/VolumetricCloudComponent.h"
-#include "Components/ExponentialHeightFogComponent.h"
+#include "Engine/World.h"
 #include "Materials/MaterialInterface.h"
-#include "Runtime/RuntimeGameplayManager.h"
-#include "EngineUtils.h"
-
-#define MODEL_DIRECTORY TEXT("/model/")
-#define PLAYER_DIRECTORY TEXT("/player/")
+#include "Setting/GameSettings.h"
+#include "System/GameManagerSubSystem.h"
+#include "TimerManager.h"
+#include "World/SkyUpdateAsyncAction.h"
+#include "World/WorldData.h"
 
 AWorldManager::AWorldManager()
 {
     RootComponent = CreateDefaultSubobject<USceneComponent>(TEXT("Root"));
+
     Sun = CreateDefaultSubobject<UDirectionalLightComponent>(TEXT("Sun"));
     Sun->SetupAttachment(RootComponent);
     Sun->bUseTemperature = true;
@@ -42,6 +31,7 @@ AWorldManager::AWorldManager()
     Sun->SetBloomScale(0.0001f);
     Sun->bCastShadowsOnClouds = true;
     Sun->bCastShadowsOnAtmosphere = true;
+
     Moon = CreateDefaultSubobject<UDirectionalLightComponent>(TEXT("Moon"));
     Moon->SetupAttachment(RootComponent);
     Moon->SetIntensity(0.005f);
@@ -51,14 +41,18 @@ AWorldManager::AWorldManager()
     Moon->SetBloomScale(0.0001f);
     Moon->bCastShadowsOnAtmosphere = true;
     Moon->ForwardShadingPriority = 1;
+
     PostProcess = CreateDefaultSubobject<UPostProcessComponent>(TEXT("PostProcess"));
     PostProcess->SetupAttachment(RootComponent);
+
     SkyAtmosphere = CreateDefaultSubobject<USkyAtmosphereComponent>(TEXT("SkyAtmosphere"));
     SkyAtmosphere->SetupAttachment(RootComponent);
-    SkyAtmosphere->RayleighScatteringScale = 0.003996;
+    SkyAtmosphere->RayleighScatteringScale = 0.003996f;
+
     Skybox = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("Skybox"));
     Skybox->SetupAttachment(RootComponent);
     Skybox->SetWorldScale3D(FVector(8192.0f, 8192.0f, 8192.0f));
+
     SkyLight = CreateDefaultSubobject<USkyLightComponent>(TEXT("SkyLight"));
     SkyLight->SetupAttachment(RootComponent);
     SkyLight->bRealTimeCapture = true;
@@ -68,219 +62,86 @@ AWorldManager::AWorldManager()
 void AWorldManager::BeginPlay()
 {
     Super::BeginPlay();
-    SpawnActors.Empty();
+
     SubSystem = UGameManagerSubSystem::GetSubSystem(this);
-    if (IsValid(SubSystem))
+    ConfigureRenderingSettings();
+
+    // Placed WorldManager actors can begin rendering once GameManagerSubSystem has already loaded world data.
+    if (IsValid(SubSystem) && IsValid(SubSystem->GetWorldData()))
     {
-        SubSystem->SetWorldLoading(true);
-        SubSystem->SetLoadingStatus(0.0f);
+        InitializeRendering(SubSystem->GetWorldData());
     }
-    ShowLoadingWidget();
-    if (IsValid(SubSystem) && IsValid(PostProcess))
-    {
-        UGameSettings *Setting = SubSystem->GetGameSettings();
-        SubSystem->SetPostProcess(PostProcess);
-        if (IsValid(Setting))
-        {
-            if (Setting->bHeightFog)
-            {
-                Fog = NewObject<UExponentialHeightFogComponent>(this);
-                AddInstanceComponent(Fog);
-                Fog->SetupAttachment(GetRootComponent());
-                Fog->RegisterComponent();
-                Fog->SetFogDensity(0.02f);
-            }
-            if (Setting->bCloud)
-            {
-                Cloud = NewObject<UVolumetricCloudComponent>(this);
-                AddInstanceComponent(Cloud);
-                Cloud->SetupAttachment(GetRootComponent());
-                Cloud->RegisterComponent();
-                Cloud->SetMaterial(CloudMaterial);
-            }
-        }
-        SubSystem->UpdateSettings();
-    }
-    LoadWorldData();
-    SpawnOcean();
-    SpawnWorld();
-    LoadWorldAsync();
 }
 
 void AWorldManager::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
-    if (IsValid(StreamSubSystem))
-    {
-        StreamSubSystem->StopMainWorldStreaming();
-    }
+    StopRendering();
     Super::EndPlay(EndPlayReason);
 }
 
-
-void AWorldManager::SpawnOcean()
+void AWorldManager::InitializeRendering(UWorldData* InWorldData)
 {
-    if (CheckOcean())
-    {
-        if (WaterClass)
-        {
-            FActorSpawnParameters SpawnParams;
-            SpawnParams.Owner = this; // BP의 Self 핀 연결
-            SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::Undefined;
-            Ocean = GetWorld()->SpawnActor<AActor>(WaterClass, OceanTransform, SpawnParams);
-        }
-    }
-}
-
-void AWorldManager::ShowLoadingWidget()
-{
-    if (LoadingWidgetClass)
-    {
-        LoadingWidgetInstance = CreateWidget<UUserWidget>(GetWorld(), LoadingWidgetClass);
-        if (LoadingWidgetInstance)
-        {
-            LoadingWidgetInstance->AddToViewport(0);
-        }
-    }
-}
-
-bool AWorldManager::CheckOcean()
-{
-    if (IsValid(Data))
-    {
-        return Data->bOcean;
-    }
-    else
-    {
-        return false;
-    }
-}
-
-void AWorldManager::SpawnWorld()
-{
+    Data = InWorldData;
     if (!IsValid(Data))
+    {
+        bRenderingActive = false;
+        return;
+    }
+
+    bRenderingActive = true;
+    GetWorldTimerManager().SetTimerForNextTick(this, &AWorldManager::AsyncTick);
+}
+
+void AWorldManager::StopRendering()
+{
+    bRenderingActive = false;
+    Data = nullptr;
+}
+
+void AWorldManager::ConfigureRenderingSettings()
+{
+    if (!IsValid(SubSystem) || !IsValid(PostProcess))
     {
         return;
     }
 
-    StreamSubSystem = UglTFStreamSubSystem::Get(this);
-    if (IsValid(StreamSubSystem))
-    {
-        StreamSubSystem->StartMainWorldStreaming(
-            this,
-            SpawnActorClass,
-            GetFilePath(MODEL_DIRECTORY),
-            GetFilePath(PLAYER_DIRECTORY),
-            Data->Player);
-    }
-}
+    UGameSettings* Setting = SubSystem->GetGameSettings();
+    SubSystem->SetPostProcess(PostProcess);
 
-void AWorldManager::Tick(float DeltaSeconds)
-{
-    Super::Tick(DeltaSeconds);
-    if (IsValid(Data))
+    if (IsValid(Setting))
     {
-        Data->WorldTime += DeltaSeconds * Data->TimeSpeed;
-        Data->PlayerLocation = SubSystem->GetPlayerLocation();
-    }
-}
-
-
-bool AWorldManager::CheckAllSpawnActorLoaded()
-{
-    if (!IsValid(StreamSubSystem))
-    {
-        if (IsValid(SubSystem))
+        if (Setting->bHeightFog && !IsValid(Fog))
         {
-            SubSystem->SetLoadingStatus(1.0f);
+            Fog = NewObject<UExponentialHeightFogComponent>(this);
+            AddInstanceComponent(Fog);
+            Fog->SetupAttachment(GetRootComponent());
+            Fog->RegisterComponent();
+            Fog->SetFogDensity(0.02f);
         }
-        return true;
-    }
 
-    const float Percent = StreamSubSystem->GetLoadingStatus();
-    if (IsValid(SubSystem))
-    {
-        SubSystem->SetLoadingStatus(FMath::Clamp(Percent, 0.0f, 1.0f));
-    }
-    return StreamSubSystem->IsInitialWorldReady();
-}
-
-FString AWorldManager::GetFilePath(const FString &FileName)
-{
-    if (IsValid(SubSystem))
-    {
-        return FPaths::Combine(PATH_ROOT, SubSystem->GetCurrentWorldName()).Append(FileName);
-    }
-    return TEXT("");
-}
-
-
-void AWorldManager::LoadWorldData()
-{
-    Data = NewObject<UWorldData>(this);
-    if (IsValid(Data) && IsValid(SubSystem))
-    {
-        FString Path = GetFilePath(LEVEL_FILE_NAME);
-        TSharedPtr<FJsonObject> Json = UFileFunctionLibrary::FromJson(Path);
-        if (!UWorldData::DeserializeData(Data, Json))
+        if (Setting->bCloud && !IsValid(Cloud))
         {
-            UE_LOG(LogTemp, Log, TEXT("World file doesn't exist. Generate new one."));
-            SaveWorldData();
-        }
-        SubSystem->SetPlayerLocation(Data->PlayerLocation);
-        SubSystem->SetWorldData(Data);
-    }
-}
-
-
-void AWorldManager::SaveWorldData()
-{
-    if (IsValid(Data))
-    {
-        TSharedRef<FJsonObject> Json = UWorldData::SerializeData(Data);
-        FString Path = GetFilePath(LEVEL_FILE_NAME);
-        UFileFunctionLibrary::ToJsonAsync(Json, Path);
-    }
-}
-
-// --- Load World Async 섹션 ---
-void AWorldManager::LoadWorldAsync()
-{
-    if (CheckAllSpawnActorLoaded() && IsValid(SubSystem))
-    {
-        SubSystem->SetLoadingStatus(1.0f);
-        AsyncTick();
-        SaveTick();
-
-        // 로딩 위젯만 제거합니다. RemoveAllWidgets는 기존 Blueprint HUD까지 지워 Runtime HUD와 충돌을 일으킵니다.
-        if (IsValid(LoadingWidgetInstance))
-        {
-            LoadingWidgetInstance->RemoveFromParent();
-            LoadingWidgetInstance = nullptr;
-        }
-        SubSystem->SetWorldLoading(false);
-
-        SpawnRuntimeGameplayManager();
-        if (!SubSystem->GetGamePaused())
-        {
-            if (APlayerCharacterController* PlayerController = Cast<APlayerCharacterController>(UGameplayStatics::GetPlayerController(this, 0)))
-            {
-                PlayerController->ApplyGameInputMode();
-            }
+            Cloud = NewObject<UVolumetricCloudComponent>(this);
+            AddInstanceComponent(Cloud);
+            Cloud->SetupAttachment(GetRootComponent());
+            Cloud->RegisterComponent();
+            Cloud->SetMaterial(CloudMaterial);
         }
     }
-    else
-    {
-        GetWorldTimerManager().SetTimerForNextTick(this, &AWorldManager::LoadWorldAsync);
-    }
-}
 
+    SubSystem->UpdateSettings();
+}
 
 void AWorldManager::AsyncTick()
 {
-    USkyUpdateAsyncAction *AsyncAction = USkyUpdateAsyncAction::SkyUpdateAsync(this, Data);
+    if (!bRenderingActive || !IsValid(Data))
+    {
+        return;
+    }
+
+    USkyUpdateAsyncAction* AsyncAction = USkyUpdateAsyncAction::SkyUpdateAsync(this, Data);
     if (AsyncAction)
     {
-        // 중요: 결과값을 인자로 받는 현재 함수를 다시 바인딩합니다.
         AsyncAction->OnCompleted.AddDynamic(this, &AWorldManager::SkyUpdate);
         AsyncAction->Activate();
     }
@@ -288,61 +149,20 @@ void AWorldManager::AsyncTick()
 
 void AWorldManager::SkyUpdate(FLightRotation Result)
 {
+    if (!bRenderingActive)
+    {
+        return;
+    }
+
     if (IsValid(Sun))
     {
         Sun->SetWorldRotation(Result.Sun);
-        // float Intensity = 15.0f;
-        // Sun->SetIntensity(Intensity);
     }
 
     if (IsValid(Moon))
     {
         Moon->SetWorldRotation(Result.Moon);
-        // float Intensity = 15.0f;
-        // Moon->SetIntensity(Intensity);
     }
+
     GetWorldTimerManager().SetTimerForNextTick(this, &AWorldManager::AsyncTick);
-}
-
-void AWorldManager::SaveTick()
-{
-    SaveWorldData();
-
-    // BP: 10초 Delay 후 다음 틱에 실행
-    FTimerDelegate SaveDelegate;
-    SaveDelegate.BindLambda([this]()
-    {
-        GetWorldTimerManager().SetTimerForNextTick(this, &AWorldManager::SaveTick);
-    });
-
-    GetWorldTimerManager().SetTimer(TimerHandle_SaveTick, SaveDelegate, 10.0f, false);
-}
-
-void AWorldManager::SpawnRuntimeGameplayManager()
-{
-    UWorld* World = GetWorld();
-    if (IsValid(RuntimeGameplayManager) || !World)
-    {
-        return;
-    }
-
-    if (APlayerCharacterController* PlayerController = Cast<APlayerCharacterController>(UGameplayStatics::GetPlayerController(this, 0)))
-    {
-        RuntimeGameplayManager = PlayerController->GetRuntimeGameplayManager();
-        if (IsValid(RuntimeGameplayManager))
-        {
-            return;
-        }
-    }
-
-    for (TActorIterator<ARuntimeGameplayManager> It(World); It; ++It)
-    {
-        RuntimeGameplayManager = *It;
-        return;
-    }
-
-    FActorSpawnParameters Params;
-    Params.Owner = this;
-    Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-    RuntimeGameplayManager = World->SpawnActor<ARuntimeGameplayManager>(ARuntimeGameplayManager::StaticClass(), FTransform::Identity, Params);
 }

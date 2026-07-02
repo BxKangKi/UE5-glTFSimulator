@@ -16,7 +16,7 @@
 #define STATE_FLYING (1 << 4)
 #define STATET_FLOATING (1 << 5)
 
-namespace RuntimeCharacterConstants
+namespace CharacterConstants
 {
     static constexpr float MaxRagdollWeight = 3.0f;
 }

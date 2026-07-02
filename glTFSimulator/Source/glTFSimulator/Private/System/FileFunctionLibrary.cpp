@@ -11,10 +11,11 @@
 #include "Serialization/JsonWriter.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonReader.h"
+#include "System/MacroLibrary.h"
 
 
 #pragma region File IO
-// static 멤버 변수 정의
+// Static member definitions.
 FCriticalSection UFileFunctionLibrary::FileWriteCriticalSection;
 
 bool UFileFunctionLibrary::CheckFile(const FString &FilePath)
@@ -51,11 +52,11 @@ FString UFileFunctionLibrary::GetPathWithoutExtension(const FString &Path)
 TArray<FString> UFileFunctionLibrary::GetFileNamesWithExtension(const FString &Directory, const FString &Extension)
 {
     TArray<FString> FoundFiles;
-    // 확장자가 포함된 검색 패턴 생성 (예: "*.png")
+    // Build a search pattern that includes the extension, for example "*.png".
     FString FilePattern = FString::Printf(TEXT("*.%s"), *Extension);
-    // IFileManager로 파일 검색 (재귀 옵션으로 하위 폴더 포함 가능)
+    // Search files with IFileManager, optionally including child folders recursively.
     IFileManager &FileManager = IFileManager::Get();
-    // 디렉터리 경로가 절대 경로가 아니면 절대 경로로 변환
+    // Convert the directory path to an absolute path when needed.
     FString AbsoluteDirectory = FPaths::ConvertRelativePathToFull(Directory);
     FileManager.FindFilesRecursive(FoundFiles, *AbsoluteDirectory, *FilePattern, true, false, false);
     return FoundFiles;
@@ -96,8 +97,9 @@ bool UFileFunctionLibrary::FromBinary(TArray<uint8> &FileData, const FString &Fi
 
 bool UFileFunctionLibrary::AppendLineToFile(const FString &Line, const FString &FilePath)
 {
-    // 다시 파일에 저장 (덮어쓰기)
-    return AppendStringToFileInternal(Line, *FilePath);
+    // Append exactly one log-style line and create the parent directory when needed.
+    const FString TextToAppend = Line.EndsWith(LINE_TERMINATOR) ? Line : Line + LINE_TERMINATOR;
+    return AppendStringToFileInternal(TextToAppend, FilePath);
 }
 
 void UFileFunctionLibrary::AppendLineToFileAsync(const FString &Line, const FString &FilePath)
@@ -105,7 +107,8 @@ void UFileFunctionLibrary::AppendLineToFileAsync(const FString &Line, const FStr
     Async(EAsyncExecution::ThreadPool, [Line, FilePath]()
           {
               FScopeLock Lock(&FileWriteCriticalSection);
-              bool bSuccess = AppendStringToFileInternal(Line + LINE_TERMINATOR, FilePath);
+              const FString TextToAppend = Line.EndsWith(LINE_TERMINATOR) ? Line : Line + LINE_TERMINATOR;
+              bool bSuccess = AppendStringToFileInternal(TextToAppend, FilePath);
 #if WITH_EDITOR
               if (bSuccess)
               {
@@ -119,6 +122,35 @@ void UFileFunctionLibrary::AppendLineToFileAsync(const FString &Line, const FStr
           });
 }
 
+FString UFileFunctionLibrary::GetSimulatorLogFilePath()
+{
+    const FString LogDirectory = FPaths::Combine(DIRECTORY_USER, DIRECTORY_GAME, DIRECTORY_LOG);
+    const FString LogFileName = FString::Printf(TEXT("log_%s.txt"), *FDateTime::Now().ToString(TEXT("%Y%m%d")));
+    return FPaths::Combine(LogDirectory, LogFileName);
+}
+
+bool UFileFunctionLibrary::WriteSimulatorLog(const FString& Category, const FString& Message)
+{
+    const FString SafeCategory = Category.IsEmpty() ? TEXT("General") : Category;
+    const FString Line = FString::Printf(TEXT("[%s][%s] %s"), *FDateTime::Now().ToString(), *SafeCategory, *Message);
+    return AppendLineToFile(Line, GetSimulatorLogFilePath());
+}
+
+void UFileFunctionLibrary::WriteSimulatorLogAsync(const FString& Category, const FString& Message)
+{
+    Async(EAsyncExecution::ThreadPool, [Category, Message]()
+    {
+        FScopeLock Lock(&FileWriteCriticalSection);
+        const bool bSuccess = WriteSimulatorLog(Category, Message);
+#if WITH_EDITOR
+        if (!bSuccess)
+        {
+            UE_LOG(LogTemp, Error, TEXT("Failed to write simulator log. Category=%s Message=%s"), *Category, *Message);
+        }
+#endif
+    });
+}
+
 // CoreSystem/Source/CoreSystem/Private/FileFunctionLibrary.cpp
 bool UFileFunctionLibrary::GetSubFolders(const FString& ParentFolderPath, TArray<FString>& OutSubFolders)
 {
@@ -126,11 +158,11 @@ bool UFileFunctionLibrary::GetSubFolders(const FString& ParentFolderPath, TArray
     
     IFileManager& FileManager = IFileManager::Get();
     
-    // UE5.7 기준: FindFilesRecursive 또는 DirectoryExists + FindFiles 사용
+    // UE5.7 path: use FindFilesRecursive or DirectoryExists plus FindFiles.
     TArray<FString> AllItems;
     FileManager.FindFiles(AllItems, *(ParentFolderPath + TEXT("*")), true, true);
 
-    // 디렉토리만 필터링
+    // Keep only directories.
     for (const FString& Item : AllItems)
     {
         FString FullPath = ParentFolderPath + Item;
@@ -173,7 +205,7 @@ bool UFileFunctionLibrary::ToJson(TSharedRef<FJsonObject> Json, const FString &F
         return false;
     }
 
-    // 폴더 경로 추출 및 존재하지 않을 경우 생성
+    // Extract the folder path and create it when missing.
     GenerateDirectory(FilePath);
 
     if (!FFileHelper::SaveStringToFile(OutputString, *FilePath))
@@ -205,8 +237,8 @@ TSharedPtr<FJsonObject> UFileFunctionLibrary::FromJson(const FString &Path)
     return JsonObject;
 }
 
-// 파일 경로와 키 이름을 받아서 문자열 값 추출
-// 성공 시 OutValue에 값 저장, true 반환
+// Extracts a string value from a file path and key name.
+// Stores the value in OutValue and returns true on success.
 bool UFileFunctionLibrary::LoadJsonStringValue(
     const FString &JsonFilePath,
     const FString &KeyName,
@@ -214,14 +246,14 @@ bool UFileFunctionLibrary::LoadJsonStringValue(
 {
     OutValue.Reset();
 
-    // 파일 존재 확인 및 내용 읽기
+    // Check whether the file exists and read its contents.
     FString JsonRaw;
     if (!FFileHelper::LoadFileToString(JsonRaw, *JsonFilePath))
     {
         return false;
     }
 
-    // JSON 파싱
+    // Parse JSON.
     TSharedPtr<FJsonObject> JsonObject;
     TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonRaw);
 
@@ -230,7 +262,7 @@ bool UFileFunctionLibrary::LoadJsonStringValue(
         return false;
     }
 
-    // 키 값 추출
+    // Extract the key value.
     return JsonObject->TryGetStringField(*KeyName, OutValue);
 }
 

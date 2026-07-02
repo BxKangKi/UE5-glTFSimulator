@@ -4,98 +4,96 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "GameFramework/Actor.h"
 #include "World/LightRotation.h"
 #include "WorldManager.generated.h"
 
 class UGameManagerSubSystem;
 class UDirectionalLightComponent;
 class UWorldData;
-class AglTFStreamActor;
 class UPostProcessComponent;
 class USkyAtmosphereComponent;
 class UStaticMeshComponent;
 class USkyLightComponent;
 class UVolumetricCloudComponent;
 class UMaterialInterface;
-class UStaticMesh;
 class UExponentialHeightFogComponent;
-class ARuntimeGameplayManager;
-class UglTFStreamSubSystem;
 
-UCLASS() class GLTFSIMULATOR_API AWorldManager : public AActor
+/**
+ * Rendering-only world actor.
+ *
+ * GameManagerSubSystem owns loading, time, saving, water, and streamed model spawning.
+ * WorldManager only owns sky/fog/cloud/light components and continuously reflects the current UWorldData.
+ */
+UCLASS()
+class GLTFSIMULATOR_API AWorldManager : public AActor
 {
     GENERATED_BODY()
+
 public:
     AWorldManager();
-    void Load();
-    float GetLoadingStatus() const { return LoadingStatus; }
+
+    /** Starts sky/light rendering updates from the supplied world data object. */
+    UFUNCTION(BlueprintCallable, Category="World|Rendering")
+    void InitializeRendering(UWorldData* InWorldData);
+
+    /** Stops scheduled rendering updates without touching gameplay-owned systems. */
+    UFUNCTION(BlueprintCallable, Category="World|Rendering")
+    void StopRendering();
+
+    /** Exposes the active world data for debug widgets that only read rendering state. */
+    UFUNCTION(BlueprintPure, Category="World|Rendering")
+    UWorldData* GetWorldData() const { return Data; }
 
 protected:
     virtual void BeginPlay() override;
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
-    virtual void Tick(float DeltaSeconds) override;
-    UPROPERTY(EditAnywhere, BlueprintReadWrite)
-    TSubclassOf<class AglTFStreamActor> SpawnActorClass;
-    // 에디터에서 WBP_Loading_C 클래스를 선택할 수 있게 노출합니다.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite)
-    TSubclassOf<UUserWidget> LoadingWidgetClass;
-    UPROPERTY(EditAnywhere, BlueprintReadWrite)
-    TSubclassOf<AActor> WaterClass;
-    // 바다 스폰 위치 (BP의 OceanTransform 변수)
-    UPROPERTY(EditAnywhere, BlueprintReadWrite)
-    FTransform OceanTransform;
-    UPROPERTY(EditAnywhere, BlueprintReadWrite)
+
+    /** Optional cloud material assigned by the level or Blueprint subclass. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="World|Rendering")
     TObjectPtr<UMaterialInterface> CloudMaterial;
-    UPROPERTY(EditAnywhere, BlueprintReadWrite)
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="World|Rendering")
     TObjectPtr<UStaticMeshComponent> Skybox;
-    UPROPERTY(EditAnywhere, BlueprintReadWrite)
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="World|Rendering")
     TObjectPtr<UPostProcessComponent> PostProcess;
-    UPROPERTY(EditAnywhere, BlueprintReadWrite)
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="World|Rendering")
     TObjectPtr<USkyAtmosphereComponent> SkyAtmosphere;
-    UPROPERTY(EditAnywhere, BlueprintReadWrite)
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="World|Rendering")
     TObjectPtr<USkyLightComponent> SkyLight;
-    UPROPERTY(EditAnywhere, BlueprintReadWrite)
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="World|Rendering")
     TObjectPtr<UDirectionalLightComponent> Sun;
-    UPROPERTY(EditAnywhere, BlueprintReadWrite)
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="World|Rendering")
     TObjectPtr<UDirectionalLightComponent> Moon;
 
 private:
-    float LoadingStatus;
-    bool CheckAllSpawnActorLoaded();
-    FString GetFilePath(const FString &FileName);
-    void SaveWorldData();
-    void LoadWorldData();
-    void SpawnWorld();
-    bool CheckOcean();
-    void SpawnOcean();
-    void LoadWorldAsync();
-    void ShowLoadingWidget();
-    UPROPERTY()
-    TObjectPtr<UWorldData> Data;
-    UPROPERTY()
-    TObjectPtr<AActor> Ocean;
-    UPROPERTY()
-    TObjectPtr<UVolumetricCloudComponent> Cloud;
-    UPROPERTY()
-    TObjectPtr<UExponentialHeightFogComponent> Fog;
-    UPROPERTY()
-    TObjectPtr<UGameManagerSubSystem> SubSystem;
-    UPROPERTY()
-    TObjectPtr<UglTFStreamSubSystem> StreamSubSystem;
-    UPROPERTY()
-    TArray<TObjectPtr<AglTFStreamActor>> SpawnActors;
-    UPROPERTY()
-    TObjectPtr<UUserWidget> LoadingWidgetInstance;
-    UPROPERTY()
-    TObjectPtr<ARuntimeGameplayManager> RuntimeGameplayManager;
-    FTimerHandle TimerHandle_SaveTick;
-    FTimerHandle TimerHandle_AsyncTick;
-    FTimerHandle TimerHandle_LoadWorld;
+    /** Reads current settings and creates optional fog/cloud components. */
+    void ConfigureRenderingSettings();
+
+    /** Queues the next asynchronous sky rotation calculation. */
     UFUNCTION()
     void AsyncTick();
-    UFUNCTION()
-    void SaveTick();
-    void SpawnRuntimeGameplayManager();
+
+    /** Applies the asynchronous sun/moon rotation result. */
     UFUNCTION()
     void SkyUpdate(FLightRotation Result);
+
+    UPROPERTY()
+    TObjectPtr<UWorldData> Data;
+
+    UPROPERTY()
+    TObjectPtr<UVolumetricCloudComponent> Cloud;
+
+    UPROPERTY()
+    TObjectPtr<UExponentialHeightFogComponent> Fog;
+
+    UPROPERTY()
+    TObjectPtr<UGameManagerSubSystem> SubSystem;
+
+    bool bRenderingActive = false;
 };

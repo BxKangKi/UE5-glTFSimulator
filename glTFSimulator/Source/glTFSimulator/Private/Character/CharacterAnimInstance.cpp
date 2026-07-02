@@ -8,7 +8,7 @@
 #include "Character/CharacterController.h"
 #include "Character/CharacterComponent.h"
 
-namespace RuntimeCharacterAnim
+namespace CharacterAnimTuning
 {
     constexpr float MinDivingVelocity = 1000.0f;
     constexpr float GetUpDelay = 0.2f;
@@ -76,7 +76,7 @@ void UCharacterAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
     // AnimBP now handles water recovery explicitly. Keep GetUp true underwater too,
     // while bIsSwimming/bIsFalling above keep the transition out of the falling branch.
     bIsGettingUp = Component->IsGettingUp();
-    bGetUpTrigger = bIsGettingUp && Component->GetRagdollWeight() < (RuntimeCharacterConstants::MaxRagdollWeight - RuntimeCharacterAnim::GetUpDelay);
+    bGetUpTrigger = bIsGettingUp && Component->GetRagdollWeight() < (CharacterConstants::MaxRagdollWeight - CharacterAnimTuning::GetUpDelay);
     IsLieOnBack = Component->IsLieOnBack() ? 1.0f: 0.0f;
     CapturedMeshLocation = Component->GetCapturedMeshLocation();
     CapturedMeshRotation = Component->GetCapturedMeshRotation();
@@ -94,11 +94,11 @@ void UCharacterAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
         ? FMath::Clamp(Velocity.Z / MaxSwim, -0.9f, 0.9f)
         : 0.0f;
     const float UpSpeedInterpRate = bIsSwimming
-        ? RuntimeCharacterAnim::SwimVerticalSpeedInterpRate
-        : RuntimeCharacterAnim::SwimVerticalSpeedReturnInterpRate;
+        ? CharacterAnimTuning::SwimVerticalSpeedInterpRate
+        : CharacterAnimTuning::SwimVerticalSpeedReturnInterpRate;
     UpSpeed = FMath::FInterpTo(UpSpeed, TargetUpSpeed, DeltaSeconds, UpSpeedInterpRate);
-    if (FMath::Abs(UpSpeed) < RuntimeCharacterAnim::SwimVerticalSpeedDeadZone
-        && FMath::Abs(TargetUpSpeed) < RuntimeCharacterAnim::SwimVerticalSpeedDeadZone)
+    if (FMath::Abs(UpSpeed) < CharacterAnimTuning::SwimVerticalSpeedDeadZone
+        && FMath::Abs(TargetUpSpeed) < CharacterAnimTuning::SwimVerticalSpeedDeadZone)
     {
         UpSpeed = 0.0f;
     }
@@ -106,12 +106,12 @@ void UCharacterAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
     // 8. Diving state and ground trace.
     // Keep owner lookup inside the branch so normal animation frames do no extra work.
 
-    if (!bWaterRagdollState && bIsSwimming && Velocity.Z < -RuntimeCharacterAnim::MinDivingVelocity)
+    if (!bWaterRagdollState && bIsSwimming && Velocity.Z < -CharacterAnimTuning::MinDivingVelocity)
     {
         // Use the already-known movement location as the trace start.
         const FVector Start = Movement->GetActorLocation();
         // End is derived from current downward speed so fast dives trace farther.
-        const FVector End = Start + (FVector::UpVector * -(Velocity.Z * DeltaSeconds + RuntimeCharacterAnim::MinDivingVelocity));
+        const FVector End = Start + (FVector::UpVector * -(Velocity.Z * DeltaSeconds + CharacterAnimTuning::MinDivingVelocity));
 
         // Cache CharacterOwner once for the raycast.
         if (ACharacter *Owner = Movement->GetCharacterOwner())

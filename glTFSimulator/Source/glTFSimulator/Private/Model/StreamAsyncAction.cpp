@@ -153,8 +153,8 @@ void UStreamAsyncAction::ProcessChunk()
         Wrapper.NodeMap = MoveTemp(NodeMap);
         Wrapper.LoadedNodes = MoveTemp(LoadedNodes);
         Wrapper.InstanceMap = MoveTemp(InstanceMap);
-        Wrapper.UnloadBoxMap = MoveTemp(UnloadBoxMap); // Wrapper 구조체로 데이터 이관
-        Wrapper.DynamicComponentMap = MoveTemp(DynamicComponentMap); // Wrapper 구조체로 데이터 이관
+        Wrapper.UnloadBoxMap = MoveTemp(UnloadBoxMap); // Move data into the wrapper struct.
+        Wrapper.DynamicComponentMap = MoveTemp(DynamicComponentMap); // Move data into the wrapper struct.
 
         Progress.Broadcast(1.0f);
         Completed.Broadcast(Wrapper);
@@ -204,7 +204,7 @@ void UStreamAsyncAction::ProcessUnloadNode(const FName &Name)
     if (!Info)
         return;
 
-    DestroyRuntimeComponents(Name);
+    DestroyStreamComponents(Name);
 
     UInstancedStaticMeshComponent *ISMC = InstanceMap.FindRef(Info->MeshName);
     if (IsValid(ISMC))
@@ -235,7 +235,7 @@ void UStreamAsyncAction::ProcessUnloadNode(const FName &Name)
         LoadedNodes.Remove(Name);
     }
 
-    // 분리 수정: UnloadBoxMap에서 대상 확인 및 생성 관리
+    // Use UnloadBoxMap to check targets and manage creation separately.
     TObjectPtr<UBoxComponent> *UnloadBoxPtr = UnloadBoxMap.Find(Name);
     if (!UnloadBoxPtr || !IsValid(*UnloadBoxPtr))
     {
@@ -302,14 +302,14 @@ FORCEINLINE float CalculateLODScreenSize(int32 i, int32 N)
     return FMath::Lerp(StartValue, EndValue, Alpha);
 }
 
-static bool ShouldInjectTerrainTextureArrayForMesh(const FName& MeshName)
+static bool ShouldInjectTerrainTextureOverrideForMesh(const FName& MeshName)
 {
     const FString MeshNameString = MeshName.ToString();
     return MeshNameString.Equals(TEXT("terrain"), ESearchCase::IgnoreCase)
         || MeshNameString.Contains(TEXT("terrain"), ESearchCase::IgnoreCase);
 }
 
-static UTexture* FindTerrainTextureArrayParam(const FglTFRuntimeStaticMeshConfig& Config)
+static UTexture* FindTerrainTextureOverrideParam(const FglTFRuntimeStaticMeshConfig& Config)
 {
     if (UTexture* const* Texture = Config.MaterialsConfig.CustomTextureParams.Find(TEXT("TerrainTextures")))
     {
@@ -345,11 +345,11 @@ void UStreamAsyncAction::LoadStaticMeshAsync(const FName &MeshName)
         Config.LODScreenSize = LODScreenSize;
         Config.LODScreenSizeMultiplier = 1.0f;
 
-        UTexture* TerrainTextureArray = FindTerrainTextureArrayParam(StaticMeshConfig);
-        if (TerrainTextureArray && ShouldInjectTerrainTextureArrayForMesh(MeshName))
+        UTexture* TerrainTextureOverride = FindTerrainTextureOverrideParam(StaticMeshConfig);
+        if (TerrainTextureOverride && ShouldInjectTerrainTextureOverrideForMesh(MeshName))
         {
-            Config.MaterialsConfig.CustomTextureParams.Add(TEXT("baseColor"), TerrainTextureArray);
-            Config.MaterialsConfig.CustomTextureParams.Add(TEXT("BaseColor"), TerrainTextureArray);
+            Config.MaterialsConfig.CustomTextureParams.Add(TEXT("baseColor"), TerrainTextureOverride);
+            Config.MaterialsConfig.CustomTextureParams.Add(TEXT("BaseColor"), TerrainTextureOverride);
         }
         else
         {
@@ -378,10 +378,10 @@ void UStreamAsyncAction::AddTrasnform(const FName &Name, UInstancedStaticMeshCom
 
         if (const FModelMeshData *MeshData = MeshMap.Find(NodeInfo->MeshName))
         {
-            SpawnRuntimeComponents(Name, *NodeInfo, MeshData->Data);
+            SpawnStreamComponents(Name, *NodeInfo, MeshData->Data);
         }
 
-        // 분리 수정: 노드가 로드되었으므로 기존 UnloadBox가 있다면 제거 및 청소
+        // The node is loaded, so remove and clean up any existing unload box.
         TObjectPtr<UBoxComponent> *UnloadBoxPtr = UnloadBoxMap.Find(Name);
         if (UnloadBoxPtr && IsValid(*UnloadBoxPtr))
         {
@@ -397,15 +397,15 @@ void UStreamAsyncAction::AddTrasnform(const FName &Name, UInstancedStaticMeshCom
     ResetLoadState();
 }
 
-void UStreamAsyncAction::SpawnRuntimeComponents(const FName &NodeName, const FModelNodeData &NodeInfo, const FRuntimeMeshData &Data)
+void UStreamAsyncAction::SpawnStreamComponents(const FName &NodeName, const FModelNodeData &NodeInfo, const FMeshData &Data)
 {
-    FRuntimeComponentGroup *ExistingGroupPtr = DynamicComponentMap.Find(NodeName);
+    FComponentGroup *ExistingGroupPtr = DynamicComponentMap.Find(NodeName);
     if (ExistingGroupPtr && (ExistingGroupPtr->Colliders.Num() > 0 || ExistingGroupPtr->Lights.Num() > 0))
     {
         return;
     }
 
-    FRuntimeComponentGroup Group;
+    FComponentGroup Group;
     UWorld *World = OwnerActor->GetWorld();
     if (!World)
         return;
@@ -457,7 +457,7 @@ void UStreamAsyncAction::SpawnRuntimeComponents(const FName &NodeName, const FMo
         }
     }
 
-    for (const FRuntimeLightData &LightData : Data.Lights)
+    for (const FLightData &LightData : Data.Lights)
     {
         UDynamicPointLightComponent *PointLight = NewObject<UDynamicPointLightComponent>(OwnerActor);
         if (PointLight)
@@ -484,9 +484,9 @@ void UStreamAsyncAction::SpawnRuntimeComponents(const FName &NodeName, const FMo
     }
 }
 
-void UStreamAsyncAction::DestroyRuntimeComponents(const FName &NodeName)
+void UStreamAsyncAction::DestroyStreamComponents(const FName &NodeName)
 {
-    FRuntimeComponentGroup *GroupPtr = DynamicComponentMap.Find(NodeName);
+    FComponentGroup *GroupPtr = DynamicComponentMap.Find(NodeName);
     if (!GroupPtr)
         return;
 
@@ -508,7 +508,7 @@ void UStreamAsyncAction::DestroyRuntimeComponents(const FName &NodeName)
     }
     GroupPtr->Lights.Empty();
 
-    // 구조체 내부에 UnloadBox 판별 로직이 빠졌으므로 동적 컴포넌트 정리 시 즉시 제거합니다.
+    // Remove dynamic components immediately because unload-box checks are no longer inside the struct.
     DynamicComponentMap.Remove(NodeName);
 }
 

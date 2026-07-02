@@ -5,9 +5,9 @@
 
 #include "CoreMinimal.h"
 #include "Kismet/BlueprintAsyncActionBase.h"
-#include "Model/RuntimeData.h"
+#include "Model/Data.h"
 #include "glTFRuntimeAsset.h"
-#include "Dom/JsonObject.h" // FJsonObject 처리를 위해 포함
+#include "Dom/JsonObject.h" // Required for FJsonObject handling.
 #include "LoadAsyncAction.generated.h"
 
 class UglTFRuntimeAsset;
@@ -27,8 +27,8 @@ class GLTFSIMULATOR_API ULoadAsyncAction : public UBlueprintAsyncActionBase
 
 public:
     /**
-     * glTF 에셋을 청크 단위로 비동기 로드하고, 동일 경로의 JSON 설정을 함께 병합합니다.
-     * @param InJsonFilePath 확장자를 포함한 대상 JSON 파일의 절대 경로 또는 프로젝트 상대 경로
+     * Asynchronously loads a glTF asset in chunks and merges the JSON settings from the same path.
+     * @param InJsonFilePath Absolute or project-relative target JSON file path including the extension.
      */
     UFUNCTION(BlueprintCallable, meta=(WorldContext="WorldContextObject"))
     static ULoadAsyncAction *LoadAsync(
@@ -39,7 +39,7 @@ public:
         const FString& InJsonFilePath);
 
     UPROPERTY(BlueprintAssignable)
-    FLoadAsyncCompleted Completed;  // 사용자 정의 델리게이트
+    FLoadAsyncCompleted Completed;  // Custom completion delegate.
 
     UPROPERTY(BlueprintAssignable)
     FLoadAsyncProgress Progress;
@@ -69,13 +69,13 @@ private:
     int32 MaxCount = 0;
     FName CurrentMeshName;
     int32 ChunkSize;
-    FRuntimeModelData GeneratedModelData;
+    FModelData GeneratedModelData;
 
-    // [추가] JSON 비동기 처리를 위한 멤버 변수
+    // Members used for asynchronous JSON processing.
     FString JsonFilePath;
 
     UPROPERTY()
-    FRuntimeModelData LoadedJsonModelData;
+    FModelData LoadedJsonModelData;
 
     UFUNCTION()
     void GetStaticMesh(UStaticMesh *StaticMesh);
@@ -86,13 +86,13 @@ private:
     void UpdateNext();
     void LoadTextureAsync(FString ImagePath);
 
-    // JSON 로드 및 병합 제어 함수
+    // Functions that control JSON loading and merging.
     void LoadJsonAsync();
     void MergeJsonDataToMeshMap();
     void RefreshGeneratedModelData();
     void SaveGeneratedJsonAsync() const;
     void WriteLogAsync(const FString& Message) const;
     
-    // [추가] 파일 유실 시 디폴트 파일 생성을 위한 내부 헬퍼 함수
+    // Internal helper that creates a default file when the source file is missing.
     bool CreateDefaultJsonFile(const FString& Path);
 };

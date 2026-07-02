@@ -12,22 +12,22 @@ class UMaterialInterface;
 class UStaticMesh;
 class UTexture;
 
-struct FManagedRuntimeAssetEntryBase
+struct FManagedAssetEntryBase
 {
     int32 RefCount = 0;
 };
 
-struct FManagedRuntimeStaticMeshEntry : public FManagedRuntimeAssetEntryBase
+struct FManagedStaticMeshEntry : public FManagedAssetEntryBase
 {
     TWeakObjectPtr<UStaticMesh> Asset;
 };
 
-struct FManagedRuntimeMaterialEntry : public FManagedRuntimeAssetEntryBase
+struct FManagedMaterialEntry : public FManagedAssetEntryBase
 {
     TWeakObjectPtr<UMaterialInterface> Asset;
 };
 
-struct FManagedRuntimeTextureEntry : public FManagedRuntimeAssetEntryBase
+struct FManagedTextureEntry : public FManagedAssetEntryBase
 {
     TWeakObjectPtr<UTexture> Asset;
 };
@@ -45,23 +45,23 @@ public:
     void ActivateForMainWorld(UObject* WorldContextObject);
     void DeactivateAndRelease();
 
-    UStaticMesh* AcquireStaticMesh(UObject* WorldContextObject, const FName& MeshKey, UStaticMesh* RuntimeMesh);
-    void ReleaseStaticMesh(UObject* WorldContextObject, UStaticMesh* RuntimeMesh);
+    UStaticMesh* AcquireStaticMesh(UObject* WorldContextObject, const FName& MeshKey, UStaticMesh* GeneratedMeshAsset);
+    void ReleaseStaticMesh(UObject* WorldContextObject, UStaticMesh* GeneratedMeshAsset);
 
-    UMaterialInterface* AcquireMaterial(UObject* WorldContextObject, UMaterialInterface* RuntimeMaterial);
-    void ReleaseMaterial(UObject* WorldContextObject, UMaterialInterface* RuntimeMaterial);
+    UMaterialInterface* AcquireMaterial(UObject* WorldContextObject, UMaterialInterface* GeneratedMaterialAsset);
+    void ReleaseMaterial(UObject* WorldContextObject, UMaterialInterface* GeneratedMaterialAsset);
 
-    UTexture* AcquireTexture(UObject* WorldContextObject, UTexture* RuntimeTexture);
-    void ReleaseTexture(UObject* WorldContextObject, UTexture* RuntimeTexture);
+    UTexture* AcquireTexture(UObject* WorldContextObject, UTexture* GeneratedTextureAsset);
+    void ReleaseTexture(UObject* WorldContextObject, UTexture* GeneratedTextureAsset);
 
     bool IsActive() const { return bActive; }
 
 private:
     bool bActive = false;
     FCriticalSection RegistryLock;
-    TMap<uint32, FManagedRuntimeStaticMeshEntry> StaticMeshSet;
-    TMap<uint32, FManagedRuntimeMaterialEntry> MaterialSet;
-    TMap<uint32, FManagedRuntimeTextureEntry> TextureSet;
+    TMap<uint32, FManagedStaticMeshEntry> StaticMeshSet;
+    TMap<uint32, FManagedMaterialEntry> MaterialSet;
+    TMap<uint32, FManagedTextureEntry> TextureSet;
 
     uint32 HashStaticMesh(const FName& MeshKey, const UStaticMesh* Mesh) const;
     uint32 HashMaterial(const UMaterialInterface* Material) const;

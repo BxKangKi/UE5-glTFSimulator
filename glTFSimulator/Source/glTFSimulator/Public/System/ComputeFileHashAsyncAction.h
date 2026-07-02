@@ -15,15 +15,15 @@ class GLTFSIMULATOR_API UComputeFileHashAsyncAction : public UBlueprintAsyncActi
     GENERATED_BODY()
 
 public:
-    // 블루프린트에서 호출할 정적 함수
+    // Static function callable from Blueprint.
     UFUNCTION(BlueprintCallable, meta = (BlueprintInternalUseOnly = "true"), Category = "File|Hash")
     static UComputeFileHashAsyncAction *ComputeFileHashAsync(UObject *WorldContextObject, const FString &FilePath);
 
-    // 블루프린트 이벤트 바인딩
+    // Blueprint event binding.
     UPROPERTY(BlueprintAssignable)
     FOnHashComputed OnCompleted;
 
-    // 비동기 실행 함수 오버라이드
+    // Asynchronous execution override.
     virtual void Activate() override;
 
 private:

@@ -25,19 +25,19 @@ class GLTFSIMULATOR_API USystemInfoFunctionLibrary : public UBlueprintFunctionLi
     GENERATED_BODY()
 
 public:
-    // 블루프린트에서 순수 함수(Pure)로 호출할 수 있도록 노출
+    // Exposed as a BlueprintPure function.
     UFUNCTION(BlueprintPure)
     static FSystemHardwareInfo GetSystemHardwareInfo();
 
-    // 현재 프레임 타임(Delta Time)을 밀리초(ms) 단위로 반환합니다.
+    // Returns the current frame delta time in milliseconds.
     UFUNCTION(BlueprintPure)
     static float GetFramerate();
 
-    // 현재 사용 중인 물리 메모리(RAM) 용량을 메가바이트(MB) 단위로 반환합니다.
+    // Returns currently used physical memory in megabytes.
     UFUNCTION(BlueprintPure)
     static int32 GetUsedMemory();
 
-    // 시스템의 전체 물리 메모리(RAM) 용량을 반환합니다. (퍼센트 계산용)
+    // Returns total physical memory for percentage calculations.
     UFUNCTION(BlueprintPure)
     static int32 GetTotalMemory();
 };

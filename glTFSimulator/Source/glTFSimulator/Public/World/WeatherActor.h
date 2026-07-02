@@ -34,7 +34,7 @@ private:
     FVector LocationOffset;
     void AsyncTick();
 
-    // 비동기 작업 완료 시 호출될 콜백 함수
+    // Callback invoked when the asynchronous task completes.
     UFUNCTION()
     void OnRainUpdateCompleted();
 

@@ -40,6 +40,15 @@ public:
     // async add line function
     UFUNCTION(BlueprintCallable)
     static void AppendLineToFileAsync(const FString &Line, const FString &FilePath);
+
+    // Returns the daily simulator log file under the user-facing Logs directory.
+    static FString GetSimulatorLogFilePath();
+
+    // Writes a categorized simulator log line to the daily Logs/log_YYYYMMDD.txt file.
+    static bool WriteSimulatorLog(const FString& Category, const FString& Message);
+
+    // Thread-pool version of WriteSimulatorLog for heavy streaming systems.
+    static void WriteSimulatorLogAsync(const FString& Category, const FString& Message);
 #pragma region Json File
     // Json related functions
     static void ToJsonAsync(TSharedRef<FJsonObject> Json, const FString &Path);
@@ -55,6 +64,6 @@ public:
 
 private:
     static FCriticalSection FileWriteCriticalSection;
-    // 파일에 문자열을 추가 저장하는 내부 함수
+    // Internal helper that appends text to a file.
     static bool AppendStringToFileInternal(const FString &Line, const FString &FilePath);
 };

@@ -17,9 +17,9 @@ void AStartActor::BuildLevelFolderNameMap()
 {
     FolderNameMap.Empty();
 
-    // 프로젝트 Content 디렉토리 기준 절대 경로 생성
+    // Build absolute paths relative to the project Content directory.
     FString RootPath = PATH_ROOT;
-    // 헬퍼 함수들로 한 줄씩 처리
+    // Process each line through helper functions.
     TArray<FString> SubFolders;
     if (!UFileFunctionLibrary::GetSubFolders(RootPath, SubFolders))
     {
@@ -27,7 +27,7 @@ void AStartActor::BuildLevelFolderNameMap()
         return;
     }
 
-    // 각 하위 폴더 처리
+    // Process each child folder.
     for (const FString &SubFolderName : SubFolders)
     {
         FString FullSubFolderPath = RootPath + SubFolderName;

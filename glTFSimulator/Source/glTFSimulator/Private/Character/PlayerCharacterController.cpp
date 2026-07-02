@@ -12,11 +12,11 @@
 #include "InputMappingContext.h"
 #include "InputCoreTypes.h"
 #include "Model/glTFStreamSubSystem.h"
-#include "Runtime/RuntimeGameplayManager.h"
-#include "Runtime/RuntimeCreatorHUDWidget.h"
-#include "Runtime/RuntimePauseMenuWidget.h"
-#include "Runtime/RuntimeSettingsMenuWidget.h"
-#include "Runtime/RuntimeVehiclePawn.h"
+#include "System/GameManagerActor.h"
+#include "Gameplay/CreatorHUDWidget.h"
+#include "Gameplay/PauseMenuWidget.h"
+#include "Gameplay/SettingsMenuWidget.h"
+#include "Gameplay/VehiclePawn.h"
 #include "System/GameManagerSubSystem.h"
 #include "TimerManager.h"
 #include "UObject/ConstructorHelpers.h"
@@ -28,7 +28,7 @@
 
 APlayerCharacterController::APlayerCharacterController()
 {
-    RuntimeGameplayManagerClass = nullptr;
+    GameManagerActorClass = nullptr;
 
     static ConstructorHelpers::FObjectFinder<UInputAction> DebugActionFinder(TEXT("/Game/Input/Actions/IA_Debug.IA_Debug"));
     if (DebugActionFinder.Succeeded())
@@ -48,7 +48,7 @@ APlayerCharacterController::APlayerCharacterController()
         DebugWidgetClass = DebugWidgetFinder.Class;
     }
 
-    bAutoCreateRuntimeCreatorHUD = false;
+    bAutoCreateCreatorHUD = false;
     PauseMenuWidgetClass = nullptr;
     SettingsMenuWidgetClass = nullptr;
 }
@@ -65,13 +65,13 @@ void APlayerCharacterController::BeginPlay()
         ApplyConfiguredInputMappingContexts();
     }
 
-    if (bAutoSpawnRuntimeGameplayManager)
+    if (bAutoSpawnGameManager)
     {
         GetWorldTimerManager().SetTimerForNextTick(FTimerDelegate::CreateWeakLambda(this, [this]()
         {
             if (!IsValid(SubSystem) || !SubSystem->IsWorldLoading())
             {
-                GetRuntimeGameplayManager();
+                GetGameManager();
             }
         }));
     }
@@ -94,7 +94,7 @@ void APlayerCharacterController::BeginPlay()
 }
 
 
-UUserWidget* APlayerCharacterController::CreateRuntimeCreatorHUD()
+UUserWidget* APlayerCharacterController::CreateCreatorHUD()
 {
     if (IsValid(SubSystem) && SubSystem->IsWorldLoading())
     {
@@ -102,54 +102,54 @@ UUserWidget* APlayerCharacterController::CreateRuntimeCreatorHUD()
     }
 
     // No native/WBP fallback class is loaded here anymore. Assign a WBP class explicitly or create the widget in Blueprint.
-    if (!RuntimeCreatorHUDWidgetClass)
+    if (!CreatorHUDWidgetClass)
     {
-        UE_LOG(LogTemp, Verbose, TEXT("PlayerCharacterController: RuntimeCreatorHUDWidgetClass is not assigned; skipping Creator HUD creation."));
+        UE_LOG(LogTemp, Verbose, TEXT("PlayerCharacterController: CreatorHUDWidgetClass is not assigned; skipping Creator HUD creation."));
         return nullptr;
     }
 
     // Reuse the existing HUD instance when it is still alive.
-    if (IsValid(RuntimeCreatorHUDWidget))
+    if (IsValid(CreatorHUDWidget))
     {
-        if (!RuntimeCreatorHUDWidget->IsInViewport())
+        if (!CreatorHUDWidget->IsInViewport())
         {
-            RuntimeCreatorHUDWidget->AddToViewport(RuntimeCreatorHUDZOrder);
+            CreatorHUDWidget->AddToViewport(CreatorHUDZOrder);
         }
-        return RuntimeCreatorHUDWidget.Get();
+        return CreatorHUDWidget.Get();
     }
 
     // Only instantiate an explicitly assigned WBP class.
-    RuntimeCreatorHUDWidget = CreateWidget<UUserWidget>(this, RuntimeCreatorHUDWidgetClass);
+    CreatorHUDWidget = CreateWidget<UUserWidget>(this, CreatorHUDWidgetClass);
 
     // Return nullptr if widget creation fails.
-    if (!IsValid(RuntimeCreatorHUDWidget))
+    if (!IsValid(CreatorHUDWidget))
     {
         return nullptr;
     }
 
     // Add the HUD to the viewport.
-    RuntimeCreatorHUDWidget->AddToViewport(RuntimeCreatorHUDZOrder);
+    CreatorHUDWidget->AddToViewport(CreatorHUDZOrder);
 
     // Keep GameOnly input so this HUD does not interrupt crosshair-centered gameplay.
-    if (!bRuntimeUIInputMode)
+    if (!bUIInputMode)
     {
         ApplyGameInputMode();
     }
 
     // Return the created HUD instance.
-    return RuntimeCreatorHUDWidget.Get();
+    return CreatorHUDWidget.Get();
 }
 
-void APlayerCharacterController::RemoveRuntimeCreatorHUD()
+void APlayerCharacterController::RemoveCreatorHUD()
 {
     // Remove the HUD from the viewport if it is valid.
-    if (IsValid(RuntimeCreatorHUDWidget))
+    if (IsValid(CreatorHUDWidget))
     {
-        RuntimeCreatorHUDWidget->RemoveFromParent();
+        CreatorHUDWidget->RemoveFromParent();
     }
 
     // Clear the reference so the next request can create a fresh instance.
-    RuntimeCreatorHUDWidget = nullptr;
+    CreatorHUDWidget = nullptr;
 }
 
 void APlayerCharacterController::SetupInputComponent()
@@ -170,9 +170,9 @@ void APlayerCharacterController::BeginPlayingState()
     {
         ApplyConfiguredInputMappingContexts();
     }
-    if (bLogRuntimeInputSetup)
+    if (bLogInputSetup)
     {
-        PrintRuntimeInputSetupStatus();
+        PrintInputSetupStatus();
     }
 }
 
@@ -180,7 +180,7 @@ void APlayerCharacterController::Tick(float DeltaSeconds)
 {
     Super::Tick(DeltaSeconds);
 
-    if (bEnableFallbackKeyBindings && !bRuntimeUIInputMode &&
+    if (bEnableFallbackKeyBindings && !bUIInputMode &&
         (bFallbackMoveForward || bFallbackMoveBackward || bFallbackMoveRight || bFallbackMoveLeft))
     {
         UpdateFallbackMoveInput();
@@ -189,7 +189,7 @@ void APlayerCharacterController::Tick(float DeltaSeconds)
 
 void APlayerCharacterController::ApplyGameInputMode()
 {
-    bRuntimeUIInputMode = false;
+    bUIInputMode = false;
     UWidgetBlueprintLibrary::SetInputMode_GameOnly(this, false);
     bShowMouseCursor = !bHideMouseCursorDuringGameplay;
     bEnableClickEvents = false;
@@ -200,7 +200,7 @@ void APlayerCharacterController::ApplyGameInputMode()
 
 void APlayerCharacterController::ApplyUIInputMode(UUserWidget* WidgetToFocus)
 {
-    bRuntimeUIInputMode = true;
+    bUIInputMode = true;
     UWidgetBlueprintLibrary::SetInputMode_GameAndUIEx(
         this,
         WidgetToFocus,
@@ -243,7 +243,7 @@ void APlayerCharacterController::ApplyConfiguredInputMappingContexts()
         return false;
     };
 
-    bAnyInputMappingContextApplied |= AddContextIfValid(RuntimeInputMappingContext.Get(), RuntimeInputMappingPriority);
+    bAnyInputMappingContextApplied |= AddContextIfValid(InputMappingContext.Get(), InputMappingPriority);
 
     for (const FPlayerInputMappingContextConfig& ContextConfig : AdditionalInputMappingContexts)
     {
@@ -254,36 +254,36 @@ void APlayerCharacterController::ApplyConfiguredInputMappingContexts()
 void APlayerCharacterController::RefreshConfiguredEnhancedInput()
 {
     ApplyConfiguredInputMappingContexts();
-    PrintRuntimeInputSetupStatus();
+    PrintInputSetupStatus();
 }
 
-FString APlayerCharacterController::GetRuntimeInputFixVersion() const
+FString APlayerCharacterController::GetInputFixVersion() const
 {
-    return TEXT("RuntimeInput");
+    return TEXT("GameplayInput");
 }
 
-FString APlayerCharacterController::GetRuntimeInputSetupStatus() const
+FString APlayerCharacterController::GetInputSetupStatus() const
 {
     return FString::Printf(
-        TEXT("%s | Controller=%s | Class=%s | PrimaryIMC=%s | IMCCount=%d | IAAssigned=%d | EnhancedInputComponent=%s | MappingApplied=%s | RuntimeMouse=%s | ManagerClass=%s"),
-        TEXT("RuntimeInput"),
+        TEXT("%s | Controller=%s | Class=%s | PrimaryIMC=%s | IMCCount=%d | IAAssigned=%d | EnhancedInputComponent=%s | MappingApplied=%s | GameplayMouse=%s | ManagerClass=%s"),
+        TEXT("GameplayInput"),
         *GetNameSafe(this),
         *GetNameSafe(GetClass()),
-        *GetNameSafe(RuntimeInputMappingContext.Get()),
+        *GetNameSafe(InputMappingContext.Get()),
         CountConfiguredInputMappingContexts(),
         CountAssignedEnhancedInputActions(),
         bEnhancedInputComponentWasAvailable ? TEXT("OK") : TEXT("NO"),
         bAnyInputMappingContextApplied ? TEXT("YES") : TEXT("NO"),
-        (bEnableFallbackKeyBindings && bBindRuntimeMouseButtons) ? TEXT("LMB/RMB") : TEXT("OFF"),
-        *GetNameSafe(RuntimeGameplayManagerClass ? RuntimeGameplayManagerClass.Get() : ARuntimeGameplayManager::StaticClass()));
+        (bEnableFallbackKeyBindings && bBindMouseButtons) ? TEXT("LMB/RMB") : TEXT("OFF"),
+        *GetNameSafe(GameManagerActorClass ? GameManagerActorClass.Get() : AGameManagerActor::StaticClass()));
 }
 
-void APlayerCharacterController::PrintRuntimeInputSetupStatus() const
+void APlayerCharacterController::PrintInputSetupStatus() const
 {
-    const FString Status = GetRuntimeInputSetupStatus();
-    UE_LOG(LogTemp, Display, TEXT("[RuntimeInput] %s"), *Status);
+    const FString Status = GetInputSetupStatus();
+    UE_LOG(LogTemp, Display, TEXT("[GameplayInput] %s"), *Status);
 
-    if (bShowRuntimeInputSetupOnScreen && GEngine && IsLocalController())
+    if (bShowInputSetupOnScreen && GEngine && IsLocalController())
     {
         GEngine->AddOnScreenDebugMessage(-1, 6.0f, FColor::Green, Status);
     }
@@ -339,54 +339,54 @@ void APlayerCharacterController::BindConfiguredInputActions()
         EnhancedInputComponent->BindAction(RagdollAction.Get(), ETriggerEvent::Started, this, &APlayerCharacterController::Input_RagdollPressed);
     }
 
-    if (RuntimeInteractAction)
+    if (InteractAction)
     {
-        EnhancedInputComponent->BindAction(RuntimeInteractAction.Get(), ETriggerEvent::Started, this, &APlayerCharacterController::Input_RuntimeInteractPressed);
+        EnhancedInputComponent->BindAction(InteractAction.Get(), ETriggerEvent::Started, this, &APlayerCharacterController::Input_InteractPressed);
     }
-    if (RuntimeToggleFirstPersonAction)
+    if (ToggleFirstPersonAction)
     {
-        EnhancedInputComponent->BindAction(RuntimeToggleFirstPersonAction.Get(), ETriggerEvent::Started, this, &APlayerCharacterController::Input_RuntimeToggleFirstPersonPressed);
+        EnhancedInputComponent->BindAction(ToggleFirstPersonAction.Get(), ETriggerEvent::Started, this, &APlayerCharacterController::Input_ToggleFirstPersonPressed);
     }
     if (ChangeCharacterAction)
     {
         EnhancedInputComponent->BindAction(ChangeCharacterAction.Get(), ETriggerEvent::Started, this, &APlayerCharacterController::Input_ChangeCharacterPressed);
     }
-    if (RuntimeToolbarScrollAction)
+    if (ToolbarScrollAction)
     {
-        EnhancedInputComponent->BindAction(RuntimeToolbarScrollAction.Get(), ETriggerEvent::Triggered, this, &APlayerCharacterController::HandleToolbarScrollTriggered);
+        EnhancedInputComponent->BindAction(ToolbarScrollAction.Get(), ETriggerEvent::Triggered, this, &APlayerCharacterController::HandleToolbarScrollTriggered);
     }
-    if (RuntimeToggleItemListAction)
+    if (ToggleItemListAction)
     {
-        EnhancedInputComponent->BindAction(RuntimeToggleItemListAction.Get(), ETriggerEvent::Started, this, &APlayerCharacterController::Input_RuntimeToggleItemListPressed);
+        EnhancedInputComponent->BindAction(ToggleItemListAction.Get(), ETriggerEvent::Started, this, &APlayerCharacterController::Input_ToggleItemListPressed);
     }
-    if (RuntimeSnapAction)
+    if (SnapAction)
     {
-        EnhancedInputComponent->BindAction(RuntimeSnapAction.Get(), ETriggerEvent::Started, this, &APlayerCharacterController::Input_RuntimeSnapPressed);
+        EnhancedInputComponent->BindAction(SnapAction.Get(), ETriggerEvent::Started, this, &APlayerCharacterController::Input_SnapPressed);
     }
 
-    if (RuntimeVehicleMoveAction)
+    if (VehicleMoveAction)
     {
-        EnhancedInputComponent->BindAction(RuntimeVehicleMoveAction.Get(), ETriggerEvent::Triggered, this, &APlayerCharacterController::HandleVehicleMoveTriggered);
-        EnhancedInputComponent->BindAction(RuntimeVehicleMoveAction.Get(), ETriggerEvent::Completed, this, &APlayerCharacterController::HandleVehicleMoveCompleted);
-        EnhancedInputComponent->BindAction(RuntimeVehicleMoveAction.Get(), ETriggerEvent::Canceled, this, &APlayerCharacterController::HandleVehicleMoveCompleted);
+        EnhancedInputComponent->BindAction(VehicleMoveAction.Get(), ETriggerEvent::Triggered, this, &APlayerCharacterController::HandleVehicleMoveTriggered);
+        EnhancedInputComponent->BindAction(VehicleMoveAction.Get(), ETriggerEvent::Completed, this, &APlayerCharacterController::HandleVehicleMoveCompleted);
+        EnhancedInputComponent->BindAction(VehicleMoveAction.Get(), ETriggerEvent::Canceled, this, &APlayerCharacterController::HandleVehicleMoveCompleted);
     }
-    if (RuntimeVehicleThrottleAction)
+    if (VehicleThrottleAction)
     {
-        EnhancedInputComponent->BindAction(RuntimeVehicleThrottleAction.Get(), ETriggerEvent::Triggered, this, &APlayerCharacterController::HandleVehicleThrottleTriggered);
-        EnhancedInputComponent->BindAction(RuntimeVehicleThrottleAction.Get(), ETriggerEvent::Completed, this, &APlayerCharacterController::HandleVehicleThrottleCompleted);
-        EnhancedInputComponent->BindAction(RuntimeVehicleThrottleAction.Get(), ETriggerEvent::Canceled, this, &APlayerCharacterController::HandleVehicleThrottleCompleted);
+        EnhancedInputComponent->BindAction(VehicleThrottleAction.Get(), ETriggerEvent::Triggered, this, &APlayerCharacterController::HandleVehicleThrottleTriggered);
+        EnhancedInputComponent->BindAction(VehicleThrottleAction.Get(), ETriggerEvent::Completed, this, &APlayerCharacterController::HandleVehicleThrottleCompleted);
+        EnhancedInputComponent->BindAction(VehicleThrottleAction.Get(), ETriggerEvent::Canceled, this, &APlayerCharacterController::HandleVehicleThrottleCompleted);
     }
-    if (RuntimeVehicleSteeringAction)
+    if (VehicleSteeringAction)
     {
-        EnhancedInputComponent->BindAction(RuntimeVehicleSteeringAction.Get(), ETriggerEvent::Triggered, this, &APlayerCharacterController::HandleVehicleSteeringTriggered);
-        EnhancedInputComponent->BindAction(RuntimeVehicleSteeringAction.Get(), ETriggerEvent::Completed, this, &APlayerCharacterController::HandleVehicleSteeringCompleted);
-        EnhancedInputComponent->BindAction(RuntimeVehicleSteeringAction.Get(), ETriggerEvent::Canceled, this, &APlayerCharacterController::HandleVehicleSteeringCompleted);
+        EnhancedInputComponent->BindAction(VehicleSteeringAction.Get(), ETriggerEvent::Triggered, this, &APlayerCharacterController::HandleVehicleSteeringTriggered);
+        EnhancedInputComponent->BindAction(VehicleSteeringAction.Get(), ETriggerEvent::Completed, this, &APlayerCharacterController::HandleVehicleSteeringCompleted);
+        EnhancedInputComponent->BindAction(VehicleSteeringAction.Get(), ETriggerEvent::Canceled, this, &APlayerCharacterController::HandleVehicleSteeringCompleted);
     }
-    if (RuntimeVehicleStopAction)
+    if (VehicleStopAction)
     {
-        EnhancedInputComponent->BindAction(RuntimeVehicleStopAction.Get(), ETriggerEvent::Started, this, &APlayerCharacterController::Input_RuntimeVehicleStop);
-        EnhancedInputComponent->BindAction(RuntimeVehicleStopAction.Get(), ETriggerEvent::Completed, this, &APlayerCharacterController::Input_RuntimeVehicleStop);
-        EnhancedInputComponent->BindAction(RuntimeVehicleStopAction.Get(), ETriggerEvent::Canceled, this, &APlayerCharacterController::Input_RuntimeVehicleStop);
+        EnhancedInputComponent->BindAction(VehicleStopAction.Get(), ETriggerEvent::Started, this, &APlayerCharacterController::Input_VehicleStop);
+        EnhancedInputComponent->BindAction(VehicleStopAction.Get(), ETriggerEvent::Completed, this, &APlayerCharacterController::Input_VehicleStop);
+        EnhancedInputComponent->BindAction(VehicleStopAction.Get(), ETriggerEvent::Canceled, this, &APlayerCharacterController::Input_VehicleStop);
     }
     if (PauseAction)
     {
@@ -400,7 +400,7 @@ void APlayerCharacterController::BindConfiguredInputActions()
 
 int32 APlayerCharacterController::CountConfiguredInputMappingContexts() const
 {
-    int32 Count = IsValid(RuntimeInputMappingContext.Get()) ? 1 : 0;
+    int32 Count = IsValid(InputMappingContext.Get()) ? 1 : 0;
     for (const FPlayerInputMappingContextConfig& ContextConfig : AdditionalInputMappingContexts)
     {
         if (IsValid(ContextConfig.MappingContext.Get()))
@@ -429,16 +429,16 @@ int32 APlayerCharacterController::CountAssignedEnhancedInputActions() const
     CountIfValid(CrouchAction.Get());
     CountIfValid(FlyAction.Get());
     CountIfValid(RagdollAction.Get());
-    CountIfValid(RuntimeToggleFirstPersonAction.Get());
+    CountIfValid(ToggleFirstPersonAction.Get());
     CountIfValid(ChangeCharacterAction.Get());
-    CountIfValid(RuntimeToolbarScrollAction.Get());
-    CountIfValid(RuntimeToggleItemListAction.Get());
-    CountIfValid(RuntimeSnapAction.Get());
-    CountIfValid(RuntimeInteractAction.Get());
-    CountIfValid(RuntimeVehicleMoveAction.Get());
-    CountIfValid(RuntimeVehicleThrottleAction.Get());
-    CountIfValid(RuntimeVehicleSteeringAction.Get());
-    CountIfValid(RuntimeVehicleStopAction.Get());
+    CountIfValid(ToolbarScrollAction.Get());
+    CountIfValid(ToggleItemListAction.Get());
+    CountIfValid(SnapAction.Get());
+    CountIfValid(InteractAction.Get());
+    CountIfValid(VehicleMoveAction.Get());
+    CountIfValid(VehicleThrottleAction.Get());
+    CountIfValid(VehicleSteeringAction.Get());
+    CountIfValid(VehicleStopAction.Get());
     CountIfValid(PauseAction.Get());
     CountIfValid(DebugAction.Get());
 
@@ -512,37 +512,37 @@ void APlayerCharacterController::BindFallbackKeyInputs()
     // action yet, and Input_DebugPressed is debounced so a duplicate Enhanced Input event is harmless.
     InputComponent->BindKey(EKeys::F3, IE_Pressed, this, &APlayerCharacterController::Input_DebugPressed);
 
-    // Runtime tool commands are UI-driven. Only mouse placement and vehicle/camera hotkeys remain here.
-    if (bBindRuntimeMouseButtons)
+    // Gameplay tool commands are UI-driven. Only mouse placement and vehicle/camera hotkeys remain here.
+    if (bBindMouseButtons)
     {
-        InputComponent->BindKey(EKeys::LeftMouseButton, IE_Pressed, this, &APlayerCharacterController::Input_RuntimePrimaryPressed);
-        InputComponent->BindKey(EKeys::LeftMouseButton, IE_Released, this, &APlayerCharacterController::Input_RuntimePrimaryReleased);
-        InputComponent->BindKey(EKeys::RightMouseButton, IE_Pressed, this, &APlayerCharacterController::Input_RuntimeSecondaryPressed);
+        InputComponent->BindKey(EKeys::LeftMouseButton, IE_Pressed, this, &APlayerCharacterController::Input_PrimaryPressed);
+        InputComponent->BindKey(EKeys::LeftMouseButton, IE_Released, this, &APlayerCharacterController::Input_PrimaryReleased);
+        InputComponent->BindKey(EKeys::RightMouseButton, IE_Pressed, this, &APlayerCharacterController::Input_SecondaryPressed);
     }
 
-    if (ShouldBindFallbackKeyForAction(RuntimeInteractAction.Get()))
+    if (ShouldBindFallbackKeyForAction(InteractAction.Get()))
     {
-        InputComponent->BindKey(EKeys::F, IE_Pressed, this, &APlayerCharacterController::Input_RuntimeInteractPressed);
+        InputComponent->BindKey(EKeys::F, IE_Pressed, this, &APlayerCharacterController::Input_InteractPressed);
     }
-    if (ShouldBindFallbackKeyForAction(RuntimeToggleFirstPersonAction.Get()))
+    if (ShouldBindFallbackKeyForAction(ToggleFirstPersonAction.Get()))
     {
-        InputComponent->BindKey(EKeys::V, IE_Pressed, this, &APlayerCharacterController::Input_RuntimeToggleFirstPersonPressed);
+        InputComponent->BindKey(EKeys::V, IE_Pressed, this, &APlayerCharacterController::Input_ToggleFirstPersonPressed);
     }
     if (ShouldBindFallbackKeyForAction(ChangeCharacterAction.Get()))
     {
         InputComponent->BindKey(EKeys::U, IE_Pressed, this, &APlayerCharacterController::Input_ChangeCharacterPressed);
     }
-    if (ShouldBindFallbackKeyForAction(RuntimeToolbarScrollAction.Get()))
+    if (ShouldBindFallbackKeyForAction(ToolbarScrollAction.Get()))
     {
-        InputComponent->BindAxisKey(EKeys::MouseWheelAxis, this, &APlayerCharacterController::Input_RuntimeToolbarScroll);
+        InputComponent->BindAxisKey(EKeys::MouseWheelAxis, this, &APlayerCharacterController::Input_ToolbarScroll);
     }
-    if (ShouldBindFallbackKeyForAction(RuntimeToggleItemListAction.Get()))
+    if (ShouldBindFallbackKeyForAction(ToggleItemListAction.Get()))
     {
-        InputComponent->BindKey(EKeys::E, IE_Pressed, this, &APlayerCharacterController::Input_RuntimeToggleItemListPressed);
+        InputComponent->BindKey(EKeys::E, IE_Pressed, this, &APlayerCharacterController::Input_ToggleItemListPressed);
     }
-    if (ShouldBindFallbackKeyForAction(RuntimeSnapAction.Get()))
+    if (ShouldBindFallbackKeyForAction(SnapAction.Get()))
     {
-        InputComponent->BindKey(EKeys::G, IE_Pressed, this, &APlayerCharacterController::Input_RuntimeSnapPressed);
+        InputComponent->BindKey(EKeys::G, IE_Pressed, this, &APlayerCharacterController::Input_SnapPressed);
     }
 }
 
@@ -608,15 +608,15 @@ void APlayerCharacterController::StopFallbackMovement()
     bFallbackMoveRight = false;
     bFallbackMoveLeft = false;
 
-    const bool bWasRuntimeUIInputMode = bRuntimeUIInputMode;
-    bRuntimeUIInputMode = false;
+    const bool bWasUIInputMode = bUIInputMode;
+    bUIInputMode = false;
     Input_Move(FVector2D::ZeroVector);
-    bRuntimeUIInputMode = bWasRuntimeUIInputMode;
+    bUIInputMode = bWasUIInputMode;
 }
 
 void APlayerCharacterController::FallbackLookYaw(float Value)
 {
-    if (!bRuntimeUIInputMode && !FMath::IsNearlyZero(Value))
+    if (!bUIInputMode && !FMath::IsNearlyZero(Value))
     {
         Input_Look(FVector2D(Value, 0.0f));
     }
@@ -624,13 +624,13 @@ void APlayerCharacterController::FallbackLookYaw(float Value)
 
 void APlayerCharacterController::FallbackLookPitch(float Value)
 {
-    if (!bRuntimeUIInputMode && !FMath::IsNearlyZero(Value))
+    if (!bUIInputMode && !FMath::IsNearlyZero(Value))
     {
         Input_Look(FVector2D(0.0f, Value));
     }
 }
 
-bool APlayerCharacterController::ConsumeRuntimeInput(double& LastInputTime)
+bool APlayerCharacterController::ConsumeInputDebounce(double& LastInputTime)
 {
     const UWorld* World = GetWorld();
     const double Now = World ? World->GetTimeSeconds() : FPlatformTime::Seconds();
@@ -660,47 +660,47 @@ void APlayerCharacterController::HandleLookTriggered(const FInputActionValue& Va
 
 void APlayerCharacterController::HandleToolbarScrollTriggered(const FInputActionValue& Value)
 {
-    Input_RuntimeToolbarScroll(Value.Get<float>());
+    Input_ToolbarScroll(Value.Get<float>());
 }
 
 void APlayerCharacterController::HandleVehicleMoveTriggered(const FInputActionValue& Value)
 {
-    Input_RuntimeVehicleMove(Value.Get<FVector2D>());
+    Input_VehicleMove(Value.Get<FVector2D>());
 }
 
 void APlayerCharacterController::HandleVehicleMoveCompleted(const FInputActionValue& Value)
 {
-    Input_RuntimeVehicleMove(FVector2D::ZeroVector);
+    Input_VehicleMove(FVector2D::ZeroVector);
 }
 
 void APlayerCharacterController::HandleVehicleThrottleTriggered(const FInputActionValue& Value)
 {
-    Input_RuntimeVehicleThrottle(Value.Get<float>());
+    Input_VehicleThrottle(Value.Get<float>());
 }
 
 void APlayerCharacterController::HandleVehicleThrottleCompleted(const FInputActionValue& Value)
 {
-    Input_RuntimeVehicleThrottle(0.0f);
+    Input_VehicleThrottle(0.0f);
 }
 
 void APlayerCharacterController::HandleVehicleSteeringTriggered(const FInputActionValue& Value)
 {
-    Input_RuntimeVehicleSteering(Value.Get<float>());
+    Input_VehicleSteering(Value.Get<float>());
 }
 
 void APlayerCharacterController::HandleVehicleSteeringCompleted(const FInputActionValue& Value)
 {
-    Input_RuntimeVehicleSteering(0.0f);
+    Input_VehicleSteering(0.0f);
 }
 
 void APlayerCharacterController::Input_Move(const FVector2D& MoveValue)
 {
-    if (bRuntimeUIInputMode)
+    if (bUIInputMode)
     {
         return;
     }
 
-    if (ARuntimeVehiclePawn* Vehicle = Cast<ARuntimeVehiclePawn>(GetPawn()))
+    if (AVehiclePawn* Vehicle = Cast<AVehiclePawn>(GetPawn()))
     {
         Vehicle->SetDriveInput(MoveValue.Y, MoveValue.X);
         return;
@@ -714,7 +714,7 @@ void APlayerCharacterController::Input_Move(const FVector2D& MoveValue)
 
 void APlayerCharacterController::Input_Look(const FVector2D& LookValue)
 {
-    if (bRuntimeUIInputMode)
+    if (bUIInputMode)
     {
         return;
     }
@@ -794,66 +794,66 @@ void APlayerCharacterController::Input_RagdollPressed()
     }
 }
 
-void APlayerCharacterController::Input_RuntimePrimaryPressed()
+void APlayerCharacterController::Input_PrimaryPressed()
 {
-    if (bRuntimeUIInputMode || !ConsumeRuntimeInput(LastRuntimePrimaryInputTime))
+    if (bUIInputMode || !ConsumeInputDebounce(LastPrimaryInputTime))
     {
         return;
     }
 
-    if (ARuntimeGameplayManager* Manager = GetRuntimeGameplayManager())
+    if (UGameManagerSubSystem* Manager = GetGameManager())
     {
         Manager->InputPrimaryPressed();
     }
 }
 
-void APlayerCharacterController::Input_RuntimePrimaryReleased()
+void APlayerCharacterController::Input_PrimaryReleased()
 {
-    if (bRuntimeUIInputMode)
+    if (bUIInputMode)
     {
         return;
     }
 
-    if (ARuntimeGameplayManager* Manager = GetRuntimeGameplayManager())
+    if (UGameManagerSubSystem* Manager = GetGameManager())
     {
         Manager->InputPrimaryReleased();
     }
 }
 
-void APlayerCharacterController::Input_RuntimeSecondaryPressed()
+void APlayerCharacterController::Input_SecondaryPressed()
 {
-    if (bRuntimeUIInputMode || !ConsumeRuntimeInput(LastRuntimeSecondaryInputTime))
+    if (bUIInputMode || !ConsumeInputDebounce(LastSecondaryInputTime))
     {
         return;
     }
 
-    if (ARuntimeGameplayManager* Manager = GetRuntimeGameplayManager())
+    if (UGameManagerSubSystem* Manager = GetGameManager())
     {
         Manager->InputSecondaryAction();
     }
 }
 
-void APlayerCharacterController::Input_RuntimeInteractPressed()
+void APlayerCharacterController::Input_InteractPressed()
 {
-    if (!ConsumeRuntimeInput(LastRuntimeInteractInputTime))
+    if (!ConsumeInputDebounce(LastInteractInputTime))
     {
         return;
     }
 
-    if (ARuntimeGameplayManager* Manager = GetRuntimeGameplayManager())
+    if (UGameManagerSubSystem* Manager = GetGameManager())
     {
         Manager->InputInteractAction();
     }
 }
 
-void APlayerCharacterController::Input_RuntimeToggleFirstPersonPressed()
+void APlayerCharacterController::Input_ToggleFirstPersonPressed()
 {
-    if (!ConsumeRuntimeInput(LastRuntimeToggleFirstPersonInputTime))
+    if (!ConsumeInputDebounce(LastToggleFirstPersonInputTime))
     {
         return;
     }
 
-    if (ARuntimeGameplayManager* Manager = GetRuntimeGameplayManager())
+    if (UGameManagerSubSystem* Manager = GetGameManager())
     {
         Manager->InputToggleFirstPersonAction();
     }
@@ -861,7 +861,7 @@ void APlayerCharacterController::Input_RuntimeToggleFirstPersonPressed()
 
 void APlayerCharacterController::Input_ChangeCharacterPressed()
 {
-    if (bRuntimeUIInputMode || !ConsumeRuntimeInput(LastRuntimeChangeCharacterInputTime))
+    if (bUIInputMode || !ConsumeInputDebounce(LastChangeCharacterInputTime))
     {
         return;
     }
@@ -882,27 +882,27 @@ void APlayerCharacterController::Input_ChangeCharacterPressed()
     }
 }
 
-void APlayerCharacterController::Input_RuntimeToolbarScroll(float ScrollValue)
+void APlayerCharacterController::Input_ToolbarScroll(float ScrollValue)
 {
-    if (bRuntimeUIInputMode || FMath::IsNearlyZero(ScrollValue))
+    if (bUIInputMode || FMath::IsNearlyZero(ScrollValue))
     {
         return;
     }
 
-    if (ARuntimeGameplayManager* Manager = GetRuntimeGameplayManager())
+    if (UGameManagerSubSystem* Manager = GetGameManager())
     {
         Manager->InputToolbarScrollAction(ScrollValue);
     }
 }
 
-void APlayerCharacterController::Input_RuntimeToggleItemListPressed()
+void APlayerCharacterController::Input_ToggleItemListPressed()
 {
-    if (!ConsumeRuntimeInput(LastRuntimeToggleItemListInputTime))
+    if (!ConsumeInputDebounce(LastToggleItemListInputTime))
     {
         return;
     }
 
-    if (ARuntimeGameplayManager* Manager = GetRuntimeGameplayManager())
+    if (UGameManagerSubSystem* Manager = GetGameManager())
     {
         Manager->InputToggleItemListAction();
         if (Manager->IsItemListWindowOpen())
@@ -916,70 +916,70 @@ void APlayerCharacterController::Input_RuntimeToggleItemListPressed()
     }
 }
 
-void APlayerCharacterController::Input_RuntimeSnapPressed()
+void APlayerCharacterController::Input_SnapPressed()
 {
-    if (!ConsumeRuntimeInput(LastRuntimeSnapInputTime))
+    if (!ConsumeInputDebounce(LastSnapInputTime))
     {
         return;
     }
 
-    if (ARuntimeGameplayManager* Manager = GetRuntimeGameplayManager())
+    if (UGameManagerSubSystem* Manager = GetGameManager())
     {
         Manager->InputToggleSnapModeAction();
     }
 }
 
-void APlayerCharacterController::Input_RuntimeVehicleMove(const FVector2D& MoveValue)
+void APlayerCharacterController::Input_VehicleMove(const FVector2D& MoveValue)
 {
-    if (ARuntimeVehiclePawn* Vehicle = Cast<ARuntimeVehiclePawn>(GetPawn()))
+    if (AVehiclePawn* Vehicle = Cast<AVehiclePawn>(GetPawn()))
     {
         Vehicle->SetDriveInput(MoveValue.Y, MoveValue.X);
         return;
     }
 
-    if (ARuntimeGameplayManager* Manager = GetRuntimeGameplayManager())
+    if (UGameManagerSubSystem* Manager = GetGameManager())
     {
         Manager->InputVehicleMoveAction(MoveValue);
     }
 }
 
-void APlayerCharacterController::Input_RuntimeVehicleThrottle(float Throttle)
+void APlayerCharacterController::Input_VehicleThrottle(float Throttle)
 {
-    if (ARuntimeVehiclePawn* Vehicle = Cast<ARuntimeVehiclePawn>(GetPawn()))
+    if (AVehiclePawn* Vehicle = Cast<AVehiclePawn>(GetPawn()))
     {
         Vehicle->SetThrottleInput(Throttle);
         return;
     }
 
-    if (ARuntimeGameplayManager* Manager = GetRuntimeGameplayManager())
+    if (UGameManagerSubSystem* Manager = GetGameManager())
     {
         Manager->InputVehicleThrottleAction(Throttle);
     }
 }
 
-void APlayerCharacterController::Input_RuntimeVehicleSteering(float Steering)
+void APlayerCharacterController::Input_VehicleSteering(float Steering)
 {
-    if (ARuntimeVehiclePawn* Vehicle = Cast<ARuntimeVehiclePawn>(GetPawn()))
+    if (AVehiclePawn* Vehicle = Cast<AVehiclePawn>(GetPawn()))
     {
         Vehicle->SetSteeringInput(Steering);
         return;
     }
 
-    if (ARuntimeGameplayManager* Manager = GetRuntimeGameplayManager())
+    if (UGameManagerSubSystem* Manager = GetGameManager())
     {
         Manager->InputVehicleSteeringAction(Steering);
     }
 }
 
-void APlayerCharacterController::Input_RuntimeVehicleStop()
+void APlayerCharacterController::Input_VehicleStop()
 {
-    if (ARuntimeVehiclePawn* Vehicle = Cast<ARuntimeVehiclePawn>(GetPawn()))
+    if (AVehiclePawn* Vehicle = Cast<AVehiclePawn>(GetPawn()))
     {
         Vehicle->ClearDriveInput();
         return;
     }
 
-    if (ARuntimeGameplayManager* Manager = GetRuntimeGameplayManager())
+    if (UGameManagerSubSystem* Manager = GetGameManager())
     {
         Manager->InputVehicleMoveAction(FVector2D::ZeroVector);
     }
@@ -989,7 +989,7 @@ void APlayerCharacterController::ClearLatchedMovementInput()
 {
     StopFallbackMovement();
 
-    if (ARuntimeVehiclePawn* Vehicle = Cast<ARuntimeVehiclePawn>(GetPawn()))
+    if (AVehiclePawn* Vehicle = Cast<AVehiclePawn>(GetPawn()))
     {
         Vehicle->ClearDriveInput();
     }
@@ -1003,7 +1003,7 @@ void APlayerCharacterController::ClearLatchedMovementInput()
 // Debug toggle translated from the Blueprint flow into C++.
 void APlayerCharacterController::Input_DebugPressed()
 {
-    if (!ConsumeRuntimeInput(LastRuntimeDebugInputTime))
+    if (!ConsumeInputDebounce(LastDebugInputTime))
     {
         return;
     }
@@ -1247,10 +1247,10 @@ void APlayerCharacterController::ReturnToPauseMenuFromSettings()
 
 void APlayerCharacterController::ExitToStartWorldFromPauseMenu()
 {
-    ARuntimeGameplayManager* Manager = GetRuntimeGameplayManager();
+    UGameManagerSubSystem* Manager = GetGameManager();
     if (IsValid(Manager))
     {
-        Manager->SaveRuntimeScene();
+        Manager->SaveScene();
     }
 
     if (IsValid(SettingsMenuWidget))
@@ -1278,61 +1278,73 @@ void APlayerCharacterController::ExitToStartWorldFromPauseMenu()
     }
 }
 
-ARuntimeGameplayManager *APlayerCharacterController::GetRuntimeGameplayManager()
+UGameManagerSubSystem* APlayerCharacterController::GetGameManager()
 {
-    const UClass* DesiredManagerClass = RuntimeGameplayManagerClass ? RuntimeGameplayManagerClass.Get() : ARuntimeGameplayManager::StaticClass();
-
-    if (IsValid(CachedRuntimeGameplayManager))
+    UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(this);
+    if (!IsValid(Manager))
     {
-        if (CachedRuntimeGameplayManager->IsA(DesiredManagerClass))
-        {
-            return CachedRuntimeGameplayManager;
-        }
-        CachedRuntimeGameplayManager = nullptr;
+        return nullptr;
     }
+
+    SubSystem = Manager;
+
+    const UClass* DesiredActorClass = GameManagerActorClass ? GameManagerActorClass.Get() : AGameManagerActor::StaticClass();
+
+    if (IsValid(CachedGameManagerActor) && CachedGameManagerActor->IsA(DesiredActorClass))
+    {
+        Manager->StartGameManager(CachedGameManagerActor.Get());
+        return Manager;
+    }
+    CachedGameManagerActor = nullptr;
 
     UWorld* World = GetWorld();
     if (!World)
     {
-        return nullptr;
+        return Manager;
     }
 
-    ARuntimeGameplayManager* FirstCompatibleManager = nullptr;
-    for (TActorIterator<ARuntimeGameplayManager> It(World); It; ++It)
+    AGameManagerActor* FirstCompatibleActor = nullptr;
+    for (TActorIterator<AGameManagerActor> It(World); It; ++It)
     {
-        ARuntimeGameplayManager* ExistingManager = *It;
-        if (!IsValid(ExistingManager))
+        AGameManagerActor* ExistingActor = *It;
+        if (!IsValid(ExistingActor))
         {
             continue;
         }
 
-        if (ExistingManager->IsA(DesiredManagerClass))
+        if (ExistingActor->IsA(DesiredActorClass))
         {
-            CachedRuntimeGameplayManager = ExistingManager;
-            return CachedRuntimeGameplayManager;
+            CachedGameManagerActor = ExistingActor;
+            Manager->StartGameManager(ExistingActor);
+            return Manager;
         }
 
-        if (!FirstCompatibleManager && DesiredManagerClass == ARuntimeGameplayManager::StaticClass())
+        if (!FirstCompatibleActor && DesiredActorClass == AGameManagerActor::StaticClass())
         {
-            FirstCompatibleManager = ExistingManager;
+            FirstCompatibleActor = ExistingActor;
         }
     }
 
-    if (FirstCompatibleManager)
+    if (FirstCompatibleActor)
     {
-        CachedRuntimeGameplayManager = FirstCompatibleManager;
-        return CachedRuntimeGameplayManager;
+        CachedGameManagerActor = FirstCompatibleActor;
+        Manager->StartGameManager(FirstCompatibleActor);
+        return Manager;
     }
 
-    if (IsValid(SubSystem) && SubSystem->IsWorldLoading())
+    if (Manager->IsWorldLoading())
     {
-        return nullptr;
+        return Manager;
     }
 
     FActorSpawnParameters Params;
     Params.Owner = this;
     Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-    UClass* ManagerSpawnClass = RuntimeGameplayManagerClass ? RuntimeGameplayManagerClass.Get() : ARuntimeGameplayManager::StaticClass();
-    CachedRuntimeGameplayManager = World->SpawnActor<ARuntimeGameplayManager>(ManagerSpawnClass, FTransform::Identity, Params);
-    return CachedRuntimeGameplayManager;
+    UClass* ManagerSpawnClass = GameManagerActorClass ? GameManagerActorClass.Get() : AGameManagerActor::StaticClass();
+    CachedGameManagerActor = World->SpawnActor<AGameManagerActor>(ManagerSpawnClass, FTransform::Identity, Params);
+    if (IsValid(CachedGameManagerActor))
+    {
+        Manager->StartGameManager(CachedGameManagerActor.Get());
+    }
+    return Manager;
 }

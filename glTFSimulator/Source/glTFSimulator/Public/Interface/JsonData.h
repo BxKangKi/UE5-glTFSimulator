@@ -8,14 +8,14 @@
 #include "Dom/JsonObject.h"
 #include "JsonData.generated.h"
 
-// 엔진 내부용 클래스 (수정 X)
+// Engine-internal class; do not edit manually.
 UINTERFACE(MinimalAPI, Blueprintable)
 class UJsonData : public UInterface
 {
     GENERATED_BODY()
 };
 
-// 실제 인터페이스 클래스
+// Actual interface class exposed to gameplay code.
 class GLTFSIMULATOR_API IJsonData
 {
     GENERATED_BODY()

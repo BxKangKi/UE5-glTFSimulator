@@ -7,14 +7,14 @@
 
 UDynamicPointLightComponent::UDynamicPointLightComponent()
 {
-    PrimaryComponentTick.bCanEverTick = false; // 틱을 완전히 꺼서 무거운 스케줄링 오버헤드 제거
+    PrimaryComponentTick.bCanEverTick = false; // Disable ticking to remove scheduling overhead.
 }
 
 void UDynamicPointLightComponent::BeginPlay()
 {
     Super::BeginPlay();
 
-    // 월드 서브시스템에 관리대상으로 등록
+    // Register this component with the world subsystem.
     if (UWorld *World = GetWorld())
     {
         if (auto *Subsystem = World->GetSubsystem<UDynamicLightSubsystem>())
@@ -26,7 +26,7 @@ void UDynamicPointLightComponent::BeginPlay()
 
 void UDynamicPointLightComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
-    // 소멸 시 서브시스템에서 해제
+    // Unregister this component when it is destroyed.
     if (UWorld *World = GetWorld())
     {
         if (auto *Subsystem = World->GetSubsystem<UDynamicLightSubsystem>())

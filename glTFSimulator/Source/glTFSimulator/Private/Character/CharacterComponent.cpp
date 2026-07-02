@@ -17,10 +17,10 @@
 #include "CollisionQueryParams.h"
 #include "CoreGlobals.h"
 
-using FRuntimeRagdollProbeLocationArray = TArray<FVector, TInlineAllocator<16>>;
-using FRuntimeRagdollSmallProbeLocationArray = TArray<FVector, TInlineAllocator<4>>;
+using FRagdollProbeLocationArray = TArray<FVector, TInlineAllocator<16>>;
+using FRagdollSmallProbeLocationArray = TArray<FVector, TInlineAllocator<4>>;
 
-namespace RuntimeCharacterRagdoll
+namespace CharacterRagdollTuning
 {
     static const FName PoseSnapshotName(TEXT("RagdollPose"));
     static const FVector MeshRecoveryRelativeLocation(0.0f, 0.0f, -90.0f);
@@ -47,7 +47,7 @@ namespace RuntimeCharacterRagdoll
     constexpr int32 WaterReleaseMinCoreProbes = 2;
 }
 
-namespace RuntimeCharacterMovement
+namespace CharacterMovementTuning
 {
     constexpr float BaseAccelerationTimeScale = 5.0f;
     constexpr float FlyingRagdollResistance = 1000000.0f;
@@ -70,7 +70,7 @@ namespace RuntimeCharacterMovement
     constexpr float GroundSprintSpeed = 533.3f;
 }
 
-namespace RuntimeCharacterWater
+namespace CharacterWaterTuning
 {
     // Native waterline constants. These are derived from the capsule and stable
     // head reference every frame. They are intentionally not exposed as Blueprint
@@ -105,7 +105,7 @@ namespace RuntimeCharacterWater
     constexpr float WalkWaterMinSpeedMultiplier = 0.42f;
 }
 
-static FORCEINLINE FVector MakeRuntimeForwardVectorFromYaw(const float YawDegrees)
+static FORCEINLINE FVector MakeForwardVectorFromYaw(const float YawDegrees)
 {
     float SinYaw = 0.0f;
     float CosYaw = 1.0f;
@@ -113,7 +113,7 @@ static FORCEINLINE FVector MakeRuntimeForwardVectorFromYaw(const float YawDegree
     return FVector(CosYaw, SinYaw, 0.0f);
 }
 
-static FORCEINLINE FVector MakeRuntimeRightVectorFromYaw(const float YawDegrees)
+static FORCEINLINE FVector MakeRightVectorFromYaw(const float YawDegrees)
 {
     float SinYaw = 0.0f;
     float CosYaw = 1.0f;
@@ -121,7 +121,7 @@ static FORCEINLINE FVector MakeRuntimeRightVectorFromYaw(const float YawDegrees)
     return FVector(-SinYaw, CosYaw, 0.0f);
 }
 
-static FORCEINLINE void StopRuntimeMovementAndSetMode(UCharacterMovementComponent* Movement, const EMovementMode NewMode)
+static FORCEINLINE void StopMovementAndSetMode(UCharacterMovementComponent* Movement, const EMovementMode NewMode)
 {
     if (!IsValid(Movement))
     {
@@ -135,7 +135,7 @@ static FORCEINLINE void StopRuntimeMovementAndSetMode(UCharacterMovementComponen
     }
 }
 
-static FORCEINLINE void StopRuntimeMovementAndDisable(UCharacterMovementComponent* Movement)
+static FORCEINLINE void StopMovementAndDisable(UCharacterMovementComponent* Movement)
 {
     if (!IsValid(Movement))
     {
@@ -146,24 +146,24 @@ static FORCEINLINE void StopRuntimeMovementAndDisable(UCharacterMovementComponen
     Movement->DisableMovement();
 }
 
-static FRotator MakeRuntimeFlatYawRotation(const float Yaw)
+static FRotator MakeFlatYawRotation(const float Yaw)
 {
     return FRotator(0.0f, FRotator::NormalizeAxis(Yaw), 0.0f);
 }
 
-static FRotator MakeRuntimeFlatYawRotationNear(const float DesiredYaw, const FRotator& ReferenceRotation)
+static FRotator MakeFlatYawRotationNear(const float DesiredYaw, const FRotator& ReferenceRotation)
 {
     const float ReferenceYaw = FRotator::NormalizeAxis(ReferenceRotation.Yaw);
     const float DeltaYaw = FMath::FindDeltaAngleDegrees(ReferenceYaw, DesiredYaw);
     return FRotator(0.0f, ReferenceYaw + DeltaYaw, 0.0f);
 }
 
-static float ComputeRuntimeExponentialDampingFactor(const float DampingRate, const float DeltaTime)
+static float ComputeExponentialDampingFactor(const float DampingRate, const float DeltaTime)
 {
     return FMath::Exp(-FMath::Max(0.0f, DampingRate) * FMath::Max(0.0f, DeltaTime));
 }
 
-static FORCEINLINE float ComputeRuntimeCapsuleWaterImmersionDepth(
+static FORCEINLINE float ComputeCapsuleWaterImmersionDepth(
     const FVector& ActorLocation,
     const float CapsuleHalfHeight,
     const float WaterLevel)
@@ -173,7 +173,7 @@ static FORCEINLINE float ComputeRuntimeCapsuleWaterImmersionDepth(
     return WaterLevel - (ActorLocation.Z - FMath::Max(0.0f, CapsuleHalfHeight));
 }
 
-static void GetRuntimeWaterReferenceZBounds(
+static void GetWaterReferenceZBounds(
     const float CapsuleHalfHeight,
     const float CapsuleRadius,
     float& OutMinZ,
@@ -186,13 +186,13 @@ static void GetRuntimeWaterReferenceZBounds(
     // believable upper capsule band.  Imported rigs can report a head socket/bone
     // above the visual mesh during early pose setup, which would place the waterline
     // target far above the character and make surface correction fight animation.
-    OutMinZ = FMath::Max(SafeRadius + 1.0f, SafeHalfHeight * RuntimeCharacterWater::ReferenceMinHalfHeightRatio);
-    const float MaxByHalfHeight = SafeHalfHeight * RuntimeCharacterWater::ReferenceMaxHalfHeightRatio;
-    const float MaxByTopMargin = SafeHalfHeight - SafeRadius * RuntimeCharacterWater::ReferenceTopMarginRadiusRatio;
+    OutMinZ = FMath::Max(SafeRadius + 1.0f, SafeHalfHeight * CharacterWaterTuning::ReferenceMinHalfHeightRatio);
+    const float MaxByHalfHeight = SafeHalfHeight * CharacterWaterTuning::ReferenceMaxHalfHeightRatio;
+    const float MaxByTopMargin = SafeHalfHeight - SafeRadius * CharacterWaterTuning::ReferenceTopMarginRadiusRatio;
     OutMaxZ = FMath::Max(OutMinZ + 1.0f, FMath::Min(MaxByHalfHeight, MaxByTopMargin));
 }
 
-static FVector SanitizeRuntimeWaterReferenceOffset(
+static FVector SanitizeWaterReferenceOffset(
     const FVector& CandidateOffset,
     const float CapsuleHalfHeight,
     const float CapsuleRadius,
@@ -200,7 +200,7 @@ static FVector SanitizeRuntimeWaterReferenceOffset(
 {
     float MinReferenceZ = 0.0f;
     float MaxReferenceZ = 0.0f;
-    GetRuntimeWaterReferenceZBounds(CapsuleHalfHeight, CapsuleRadius, MinReferenceZ, MaxReferenceZ);
+    GetWaterReferenceZBounds(CapsuleHalfHeight, CapsuleRadius, MinReferenceZ, MaxReferenceZ);
 
     FVector SanitizedOffset = CandidateOffset;
     SanitizedOffset.Z = bClampLowerBound
@@ -216,7 +216,7 @@ static FVector SanitizeRuntimeWaterReferenceOffset(
     return SanitizedOffset;
 }
 
-static bool TryGetRuntimeSkeletalReferenceLocation(
+static bool TryGetSkeletalReferenceLocation(
     const USkeletalMeshComponent* SkeletalMesh,
     const FName BoneName,
     FVector& OutLocation)
@@ -240,12 +240,12 @@ static bool TryGetRuntimeSkeletalReferenceLocation(
     return !OutLocation.ContainsNaN();
 }
 
-static FVector MakeRuntimeSwimmingForwardVector(
+static FVector MakeSwimmingForwardVector(
     const FRotator& ControlRotation,
     const float SurfacePlaneAlpha)
 {
     const FVector PitchedForward = ControlRotation.Vector();
-    const FVector FlatForward = MakeRuntimeForwardVectorFromYaw(ControlRotation.Yaw);
+    const FVector FlatForward = MakeForwardVectorFromYaw(ControlRotation.Yaw);
     const float SafeAlpha = FMath::Clamp(SurfacePlaneAlpha, 0.0f, 1.0f);
 
     // Blend into flat-yaw motion as the stable head reference approaches the surface.
@@ -253,7 +253,7 @@ static FVector MakeRuntimeSwimmingForwardVector(
     return FMath::Lerp(PitchedForward, FlatForward, SafeAlpha).GetSafeNormal();
 }
 
-static float ComputeRuntimeSwimmingSurfacePlaneAlpha(
+static float ComputeSwimmingSurfacePlaneAlpha(
     const float ImmersionDepth,
     const float SurfaceLockDepth)
 {
@@ -265,19 +265,19 @@ static float ComputeRuntimeSwimmingSurfacePlaneAlpha(
     return LinearAlpha * LinearAlpha * (3.0f - 2.0f * LinearAlpha);
 }
 
-static FVector ComputeRuntimeSwimmingInputDirection(
+static FVector ComputeSwimmingInputDirection(
     const FVector& MoveInput,
     const FRotator& ControlRotation,
     const float SurfacePlaneAlpha)
 {
-    const FVector FlatRight = MakeRuntimeRightVectorFromYaw(ControlRotation.Yaw);
-    const FVector Forward = MakeRuntimeSwimmingForwardVector(ControlRotation, SurfacePlaneAlpha);
+    const FVector FlatRight = MakeRightVectorFromYaw(ControlRotation.Yaw);
+    const FVector Forward = MakeSwimmingForwardVector(ControlRotation, SurfacePlaneAlpha);
     const FVector DesiredDirection = FlatRight * MoveInput.X + Forward * MoveInput.Y + FVector::UpVector * MoveInput.Z;
 
     return DesiredDirection.GetSafeNormal();
 }
 
-static void ApplyRuntimeSwimmingVelocityDamping(
+static void ApplySwimmingVelocityDamping(
     UCharacterMovementComponent* Movement,
     const FVector& MoveInput,
     const FRotator& ControlRotation,
@@ -304,9 +304,9 @@ static void ApplyRuntimeSwimmingVelocityDamping(
     // surface fix made this run too aggressively after a ceiling latch, which
     // made normal underwater movement feel stuck.
     const float BaseDampingRate = FMath::Lerp(0.35f, 0.95f, SafeSubmergedAlpha);
-    Velocity *= ComputeRuntimeExponentialDampingFactor(BaseDampingRate, DeltaTime);
+    Velocity *= ComputeExponentialDampingFactor(BaseDampingRate, DeltaTime);
 
-    const FVector InputDirection = ComputeRuntimeSwimmingInputDirection(MoveInput, ControlRotation, SurfacePlaneAlpha);
+    const FVector InputDirection = ComputeSwimmingInputDirection(MoveInput, ControlRotation, SurfacePlaneAlpha);
     if (InputAmount > 0.05f && !InputDirection.IsNearlyZero())
     {
         const float AlongSpeed = FVector::DotProduct(Velocity, InputDirection);
@@ -316,20 +316,20 @@ static void ApplyRuntimeSwimmingVelocityDamping(
         // Sideways/backward carry-over should still fade faster than intentional swimming velocity,
         // but not so fast that diagonal underwater movement loses most of its speed.
         const float DriftDampingRate = FMath::Lerp(3.0f, 7.0f, SafeSubmergedAlpha);
-        Velocity = AlongInputVelocity + DriftVelocity * ComputeRuntimeExponentialDampingFactor(DriftDampingRate, DeltaTime);
+        Velocity = AlongInputVelocity + DriftVelocity * ComputeExponentialDampingFactor(DriftDampingRate, DeltaTime);
     }
     else
     {
         // Releasing input should still slow down, while preserving enough water inertia
         // that the swimmer does not feel like they are dragging through glue.
         const float NoInputDampingRate = FMath::Lerp(0.9f, 1.8f, SafeSubmergedAlpha);
-        Velocity *= ComputeRuntimeExponentialDampingFactor(NoInputDampingRate, DeltaTime);
+        Velocity *= ComputeExponentialDampingFactor(NoInputDampingRate, DeltaTime);
     }
 
     if (bBlockUpwardVelocity && Velocity.Z > 0.0f)
     {
         const float SurfaceUpDampingRate = FMath::Lerp(2.0f, 5.0f, SafeSubmergedAlpha);
-        Velocity.Z *= ComputeRuntimeExponentialDampingFactor(SurfaceUpDampingRate, DeltaTime);
+        Velocity.Z *= ComputeExponentialDampingFactor(SurfaceUpDampingRate, DeltaTime);
     }
 
     if (Velocity.SizeSquared() < FMath::Square(8.0f))
@@ -340,7 +340,7 @@ static void ApplyRuntimeSwimmingVelocityDamping(
     Movement->Velocity = Velocity;
 }
 
-static bool UpdateRuntimeSwimmingSurfaceCeilingLock(
+static bool UpdateSwimmingSurfaceCeilingLock(
     const float ReferenceImmersionDepth,
     const float SurfaceCeilingDepth,
     const float SwimExitDepth,
@@ -380,7 +380,7 @@ static bool UpdateRuntimeSwimmingSurfaceCeilingLock(
     return bInOutLocked;
 }
 
-static void ApplyRuntimeSwimmingSurfaceRiseAssist(
+static void ApplySwimmingSurfaceRiseAssist(
     UCharacterMovementComponent* Movement,
     const float DeltaTime,
     const float ImmersionDepth,
@@ -394,24 +394,24 @@ static void ApplyRuntimeSwimmingSurfaceRiseAssist(
     }
 
     const float DepthBelowVisibleLine = ImmersionDepth - SurfaceCeilingDepth;
-    if (DepthBelowVisibleLine <= RuntimeCharacterWater::SurfaceRiseAssistDeadZoneCm)
+    if (DepthBelowVisibleLine <= CharacterWaterTuning::SurfaceRiseAssistDeadZoneCm)
     {
         return;
     }
 
     FVector Velocity = Movement->Velocity;
     const float DesiredUpSpeed = FMath::Clamp(
-        DepthBelowVisibleLine * RuntimeCharacterWater::SurfaceRiseAssistVelocityPerCm,
-        RuntimeCharacterWater::SurfaceRiseAssistMinUpSpeed,
-        RuntimeCharacterWater::SurfaceRiseAssistMaxUpSpeed);
+        DepthBelowVisibleLine * CharacterWaterTuning::SurfaceRiseAssistVelocityPerCm,
+        CharacterWaterTuning::SurfaceRiseAssistMinUpSpeed,
+        CharacterWaterTuning::SurfaceRiseAssistMaxUpSpeed);
     const float CurrentUpSpeed = FMath::Max(0.0f, Velocity.Z);
     Velocity.Z = FMath::Max(
         Velocity.Z,
-        FMath::FInterpTo(CurrentUpSpeed, DesiredUpSpeed, DeltaTime, RuntimeCharacterWater::SurfaceRiseAssistInterpSpeed));
+        FMath::FInterpTo(CurrentUpSpeed, DesiredUpSpeed, DeltaTime, CharacterWaterTuning::SurfaceRiseAssistInterpSpeed));
     Movement->Velocity = Velocity;
 }
 
-static void ApplyRuntimeSwimmingSurfaceConstraint(
+static void ApplySwimmingSurfaceConstraint(
     UCharacterMovementComponent* Movement,
     FVector& InOutCurrentSpeed,
     const float DeltaTime,
@@ -480,7 +480,7 @@ static void ApplyRuntimeSwimmingSurfaceConstraint(
     Movement->Velocity = Velocity;
 }
 
-static FString GetRuntimeCharacterNormalizedBoneName(const FName BoneName)
+static FString GetCharacterNormalizedBoneName(const FName BoneName)
 {
     FString BoneString = BoneName.ToString().ToLower();
     BoneString.ReplaceInline(TEXT("_"), TEXT(""));
@@ -491,7 +491,7 @@ static FString GetRuntimeCharacterNormalizedBoneName(const FName BoneName)
     return BoneString;
 }
 
-static bool RuntimeCharacterBoneStringContainsAny(const FString& BoneString, const TCHAR* const* Tokens, const int32 TokenCount)
+static bool CharacterBoneStringContainsAny(const FString& BoneString, const TCHAR* const* Tokens, const int32 TokenCount)
 {
     for (int32 TokenIndex = 0; TokenIndex < TokenCount; ++TokenIndex)
     {
@@ -503,7 +503,7 @@ static bool RuntimeCharacterBoneStringContainsAny(const FString& BoneString, con
     return false;
 }
 
-static bool IsRuntimeRagdollCosmeticOrHelperBoneName(const FString& BoneString)
+static bool IsRagdollCosmeticOrHelperBoneName(const FString& BoneString)
 {
     static const TCHAR* IgnoredTokens[] = {
         TEXT("hair"),
@@ -519,10 +519,10 @@ static bool IsRuntimeRagdollCosmeticOrHelperBoneName(const FString& BoneString)
         TEXT("weapon")
     };
 
-    return RuntimeCharacterBoneStringContainsAny(BoneString, IgnoredTokens, UE_ARRAY_COUNT(IgnoredTokens));
+    return CharacterBoneStringContainsAny(BoneString, IgnoredTokens, UE_ARRAY_COUNT(IgnoredTokens));
 }
 
-static bool IsRuntimeRagdollLimbBoneName(const FString& BoneString)
+static bool IsRagdollLimbBoneName(const FString& BoneString)
 {
     static const TCHAR* LimbTokens[] = {
         TEXT("clavicle"),
@@ -554,37 +554,37 @@ static bool IsRuntimeRagdollLimbBoneName(const FString& BoneString)
         TEXT("ball")
     };
 
-    return RuntimeCharacterBoneStringContainsAny(BoneString, LimbTokens, UE_ARRAY_COUNT(LimbTokens));
+    return CharacterBoneStringContainsAny(BoneString, LimbTokens, UE_ARRAY_COUNT(LimbTokens));
 }
 
-static bool IsRuntimeRagdollReleaseIgnoredBone(const FName BoneName)
+static bool IsRagdollReleaseIgnoredBone(const FName BoneName)
 {
-    const FString BoneString = GetRuntimeCharacterNormalizedBoneName(BoneName);
-    return IsRuntimeRagdollCosmeticOrHelperBoneName(BoneString) || IsRuntimeRagdollLimbBoneName(BoneString);
+    const FString BoneString = GetCharacterNormalizedBoneName(BoneName);
+    return IsRagdollCosmeticOrHelperBoneName(BoneString) || IsRagdollLimbBoneName(BoneString);
 }
 
-static bool IsRuntimeRagdollWaterProbeBone(const FName BoneName)
+static bool IsRagdollWaterProbeBone(const FName BoneName)
 {
-    return !IsRuntimeRagdollCosmeticOrHelperBoneName(GetRuntimeCharacterNormalizedBoneName(BoneName));
+    return !IsRagdollCosmeticOrHelperBoneName(GetCharacterNormalizedBoneName(BoneName));
 }
 
-static bool IsRuntimeRagdollPrimaryReleaseBone(const FName BoneName)
+static bool IsRagdollPrimaryReleaseBone(const FName BoneName)
 {
-    const FString BoneString = GetRuntimeCharacterNormalizedBoneName(BoneName);
+    const FString BoneString = GetCharacterNormalizedBoneName(BoneName);
     return BoneString == TEXT("root")
         || BoneString.Contains(TEXT("hips"))
         || BoneString.Contains(TEXT("pelvis"));
 }
 
-static bool IsRuntimeRagdollCoreReleaseBone(const FName BoneName)
+static bool IsRagdollCoreReleaseBone(const FName BoneName)
 {
-    if (IsRuntimeRagdollReleaseIgnoredBone(BoneName))
+    if (IsRagdollReleaseIgnoredBone(BoneName))
     {
         return false;
     }
 
-    const FString BoneString = GetRuntimeCharacterNormalizedBoneName(BoneName);
-    return IsRuntimeRagdollPrimaryReleaseBone(BoneName)
+    const FString BoneString = GetCharacterNormalizedBoneName(BoneName);
+    return IsRagdollPrimaryReleaseBone(BoneName)
         || BoneString.Contains(TEXT("spine"))
         || BoneString.Contains(TEXT("chest"))
         || BoneString.Contains(TEXT("torso"))
@@ -593,7 +593,7 @@ static bool IsRuntimeRagdollCoreReleaseBone(const FName BoneName)
         || BoneString.Contains(TEXT("head"));
 }
 
-static FORCEINLINE bool IsRuntimeRagdollPreferredProbeBone(const FName BoneName)
+static FORCEINLINE bool IsRagdollPreferredProbeBone(const FName BoneName)
 {
     return BoneName == FName(BONE_HIPS)
         || BoneName == FName(BONE_NECK)
@@ -604,14 +604,14 @@ static FORCEINLINE bool IsRuntimeRagdollPreferredProbeBone(const FName BoneName)
         || BoneName == FName(BONE_RIGHT_FOOT);
 }
 
-static FORCEINLINE bool IsRuntimeRagdollPreferredCoreProbeBone(const FName BoneName)
+static FORCEINLINE bool IsRagdollPreferredCoreProbeBone(const FName BoneName)
 {
     return BoneName == FName(BONE_HIPS)
         || BoneName == FName(BONE_NECK)
         || BoneName == FName(BONE_HEAD);
 }
 
-static bool IsRuntimeRagdollBodySimulatingForRelease(USkeletalMeshComponent* SkeletalMesh, const FName BoneName)
+static bool IsRagdollBodySimulatingForRelease(USkeletalMeshComponent* SkeletalMesh, const FName BoneName)
 {
     if (!IsValid(SkeletalMesh) || BoneName == NAME_None)
     {
@@ -622,10 +622,10 @@ static bool IsRuntimeRagdollBodySimulatingForRelease(USkeletalMeshComponent* Ske
     return BodyInstance != nullptr && BodyInstance->IsInstanceSimulatingPhysics();
 }
 
-static bool AddRuntimeRagdollProbeLocation(
+static bool AddRagdollProbeLocation(
     const USkeletalMeshComponent* SkeletalMesh,
     const FName BoneName,
-    FRuntimeRagdollProbeLocationArray& OutLocations,
+    FRagdollProbeLocationArray& OutLocations,
     const bool bRequireSimulatingBody)
 {
     if (!IsValid(SkeletalMesh) || BoneName == NAME_None || SkeletalMesh->GetBoneIndex(BoneName) == INDEX_NONE)
@@ -633,7 +633,7 @@ static bool AddRuntimeRagdollProbeLocation(
         return false;
     }
 
-    if (bRequireSimulatingBody && !IsRuntimeRagdollBodySimulatingForRelease(const_cast<USkeletalMeshComponent*>(SkeletalMesh), BoneName))
+    if (bRequireSimulatingBody && !IsRagdollBodySimulatingForRelease(const_cast<USkeletalMeshComponent*>(SkeletalMesh), BoneName))
     {
         return false;
     }
@@ -648,9 +648,9 @@ static bool AddRuntimeRagdollProbeLocation(
     return true;
 }
 
-static void GatherRuntimeRagdollProbeLocations(
+static void GatherRagdollProbeLocations(
     const USkeletalMeshComponent* SkeletalMesh,
-    FRuntimeRagdollProbeLocationArray& OutLocations,
+    FRagdollProbeLocationArray& OutLocations,
     const bool bPreferSimulatingBodies,
     const bool bCoreOnly)
 {
@@ -678,9 +678,9 @@ static void GatherRuntimeRagdollProbeLocations(
     {
         for (const FName BoneName : PreferredBones)
         {
-            if (!bCoreOnly || IsRuntimeRagdollPreferredCoreProbeBone(BoneName))
+            if (!bCoreOnly || IsRagdollPreferredCoreProbeBone(BoneName))
             {
-                AddRuntimeRagdollProbeLocation(SkeletalMesh, BoneName, OutLocations, bRequireSimulatingBody);
+                AddRagdollProbeLocation(SkeletalMesh, BoneName, OutLocations, bRequireSimulatingBody);
             }
         }
     };
@@ -710,24 +710,24 @@ static void GatherRuntimeRagdollProbeLocations(
         for (int32 BoneIndex = 0; BoneIndex < BoneCount; ++BoneIndex)
         {
             const FName BoneName = SkeletalMesh->GetBoneName(BoneIndex);
-            if (IsRuntimeRagdollPreferredProbeBone(BoneName))
+            if (IsRagdollPreferredProbeBone(BoneName))
             {
                 continue;
             }
 
             if (bCoreOnly)
             {
-                if (!IsRuntimeRagdollCoreReleaseBone(BoneName))
+                if (!IsRagdollCoreReleaseBone(BoneName))
                 {
                     continue;
                 }
             }
-            else if (!IsRuntimeRagdollWaterProbeBone(BoneName))
+            else if (!IsRagdollWaterProbeBone(BoneName))
             {
                 continue;
             }
 
-            AddRuntimeRagdollProbeLocation(SkeletalMesh, BoneName, OutLocations, bRequireSimulatingBody);
+            AddRagdollProbeLocation(SkeletalMesh, BoneName, OutLocations, bRequireSimulatingBody);
         }
     };
 
@@ -752,7 +752,7 @@ static void GatherRuntimeRagdollProbeLocations(
 }
 
 template <typename AllocatorType>
-static bool ProbeRuntimeRagdollWaterLevelFromLocations(const UObject* WorldContext, const TArray<FVector, AllocatorType>& ProbeLocations, float& InOutWaterLevel)
+static bool ProbeRagdollWaterLevelFromLocations(const UObject* WorldContext, const TArray<FVector, AllocatorType>& ProbeLocations, float& InOutWaterLevel)
 {
     bool bFoundWater = false;
     float DetectedLevel = InOutWaterLevel;
@@ -775,7 +775,7 @@ static bool ProbeRuntimeRagdollWaterLevelFromLocations(const UObject* WorldConte
 }
 
 template <typename AllocatorType>
-static void UpdateRuntimeRagdollProbeReferenceState(const TArray<FVector, AllocatorType>& ProbeLocations, FCharacterRagdollEnvironmentState& State)
+static void UpdateRagdollProbeReferenceState(const TArray<FVector, AllocatorType>& ProbeLocations, FCharacterRagdollEnvironmentState& State)
 {
     State.RagdollProbeLocationCount = ProbeLocations.Num();
     if (ProbeLocations.Num() == 0)
@@ -807,7 +807,7 @@ static void UpdateRuntimeRagdollProbeReferenceState(const TArray<FVector, Alloca
     State.RagdollHighestLocation = Highest;
 }
 
-struct FRuntimeRagdollSubmersionMetrics
+struct FRagdollSubmersionMetrics
 {
     float MaxDepth = 0.0f;
     float AverageDepth = 0.0f;
@@ -815,9 +815,9 @@ struct FRuntimeRagdollSubmersionMetrics
 };
 
 template <typename AllocatorType>
-static FRuntimeRagdollSubmersionMetrics ComputeRuntimeRagdollSubmersionMetrics(const TArray<FVector, AllocatorType>& ProbeLocations, const float WaterLevel)
+static FRagdollSubmersionMetrics ComputeRagdollSubmersionMetrics(const TArray<FVector, AllocatorType>& ProbeLocations, const float WaterLevel)
 {
-    FRuntimeRagdollSubmersionMetrics Metrics;
+    FRagdollSubmersionMetrics Metrics;
     float SumDepth = 0.0f;
 
     for (const FVector& Location : ProbeLocations)
@@ -841,12 +841,12 @@ static FRuntimeRagdollSubmersionMetrics ComputeRuntimeRagdollSubmersionMetrics(c
     return Metrics;
 }
 
-static FORCEINLINE float GetRuntimeRagdollGroundTraceDistance(const float TraceDistance, const float CapsuleRadius)
+static FORCEINLINE float GetRagdollGroundTraceDistance(const float TraceDistance, const float CapsuleRadius)
 {
     return FMath::Max(TraceDistance, FMath::Max(45.0f, CapsuleRadius * 0.75f + 24.0f));
 }
 
-static FORCEINLINE float GetRuntimeRaisedGroundTraceStartLift(const float CapsuleRadius)
+static FORCEINLINE float GetRaisedGroundTraceStartLift(const float CapsuleRadius)
 {
     // Start ground probes above the sampled point instead of exactly at it.
     // This prevents thin platforms from being skipped when the capsule or ragdoll
@@ -854,30 +854,30 @@ static FORCEINLINE float GetRuntimeRaisedGroundTraceStartLift(const float Capsul
     return FMath::Max(24.0f, CapsuleRadius * 0.45f + 8.0f);
 }
 
-static FORCEINLINE FVector GetRuntimeRagdollGroundTraceStart(const FVector& WorldLocation, const float CapsuleRadius)
+static FORCEINLINE FVector GetRagdollGroundTraceStart(const FVector& WorldLocation, const float CapsuleRadius)
 {
-    return WorldLocation + FVector::UpVector * GetRuntimeRaisedGroundTraceStartLift(CapsuleRadius);
+    return WorldLocation + FVector::UpVector * GetRaisedGroundTraceStartLift(CapsuleRadius);
 }
 
-static FORCEINLINE FVector GetRuntimeRagdollGroundTraceEnd(const FVector& WorldLocation, const float TraceDistance)
+static FORCEINLINE FVector GetRagdollGroundTraceEnd(const FVector& WorldLocation, const float TraceDistance)
 {
     return WorldLocation - FVector::UpVector * FMath::Max(1.0f, TraceDistance);
 }
 
-static FORCEINLINE bool IsRuntimeRagdollWalkableGroundHit(const FHitResult& Hit, const UCharacterMovementComponent* Movement)
+static FORCEINLINE bool IsRagdollWalkableGroundHit(const FHitResult& Hit, const UCharacterMovementComponent* Movement)
 {
     const float WalkableZ = IsValid(Movement) ? Movement->GetWalkableFloorZ() : 0.55f;
     return Hit.bBlockingHit && Hit.ImpactNormal.Z >= FMath::Max(0.35f, WalkableZ - 0.05f);
 }
 
-static bool IsRuntimeIgnoredWaterTraceHit(const FHitResult& Hit)
+static bool IsIgnoredWaterTraceHit(const FHitResult& Hit)
 {
     // Water is a state trigger, not walkable support. Skip it while searching for
     // dry collision that can block water entry or finish ragdoll recovery on land.
     return Cast<AWaterActor>(Hit.GetActor()) != nullptr;
 }
 
-static void AddRuntimeCharacterSelfIgnore(
+static void AddCharacterSelfIgnore(
     FCollisionQueryParams& QueryParams,
     const ACharacterController* Character,
     const USkeletalMeshComponent* MeshComponent)
@@ -898,7 +898,7 @@ static void AddRuntimeCharacterSelfIgnore(
     }
 }
 
-static bool TraceRuntimeWalkableGroundByChannel(
+static bool TraceWalkableGroundByChannel(
     UWorld* World,
     const FVector& Start,
     const FVector& End,
@@ -919,7 +919,7 @@ static bool TraceRuntimeWalkableGroundByChannel(
 
     for (const FHitResult& Hit : Hits)
     {
-        if (IsRuntimeIgnoredWaterTraceHit(Hit) || !IsRuntimeRagdollWalkableGroundHit(Hit, Movement))
+        if (IsIgnoredWaterTraceHit(Hit) || !IsRagdollWalkableGroundHit(Hit, Movement))
         {
             continue;
         }
@@ -959,7 +959,7 @@ void UCharacterComponent::BeginPlay()
         SpringArm = OwnerCharacter->GetSpringArm();
 
         // Do not sample BONE_HEAD, write WaterReferenceOffsetFromCapsule, or
-        // commit a capsule fallback in BeginPlay. Runtime glTF meshes are assigned
+        // commit a capsule fallback in BeginPlay. Dynamically loaded glTF meshes are assigned
         // asynchronously, so the waterline reference must be resolved only from the
         // mesh-load completion path.
     }
@@ -1054,7 +1054,7 @@ void UCharacterComponent::RefreshWaterReferenceOffsetFromHead()
             // Keep the BONE_HEAD source, but clamp impossible capsule-local height.
             // This prevents the cached surface reference from sitting well above
             // the visible character while still preserving valid low head bones.
-            WaterReferenceOffsetFromCapsule = SanitizeRuntimeWaterReferenceOffset(CandidateOffset, HalfHeight, Radius, false);
+            WaterReferenceOffsetFromCapsule = SanitizeWaterReferenceOffset(CandidateOffset, HalfHeight, Radius, false);
             WaterOffset = FMath::Max(1.0f, WaterReferenceOffsetFromCapsule.Z);
             bHasWaterReferenceOffsetFromCapsule = true;
         }
@@ -1065,8 +1065,8 @@ void UCharacterComponent::RefreshWaterReferenceOffsetFromHead()
         // Loaded non-humanoid or incomplete rigs still get a deterministic
         // upper-capsule reference. This fallback is allowed only after mesh-load
         // completion so BeginPlay can never lock in a default/fallback height.
-        FVector FallbackOffset(0.0f, 0.0f, FMath::Max(1.0f, HalfHeight * RuntimeCharacterWater::FallbackHeadOffsetHalfHeightRatio));
-        WaterReferenceOffsetFromCapsule = SanitizeRuntimeWaterReferenceOffset(FallbackOffset, HalfHeight, Radius, true);
+        FVector FallbackOffset(0.0f, 0.0f, FMath::Max(1.0f, HalfHeight * CharacterWaterTuning::FallbackHeadOffsetHalfHeightRatio));
+        WaterReferenceOffsetFromCapsule = SanitizeWaterReferenceOffset(FallbackOffset, HalfHeight, Radius, true);
         WaterOffset = FMath::Max(1.0f, WaterReferenceOffsetFromCapsule.Z);
         bHasWaterReferenceOffsetFromCapsule = true;
     }
@@ -1123,7 +1123,7 @@ void UCharacterComponent::UpdateComponent(float DeltaTime, const FVector &MoveIn
             bRagdollRecoveryWantsSwimming = true;
         }
 
-        StopRuntimeMovementAndSetMode(Movement, MOVE_Swimming);
+        StopMovementAndSetMode(Movement, MOVE_Swimming);
 
         UpdateRagdoll(DeltaTime, OwnerCharacter, MeshComp);
         return;
@@ -1136,7 +1136,7 @@ void UCharacterComponent::UpdateComponent(float DeltaTime, const FVector &MoveIn
         ClearRagdollWaterIntent();
         if (Movement->MovementMode == MOVE_Swimming)
         {
-            StopRuntimeMovementAndDisable(Movement);
+            StopMovementAndDisable(Movement);
         }
     }
     else
@@ -1159,22 +1159,22 @@ void UCharacterComponent::UpdateComponent(float DeltaTime, const FVector &MoveIn
 
     Movement->bOrientRotationToMovement = (MoveInput.X != 0.0f || MoveInput.Y != 0.0f) && !bIsFalling;
 
-    const float BaseTime = DeltaTime * RuntimeCharacterMovement::BaseAccelerationTimeScale;
+    const float BaseTime = DeltaTime * CharacterMovementTuning::BaseAccelerationTimeScale;
 
     // 2. Flying mode.
     if (Movement->IsFlying())
     {
         bSwimmingSurfaceCeilingLocked = false;
 
-        RagdollResistance = RuntimeCharacterMovement::FlyingRagdollResistance;
+        RagdollResistance = CharacterMovementTuning::FlyingRagdollResistance;
         CurrentSpeed.X = CalculateAcceleration(CurrentSpeed.X, MoveInput.X, BaseTime);
         CurrentSpeed.Y = CalculateAcceleration(CurrentSpeed.Y, MoveInput.Y, BaseTime);
         CurrentSpeed.Z = CalculateAcceleration(CurrentSpeed.Z, MoveInput.Z, BaseTime);
 
-        Movement->MaxAcceleration = RuntimeCharacterMovement::FlyingMaxAcceleration;
+        Movement->MaxAcceleration = CharacterMovementTuning::FlyingMaxAcceleration;
         Movement->MaxFlySpeed = UCharacterFunctionLibrary::IsStateActive(CharacterState, STATE_SPRINT)
-            ? RuntimeCharacterMovement::FlyingSprintMaxSpeed
-            : RuntimeCharacterMovement::FlyingMaxSpeed;
+            ? CharacterMovementTuning::FlyingSprintMaxSpeed
+            : CharacterMovementTuning::FlyingMaxSpeed;
 
         ApplyMoveRightForward(OwnerCharacter, ControlRot, CurrentSpeed);
         OwnerCharacter->AddMovementInput(FVector::UpVector, CurrentSpeed.Z);
@@ -1182,7 +1182,7 @@ void UCharacterComponent::UpdateComponent(float DeltaTime, const FVector &MoveIn
     // 3. Swimming and ground movement modes.
     else
     {
-        RagdollResistance = RuntimeCharacterMovement::GroundWaterRagdollResistance;
+        RagdollResistance = CharacterMovementTuning::GroundWaterRagdollResistance;
         const float DirectWaterReferenceDepth = GetDirectWaterImmersionDepth(EffectiveWaterLevel);
         const float SurfaceLimitDepth = DirectWaterReferenceDepth;
         const float CapsuleImmersionDepth = GetDirectWaterCapsuleImmersionDepth(EffectiveWaterLevel);
@@ -1208,12 +1208,12 @@ void UCharacterComponent::UpdateComponent(float DeltaTime, const FVector &MoveIn
         const bool bGroundSupportShouldStayDry = bIsGrounded
             && IsGroundSupportBlockingDirectWater(EffectiveWaterLevel, DirectWaterReferenceDepth, bAlreadySwimming);
         const float SlopeExitSurfaceBypassMargin = FMath::Max(
-            RuntimeCharacterWater::SlopeExitSurfaceBypassMinMarginCm,
-            Radius * RuntimeCharacterWater::SlopeExitSurfaceBypassMarginRadiusRatio);
+            CharacterWaterTuning::SlopeExitSurfaceBypassMinMarginCm,
+            Radius * CharacterWaterTuning::SlopeExitSurfaceBypassMarginRadiusRatio);
         const bool bGroundedOnShoreExitSlope = bAlreadySwimming
             && bIsContactGround
-            && GroundNormal.Z >= RuntimeCharacterWater::SlopeExitNormalZMin
-            && GroundNormal.Z <= RuntimeCharacterWater::SlopeExitNormalZMax
+            && GroundNormal.Z >= CharacterWaterTuning::SlopeExitNormalZMin
+            && GroundNormal.Z <= CharacterWaterTuning::SlopeExitNormalZMax
             && HitResult.ImpactPoint.Z >= EffectiveWaterLevel - SlopeExitSurfaceBypassMargin;
         const bool bCanEnterFromGroundAtVisibleHeadLine = bReferenceReachedSwimLine && bCapsuleAtLeastHalfSubmerged;
         const bool bCheckSwimming = bEffectiveInWaterState
@@ -1233,23 +1233,23 @@ void UCharacterComponent::UpdateComponent(float DeltaTime, const FVector &MoveIn
             // Use moderate resistance for normal swimming.  Surface clamping handles
             // the waterline; underwater control should stay responsive and should not
             // inherit the heavy anti-pop damping used near the ceiling.
-            const float LinearResistance = RuntimeCharacterMovement::SwimmingLinearResistance;
-            const float QuadraticResistance = RuntimeCharacterMovement::SwimmingQuadraticResistanceScale * VelocitySize * VelocitySize;
+            const float LinearResistance = CharacterMovementTuning::SwimmingLinearResistance;
+            const float QuadraticResistance = CharacterMovementTuning::SwimmingQuadraticResistanceScale * VelocitySize * VelocitySize;
             const float Braking = FMath::Clamp(
                 LinearResistance * VelocitySize + QuadraticResistance + FMath::Sqrt(FMath::Max(0.0f, QuadraticResistance)),
-                RuntimeCharacterMovement::SwimmingMinBrakingDeceleration,
-                RuntimeCharacterMovement::SwimmingMaxBrakingDeceleration);
+                CharacterMovementTuning::SwimmingMinBrakingDeceleration,
+                CharacterMovementTuning::SwimmingMaxBrakingDeceleration);
 
             Movement->BrakingDecelerationSwimming = Braking;
-            Movement->MaxAcceleration = RuntimeCharacterMovement::SwimmingMaxAcceleration;
+            Movement->MaxAcceleration = CharacterMovementTuning::SwimmingMaxAcceleration;
             Movement->MaxSwimSpeed = bIsSprint
-                ? RuntimeCharacterMovement::SwimmingSprintMaxSpeed
-                : RuntimeCharacterMovement::SwimmingMaxSpeed;
+                ? CharacterMovementTuning::SwimmingSprintMaxSpeed
+                : CharacterMovementTuning::SwimmingMaxSpeed;
 
             FVector SwimMoveInput = MoveInput;
-            const bool bWantsUpAtSurface = SwimMoveInput.Z > RuntimeCharacterMovement::SwimmingInputDeadZone;
-            const bool bWantsDownAtSurface = SwimMoveInput.Z < -RuntimeCharacterMovement::SwimmingInputDeadZone;
-            const bool bLatchedAtSurfaceCeiling = UpdateRuntimeSwimmingSurfaceCeilingLock(
+            const bool bWantsUpAtSurface = SwimMoveInput.Z > CharacterMovementTuning::SwimmingInputDeadZone;
+            const bool bWantsDownAtSurface = SwimMoveInput.Z < -CharacterMovementTuning::SwimmingInputDeadZone;
+            const bool bLatchedAtSurfaceCeiling = UpdateSwimmingSurfaceCeilingLock(
                 SurfaceLimitDepth,
                 SurfaceCeilingDepth,
                 SwimExitDepth,
@@ -1270,7 +1270,7 @@ void UCharacterComponent::UpdateComponent(float DeltaTime, const FVector &MoveIn
                 && (bLatchedAtSurfaceCeiling || bAtVisibleSurfaceCeiling);
             if (!bGroundedOnShoreExitSlope)
             {
-                ApplyRuntimeSwimmingSurfaceRiseAssist(Movement, DeltaTime, SurfaceLimitDepth, SurfaceCeilingDepth, bWantsUpAtSurface, bWantsDownAtSurface);
+                ApplySwimmingSurfaceRiseAssist(Movement, DeltaTime, SurfaceLimitDepth, SurfaceCeilingDepth, bWantsUpAtSurface, bWantsDownAtSurface);
             }
             if (bAtVisibleSurfaceCeiling)
             {
@@ -1280,25 +1280,25 @@ void UCharacterComponent::UpdateComponent(float DeltaTime, const FVector &MoveIn
                 CurrentSpeed.Z = bWantsDownAtSurface ? FMath::Min(CurrentSpeed.Z, 0.0f) : 0.0f;
             }
 
-            const float SwimAccelTime = BaseTime * RuntimeCharacterMovement::SwimmingAccelerationTimeScale;
-            const float SwimBrakeTime = BaseTime * RuntimeCharacterMovement::SwimmingBrakeTimeScale;
-            CurrentSpeed.X = CalculateAcceleration(CurrentSpeed.X, SwimMoveInput.X, FMath::IsNearlyZero(SwimMoveInput.X, RuntimeCharacterMovement::SwimmingInputDeadZone) ? SwimBrakeTime : SwimAccelTime);
-            CurrentSpeed.Y = CalculateAcceleration(CurrentSpeed.Y, SwimMoveInput.Y, FMath::IsNearlyZero(SwimMoveInput.Y, RuntimeCharacterMovement::SwimmingInputDeadZone) ? SwimBrakeTime : SwimAccelTime);
-            CurrentSpeed.Z = CalculateAcceleration(CurrentSpeed.Z, SwimMoveInput.Z, FMath::IsNearlyZero(SwimMoveInput.Z, RuntimeCharacterMovement::SwimmingInputDeadZone) ? SwimBrakeTime : SwimAccelTime);
+            const float SwimAccelTime = BaseTime * CharacterMovementTuning::SwimmingAccelerationTimeScale;
+            const float SwimBrakeTime = BaseTime * CharacterMovementTuning::SwimmingBrakeTimeScale;
+            CurrentSpeed.X = CalculateAcceleration(CurrentSpeed.X, SwimMoveInput.X, FMath::IsNearlyZero(SwimMoveInput.X, CharacterMovementTuning::SwimmingInputDeadZone) ? SwimBrakeTime : SwimAccelTime);
+            CurrentSpeed.Y = CalculateAcceleration(CurrentSpeed.Y, SwimMoveInput.Y, FMath::IsNearlyZero(SwimMoveInput.Y, CharacterMovementTuning::SwimmingInputDeadZone) ? SwimBrakeTime : SwimAccelTime);
+            CurrentSpeed.Z = CalculateAcceleration(CurrentSpeed.Z, SwimMoveInput.Z, FMath::IsNearlyZero(SwimMoveInput.Z, CharacterMovementTuning::SwimmingInputDeadZone) ? SwimBrakeTime : SwimAccelTime);
 
             if (!bGroundedOnShoreExitSlope)
             {
-                ApplyRuntimeSwimmingSurfaceConstraint(Movement, CurrentSpeed, DeltaTime, SurfaceLimitDepth, SurfaceCeilingDepth, SwimSurfaceLockDepth, bSurfaceAssistActive);
+                ApplySwimmingSurfaceConstraint(Movement, CurrentSpeed, DeltaTime, SurfaceLimitDepth, SurfaceCeilingDepth, SwimSurfaceLockDepth, bSurfaceAssistActive);
             }
 
             const float CharacterHeight = FMath::Max(1.0f, HalfHeight * 2.0f);
             const float CharacterSubmergedAlpha = FMath::Clamp(CapsuleImmersionDepth / CharacterHeight, 0.0f, 1.0f);
-            const float SurfacePlaneAlpha = ComputeRuntimeSwimmingSurfacePlaneAlpha(SurfaceLimitDepth, SwimSurfaceLockDepth);
+            const float SurfacePlaneAlpha = ComputeSwimmingSurfacePlaneAlpha(SurfaceLimitDepth, SwimSurfaceLockDepth);
             const float ForwardSurfacePlaneAlpha = bIsSprint ? SurfacePlaneAlpha : 1.0f;
-            ApplyRuntimeSwimmingVelocityDamping(Movement, SwimMoveInput, ControlRot, DeltaTime, CharacterSubmergedAlpha, ForwardSurfacePlaneAlpha, bAtVisibleSurfaceCeiling);
+            ApplySwimmingVelocityDamping(Movement, SwimMoveInput, ControlRot, DeltaTime, CharacterSubmergedAlpha, ForwardSurfacePlaneAlpha, bAtVisibleSurfaceCeiling);
 
-            const FVector SwimForward = MakeRuntimeSwimmingForwardVector(ControlRot, ForwardSurfacePlaneAlpha);
-            OwnerCharacter->AddMovementInput(MakeRuntimeRightVectorFromYaw(ControlRot.Yaw), CurrentSpeed.X);
+            const FVector SwimForward = MakeSwimmingForwardVector(ControlRot, ForwardSurfacePlaneAlpha);
+            OwnerCharacter->AddMovementInput(MakeRightVectorFromYaw(ControlRot.Yaw), CurrentSpeed.X);
             OwnerCharacter->AddMovementInput(SwimForward, CurrentSpeed.Y);
 
             if (CurrentSpeed.Z < 0.0f || !bAtVisibleSurfaceCeiling)
@@ -1323,7 +1323,7 @@ void UCharacterComponent::UpdateComponent(float DeltaTime, const FVector &MoveIn
 
             if (!bIsGrounded)
             {
-                Movement->MaxWalkSpeed = RuntimeCharacterMovement::DryAirborneWalkSpeed;
+                Movement->MaxWalkSpeed = CharacterMovementTuning::DryAirborneWalkSpeed;
                 if (!bIsJumping)
                 {
                     CurrentSpeed.X = 0.0f;
@@ -1333,8 +1333,8 @@ void UCharacterComponent::UpdateComponent(float DeltaTime, const FVector &MoveIn
             else
             {
                 float TargetMaxSpeed = bIsSprint
-                    ? RuntimeCharacterMovement::GroundSprintSpeed
-                    : RuntimeCharacterMovement::GroundWalkSpeed;
+                    ? CharacterMovementTuning::GroundSprintSpeed
+                    : CharacterMovementTuning::GroundWalkSpeed;
                 TargetMaxSpeed *= GetGroundedWaterWalkSpeedMultiplier(EffectiveWaterLevel);
                 Movement->MaxWalkSpeed = ClampGroundSpeed(TargetMaxSpeed, GroundNormal.Z, Movement->GetWalkableFloorZ());
             }
@@ -1469,7 +1469,7 @@ void UCharacterComponent::ClearRagdollSwimmingRecoveryLock(bool bKeepCurrentWate
 
 bool UCharacterComponent::TryGetHeadWaterReferenceLocation(FVector& OutLocation) const
 {
-    return TryGetRuntimeSkeletalReferenceLocation(MeshComp.Get(), FName(BONE_HEAD), OutLocation);
+    return TryGetSkeletalReferenceLocation(MeshComp.Get(), FName(BONE_HEAD), OutLocation);
 }
 
 float UCharacterComponent::GetDirectWaterCapsuleImmersionDepth(float InWaterLevel) const
@@ -1482,7 +1482,7 @@ float UCharacterComponent::GetDirectWaterCapsuleImmersionDepth(float InWaterLeve
     const float CapsuleHalfHeight = HalfHeight > KINDA_SMALL_NUMBER
         ? HalfHeight
         : (OwnerCharacter->GetCapsuleComponent() ? OwnerCharacter->GetCapsuleComponent()->GetScaledCapsuleHalfHeight() : 0.0f);
-    return ComputeRuntimeCapsuleWaterImmersionDepth(OwnerCharacter->GetActorLocation(), CapsuleHalfHeight, InWaterLevel);
+    return ComputeCapsuleWaterImmersionDepth(OwnerCharacter->GetActorLocation(), CapsuleHalfHeight, InWaterLevel);
 }
 
 float UCharacterComponent::GetStableHeadEmergenceHeight() const
@@ -1498,10 +1498,10 @@ float UCharacterComponent::GetStableHeadEmergenceHeight() const
     // The ceiling is measured from the stable BONE_HEAD reference. The target is
     // deliberately a visible-head line: the body can swim while the head remains
     // above the surface instead of forcing the reference point underwater first.
-    const float RequestedClearance = RadiusReference * RuntimeCharacterWater::HeadSurfaceClearanceRadiusRatio;
+    const float RequestedClearance = RadiusReference * CharacterWaterTuning::HeadSurfaceClearanceRadiusRatio;
     const float NativeMinimumClearance = FMath::Max(
-        RuntimeCharacterWater::HeadSurfaceClearanceMinCm,
-        RadiusReference * RuntimeCharacterWater::HeadSurfaceClearanceRadiusRatio);
+        CharacterWaterTuning::HeadSurfaceClearanceMinCm,
+        RadiusReference * CharacterWaterTuning::HeadSurfaceClearanceRadiusRatio);
     const float MaxClearance = FMath::Max(0.0f, WaterReferenceOffsetFromCapsule.Z - 1.0f);
     return FMath::Clamp(FMath::Max(RequestedClearance, NativeMinimumClearance), 0.0f, MaxClearance);
 }
@@ -1531,8 +1531,8 @@ bool UCharacterComponent::IsCapsuleAtLeastHalfSubmerged(float InWaterLevel) cons
     }
 
     const float CapsuleHeight = FMath::Max(1.0f, CapsuleHalfHeight * 2.0f);
-    const float RequiredImmersionDepth = CapsuleHeight * RuntimeCharacterWater::CapsuleSwimLockSubmergedRatio;
-    const float StableRequiredDepth = FMath::Max(1.0f, RequiredImmersionDepth - RuntimeCharacterWater::CapsuleSwimLockHysteresisCm);
+    const float RequiredImmersionDepth = CapsuleHeight * CharacterWaterTuning::CapsuleSwimLockSubmergedRatio;
+    const float StableRequiredDepth = FMath::Max(1.0f, RequiredImmersionDepth - CharacterWaterTuning::CapsuleSwimLockHysteresisCm);
     return GetDirectWaterCapsuleImmersionDepth(InWaterLevel) >= StableRequiredDepth;
 }
 
@@ -1541,7 +1541,7 @@ bool UCharacterComponent::HasStableHeadReachedShoreExitLine(float DirectImmersio
     // The player may step out only after the surface servo has visibly raised the
     // head reference above water.  This prevents fully submerged floor contact
     // from turning into Walking, while still allowing a real shoreline exit.
-    const float RequiredEmergence = FMath::Max(2.0f, GetStableHeadEmergenceHeight() * RuntimeCharacterWater::ShoreExitHeadClearanceRatio);
+    const float RequiredEmergence = FMath::Max(2.0f, GetStableHeadEmergenceHeight() * CharacterWaterTuning::ShoreExitHeadClearanceRatio);
     return DirectImmersionDepth <= -RequiredEmergence;
 }
 
@@ -1565,7 +1565,7 @@ float UCharacterComponent::GetGroundedWaterSwimOverrideDepth() const
     // Ground support wins for shallow water, so a shoreline or thin floor cannot trap
     // the character in Swimming. The half-capsule submerged rule bypasses this gate;
     // below that, require a strong direct-reference signal before ground can be ignored.
-    return FMath::Max(EnterDepth, RadiusReference * RuntimeCharacterWater::GroundedSwimOverrideDepthRadiusRatio);
+    return FMath::Max(EnterDepth, RadiusReference * CharacterWaterTuning::GroundedSwimOverrideDepthRadiusRatio);
 }
 
 float UCharacterComponent::GetGroundedWaterWalkSpeedMultiplier(float InWaterLevel) const
@@ -1605,14 +1605,14 @@ float UCharacterComponent::GetGroundedWaterWalkSpeedMultiplier(float InWaterLeve
 
     const float ReferenceHeightFromBottom = FMath::Max(1.0f, ReferenceLocation.Z - BottomLocation.Z);
     const float SubmergedRatio = FMath::Clamp((WalkWaterLevel - BottomLocation.Z) / ReferenceHeightFromBottom, 0.0f, 1.0f);
-    const float StartRatio = RuntimeCharacterWater::WalkWaterSlowStartSubmergedRatio;
-    const float FullRatio = FMath::Max(StartRatio + KINDA_SMALL_NUMBER, RuntimeCharacterWater::WalkWaterSlowFullSubmergedRatio);
+    const float StartRatio = CharacterWaterTuning::WalkWaterSlowStartSubmergedRatio;
+    const float FullRatio = FMath::Max(StartRatio + KINDA_SMALL_NUMBER, CharacterWaterTuning::WalkWaterSlowFullSubmergedRatio);
     const float LinearAlpha = FMath::Clamp((SubmergedRatio - StartRatio) / (FullRatio - StartRatio), 0.0f, 1.0f);
     const float SmoothAlpha = LinearAlpha * LinearAlpha * (3.0f - 2.0f * LinearAlpha);
 
     // Scale only the dry/wading walk speed. Full Swimming still uses the swim
     // movement branch, while shallow shoreline contact remains close to normal speed.
-    return FMath::Lerp(1.0f, RuntimeCharacterWater::WalkWaterMinSpeedMultiplier, SmoothAlpha);
+    return FMath::Lerp(1.0f, CharacterWaterTuning::WalkWaterMinSpeedMultiplier, SmoothAlpha);
 }
 
 bool UCharacterComponent::TraceCharacterWalkableGroundFromAbove(FHitResult& OutHit, float ExtraDownDistance) const
@@ -1639,17 +1639,17 @@ bool UCharacterComponent::TraceCharacterWalkableGroundFromAbove(FHitResult& OutH
         : Capsule->GetScaledCapsuleRadius();
 
     const FVector ActorLocation = OwnerCharacter->GetActorLocation();
-    const float StartLift = GetRuntimeRaisedGroundTraceStartLift(CapsuleRadius);
+    const float StartLift = GetRaisedGroundTraceStartLift(CapsuleRadius);
     const float DefaultBelowCapsuleReach = FMath::Max(10.0f, CapsuleRadius * 0.30f);
     const float DownReach = CapsuleHalfHeight + DefaultBelowCapsuleReach + FMath::Max(0.0f, ExtraDownDistance);
     const FVector Start = ActorLocation + FVector::UpVector * StartLift;
     const FVector End = ActorLocation - FVector::UpVector * DownReach;
 
-    FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(RuntimeCharacterGroundCheck), true, OwnerCharacter);
-    AddRuntimeCharacterSelfIgnore(QueryParams, OwnerCharacter.Get(), MeshComp.Get());
+    FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(CharacterGroundCheck), true, OwnerCharacter);
+    AddCharacterSelfIgnore(QueryParams, OwnerCharacter.Get(), MeshComp.Get());
     QueryParams.bTraceComplex = true;
 
-    return TraceRuntimeWalkableGroundByChannel(World, Start, End, Movement.Get(), QueryParams, &OutHit);
+    return TraceWalkableGroundByChannel(World, Start, End, Movement.Get(), QueryParams, &OutHit);
 }
 
 bool UCharacterComponent::IsCharacterSupportedByWalkableGround(float ExtraDownDistance) const
@@ -1668,8 +1668,8 @@ bool UCharacterComponent::IsGroundSupportBlockingDirectWater(float InWaterLevel,
     }
 
     const float SurfaceBlockMargin = FMath::Max(
-        RuntimeCharacterWater::ShoreExitGroundSurfaceMinMarginCm,
-        Radius * RuntimeCharacterWater::ShoreExitGroundSurfaceMarginRadiusRatio);
+        CharacterWaterTuning::ShoreExitGroundSurfaceMinMarginCm,
+        Radius * CharacterWaterTuning::ShoreExitGroundSurfaceMarginRadiusRatio);
     const bool bWalkableGroundNearSurface = GroundHit.ImpactPoint.Z >= InWaterLevel - SurfaceBlockMargin;
     const bool bCapsuleAtLeastHalfSubmerged = IsCapsuleAtLeastHalfSubmerged(InWaterLevel);
 
@@ -1729,8 +1729,8 @@ bool UCharacterComponent::TryGetWaterReferenceOrCapsuleFallbackLocation(FVector&
 
     // Early ticks may need a water height before the async mesh has finished.
     // This fallback is deliberately temporary and never writes to member state.
-    const FVector FallbackOffset = SanitizeRuntimeWaterReferenceOffset(
-        FVector(0.0f, 0.0f, FMath::Max(1.0f, CapsuleHalfHeight * RuntimeCharacterWater::FallbackHeadOffsetHalfHeightRatio)),
+    const FVector FallbackOffset = SanitizeWaterReferenceOffset(
+        FVector(0.0f, 0.0f, FMath::Max(1.0f, CapsuleHalfHeight * CharacterWaterTuning::FallbackHeadOffsetHalfHeightRatio)),
         CapsuleHalfHeight,
         CapsuleRadius,
         true);
@@ -1777,12 +1777,12 @@ void UCharacterComponent::GetCapsuleSwimmingDepths(float& OutEnterDepth, float& 
     const float MaxCapsuleDepth = FMath::Max(RadiusReference + 1.0f, CapsuleHalfHeight * 2.0f);
 
     OutEnterDepth = FMath::Clamp(
-        RadiusReference * RuntimeCharacterWater::SwimSurfaceCaptureDepthRadiusRatio,
+        RadiusReference * CharacterWaterTuning::SwimSurfaceCaptureDepthRadiusRatio,
         1.0f,
         MaxCapsuleDepth);
 
     OutExitDepth = FMath::Clamp(
-        RadiusReference * RuntimeCharacterWater::SwimExitPaddingRadiusRatio,
+        RadiusReference * CharacterWaterTuning::SwimExitPaddingRadiusRatio,
         0.0f,
         OutEnterDepth);
 
@@ -1791,7 +1791,7 @@ void UCharacterComponent::GetCapsuleSwimmingDepths(float& OutEnterDepth, float& 
     // the ceiling correction to pull them back instead of popping out.
     OutSurfaceLockDepth = FMath::Min(
         MaxCapsuleDepth,
-        FMath::Max(OutEnterDepth + 1.0f, RadiusReference * RuntimeCharacterWater::SurfaceLockDepthRadiusRatio));
+        FMath::Max(OutEnterDepth + 1.0f, RadiusReference * CharacterWaterTuning::SurfaceLockDepthRadiusRatio));
 }
 
 bool UCharacterComponent::ShouldUseDirectWaterState(float InWaterLevel, bool bCurrentlySwimming) const
@@ -1864,7 +1864,7 @@ bool UCharacterComponent::RefreshRagdollWaterDetection(float* OutDetectedWaterLe
 
     if (IsValid(Movement))
     {
-        StopRuntimeMovementAndSetMode(Movement, MOVE_Swimming);
+        StopMovementAndSetMode(Movement, MOVE_Swimming);
     }
 
     return true;
@@ -1955,43 +1955,43 @@ FCharacterRagdollEnvironmentState UCharacterComponent::UpdateRagdollEnvironmentS
         return StoreAndReturn(State);
     }
 
-    FRuntimeRagdollProbeLocationArray RagdollProbeLocations;
-    GatherRuntimeRagdollProbeLocations(MeshComp, RagdollProbeLocations, true, false);
-    UpdateRuntimeRagdollProbeReferenceState(RagdollProbeLocations, State);
+    FRagdollProbeLocationArray RagdollProbeLocations;
+    GatherRagdollProbeLocations(MeshComp, RagdollProbeLocations, true, false);
+    UpdateRagdollProbeReferenceState(RagdollProbeLocations, State);
 
-    FRuntimeRagdollProbeLocationArray CoreRagdollProbeLocations;
-    GatherRuntimeRagdollProbeLocations(MeshComp, CoreRagdollProbeLocations, true, true);
+    FRagdollProbeLocationArray CoreRagdollProbeLocations;
+    GatherRagdollProbeLocations(MeshComp, CoreRagdollProbeLocations, true, true);
 
     // The all-body list already contains the preferred core probes, so one filtered water scan is enough.
-    State.bIsInWater = ProbeRuntimeRagdollWaterLevelFromLocations(this, RagdollProbeLocations, State.WaterLevel);
+    State.bIsInWater = ProbeRagdollWaterLevelFromLocations(this, RagdollProbeLocations, State.WaterLevel);
 
     if (!State.bIsInWater && State.RagdollProbeLocationCount > 0)
     {
         // Use the ragdoll pose, not the stale capsule, to emulate the normal character water check.
-        FRuntimeRagdollSmallProbeLocationArray RagdollCharacterProbeLocations;
+        FRagdollSmallProbeLocationArray RagdollCharacterProbeLocations;
         const FVector HipsLocation = UCharacterFunctionLibrary::GetBoneLocation(*MeshComp, BONE_HIPS);
         const FVector RagdollActorLocation = GetRagdollRecoveryActorLocationFromHips(HipsLocation, false);
         RagdollCharacterProbeLocations.Add(RagdollActorLocation);
         RagdollCharacterProbeLocations.Add(RagdollActorLocation - FVector::UpVector * FMath::Max(1.0f, HalfHeight));
         RagdollCharacterProbeLocations.Add(State.RagdollReferenceLocation);
-        State.bIsInWater = ProbeRuntimeRagdollWaterLevelFromLocations(this, RagdollCharacterProbeLocations, State.WaterLevel);
+        State.bIsInWater = ProbeRagdollWaterLevelFromLocations(this, RagdollCharacterProbeLocations, State.WaterLevel);
     }
 
-    const FRuntimeRagdollSubmersionMetrics AllSubmersion = State.bIsInWater
-        ? ComputeRuntimeRagdollSubmersionMetrics(RagdollProbeLocations, State.WaterLevel)
-        : FRuntimeRagdollSubmersionMetrics();
-    const FRuntimeRagdollSubmersionMetrics CoreSubmersion = State.bIsInWater
-        ? ComputeRuntimeRagdollSubmersionMetrics(CoreRagdollProbeLocations, State.WaterLevel)
-        : FRuntimeRagdollSubmersionMetrics();
+    const FRagdollSubmersionMetrics AllSubmersion = State.bIsInWater
+        ? ComputeRagdollSubmersionMetrics(RagdollProbeLocations, State.WaterLevel)
+        : FRagdollSubmersionMetrics();
+    const FRagdollSubmersionMetrics CoreSubmersion = State.bIsInWater
+        ? ComputeRagdollSubmersionMetrics(CoreRagdollProbeLocations, State.WaterLevel)
+        : FRagdollSubmersionMetrics();
 
     State.RagdollMaxSubmersionDepth = FMath::Max(AllSubmersion.MaxDepth, CoreSubmersion.MaxDepth);
     State.RagdollAverageSubmersionDepth = CoreSubmersion.SubmergedCount > 0 ? CoreSubmersion.AverageDepth : AllSubmersion.AverageDepth;
     State.RagdollSubmergedProbeCount = AllSubmersion.SubmergedCount;
 
-    const float CoreDepthThreshold = FMath::Max(0.0f, RuntimeCharacterRagdoll::WaterRecoveryCoreDepth);
-    const float AverageDepthThreshold = FMath::Max(0.0f, RuntimeCharacterRagdoll::WaterRecoveryAverageDepth);
-    const float ReleaseHysteresisDepth = FMath::Max(0.0f, RuntimeCharacterRagdoll::WaterReleaseHysteresisDepth);
-    const int32 MinStableCoreProbeCount = FMath::Max(1, RuntimeCharacterRagdoll::WaterReleaseMinCoreProbes);
+    const float CoreDepthThreshold = FMath::Max(0.0f, CharacterRagdollTuning::WaterRecoveryCoreDepth);
+    const float AverageDepthThreshold = FMath::Max(0.0f, CharacterRagdollTuning::WaterRecoveryAverageDepth);
+    const float ReleaseHysteresisDepth = FMath::Max(0.0f, CharacterRagdollTuning::WaterReleaseHysteresisDepth);
+    const int32 MinStableCoreProbeCount = FMath::Max(1, CharacterRagdollTuning::WaterReleaseMinCoreProbes);
 
     const bool bCoreMeaningfullySubmerged = CoreSubmersion.SubmergedCount > 0
         && (CoreSubmersion.MaxDepth >= CoreDepthThreshold
@@ -1999,7 +1999,7 @@ FCharacterRagdollEnvironmentState UCharacterComponent::UpdateRagdollEnvironmentS
             || (CoreSubmersion.SubmergedCount >= MinStableCoreProbeCount && CoreSubmersion.AverageDepth >= FMath::Max(ReleaseHysteresisDepth, AverageDepthThreshold)));
     const int32 MinStableBodyProbeCount = FMath::Max(3, MinStableCoreProbeCount + 1);
     const bool bBodyMeaningfullySubmerged = AllSubmersion.SubmergedCount >= MinStableBodyProbeCount
-        && (AllSubmersion.MaxDepth >= FMath::Max(CoreDepthThreshold, RuntimeCharacterRagdoll::WaterReleaseDepthBelowSurface * 0.50f)
+        && (AllSubmersion.MaxDepth >= FMath::Max(CoreDepthThreshold, CharacterRagdollTuning::WaterReleaseDepthBelowSurface * 0.50f)
             || AllSubmersion.AverageDepth >= AverageDepthThreshold + ReleaseHysteresisDepth);
     const bool bReferenceEvidenceAllowed = CoreSubmersion.SubmergedCount > 0 || AllSubmersion.SubmergedCount >= MinStableBodyProbeCount;
     const bool bReferenceBelowSurface = bReferenceEvidenceAllowed
@@ -2044,7 +2044,7 @@ FCharacterRagdollEnvironmentState UCharacterComponent::UpdateRagdollEnvironmentS
 
     const bool bStableWaterRecoveryEvidence = State.bRagdollMeaningfullySubmerged || bCommittedToWaterRecovery;
     const bool bShallowEnoughForLandRecovery = !State.bRagdollMeaningfullySubmerged
-        && State.RagdollMaxSubmersionDepth <= FMath::Max(0.0f, RuntimeCharacterRagdoll::TreatWaterAsGroundMaxDepth);
+        && State.RagdollMaxSubmersionDepth <= FMath::Max(0.0f, CharacterRagdollTuning::TreatWaterAsGroundMaxDepth);
     const bool bUnstableWaterContact = State.bIsInWater && !bStableWaterRecoveryEvidence;
 
     // This is the anti-flicker rule: a one-frame water contact is treated as land unless the
@@ -2089,7 +2089,7 @@ FVector UCharacterComponent::GetRagdollRecoveryActorLocationFromHips(const FVect
     float ActorZOffsetFromHips = HalfHeight - Radius * 0.33333f;
     if (bWaterRecovery)
     {
-        ActorZOffsetFromHips += RuntimeCharacterRagdoll::WaterRecoveryActorZOffset;
+        ActorZOffsetFromHips += CharacterRagdollTuning::WaterRecoveryActorZOffset;
     }
     return HipsLocation + FVector(0.0f, 0.0f, ActorZOffsetFromHips);
 }
@@ -2132,7 +2132,7 @@ bool UCharacterComponent::ApplyRagdollReleaseEnvironmentStateToOwner(ACharacterC
         bLandRagdollRecoveryOverridesWater = true;
         ClearRagdollWaterIntent();
         InOwner->RefreshWaterStateForRagdollRecovery(false, ReleaseEnvironmentState.WaterLevel);
-        StopRuntimeMovementAndDisable(Movement);
+        StopMovementAndDisable(Movement);
         RagdollEnvironmentState = ReleaseEnvironmentState;
         return false;
     };
@@ -2160,7 +2160,7 @@ bool UCharacterComponent::ApplyRagdollReleaseEnvironmentStateToOwner(ACharacterC
     bRagdollRecoveryWantsSwimming = false;
     RagdollRecoverySwimLockTime = 0.0f;
 
-    StopRuntimeMovementAndSetMode(Movement, MOVE_Swimming);
+    StopMovementAndSetMode(Movement, MOVE_Swimming);
 
     RagdollEnvironmentState = ReleaseEnvironmentState;
     return true;
@@ -2220,7 +2220,7 @@ bool UCharacterComponent::RefreshRagdollWaterStateForAnimation()
         // After recovery, the short swim lock is animation-only and must not fight player input.
         if (IsValid(Movement) && IsRagdollLikeState())
         {
-            StopRuntimeMovementAndSetMode(Movement, MOVE_Swimming);
+            StopMovementAndSetMode(Movement, MOVE_Swimming);
         }
         return true;
     }
@@ -2241,7 +2241,7 @@ void UCharacterComponent::SetRagdollWaterState(bool bInWater, bool bForce)
                 bRagdollRecoveryWantsSwimming = true;
             }
 
-            StopRuntimeMovementAndSetMode(Movement, MOVE_Swimming);
+            StopMovementAndSetMode(Movement, MOVE_Swimming);
         }
         return;
     }
@@ -2292,18 +2292,18 @@ bool UCharacterComponent::IsRagdollTouchingWalkableGround(float TraceDistance, b
         return false;
     }
 
-    FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(RuntimeCharacterRagdollGroundCheck), false, OwnerCharacter);
-    AddRuntimeCharacterSelfIgnore(QueryParams, OwnerCharacter.Get(), MeshComp.Get());
+    FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(CharacterRagdollGroundCheck), false, OwnerCharacter);
+    AddCharacterSelfIgnore(QueryParams, OwnerCharacter.Get(), MeshComp.Get());
 
-    FRuntimeRagdollProbeLocationArray RagdollGroundProbeLocations;
-    GatherRuntimeRagdollProbeLocations(MeshComp, RagdollGroundProbeLocations, true, bCoreOnly);
-    const float BoneTraceDistance = GetRuntimeRagdollGroundTraceDistance(TraceDistance, Radius);
+    FRagdollProbeLocationArray RagdollGroundProbeLocations;
+    GatherRagdollProbeLocations(MeshComp, RagdollGroundProbeLocations, true, bCoreOnly);
+    const float BoneTraceDistance = GetRagdollGroundTraceDistance(TraceDistance, Radius);
 
     for (const FVector& RagdollLocation : RagdollGroundProbeLocations)
     {
-        const FVector TraceStart = GetRuntimeRagdollGroundTraceStart(RagdollLocation, Radius);
-        const FVector TraceEnd = GetRuntimeRagdollGroundTraceEnd(RagdollLocation, BoneTraceDistance);
-        if (TraceRuntimeWalkableGroundByChannel(World, TraceStart, TraceEnd, Movement.Get(), QueryParams))
+        const FVector TraceStart = GetRagdollGroundTraceStart(RagdollLocation, Radius);
+        const FVector TraceEnd = GetRagdollGroundTraceEnd(RagdollLocation, BoneTraceDistance);
+        if (TraceWalkableGroundByChannel(World, TraceStart, TraceEnd, Movement.Get(), QueryParams))
         {
             return true;
         }
@@ -2328,8 +2328,8 @@ void UCharacterComponent::RequestAsyncRagdollReleaseGroundTrace()
 
     MeshComp->UpdateComponentToWorld();
 
-    FRuntimeRagdollProbeLocationArray RagdollGroundProbeLocations;
-    GatherRuntimeRagdollProbeLocations(MeshComp, RagdollGroundProbeLocations, true, false);
+    FRagdollProbeLocationArray RagdollGroundProbeLocations;
+    GatherRagdollProbeLocations(MeshComp, RagdollGroundProbeLocations, true, false);
     if (RagdollGroundProbeLocations.Num() == 0)
     {
         FinishAsyncRagdollReleaseGroundTrace(false);
@@ -2347,10 +2347,10 @@ void UCharacterComponent::RequestAsyncRagdollReleaseGroundTrace()
     bAsyncRagdollReleaseGroundResult = false;
     PendingRagdollReleaseGroundTraceCount = RagdollGroundProbeLocations.Num();
 
-    FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(RuntimeCharacterRagdollAsyncGroundCheck), false, OwnerCharacter);
-    AddRuntimeCharacterSelfIgnore(QueryParams, OwnerCharacter.Get(), MeshComp.Get());
+    FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(CharacterRagdollAsyncGroundCheck), false, OwnerCharacter);
+    AddCharacterSelfIgnore(QueryParams, OwnerCharacter.Get(), MeshComp.Get());
 
-    const float BoneTraceDistance = GetRuntimeRagdollGroundTraceDistance(65.0f, Radius);
+    const float BoneTraceDistance = GetRagdollGroundTraceDistance(65.0f, Radius);
     for (const FVector& RagdollLocation : RagdollGroundProbeLocations)
     {
         FTraceDelegate TraceDelegate;
@@ -2358,8 +2358,8 @@ void UCharacterComponent::RequestAsyncRagdollReleaseGroundTrace()
 
         World->AsyncLineTraceByChannel(
             EAsyncTraceType::Multi,
-            GetRuntimeRagdollGroundTraceStart(RagdollLocation, Radius),
-            GetRuntimeRagdollGroundTraceEnd(RagdollLocation, BoneTraceDistance),
+            GetRagdollGroundTraceStart(RagdollLocation, Radius),
+            GetRagdollGroundTraceEnd(RagdollLocation, BoneTraceDistance),
             ECC_Visibility,
             QueryParams,
             FCollisionResponseParams::DefaultResponseParam,
@@ -2379,7 +2379,7 @@ void UCharacterComponent::OnAsyncRagdollReleaseGroundTraceCompleted(const FTrace
 
     for (const FHitResult& Hit : TraceDatum.OutHits)
     {
-        if (!IsRuntimeIgnoredWaterTraceHit(Hit) && IsRuntimeRagdollWalkableGroundHit(Hit, Movement))
+        if (!IsIgnoredWaterTraceHit(Hit) && IsRagdollWalkableGroundHit(Hit, Movement))
         {
             bRagdollReleaseGroundTraceHitWalkable = true;
             break;
@@ -2427,8 +2427,8 @@ bool UCharacterComponent::ShouldDelayWaterRagdollDeactivation(float WaterLevel, 
     const FVector NeckLocation = UCharacterFunctionLibrary::GetBoneLocation(*MeshComp, BONE_NECK);
     const FVector HeadLocation = UCharacterFunctionLibrary::GetBoneLocation(*MeshComp, BONE_HEAD);
     const FVector RecoveryActorLocation = GetRagdollRecoveryActorLocationFromHips(HipsLocation, true);
-    const float DesiredActorZ = WaterLevel - FMath::Max(0.0f, RuntimeCharacterRagdoll::WaterReleaseDepthBelowSurface);
-    const float DesiredUpperBodyZ = WaterLevel - FMath::Max(8.0f, RuntimeCharacterRagdoll::WaterReleaseDepthBelowSurface * 0.35f);
+    const float DesiredActorZ = WaterLevel - FMath::Max(0.0f, CharacterRagdollTuning::WaterReleaseDepthBelowSurface);
+    const float DesiredUpperBodyZ = WaterLevel - FMath::Max(8.0f, CharacterRagdollTuning::WaterReleaseDepthBelowSurface * 0.35f);
 
     return RecoveryActorLocation.Z > DesiredActorZ
         || NeckLocation.Z > DesiredUpperBodyZ
@@ -2441,7 +2441,7 @@ void UCharacterComponent::BeginPendingWaterRagdollDeactivation(float WaterLevel)
     PendingWaterRagdollDeactivationLevel = WaterLevel;
     bRagdollInWater = true;
     bRagdollRecoveryWantsSwimming = false;
-    RagdollWeight = RuntimeCharacterConstants::MaxRagdollWeight;
+    RagdollWeight = CharacterConstants::MaxRagdollWeight;
     RagdollActiveTime = 0.0f;
     RagdollLowSpeedTime = 0.0f;
     GetUpActiveTime = 0.0f;
@@ -2456,7 +2456,7 @@ void UCharacterComponent::BeginPendingWaterRagdollDeactivation(float WaterLevel)
 
     if (IsValid(Movement))
     {
-        StopRuntimeMovementAndSetMode(Movement, MOVE_Swimming);
+        StopMovementAndSetMode(Movement, MOVE_Swimming);
     }
 }
 
@@ -2485,7 +2485,7 @@ bool UCharacterComponent::UpdatePendingWaterRagdollDeactivation(float DeltaTime,
 
     const FVector HipsLocation = UCharacterFunctionLibrary::GetBoneLocation(*SkeletalMesh, BONE_HIPS);
     const FVector RecoveryActorLocation = GetRagdollRecoveryActorLocationFromHips(HipsLocation, true);
-    const float DesiredActorZ = DetectedWaterLevel - FMath::Max(0.0f, RuntimeCharacterRagdoll::WaterReleaseDepthBelowSurface);
+    const float DesiredActorZ = DetectedWaterLevel - FMath::Max(0.0f, CharacterRagdollTuning::WaterReleaseDepthBelowSurface);
     const float ErrorZ = FMath::Max(0.0f, RecoveryActorLocation.Z - DesiredActorZ);
     if (ErrorZ <= 0.0f)
     {
@@ -2493,8 +2493,8 @@ bool UCharacterComponent::UpdatePendingWaterRagdollDeactivation(float DeltaTime,
     }
 
     const float SafeDeltaTime = FMath::Max(DeltaTime, 0.001f);
-    const float DesiredDownSpeed = FMath::Clamp(ErrorZ / SafeDeltaTime, 20.0f, FMath::Max(20.0f, RuntimeCharacterRagdoll::WaterReleaseSinkSpeed));
-    const float ForceMagnitude = FMath::Clamp(ErrorZ * RuntimeCharacterRagdoll::WaterReleaseSinkForce, 0.0f, RuntimeCharacterRagdoll::WaterReleaseSinkForce * 1.35f);
+    const float DesiredDownSpeed = FMath::Clamp(ErrorZ / SafeDeltaTime, 20.0f, FMath::Max(20.0f, CharacterRagdollTuning::WaterReleaseSinkSpeed));
+    const float ForceMagnitude = FMath::Clamp(ErrorZ * CharacterRagdollTuning::WaterReleaseSinkForce, 0.0f, CharacterRagdollTuning::WaterReleaseSinkForce * 1.35f);
     const FVector DownForce = -FVector::UpVector * ForceMagnitude;
 
     const FName SinkBones[] = {
@@ -2549,8 +2549,8 @@ void UCharacterComponent::ApplyMoveRightForward(ACharacterController *InOwner, c
 {
     if (!InOwner)
         return;
-    InOwner->AddMovementInput(MakeRuntimeRightVectorFromYaw(ControlRotation.Yaw), Speed.X);
-    InOwner->AddMovementInput(MakeRuntimeForwardVectorFromYaw(ControlRotation.Yaw), Speed.Y);
+    InOwner->AddMovementInput(MakeRightVectorFromYaw(ControlRotation.Yaw), Speed.X);
+    InOwner->AddMovementInput(MakeForwardVectorFromYaw(ControlRotation.Yaw), Speed.Y);
 }
 
 inline float UCharacterComponent::ClampGroundSpeed(const float MaxSpeed, const float NormalZ, const float WalkableZ)
@@ -2579,7 +2579,7 @@ void UCharacterComponent::ActiveRagdoll(ACharacterController *InOwner, USkeletal
 
     UCharacterMovementComponent* CharacterMovement = InOwner->GetCharacterMovement();
     const bool bKeepWaterIntent = bRagdollInWater || bRagdollRecoveryWantsSwimming;
-    const FRotator ActorRotationBeforeRagdoll = MakeRuntimeFlatYawRotation(InOwner->GetActorRotation().Yaw);
+    const FRotator ActorRotationBeforeRagdoll = MakeFlatYawRotation(InOwner->GetActorRotation().Yaw);
 
     // If a new ragdoll starts during a land/water recovery blend, discard that recovery state.
     // The new ragdoll must start with a fresh physics pose and full ragdoll weight.
@@ -2588,7 +2588,7 @@ void UCharacterComponent::ActiveRagdoll(ACharacterController *InOwner, USkeletal
     bHasRagdollPrePhysicsActorRotation = true;
 
     bGettingUp = false;
-    RagdollWeight = RuntimeCharacterConstants::MaxRagdollWeight;
+    RagdollWeight = CharacterConstants::MaxRagdollWeight;
     bRagdollRecoveryWantsSwimming = false;
     bRagdollInWater = bKeepWaterIntent;
 
@@ -2596,7 +2596,7 @@ void UCharacterComponent::ActiveRagdoll(ACharacterController *InOwner, USkeletal
     {
         if (bRagdollInWater)
         {
-            StopRuntimeMovementAndSetMode(CharacterMovement, MOVE_Swimming);
+            StopMovementAndSetMode(CharacterMovement, MOVE_Swimming);
         }
         else
         {
@@ -2606,12 +2606,12 @@ void UCharacterComponent::ActiveRagdoll(ACharacterController *InOwner, USkeletal
 
     FActorHelper::DetachParent(SkeletalMesh, FDetachmentTransformRules::KeepWorldTransform);
     SkeletalMesh->SetAllBodiesSimulatePhysics(true);
-    UCharacterFunctionLibrary::BlendRagdoll(*SkeletalMesh, RuntimeCharacterRagdoll::MaxBlendWeight);
+    UCharacterFunctionLibrary::BlendRagdoll(*SkeletalMesh, CharacterRagdollTuning::MaxBlendWeight);
 
     if (IsValid(SpringArm))
     {
         SpringArm->bEnableCameraLag = true;
-        SpringArm->CameraLagSpeed = RuntimeCharacterRagdoll::CameraLagSpeed;
+        SpringArm->CameraLagSpeed = CharacterRagdollTuning::CameraLagSpeed;
     }
 }
 
@@ -2629,7 +2629,7 @@ void UCharacterComponent::DeactiveRagdoll(ACharacterController *InOwner, USkelet
     CapturedMeshLocation = UCharacterFunctionLibrary::GetBoneLocation(*SkeletalMesh, BONE_HIPS);
     CapturedMeshRotation = UCharacterFunctionLibrary::GetBoneRotation(*SkeletalMesh, BONE_HIPS);
 
-    AnimInst->SavePoseSnapshot(RuntimeCharacterRagdoll::PoseSnapshotName);
+    AnimInst->SavePoseSnapshot(CharacterRagdollTuning::PoseSnapshotName);
 
     // This state was captured and applied to the controller while the ragdoll bodies were still
     // simulating. Do not re-probe after bIsRagdoll is already false; that path can read sticky
@@ -2658,19 +2658,19 @@ void UCharacterComponent::DeactiveRagdoll(ACharacterController *InOwner, USkelet
         bLandRagdollRecoveryOverridesWater = false;
         bRagdollRecoveryWantsSwimming = true;
         bRagdollInWater = true;
-        RagdollWeight = RuntimeCharacterConstants::MaxRagdollWeight;
+        RagdollWeight = CharacterConstants::MaxRagdollWeight;
         GetUpActiveTime = 0.0f;
         WaterRagdollRecoveryElapsed = 0.0f;
 
         bIsLieOnBack = CheckIfLieOnBack(SkeletalMesh);
         WaterRecoveryActorStartLocation = InOwner->GetActorLocation();
-        WaterRecoveryActorStartRotation = MakeRuntimeFlatYawRotation(InOwner->GetActorRotation().Yaw);
+        WaterRecoveryActorStartRotation = MakeFlatYawRotation(InOwner->GetActorRotation().Yaw);
         WaterRecoveryActorTargetLocation = GetRagdollRecoveryActorLocationFromHips(CapturedMeshLocation, true);
         // Underwater recovery has no grounded "get-up" facing direction.  Using the floating body yaw here
         // can flip 180 degrees when the hips/head vector rolls in water, so keep the pre-ragdoll actor yaw
         // and let the mesh pose/relative rotation blend back to the normal swimming basis.
         WaterRecoveryActorTargetRotation = bHasRagdollPrePhysicsActorRotation
-            ? MakeRuntimeFlatYawRotationNear(RagdollPrePhysicsActorRotation.Yaw, WaterRecoveryActorStartRotation)
+            ? MakeFlatYawRotationNear(RagdollPrePhysicsActorRotation.Yaw, WaterRecoveryActorStartRotation)
             : WaterRecoveryActorStartRotation;
 
         // Water recovery should start from the exact current actor/mesh transform and then blend,
@@ -2689,7 +2689,7 @@ void UCharacterComponent::DeactiveRagdoll(ACharacterController *InOwner, USkelet
 
         if (UCharacterMovementComponent* CharacterMovement = InOwner->GetCharacterMovement())
         {
-            StopRuntimeMovementAndSetMode(CharacterMovement, MOVE_Swimming);
+            StopMovementAndSetMode(CharacterMovement, MOVE_Swimming);
         }
     }
     else
@@ -2699,14 +2699,14 @@ void UCharacterComponent::DeactiveRagdoll(ACharacterController *InOwner, USkelet
         bWaterRecoveryTransformInitialized = false;
         UCharacterFunctionLibrary::DisableRagdollPhysicsButKeepSecondary(*SkeletalMesh);
         FActorHelper::AttachParent(SkeletalMesh, InOwner->GetCapsuleComponent(), FAttachmentTransformRules::KeepWorldTransform);
-        SetSkeletalMeshLocationAndRotation(SkeletalMesh, RuntimeCharacterRagdoll::MeshRecoveryRelativeLocation, RuntimeCharacterRagdoll::MeshRecoveryRelativeRotation);
+        SetSkeletalMeshLocationAndRotation(SkeletalMesh, CharacterRagdollTuning::MeshRecoveryRelativeLocation, CharacterRagdollTuning::MeshRecoveryRelativeRotation);
         SkeletalMesh->SetVisibility(true, true);
 
         bGettingUp = true;
 
         if (UCharacterMovementComponent* CharacterMovement = InOwner->GetCharacterMovement())
         {
-            StopRuntimeMovementAndDisable(CharacterMovement);
+            StopMovementAndDisable(CharacterMovement);
         }
     }
 
@@ -2742,7 +2742,7 @@ void UCharacterComponent::FinalizeRagdollRecovery(ACharacterController *InOwner,
 
     UCharacterFunctionLibrary::DisableRagdollPhysicsButKeepSecondary(*SkeletalMesh);
     FActorHelper::AttachParent(SkeletalMesh, InOwner->GetCapsuleComponent(), FAttachmentTransformRules::KeepWorldTransform);
-    SetSkeletalMeshLocationAndRotation(SkeletalMesh, RuntimeCharacterRagdoll::MeshRecoveryRelativeLocation, RuntimeCharacterRagdoll::MeshRecoveryRelativeRotation);
+    SetSkeletalMeshLocationAndRotation(SkeletalMesh, CharacterRagdollTuning::MeshRecoveryRelativeLocation, CharacterRagdollTuning::MeshRecoveryRelativeRotation);
     SkeletalMesh->SetVisibility(true, true);
 
     RagdollWeight = 0.0f;
@@ -2753,7 +2753,7 @@ void UCharacterComponent::FinalizeRagdollRecovery(ACharacterController *InOwner,
     RagdollLowSpeedTime = 0.0f;
     WaterRagdollRecoveryElapsed = 0.0f;
     bWaterRecoveryTransformInitialized = false;
-    RagdollRecoverySwimLockTime = bShouldResumeSwimming ? FMath::Max(0.0f, RuntimeCharacterRagdoll::WaterSwimLockAfterRecovery) : 0.0f;
+    RagdollRecoverySwimLockTime = bShouldResumeSwimming ? FMath::Max(0.0f, CharacterRagdollTuning::WaterSwimLockAfterRecovery) : 0.0f;
     bRagdollRecoveryWantsSwimming = false;
     bRagdollInWater = bShouldResumeSwimming;
 
@@ -2780,6 +2780,7 @@ void UCharacterComponent::FinalizeRagdollRecovery(ACharacterController *InOwner,
     bHasRagdollPrePhysicsActorRotation = false;
 
     ResetMovementState();
+    InOwner->RestoreControlAfterRagdollRecovery();
 }
 
 void UCharacterComponent::SetRagdollActive(bool bActive)
@@ -2870,7 +2871,7 @@ void UCharacterComponent::UpdateRagdoll(const float DeltaTime, ACharacterControl
         {
             if (bRagdollInWater || bRagdollRecoveryWantsSwimming)
             {
-                StopRuntimeMovementAndSetMode(CharacterMovement, MOVE_Swimming);
+                StopMovementAndSetMode(CharacterMovement, MOVE_Swimming);
             }
             else
             {
@@ -2883,9 +2884,9 @@ void UCharacterComponent::UpdateRagdoll(const float DeltaTime, ACharacterControl
             && (bRagdollInWater || bRagdollRecoveryWantsSwimming || RagdollEnvironmentState.bShouldRecoverInWater || RagdollEnvironmentState.bIsInWater);
         if (bUseStableWaterYaw)
         {
-            const FRotator CurrentActorYaw = MakeRuntimeFlatYawRotation(InOwner->GetActorRotation().Yaw);
-            const FRotator DesiredStableYaw = MakeRuntimeFlatYawRotationNear(RagdollPrePhysicsActorRotation.Yaw, CurrentActorYaw);
-            const float YawBlendSpeed = FMath::Max(0.0f, RuntimeCharacterRagdoll::WaterStableYawBlendSpeed);
+            const FRotator CurrentActorYaw = MakeFlatYawRotation(InOwner->GetActorRotation().Yaw);
+            const FRotator DesiredStableYaw = MakeFlatYawRotationNear(RagdollPrePhysicsActorRotation.Yaw, CurrentActorYaw);
+            const float YawBlendSpeed = FMath::Max(0.0f, CharacterRagdollTuning::WaterStableYawBlendSpeed);
             ActorTargetRotation = YawBlendSpeed > KINDA_SMALL_NUMBER
                 ? FMath::RInterpTo(CurrentActorYaw, DesiredStableYaw, DeltaTime, YawBlendSpeed)
                 : DesiredStableYaw;
@@ -2914,19 +2915,19 @@ void UCharacterComponent::UpdateRagdoll(const float DeltaTime, ACharacterControl
             GetUpActiveTime += DeltaTime;
             WaterRagdollRecoveryElapsed += DeltaTime;
 
-            const float SafeBlendDuration = FMath::Max(0.1f, RuntimeCharacterRagdoll::WaterTransformBlendDuration);
+            const float SafeBlendDuration = FMath::Max(0.1f, CharacterRagdollTuning::WaterTransformBlendDuration);
             const float RawAlpha = FMath::Clamp(WaterRagdollRecoveryElapsed / SafeBlendDuration, 0.0f, 1.0f);
             const float SmoothAlpha = RawAlpha * RawAlpha * (3.0f - 2.0f * RawAlpha);
-            RagdollWeight = RuntimeCharacterConstants::MaxRagdollWeight * (1.0f - SmoothAlpha);
+            RagdollWeight = CharacterConstants::MaxRagdollWeight * (1.0f - SmoothAlpha);
 
             if (!bWaterRecoveryTransformInitialized)
             {
                 bIsLieOnBack = CheckIfLieOnBack(SkeletalMesh);
                 WaterRecoveryActorStartLocation = InOwner->GetActorLocation();
-                WaterRecoveryActorStartRotation = MakeRuntimeFlatYawRotation(InOwner->GetActorRotation().Yaw);
+                WaterRecoveryActorStartRotation = MakeFlatYawRotation(InOwner->GetActorRotation().Yaw);
                 WaterRecoveryActorTargetLocation = GetRagdollRecoveryActorLocationFromHips(UCharacterFunctionLibrary::GetBoneLocation(*SkeletalMesh, BONE_HIPS), true);
                 WaterRecoveryActorTargetRotation = bHasRagdollPrePhysicsActorRotation
-                    ? MakeRuntimeFlatYawRotationNear(RagdollPrePhysicsActorRotation.Yaw, WaterRecoveryActorStartRotation)
+                    ? MakeFlatYawRotationNear(RagdollPrePhysicsActorRotation.Yaw, WaterRecoveryActorStartRotation)
                     : WaterRecoveryActorStartRotation;
                 if (SkeletalMesh->GetAttachParent() != InOwner->GetCapsuleComponent())
                 {
@@ -2941,16 +2942,16 @@ void UCharacterComponent::UpdateRagdoll(const float DeltaTime, ACharacterControl
             const FQuat BlendedActorQuat = FQuat::Slerp(WaterRecoveryActorStartRotation.Quaternion(), WaterRecoveryActorTargetRotation.Quaternion(), SmoothAlpha).GetNormalized();
             InOwner->SetActorLocationAndRotation(BlendedActorLocation, BlendedActorQuat.Rotator(), false, nullptr, ETeleportType::TeleportPhysics);
 
-            const FVector BlendedMeshLocation = FMath::Lerp(WaterRecoveryMeshStartRelativeLocation, RuntimeCharacterRagdoll::MeshRecoveryRelativeLocation, SmoothAlpha);
-            const FQuat BlendedMeshQuat = FQuat::Slerp(WaterRecoveryMeshStartRelativeRotation.Quaternion(), RuntimeCharacterRagdoll::MeshRecoveryRelativeRotation.Quaternion(), SmoothAlpha).GetNormalized();
+            const FVector BlendedMeshLocation = FMath::Lerp(WaterRecoveryMeshStartRelativeLocation, CharacterRagdollTuning::MeshRecoveryRelativeLocation, SmoothAlpha);
+            const FQuat BlendedMeshQuat = FQuat::Slerp(WaterRecoveryMeshStartRelativeRotation.Quaternion(), CharacterRagdollTuning::MeshRecoveryRelativeRotation.Quaternion(), SmoothAlpha).GetNormalized();
             SkeletalMesh->SetRelativeLocationAndRotation(BlendedMeshLocation, BlendedMeshQuat.Rotator(), false, nullptr, ETeleportType::TeleportPhysics);
 
-            SkeletalMesh->SetAllBodiesPhysicsBlendWeight(FMath::Clamp(RagdollWeight / RuntimeCharacterConstants::MaxRagdollWeight, 0.0f, 1.0f));
+            SkeletalMesh->SetAllBodiesPhysicsBlendWeight(FMath::Clamp(RagdollWeight / CharacterConstants::MaxRagdollWeight, 0.0f, 1.0f));
             UCharacterFunctionLibrary::KeepSecondaryPhysicsBodies(*SkeletalMesh);
 
             if (UCharacterMovementComponent* CharacterMovement = InOwner->GetCharacterMovement())
             {
-                StopRuntimeMovementAndSetMode(CharacterMovement, MOVE_Swimming);
+                StopMovementAndSetMode(CharacterMovement, MOVE_Swimming);
             }
 
             if (RawAlpha >= 1.0f)
@@ -2976,6 +2977,8 @@ void UCharacterComponent::UpdateRagdoll(const float DeltaTime, ACharacterControl
                 {
                     SetMovementModeAfterRagdollRecovery(CharacterMovement, RagdollEnvironmentState);
                 }
+                ResetMovementState();
+                InOwner->RestoreControlAfterRagdollRecovery();
             }
         }
     }
@@ -2997,7 +3000,7 @@ float UCharacterComponent::GetRagdollReleaseSpeedSquared(USkeletalMeshComponent 
     for (int32 BoneIndex = 0; BoneIndex < BoneCount; ++BoneIndex)
     {
         const FName BoneName = SkeletalMesh->GetBoneName(BoneIndex);
-        if (!IsRuntimeRagdollBodySimulatingForRelease(SkeletalMesh, BoneName) || !IsRuntimeRagdollCoreReleaseBone(BoneName))
+        if (!IsRagdollBodySimulatingForRelease(SkeletalMesh, BoneName) || !IsRagdollCoreReleaseBone(BoneName))
         {
             continue;
         }
@@ -3009,7 +3012,7 @@ float UCharacterComponent::GetRagdollReleaseSpeedSquared(USkeletalMeshComponent 
             continue;
         }
 
-        if (IsRuntimeRagdollPrimaryReleaseBone(BoneName))
+        if (IsRagdollPrimaryReleaseBone(BoneName))
         {
             PrimaryMaxSpeedSquared = FMath::Max(PrimaryMaxSpeedSquared, SpeedSquared);
             ++PrimaryBodyCount;
@@ -3043,7 +3046,7 @@ bool UCharacterComponent::CheckRagdollStay()
     if (!bCurrentlyInWater)
     {
         ClearRagdollWaterIntent(false);
-        return GetRagdollReleaseSpeedSquared(MeshComp) < FMath::Square(FMath::Max(1.0f, RuntimeCharacterRagdoll::GetUpSpeedThreshold));
+        return GetRagdollReleaseSpeedSquared(MeshComp) < FMath::Square(FMath::Max(1.0f, CharacterRagdollTuning::GetUpSpeedThreshold));
     }
 
     bRagdollInWater = true;
@@ -3054,7 +3057,7 @@ bool UCharacterComponent::CheckRagdollStay()
         Movement->SetMovementMode(MOVE_Swimming);
     }
 
-    return GetRagdollReleaseSpeedSquared(MeshComp) < FMath::Square(FMath::Max(1.0f, RuntimeCharacterRagdoll::WaterGetUpSpeedThreshold));
+    return GetRagdollReleaseSpeedSquared(MeshComp) < FMath::Square(FMath::Max(1.0f, CharacterRagdollTuning::WaterGetUpSpeedThreshold));
 }
 
 void UCharacterComponent::StartRagdollStayChecking()
@@ -3067,7 +3070,7 @@ void UCharacterComponent::StartRagdollStayChecking()
         RagdollCheckTimerHandle,
         this,
         &UCharacterComponent::ProcessRagdollCheck,
-        FMath::Max(0.05f, RuntimeCharacterRagdoll::MinimumActiveTime),
+        FMath::Max(0.05f, CharacterRagdollTuning::MinimumActiveTime),
         false);
 }
 
@@ -3104,7 +3107,7 @@ void UCharacterComponent::ProcessRagdollCheck()
         });
 
         const bool bUseWaterRecoveryThreshold = bRagdollInWater || bRagdollRecoveryWantsSwimming;
-        const float ConfirmDelay = FMath::Max(0.05f, bUseWaterRecoveryThreshold ? RuntimeCharacterRagdoll::WaterLowSpeedConfirmTime : RuntimeCharacterRagdoll::LowSpeedConfirmTime);
+        const float ConfirmDelay = FMath::Max(0.05f, bUseWaterRecoveryThreshold ? CharacterRagdollTuning::WaterLowSpeedConfirmTime : CharacterRagdollTuning::LowSpeedConfirmTime);
         OwnerCharacter->GetWorldTimerManager().SetTimer(RagdollCheckTimerHandle, NextCheckDelegate, ConfirmDelay, false);
     }
     else

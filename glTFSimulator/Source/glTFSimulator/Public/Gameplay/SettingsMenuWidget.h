@@ -5,14 +5,14 @@
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
 #include "Components/Button.h"
-#include "RuntimeSettingsMenuWidget.generated.h"
+#include "SettingsMenuWidget.generated.h"
 
 class UTextBlock;
 class UGameSettings;
-class URuntimeSettingsMenuWidget;
+class USettingsMenuWidget;
 
 UENUM(BlueprintType)
-enum class ERuntimeSettingsField : uint8
+enum class ESettingsField : uint8
 {
     BloomIntensity UMETA(DisplayName="Bloom Intensity"),
     BloomThreshold UMETA(DisplayName="Bloom Threshold"),
@@ -36,23 +36,23 @@ enum class ERuntimeSettingsField : uint8
 
 /** Button helper that Blueprint widgets can use when they want +/- adjustment buttons. */
 UCLASS(Blueprintable)
-class GLTFSIMULATOR_API URuntimeSettingsAdjustmentButton : public UButton
+class GLTFSIMULATOR_API USettingsAdjustmentButton : public UButton
 {
     GENERATED_BODY()
 
 public:
-    UFUNCTION(BlueprintCallable, Category="Runtime Settings")
-    void SetupAdjustment(URuntimeSettingsMenuWidget* InOwner, ERuntimeSettingsField InField, float InStep);
+    UFUNCTION(BlueprintCallable, Category="Settings")
+    void SetupAdjustment(USettingsMenuWidget* InOwner, ESettingsField InField, float InStep);
 
     UFUNCTION()
     void HandleClicked();
 
 private:
     UPROPERTY()
-    TObjectPtr<URuntimeSettingsMenuWidget> OwnerWidget;
+    TObjectPtr<USettingsMenuWidget> OwnerWidget;
 
     UPROPERTY()
-    ERuntimeSettingsField Field = ERuntimeSettingsField::BloomIntensity;
+    ESettingsField Field = ESettingsField::BloomIntensity;
 
     UPROPERTY()
     float Step = 0.0f;
@@ -66,48 +66,48 @@ private:
  * AdjustSettingFromUI, ApplyAndSaveSettingsFromUI, and CloseSettingsFromUI directly.
  */
 UCLASS(Blueprintable, BlueprintType)
-class GLTFSIMULATOR_API URuntimeSettingsMenuWidget : public UUserWidget
+class GLTFSIMULATOR_API USettingsMenuWidget : public UUserWidget
 {
     GENERATED_BODY()
 
 public:
     virtual void NativeConstruct() override;
 
-    UFUNCTION(BlueprintCallable, Category="Runtime Settings")
+    UFUNCTION(BlueprintCallable, Category="Settings")
     UGameSettings* GetEditableSettings() const;
 
-    UFUNCTION(BlueprintCallable, Category="Runtime Settings")
+    UFUNCTION(BlueprintCallable, Category="Settings")
     void RefreshSettingsValues();
 
-    UFUNCTION(BlueprintCallable, Category="Runtime Settings")
-    void AdjustSettingFromUI(ERuntimeSettingsField Field, float Step);
+    UFUNCTION(BlueprintCallable, Category="Settings")
+    void AdjustSettingFromUI(ESettingsField Field, float Step);
 
-    UFUNCTION(BlueprintCallable, Category="Runtime Settings")
+    UFUNCTION(BlueprintCallable, Category="Settings")
     void ApplyAndSaveSettingsFromUI();
 
-    UFUNCTION(BlueprintCallable, Category="Runtime Settings")
+    UFUNCTION(BlueprintCallable, Category="Settings")
     void CloseSettingsFromUI();
 
 protected:
-    UPROPERTY(BlueprintReadOnly, meta=(BindWidgetOptional), Category="Runtime Settings|Widgets")
+    UPROPERTY(BlueprintReadOnly, meta=(BindWidgetOptional), Category="Settings|Widgets")
     TObjectPtr<UTextBlock> TitleText;
 
-    UPROPERTY(BlueprintReadOnly, meta=(BindWidgetOptional), Category="Runtime Settings|Widgets")
+    UPROPERTY(BlueprintReadOnly, meta=(BindWidgetOptional), Category="Settings|Widgets")
     TObjectPtr<UButton> ApplyButton;
 
-    UPROPERTY(BlueprintReadOnly, meta=(BindWidgetOptional), Category="Runtime Settings|Widgets")
+    UPROPERTY(BlueprintReadOnly, meta=(BindWidgetOptional), Category="Settings|Widgets")
     TObjectPtr<UButton> BackButton;
 
 private:
     void CacheUserWidgetReferences();
     void BindButtonEvents();
-    FText GetFieldLabel(ERuntimeSettingsField Field) const;
-    FText GetFieldValueText(ERuntimeSettingsField Field, const UGameSettings* Settings) const;
-    void AdjustSettingValue(ERuntimeSettingsField Field, float Step, UGameSettings* Settings) const;
+    FText GetFieldLabel(ESettingsField Field) const;
+    FText GetFieldValueText(ESettingsField Field, const UGameSettings* Settings) const;
+    void AdjustSettingValue(ESettingsField Field, float Step, UGameSettings* Settings) const;
 
     UPROPERTY()
     TArray<TObjectPtr<UTextBlock>> ValueTextBlocks;
 
     UPROPERTY()
-    TArray<ERuntimeSettingsField> ValueFields;
+    TArray<ESettingsField> ValueFields;
 };

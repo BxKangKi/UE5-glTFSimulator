@@ -1,6 +1,6 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
-#include "Runtime/RuntimeVehiclePawn.h"
+#include "Gameplay/VehiclePawn.h"
 
 #include "Camera/CameraComponent.h"
 #include "CollisionShape.h"
@@ -25,11 +25,11 @@
 #include "glTFRuntimeParser.h"
 #include "Materials/MaterialInterface.h"
 #include "Misc/Paths.h"
-#include "World/RuntimeBuoyancyComponent.h"
+#include "World/BuoyancyComponent.h"
 #include "World/WaterActor.h"
 
 
-static TMap<EglTFRuntimeMaterialType, UMaterialInterface*> BuildRuntimeVehicleLitMaterialOverrides()
+static TMap<EglTFRuntimeMaterialType, UMaterialInterface*> BuildVehicleLitMaterialOverrides()
     {
         TMap<EglTFRuntimeMaterialType, UMaterialInterface*> Overrides;
 
@@ -52,13 +52,13 @@ static TMap<EglTFRuntimeMaterialType, UMaterialInterface*> BuildRuntimeVehicleLi
         return Overrides;
     }
 
-static bool IsRuntimeVehicleWheelTaggedName(const FString& Name)
+static bool IsVehicleWheelTaggedName(const FString& Name)
     {
         return Name.EndsWith(TEXT(";WHEL"), ESearchCase::IgnoreCase)
             || Name.EndsWith(TEXT(";WHEEL"), ESearchCase::IgnoreCase);
     }
 
-static FTransform GetRuntimeVehicleNodeWorldTransform(const TMap<int32, FglTFRuntimeNode>& NodeMap, const FglTFRuntimeNode& Node)
+static FTransform GetVehicleNodeWorldTransform(const TMap<int32, FglTFRuntimeNode>& NodeMap, const FglTFRuntimeNode& Node)
     {
         FTransform WorldTransform = Node.Transform;
         int32 ParentIndex = Node.ParentIndex;
@@ -78,13 +78,13 @@ static FTransform GetRuntimeVehicleNodeWorldTransform(const TMap<int32, FglTFRun
         return WorldTransform;
     }
 
-struct FRuntimeVehicleWheelVisual
+struct FVehicleWheelVisual
     {
         FglTFRuntimeNode Node;
         FTransform Transform = FTransform::Identity;
 };
 
-static void GetRuntimeVehicleExitPawnCapsuleSize(const APawn* PawnToExit, float& OutRadius, float& OutHalfHeight)
+static void GetVehicleExitPawnCapsuleSize(const APawn* PawnToExit, float& OutRadius, float& OutHalfHeight)
 {
     OutRadius = 34.0f;
     OutHalfHeight = 88.0f;
@@ -111,7 +111,7 @@ static void GetRuntimeVehicleExitPawnCapsuleSize(const APawn* PawnToExit, float&
     }
 }
 
-static bool IsRuntimeVehicleExitLocationInWater(const UObject* WorldContextObject, const FVector& ActorLocation, float CapsuleHalfHeight, float& OutWaterLevel)
+static bool IsVehicleExitLocationInWater(const UObject* WorldContextObject, const FVector& ActorLocation, float CapsuleHalfHeight, float& OutWaterLevel)
 {
     float DetectedWaterLevel = OutWaterLevel;
     const float SafeHalfHeight = FMath::Max(1.0f, CapsuleHalfHeight);
@@ -128,7 +128,7 @@ static bool IsRuntimeVehicleExitLocationInWater(const UObject* WorldContextObjec
     return bInWater;
 }
 
-static void ApplyRuntimeVehicleWaterExitState(APawn* RestoredPawn, float WaterLevel)
+static void ApplyVehicleWaterExitState(APawn* RestoredPawn, float WaterLevel)
 {
     if (!IsValid(RestoredPawn))
     {
@@ -152,7 +152,7 @@ static void ApplyRuntimeVehicleWaterExitState(APawn* RestoredPawn, float WaterLe
     }
 }
 
-ARuntimeVehiclePawn::ARuntimeVehiclePawn()
+AVehiclePawn::AVehiclePawn()
 {
     PrimaryActorTick.bCanEverTick = true;
 
@@ -164,7 +164,7 @@ ARuntimeVehiclePawn::ARuntimeVehiclePawn()
     ApplyVehicleBodyPhysicsSettings();
     Body->SetUseCCD(true);
 
-    LowFrictionPhysicalMaterial = CreateDefaultSubobject<UPhysicalMaterial>(TEXT("RuntimeVehicleLowFriction"));
+    LowFrictionPhysicalMaterial = CreateDefaultSubobject<UPhysicalMaterial>(TEXT("VehicleLowFrictionMaterial"));
     if (LowFrictionPhysicalMaterial)
     {
         LowFrictionPhysicalMaterial->Friction = 0.06f;
@@ -187,7 +187,7 @@ ARuntimeVehiclePawn::ARuntimeVehiclePawn()
         WheelMeshes.Add(WheelMesh);
     }
 
-    BuoyancyComponent = CreateDefaultSubobject<URuntimeBuoyancyComponent>(TEXT("RuntimeBuoyancy"));
+    BuoyancyComponent = CreateDefaultSubobject<UBuoyancyComponent>(TEXT("Buoyancy"));
 
     bUseControllerRotationPitch = false;
     bUseControllerRotationYaw = false;
@@ -217,7 +217,7 @@ ARuntimeVehiclePawn::ARuntimeVehiclePawn()
     WheelOffsets.Add(FVector(-112.0f, -66.0f, -36.0f));
 }
 
-void ARuntimeVehiclePawn::BeginPlay()
+void AVehiclePawn::BeginPlay()
 {
     Super::BeginPlay();
     Body->InitBoxExtent(BodyExtent);
@@ -228,20 +228,22 @@ void ARuntimeVehiclePawn::BeginPlay()
 
     WheelSpinDegrees.Init(0.0f, WheelOffsets.Num());
     WheelSpringLengths.Init(SuspensionRestLength * FMath::Clamp(LoadedWheelVisualRestLengthRatio, 0.2f, 0.95f), WheelOffsets.Num());
+    WheelSuspensionForces.Init(0.0f, WheelOffsets.Num());
+    WheelLateralForces.Init(0.0f, WheelOffsets.Num());
     WheelGrounded.Init(false, WheelOffsets.Num());
 }
 
-void ARuntimeVehiclePawn::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
+void AVehiclePawn::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
 {
     Super::SetupPlayerInputComponent(PlayerInputComponent);
 }
 
-float ARuntimeVehiclePawn::GetVehicleMassScale() const
+float AVehiclePawn::GetVehicleMassScale() const
 {
     return FMath::Max(1.0f, VehicleMassKg) / 1000.0f;
 }
 
-void ARuntimeVehiclePawn::ApplyVehicleBodyPhysicsSettings()
+void AVehiclePawn::ApplyVehicleBodyPhysicsSettings()
 {
     if (!IsValid(Body))
     {
@@ -249,13 +251,13 @@ void ARuntimeVehiclePawn::ApplyVehicleBodyPhysicsSettings()
     }
 
     Body->SetMassOverrideInKg(NAME_None, FMath::Max(1.0f, VehicleMassKg), true);
-    Body->SetLinearDamping(0.32f);
-    Body->SetAngularDamping(2.10f);
-    Body->SetCenterOfMass(FVector(4.0f, 0.0f, -48.0f), NAME_None);
+    Body->SetLinearDamping(0.48f);
+    Body->SetAngularDamping(3.40f);
+    Body->SetCenterOfMass(FVector(4.0f, 0.0f, -62.0f), NAME_None);
     Body->SetPhysicsMaxAngularVelocityInRadians(FMath::Max(0.5f, MaxAngularVelocityRadians), false);
 }
 
-void ARuntimeVehiclePawn::Tick(float DeltaSeconds)
+void AVehiclePawn::Tick(float DeltaSeconds)
 {
     Super::Tick(DeltaSeconds);
 
@@ -268,18 +270,16 @@ void ARuntimeVehiclePawn::Tick(float DeltaSeconds)
     SmoothedThrottleInput = FMath::FInterpTo(SmoothedThrottleInput, ThrottleInput, SafeFrameDeltaTime, FMath::Max(0.1f, ThrottleInputInterpSpeed));
     SmoothedSteeringInput = FMath::FInterpTo(SmoothedSteeringInput, SteeringInput, SafeFrameDeltaTime, FMath::Max(0.1f, SteeringInputInterpSpeed));
 
-    const float TargetSubstep = FMath::Max(0.004f, MaxVehiclePhysicsSubstepSeconds);
-    const int32 SubstepCount = FMath::Clamp(FMath::CeilToInt(SafeFrameDeltaTime / TargetSubstep), 1, FMath::Max(1, MaxVehiclePhysicsSubsteps));
-    const float SubstepDeltaTime = SafeFrameDeltaTime / static_cast<float>(SubstepCount);
-    for (int32 StepIndex = 0; StepIndex < SubstepCount; ++StepIndex)
-    {
-        ApplySuspensionAndDrive(SubstepDeltaTime);
-    }
+    // Apply forces once per game tick. The previous code looped here as if it were doing physics substepping,
+    // but Unreal does not integrate the rigid body between ordinary Tick calls, so the same suspension,
+    // tire, downforce, and stabilization forces were accumulated multiple times in one frame.
+    // That force multiplication was the main source of the visible vehicle shaking.
+    ApplySuspensionAndDrive(SafeFrameDeltaTime);
 
     UpdateWheelVisuals(SafeFrameDeltaTime);
 }
 
-void ARuntimeVehiclePawn::SetDriveInput(float Throttle, float Steering)
+void AVehiclePawn::SetDriveInput(float Throttle, float Steering)
 {
     ThrottleInput = FMath::Clamp(Throttle, -1.0f, 1.0f);
     SteeringInput = FMath::Clamp(Steering, -1.0f, 1.0f);
@@ -289,7 +289,7 @@ void ARuntimeVehiclePawn::SetDriveInput(float Throttle, float Steering)
     }
 }
 
-void ARuntimeVehiclePawn::SetThrottleInput(float Throttle)
+void AVehiclePawn::SetThrottleInput(float Throttle)
 {
     ThrottleInput = FMath::Clamp(Throttle, -1.0f, 1.0f);
     if (IsValid(Body) && !FMath::IsNearlyZero(ThrottleInput, 0.01f))
@@ -298,12 +298,12 @@ void ARuntimeVehiclePawn::SetThrottleInput(float Throttle)
     }
 }
 
-void ARuntimeVehiclePawn::SetSteeringInput(float Steering)
+void AVehiclePawn::SetSteeringInput(float Steering)
 {
     SteeringInput = FMath::Clamp(Steering, -1.0f, 1.0f);
 }
 
-void ARuntimeVehiclePawn::ClearDriveInput()
+void AVehiclePawn::ClearDriveInput()
 {
     ThrottleInput = 0.0f;
     SteeringInput = 0.0f;
@@ -311,7 +311,7 @@ void ARuntimeVehiclePawn::ClearDriveInput()
     SmoothedSteeringInput = 0.0f;
 }
 
-void ARuntimeVehiclePawn::ClearLoadedVehicleModel()
+void AVehiclePawn::ClearLoadedVehicleModel()
 {
     for (UStaticMeshComponent* Component : LoadedBodyMeshComponents)
     {
@@ -335,17 +335,17 @@ void ARuntimeVehiclePawn::ClearLoadedVehicleModel()
     LoadedWheelBaseRotations.Empty();
     MeshCache.Empty();
 
-    if (IsValid(RuntimeAsset))
+    if (IsValid(GltfAsset))
     {
-        RuntimeAsset->ClearCache();
-        RuntimeAsset->MarkAsGarbage();
-        RuntimeAsset = nullptr;
+        GltfAsset->ClearCache();
+        GltfAsset->MarkAsGarbage();
+        GltfAsset = nullptr;
     }
 
     HideProceduralDefaultVisuals(false);
 }
 
-void ARuntimeVehiclePawn::HideProceduralDefaultVisuals(bool bHide)
+void AVehiclePawn::HideProceduralDefaultVisuals(bool bHide)
 {
     if (IsValid(BodyMesh))
     {
@@ -364,9 +364,9 @@ void ARuntimeVehiclePawn::HideProceduralDefaultVisuals(bool bHide)
     }
 }
 
-UStaticMesh* ARuntimeVehiclePawn::LoadMeshByIndex(int32 MeshIndex)
+UStaticMesh* AVehiclePawn::LoadMeshByIndex(int32 MeshIndex)
 {
-    if (!IsValid(RuntimeAsset) || MeshIndex == INDEX_NONE)
+    if (!IsValid(GltfAsset) || MeshIndex == INDEX_NONE)
     {
         return nullptr;
     }
@@ -380,7 +380,7 @@ UStaticMesh* ARuntimeVehiclePawn::LoadMeshByIndex(int32 MeshIndex)
     MeshConfig.Outer = this;
     MeshConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
     MeshConfig.MaterialsConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
-    const TMap<EglTFRuntimeMaterialType, UMaterialInterface*> LitOverrides = BuildRuntimeVehicleLitMaterialOverrides();
+    const TMap<EglTFRuntimeMaterialType, UMaterialInterface*> LitOverrides = BuildVehicleLitMaterialOverrides();
     if (LitOverrides.Num() > 0)
     {
         MeshConfig.MaterialsConfig.UnlitOverrideMap = LitOverrides;
@@ -389,7 +389,7 @@ UStaticMesh* ARuntimeVehiclePawn::LoadMeshByIndex(int32 MeshIndex)
     MeshConfig.bBuildSimpleCollision = false;
     MeshConfig.bBuildComplexCollision = false;
 
-    UStaticMesh* Mesh = RuntimeAsset->LoadStaticMesh(MeshIndex, MeshConfig);
+    UStaticMesh* Mesh = GltfAsset->LoadStaticMesh(MeshIndex, MeshConfig);
     if (IsValid(Mesh))
     {
         MeshCache.Add(MeshIndex, Mesh);
@@ -397,27 +397,27 @@ UStaticMesh* ARuntimeVehiclePawn::LoadMeshByIndex(int32 MeshIndex)
     return Mesh;
 }
 
-bool ARuntimeVehiclePawn::LoadVehicleModel(const FString& InFilePath, const FString& InRuntimeName)
+bool AVehiclePawn::LoadVehicleModel(const FString& InFilePath, const FString& InObjectName)
 {
     ClearLoadedVehicleModel();
 
     SourceFilePath = FPaths::ConvertRelativePathToFull(InFilePath);
     BaseName = FPaths::GetBaseFilename(SourceFilePath);
-    RuntimeName = InRuntimeName.IsEmpty() ? BaseName : InRuntimeName;
+    ObjectName = InObjectName.IsEmpty() ? BaseName : InObjectName;
 
     FglTFRuntimeConfig LoaderConfig;
     LoaderConfig.bAllowExternalFiles = true;
-    RuntimeAsset = UglTFRuntimeFunctionLibrary::glTFLoadAssetFromFilename(SourceFilePath, false, LoaderConfig);
-    if (!IsValid(RuntimeAsset))
+    GltfAsset = UglTFRuntimeFunctionLibrary::glTFLoadAssetFromFilename(SourceFilePath, false, LoaderConfig);
+    if (!IsValid(GltfAsset))
     {
-        UE_LOG(LogTemp, Warning, TEXT("RuntimeVehiclePawn: failed to load vehicle model %s"), *SourceFilePath);
+        UE_LOG(LogTemp, Warning, TEXT("VehiclePawn: failed to load vehicle model %s"), *SourceFilePath);
         SourceFilePath.Reset();
         BaseName = TEXT("Vehicle");
-        RuntimeName = TEXT("Vehicle");
+        ObjectName = TEXT("Vehicle");
         return false;
     }
 
-    const TArray<FglTFRuntimeNode> Nodes = RuntimeAsset->GetNodes();
+    const TArray<FglTFRuntimeNode> Nodes = GltfAsset->GetNodes();
     TMap<int32, FglTFRuntimeNode> NodeMap;
     for (const FglTFRuntimeNode& Node : Nodes)
     {
@@ -425,9 +425,9 @@ bool ARuntimeVehiclePawn::LoadVehicleModel(const FString& InFilePath, const FStr
     }
 
     TMap<int32, FString> MeshNamesByIndex;
-    if (RuntimeAsset->GetParser().IsValid())
+    if (GltfAsset->GetParser().IsValid())
     {
-        const TArray<TSharedRef<FJsonObject>> MeshObjects = RuntimeAsset->GetParser()->GetMeshes();
+        const TArray<TSharedRef<FJsonObject>> MeshObjects = GltfAsset->GetParser()->GetMeshes();
         for (int32 MeshIndex = 0; MeshIndex < MeshObjects.Num(); ++MeshIndex)
         {
             FString MeshName;
@@ -438,7 +438,7 @@ bool ARuntimeVehiclePawn::LoadVehicleModel(const FString& InFilePath, const FStr
         }
     }
 
-    TArray<FRuntimeVehicleWheelVisual> WheelNodes;
+    TArray<FVehicleWheelVisual> WheelNodes;
     int32 BodyComponentIndex = 0;
     for (const FglTFRuntimeNode& Node : Nodes)
     {
@@ -453,11 +453,11 @@ bool ARuntimeVehiclePawn::LoadVehicleModel(const FString& InFilePath, const FStr
             continue;
         }
 
-        const FTransform NodeWorldTransform = GetRuntimeVehicleNodeWorldTransform(NodeMap, Node);
+        const FTransform NodeWorldTransform = GetVehicleNodeWorldTransform(NodeMap, Node);
         const FString MeshName = MeshNamesByIndex.FindRef(Node.MeshIndex);
-        if (IsRuntimeVehicleWheelTaggedName(Node.Name) || IsRuntimeVehicleWheelTaggedName(MeshName))
+        if (IsVehicleWheelTaggedName(Node.Name) || IsVehicleWheelTaggedName(MeshName))
         {
-            FRuntimeVehicleWheelVisual WheelVisual;
+            FVehicleWheelVisual WheelVisual;
             WheelVisual.Node = Node;
             WheelVisual.Transform = NodeWorldTransform;
             WheelNodes.Add(WheelVisual);
@@ -480,7 +480,7 @@ bool ARuntimeVehiclePawn::LoadVehicleModel(const FString& InFilePath, const FStr
         LoadedBodyMeshComponents.Add(MeshComponent);
     }
 
-    WheelNodes.Sort([](const FRuntimeVehicleWheelVisual& A, const FRuntimeVehicleWheelVisual& B)
+    WheelNodes.Sort([](const FVehicleWheelVisual& A, const FVehicleWheelVisual& B)
     {
         const FVector AL = A.Transform.GetLocation();
         const FVector BL = B.Transform.GetLocation();
@@ -498,7 +498,7 @@ bool ARuntimeVehiclePawn::LoadVehicleModel(const FString& InFilePath, const FStr
     }
 
     int32 WheelComponentIndex = 0;
-    for (const FRuntimeVehicleWheelVisual& WheelNode : WheelNodes)
+    for (const FVehicleWheelVisual& WheelNode : WheelNodes)
     {
         UStaticMesh* Mesh = LoadMeshByIndex(WheelNode.Node.MeshIndex);
         if (!IsValid(Mesh))
@@ -539,6 +539,8 @@ bool ARuntimeVehiclePawn::LoadVehicleModel(const FString& InFilePath, const FStr
 
     WheelSpinDegrees.Init(0.0f, WheelOffsets.Num());
     WheelSpringLengths.Init(SuspensionRestLength * FMath::Clamp(LoadedWheelVisualRestLengthRatio, 0.2f, 0.95f), WheelOffsets.Num());
+    WheelSuspensionForces.Init(0.0f, WheelOffsets.Num());
+    WheelLateralForces.Init(0.0f, WheelOffsets.Num());
     WheelGrounded.Init(false, WheelOffsets.Num());
 
     const bool bLoadedAnyVisual = LoadedBodyMeshComponents.Num() > 0 || LoadedWheelMeshComponents.Num() > 0;
@@ -547,7 +549,7 @@ bool ARuntimeVehiclePawn::LoadVehicleModel(const FString& InFilePath, const FStr
     return bLoadedAnyVisual;
 }
 
-void ARuntimeVehiclePawn::ResetVehiclePoseAboveGround()
+void AVehiclePawn::ResetVehiclePoseAboveGround()
 {
     if (!IsValid(Body))
     {
@@ -564,7 +566,7 @@ void ARuntimeVehiclePawn::ResetVehiclePoseAboveGround()
     const FVector TraceStart = CurrentLocation + FVector(0.0f, 0.0f, 400.0f);
     const FVector TraceEnd = CurrentLocation - FVector(0.0f, 0.0f, 1400.0f);
     FHitResult Hit;
-    FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(RuntimeVehicleGroundClearance), false, this);
+    FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(VehicleGroundClearanceTrace), false, this);
     QueryParams.AddIgnoredActor(this);
 
     if (World->LineTraceSingleByChannel(Hit, TraceStart, TraceEnd, ECC_Visibility, QueryParams))
@@ -582,20 +584,20 @@ void ARuntimeVehiclePawn::ResetVehiclePoseAboveGround()
     Body->WakeRigidBody();
 }
 
-FRuntimePlacedObjectRecord ARuntimeVehiclePawn::ToPlacementRecord(int32 VehicleRecordIndex) const
+FPlacedObjectRecord AVehiclePawn::ToPlacementRecord(int32 VehicleRecordIndex) const
 {
-    FRuntimePlacedObjectRecord Record;
-    Record.RuntimeName = RuntimeName.IsEmpty()
+    FPlacedObjectRecord Record;
+    Record.ObjectName = ObjectName.IsEmpty()
         ? (VehicleRecordIndex == 0 ? TEXT("Vehicle") : TEXT("Vehicle;INST"))
-        : RuntimeName;
+        : ObjectName;
     Record.BaseName = BaseName.IsEmpty() ? TEXT("Vehicle") : BaseName;
     Record.SourceFile = SourceFilePath;
-    Record.Kind = ERuntimePlacedObjectKind::Vehicle;
+    Record.Kind = EPlacedObjectKind::Vehicle;
     Record.Transform = GetActorTransform();
     return Record;
 }
 
-bool ARuntimeVehiclePawn::EnterVehicle(APlayerController* PlayerController, APawn* PreviousPawn)
+bool AVehiclePawn::EnterVehicle(APlayerController* PlayerController, APawn* PreviousPawn)
 {
     if (!IsValid(PlayerController) || IsOccupied())
     {
@@ -615,9 +617,9 @@ bool ARuntimeVehiclePawn::EnterVehicle(APlayerController* PlayerController, APaw
         CharacterPawn->ClearTransientInputState();
     }
 
-    if (APlayerCharacterController* RuntimeController = Cast<APlayerCharacterController>(PlayerController))
+    if (APlayerCharacterController* PlayerCharacterController = Cast<APlayerCharacterController>(PlayerController))
     {
-        RuntimeController->ClearLatchedMovementInput();
+        PlayerCharacterController->ClearLatchedMovementInput();
     }
 
     OccupyingController = PlayerController;
@@ -643,7 +645,7 @@ bool ARuntimeVehiclePawn::EnterVehicle(APlayerController* PlayerController, APaw
     return true;
 }
 
-void ARuntimeVehiclePawn::ExitVehicle()
+void AVehiclePawn::ExitVehicle()
 {
     if (!IsValid(OccupyingController))
     {
@@ -652,9 +654,9 @@ void ARuntimeVehiclePawn::ExitVehicle()
 
     ClearDriveInput();
 
-    if (APlayerCharacterController* RuntimeController = Cast<APlayerCharacterController>(OccupyingController))
+    if (APlayerCharacterController* PlayerController = Cast<APlayerCharacterController>(OccupyingController))
     {
-        RuntimeController->ClearLatchedMovementInput();
+        PlayerController->ClearLatchedMovementInput();
     }
 
     if (ACharacterController* CharacterPawn = Cast<ACharacterController>(StoredPawn))
@@ -672,16 +674,16 @@ void ARuntimeVehiclePawn::ExitVehicle()
         FRotator SafeExitRotation = RestoreRotation;
         if (!FindSafeExitTransform(StoredPawn, SafeExitLocation, SafeExitRotation))
         {
-            UE_LOG(LogTemp, Warning, TEXT("RuntimeVehiclePawn: no ground or water exit location found within one vehicle length. Staying in vehicle."));
+            UE_LOG(LogTemp, Warning, TEXT("VehiclePawn: no ground or water exit location found within one vehicle length. Staying in vehicle."));
             return;
         }
 
         float ExitCapsuleRadius = 34.0f;
         float ExitCapsuleHalfHeight = 88.0f;
-        GetRuntimeVehicleExitPawnCapsuleSize(StoredPawn.Get(), ExitCapsuleRadius, ExitCapsuleHalfHeight);
+        GetVehicleExitPawnCapsuleSize(StoredPawn.Get(), ExitCapsuleRadius, ExitCapsuleHalfHeight);
 
         float ExitWaterLevel = 0.0f;
-        const bool bExitIntoWater = IsRuntimeVehicleExitLocationInWater(this, SafeExitLocation, ExitCapsuleHalfHeight, ExitWaterLevel);
+        const bool bExitIntoWater = IsVehicleExitLocationInWater(this, SafeExitLocation, ExitCapsuleHalfHeight, ExitWaterLevel);
 
         StoredPawn->DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
         StoredPawn->SetActorLocationAndRotation(SafeExitLocation, SafeExitRotation, false, nullptr, ETeleportType::TeleportPhysics);
@@ -692,17 +694,17 @@ void ARuntimeVehiclePawn::ExitVehicle()
 
         if (bExitIntoWater)
         {
-            ApplyRuntimeVehicleWaterExitState(StoredPawn.Get(), ExitWaterLevel);
+            ApplyVehicleWaterExitState(StoredPawn.Get(), ExitWaterLevel);
         }
 
         // After collision is re-enabled, resync overlaps so water volumes can notify any
         // water-aware components that were hidden while the pawn was seated in the vehicle.
         AWaterActor::CheckOverlappingWater(StoredPawn.Get());
 
-        if (APlayerCharacterController* RuntimeController = Cast<APlayerCharacterController>(OccupyingController))
+        if (APlayerCharacterController* PlayerController = Cast<APlayerCharacterController>(OccupyingController))
         {
-            RuntimeController->ApplyGameInputMode();
-            RuntimeController->ClearLatchedMovementInput();
+            PlayerController->ApplyGameInputMode();
+            PlayerController->ClearLatchedMovementInput();
         }
     }
 
@@ -714,12 +716,12 @@ void ARuntimeVehiclePawn::ExitVehicle()
     bHasStoredPawnTransform = false;
 }
 
-FVector ARuntimeVehiclePawn::GetExitLocation() const
+FVector AVehiclePawn::GetExitLocation() const
 {
     return GetActorLocation() + GetActorRightVector() * 220.0f + FVector(0.0f, 0.0f, 80.0f);
 }
 
-bool ARuntimeVehiclePawn::FindSafeExitTransform(APawn* PawnToExit, FVector& OutLocation, FRotator& OutRotation) const
+bool AVehiclePawn::FindSafeExitTransform(APawn* PawnToExit, FVector& OutLocation, FRotator& OutRotation) const
 {
     if (!IsValid(PawnToExit))
     {
@@ -734,9 +736,9 @@ bool ARuntimeVehiclePawn::FindSafeExitTransform(APawn* PawnToExit, FVector& OutL
 
     float CapsuleRadius = 34.0f;
     float CapsuleHalfHeight = 88.0f;
-    GetRuntimeVehicleExitPawnCapsuleSize(PawnToExit, CapsuleRadius, CapsuleHalfHeight);
+    GetVehicleExitPawnCapsuleSize(PawnToExit, CapsuleRadius, CapsuleHalfHeight);
 
-    FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(RuntimeVehicleExitTrace), false, this);
+    FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(VehicleExitTrace), false, this);
     QueryParams.AddIgnoredActor(this);
     QueryParams.AddIgnoredActor(PawnToExit);
 
@@ -868,7 +870,7 @@ bool ARuntimeVehiclePawn::FindSafeExitTransform(APawn* PawnToExit, FVector& OutL
     {
         float CandidateWaterLevel = VehicleWaterLevel;
         FVector CandidateActorLocation(Candidate.Location.X, Candidate.Location.Y, CandidateWaterLevel - ExitSubmergeDepth);
-        if (!IsRuntimeVehicleExitLocationInWater(this, CandidateActorLocation, CapsuleHalfHeight, CandidateWaterLevel))
+        if (!IsVehicleExitLocationInWater(this, CandidateActorLocation, CapsuleHalfHeight, CandidateWaterLevel))
         {
             continue;
         }
@@ -887,7 +889,7 @@ bool ARuntimeVehiclePawn::FindSafeExitTransform(APawn* PawnToExit, FVector& OutL
     return false;
 }
 
-void ARuntimeVehiclePawn::ApplyChassisClearanceProtection(UWorld* World, const FTransform& BodyTransform, const FCollisionQueryParams& QueryParams)
+void AVehiclePawn::ApplyChassisClearanceProtection(UWorld* World, const FTransform& BodyTransform, const FCollisionQueryParams& QueryParams)
 {
     if (!World || !IsValid(Body) || MaxChassisAntiGroundStickForce <= 0.0f || ChassisAntiGroundStickStrength <= 0.0f)
     {
@@ -936,7 +938,7 @@ void ARuntimeVehiclePawn::ApplyChassisClearanceProtection(UWorld* World, const F
     }
 }
 
-void ARuntimeVehiclePawn::ApplySuspensionAndDrive(float DeltaSeconds)
+void AVehiclePawn::ApplySuspensionAndDrive(float DeltaSeconds)
 {
     if (!IsValid(Body) || !Body->IsSimulatingPhysics())
     {
@@ -961,8 +963,10 @@ void ARuntimeVehiclePawn::ApplySuspensionAndDrive(float DeltaSeconds)
 
     WheelGrounded.SetNum(WheelOffsets.Num());
     WheelSpringLengths.SetNum(WheelOffsets.Num());
+    WheelSuspensionForces.SetNum(WheelOffsets.Num());
+    WheelLateralForces.SetNum(WheelOffsets.Num());
 
-    FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(RuntimeVehicleSuspension), false, this);
+    FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(VehicleSuspensionTrace), false, this);
     QueryParams.AddIgnoredActor(this);
 
     ApplyChassisClearanceProtection(World, BodyTransform, QueryParams);
@@ -989,7 +993,7 @@ void ARuntimeVehiclePawn::ApplySuspensionAndDrive(float DeltaSeconds)
         }
     }
 
-    struct FRuntimeVehicleWheelState
+    struct FVehicleWheelState
     {
         int32 Index = INDEX_NONE;
         FVector LocalOffset = FVector::ZeroVector;
@@ -1007,7 +1011,7 @@ void ARuntimeVehiclePawn::ApplySuspensionAndDrive(float DeltaSeconds)
         float LateralSpeed = 0.0f;
     };
 
-    TArray<FRuntimeVehicleWheelState> WheelStates;
+    TArray<FVehicleWheelState> WheelStates;
     WheelStates.SetNum(WheelOffsets.Num());
 
     float FrontMostWheelX = WheelOffsets.Num() > 0 ? WheelOffsets[0].X : 0.0f;
@@ -1034,7 +1038,7 @@ void ARuntimeVehiclePawn::ApplySuspensionAndDrive(float DeltaSeconds)
 
     for (int32 WheelIndex = 0; WheelIndex < WheelOffsets.Num(); ++WheelIndex)
     {
-        FRuntimeVehicleWheelState& WheelState = WheelStates[WheelIndex];
+        FVehicleWheelState& WheelState = WheelStates[WheelIndex];
         WheelState.Index = WheelIndex;
         WheelState.LocalOffset = WheelOffsets[WheelIndex];
         WheelState.bFront = WheelState.LocalOffset.X >= AxleSplitX;
@@ -1076,6 +1080,11 @@ void ARuntimeVehiclePawn::ApplySuspensionAndDrive(float DeltaSeconds)
             WheelState.SpringLength = RelaxedSpringLength;
             WheelState.MountWorld = MountWorld;
             WheelSpringLengths[WheelIndex] = RelaxedSpringLength;
+
+            // Fade cached tire/suspension forces out when the wheel loses contact.
+            // This prevents a stale side force from kicking the chassis on the next contact frame.
+            WheelSuspensionForces[WheelIndex] = FMath::FInterpTo(WheelSuspensionForces[WheelIndex], 0.0f, DeltaSeconds, FMath::Max(0.1f, SuspensionForceInterpSpeed));
+            WheelLateralForces[WheelIndex] = FMath::FInterpTo(WheelLateralForces[WheelIndex], 0.0f, DeltaSeconds, FMath::Max(0.1f, TireForceInterpSpeed));
             continue;
         }
 
@@ -1089,14 +1098,21 @@ void ARuntimeVehiclePawn::ApplySuspensionAndDrive(float DeltaSeconds)
             ? (PreviousSpringLength - SpringLength) / FMath::Max(0.001f, DeltaSeconds)
             : 0.0f;
         const float SuspensionVelocity = FMath::Clamp(RawSuspensionVelocity, -FMath::Max(100.0f, MaxSuspensionVelocity), FMath::Max(100.0f, MaxSuspensionVelocity));
-        float SuspensionForce = Compression * SuspensionStrength * MassScale + SuspensionVelocity * SuspensionDamping * MassScale;
-        SuspensionForce = FMath::Clamp(SuspensionForce, 0.0f, MaxSuspensionForcePerWheel * MassScale);
+        float TargetSuspensionForce = Compression * SuspensionStrength * MassScale + SuspensionVelocity * SuspensionDamping * MassScale;
+        TargetSuspensionForce = FMath::Clamp(TargetSuspensionForce * FMath::Clamp(SuspensionForceScale, 0.0f, 1.0f), 0.0f, MaxSuspensionForcePerWheel * MassScale);
 
         if (SpringLength < 3.0f)
         {
-            const float BumpStopForce = (3.0f - SpringLength) * SuspensionStrength * MassScale * 1.75f;
-            SuspensionForce = FMath::Clamp(SuspensionForce + BumpStopForce, 0.0f, MaxSuspensionForcePerWheel * MassScale);
+            // Keep the bump stop soft. A hard bump stop was one of the reasons the car popped upward after bottoming out.
+            const float BumpStopForce = (3.0f - SpringLength) * SuspensionStrength * MassScale * 0.45f;
+            TargetSuspensionForce = FMath::Clamp(TargetSuspensionForce + BumpStopForce, 0.0f, MaxSuspensionForcePerWheel * MassScale);
         }
+
+        const float PreviousSuspensionForce = WheelSuspensionForces.IsValidIndex(WheelIndex) ? WheelSuspensionForces[WheelIndex] : 0.0f;
+        const float SmoothedSuspensionForce = FMath::FInterpTo(PreviousSuspensionForce, TargetSuspensionForce, DeltaSeconds, FMath::Max(0.1f, SuspensionForceInterpSpeed));
+        const float SuspensionForceStep = FMath::Max(1000.0f, MaxSuspensionForceChangePerSecond) * MassScale * DeltaSeconds;
+        const float SuspensionForce = FMath::Clamp(SmoothedSuspensionForce, PreviousSuspensionForce - SuspensionForceStep, PreviousSuspensionForce + SuspensionForceStep);
+        WheelSuspensionForces[WheelIndex] = SuspensionForce;
 
         Body->AddForceAtLocation(Up * SuspensionForce, MountWorld);
 
@@ -1147,9 +1163,9 @@ void ARuntimeVehiclePawn::ApplySuspensionAndDrive(float DeltaSeconds)
 
     auto ApplyAntiRollForAxle = [&](bool bFrontAxle)
     {
-        FRuntimeVehicleWheelState* LeftWheel = nullptr;
-        FRuntimeVehicleWheelState* RightWheel = nullptr;
-        for (FRuntimeVehicleWheelState& WheelState : WheelStates)
+        FVehicleWheelState* LeftWheel = nullptr;
+        FVehicleWheelState* RightWheel = nullptr;
+        for (FVehicleWheelState& WheelState : WheelStates)
         {
             if (!WheelState.bGrounded || WheelState.bFront != bFrontAxle)
             {
@@ -1191,7 +1207,7 @@ void ARuntimeVehiclePawn::ApplySuspensionAndDrive(float DeltaSeconds)
     const bool bAcceleratingTowardLimit = !FMath::IsNearlyZero(SmoothedThrottleInput, 0.01f) && FMath::Sign(SmoothedThrottleInput) == FMath::Sign(BodyForwardSpeed);
     const float SpeedLimiter = bAcceleratingTowardLimit ? (1.0f - SpeedLimitAlpha) : 1.0f;
 
-    for (const FRuntimeVehicleWheelState& WheelState : WheelStates)
+    for (const FVehicleWheelState& WheelState : WheelStates)
     {
         if (!WheelState.bGrounded || WheelState.NormalForce <= KINDA_SMALL_NUMBER)
         {
@@ -1233,7 +1249,15 @@ void ARuntimeVehiclePawn::ApplySuspensionAndDrive(float DeltaSeconds)
         const float LateralLimitBase = FMath::Min(WheelState.NormalForce * TireLateralFriction, MaxLateralGripForce * MassScale) * SpeedLateralGripScale;
         const float LongitudinalUsage = FMath::Clamp(FMath::Abs(LongitudinalForce) / LongitudinalLimit, 0.0f, 1.0f);
         const float LateralLimit = LateralLimitBase * FMath::Sqrt(FMath::Max(0.0f, 1.0f - LongitudinalUsage * LongitudinalUsage));
-        const float LateralForce = FMath::Clamp(LateralDemand, -LateralLimit, LateralLimit);
+        const float TargetLateralForce = FMath::Clamp(LateralDemand, -LateralLimit, LateralLimit) * FMath::Clamp(TireLateralForceScale, 0.0f, 1.0f);
+        const float PreviousLateralForce = WheelLateralForces.IsValidIndex(WheelState.Index) ? WheelLateralForces[WheelState.Index] : 0.0f;
+        const float SmoothedLateralForce = FMath::FInterpTo(PreviousLateralForce, TargetLateralForce, DeltaSeconds, FMath::Max(0.1f, TireForceInterpSpeed));
+        const float LateralForceStep = FMath::Max(1000.0f, MaxLateralForceChangePerSecond) * MassScale * DeltaSeconds;
+        const float LateralForce = FMath::Clamp(SmoothedLateralForce, PreviousLateralForce - LateralForceStep, PreviousLateralForce + LateralForceStep);
+        if (WheelLateralForces.IsValidIndex(WheelState.Index))
+        {
+            WheelLateralForces[WheelState.Index] = LateralForce;
+        }
 
         const FVector CenterOfMassWorld = Body->GetCenterOfMass();
         const float HeightToCenter = FVector::DotProduct(CenterOfMassWorld - WheelState.ContactWorld, Up);
@@ -1283,7 +1307,7 @@ void ARuntimeVehiclePawn::ApplySuspensionAndDrive(float DeltaSeconds)
     }
 }
 
-void ARuntimeVehiclePawn::ApplyAeroDownforce(int32 GroundedWheels)
+void AVehiclePawn::ApplyAeroDownforce(int32 GroundedWheels)
 {
     if (!IsValid(Body) || !Body->IsSimulatingPhysics())
     {
@@ -1336,7 +1360,7 @@ void ARuntimeVehiclePawn::ApplyAeroDownforce(int32 GroundedWheels)
     }
 }
 
-FVector ARuntimeVehiclePawn::GetFrontAxleForceLocation() const
+FVector AVehiclePawn::GetFrontAxleForceLocation() const
 {
     if (!IsValid(Body))
     {
@@ -1376,7 +1400,7 @@ FVector ARuntimeVehiclePawn::GetFrontAxleForceLocation() const
     return Body->GetComponentTransform().TransformPosition(LocalFrontOffset);
 }
 
-void ARuntimeVehiclePawn::ApplyPitchStabilization(int32 GroundedWheels)
+void AVehiclePawn::ApplyPitchStabilization(int32 GroundedWheels)
 {
     if (!IsValid(Body) || !Body->IsSimulatingPhysics() || GroundedWheels <= 0 || MaxPitchStabilizationTorque <= 0.0f)
     {
@@ -1401,7 +1425,7 @@ void ARuntimeVehiclePawn::ApplyPitchStabilization(int32 GroundedWheels)
     }
 }
 
-void ARuntimeVehiclePawn::ApplyRollStabilization(int32 GroundedWheels)
+void AVehiclePawn::ApplyRollStabilization(int32 GroundedWheels)
 {
     if (!IsValid(Body) || !Body->IsSimulatingPhysics() || GroundedWheels <= 0 || MaxRollStabilizationTorque <= 0.0f)
     {
@@ -1426,7 +1450,7 @@ void ARuntimeVehiclePawn::ApplyRollStabilization(int32 GroundedWheels)
     }
 }
 
-float ARuntimeVehiclePawn::GetDesiredCenterHeightAboveGround() const
+float AVehiclePawn::GetDesiredCenterHeightAboveGround() const
 {
     float LowestMountOffsetZ = 0.0f;
     if (WheelOffsets.Num() > 0)
@@ -1444,7 +1468,7 @@ float ARuntimeVehiclePawn::GetDesiredCenterHeightAboveGround() const
     return FMath::Max(ChassisRideHeight, WheelRideHeight);
 }
 
-float ARuntimeVehiclePawn::GetDownforceClearanceScale() const
+float AVehiclePawn::GetDownforceClearanceScale() const
 {
     if (!IsValid(Body))
     {
@@ -1457,7 +1481,7 @@ float ARuntimeVehiclePawn::GetDownforceClearanceScale() const
         return 1.0f;
     }
 
-    FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(RuntimeVehicleDownforceClearance), false, this);
+    FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(VehicleDownforceClearanceTrace), false, this);
     QueryParams.AddIgnoredActor(this);
 
     const FVector BodyLocation = Body->GetComponentLocation();
@@ -1478,7 +1502,7 @@ float ARuntimeVehiclePawn::GetDownforceClearanceScale() const
     return FMath::Clamp((CurrentCenterHeight - LowHeight) / FadeRange, 0.0f, 1.0f);
 }
 
-void ARuntimeVehiclePawn::RestoreStoredPawnCamera(APlayerController* PlayerController, APawn* PawnToRestore) const
+void AVehiclePawn::RestoreStoredPawnCamera(APlayerController* PlayerController, APawn* PawnToRestore) const
 {
     if (!bResetCharacterCameraOnExit || !IsValid(PlayerController) || !IsValid(PawnToRestore))
     {
@@ -1496,7 +1520,7 @@ void ARuntimeVehiclePawn::RestoreStoredPawnCamera(APlayerController* PlayerContr
     PlayerController->ClientSetRotation(CleanCharacterRotation, true);
 }
 
-void ARuntimeVehiclePawn::UpdateWheelVisuals(float DeltaSeconds)
+void AVehiclePawn::UpdateWheelVisuals(float DeltaSeconds)
 {
     const FTransform BodyTransform = Body ? Body->GetComponentTransform() : GetActorTransform();
     const FVector Forward = Body ? Body->GetForwardVector() : GetActorForwardVector();
@@ -1553,7 +1577,7 @@ void ARuntimeVehiclePawn::UpdateWheelVisuals(float DeltaSeconds)
     }
 }
 
-void ARuntimeVehiclePawn::BuildBodyMesh()
+void AVehiclePawn::BuildBodyMesh()
 {
     if (!IsValid(BodyMesh))
     {
@@ -1584,7 +1608,7 @@ void ARuntimeVehiclePawn::BuildBodyMesh()
     BodyMesh->CreateMeshSection(0, Vertices, Triangles, Normals, UV0, Colors, Tangents, false);
 }
 
-void ARuntimeVehiclePawn::BuildWheelMeshes()
+void AVehiclePawn::BuildWheelMeshes()
 {
     for (UProceduralMeshComponent* WheelMesh : WheelMeshes)
     {
@@ -1592,7 +1616,7 @@ void ARuntimeVehiclePawn::BuildWheelMeshes()
     }
 }
 
-void ARuntimeVehiclePawn::BuildWheelMesh(UProceduralMeshComponent* MeshComponent) const
+void AVehiclePawn::BuildWheelMesh(UProceduralMeshComponent* MeshComponent) const
 {
     if (!IsValid(MeshComponent))
     {

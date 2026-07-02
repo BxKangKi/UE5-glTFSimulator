@@ -4,7 +4,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Model/RuntimeData.h"
+#include "Model/Data.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "glTFStreamSubSystem.generated.h"
 
@@ -49,7 +49,7 @@ private:
     TArray<FString> PlayerGlbFilePaths;
     TSet<FString> CompletedInitialPaths;
     TSet<FString> MissingFilePaths;
-    TMap<FString, FRuntimeModelData> ModelMetadataMap;
+    TMap<FString, FModelData> ModelMetadataMap;
 
     FString ModelDirectory;
     FString PlayerDirectory;
@@ -91,9 +91,9 @@ private:
     void DiscoverPlayerPaths();
     void PersistCurrentPlayerSelection();
 
-    bool TryLoadValidModelMetadata(const FString& GlbPath, FRuntimeModelData& OutModelData, bool& bOutJsonExists) const;
-    bool IsValidModelMetadata(const FRuntimeModelData& ModelData) const;
-    bool IsPlayerInsideModelRange(const FRuntimeModelData& ModelData) const;
+    bool TryLoadValidModelMetadata(const FString& GlbPath, FModelData& OutModelData, bool& bOutJsonExists) const;
+    bool IsValidModelMetadata(const FModelData& ModelData) const;
+    bool IsPlayerInsideModelRange(const FModelData& ModelData) const;
     FVector GetPlayerLocation() const;
 
     AglTFStreamActor* EnsureSpawnActor(const FString& GlbPath);

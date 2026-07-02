@@ -25,7 +25,7 @@
 
 namespace
 {
-    static bool IsValidModelBounds(const FRuntimeModelData& ModelData)
+    static bool IsValidModelBounds(const FModelData& ModelData)
     {
         return !ModelData.Size.IsNearlyZero(0.001f);
     }
@@ -83,7 +83,7 @@ void ULoadAsyncAction::LoadJsonAsync()
         }
 
         FString JsonString;
-        FRuntimeModelData TemporaryModelData;
+        FModelData TemporaryModelData;
 
         if (FFileHelper::LoadFileToString(JsonString, *LocalJsonPath))
         {
@@ -96,7 +96,7 @@ void ULoadAsyncAction::LoadJsonAsync()
 
                 if (TemporaryModelData.MeshData.Num() == 0)
                 {
-                    // 하위 호환: 예전 배열 형태 MeshData도 읽어 둔다.
+                    // Backward compatibility: also read the old MeshData array format.
                     const TArray<TSharedPtr<FJsonValue>>* JsonArrayPtr = nullptr;
                     if (JsonObject->TryGetArrayField(TEXT("MeshData"), JsonArrayPtr) && JsonArrayPtr)
                     {
@@ -105,7 +105,7 @@ void ULoadAsyncAction::LoadJsonAsync()
                             if (Value.IsValid() && Value->Type == EJson::Object)
                             {
                                 TSharedPtr<FJsonObject> MeshObj = Value->AsObject();
-                                FRuntimeMeshData MeshData;
+                                FMeshData MeshData;
                                 if (MeshData.Deserialization(MeshObj))
                                 {
                                     TemporaryModelData.MeshData.Add(NAME_None, MeshData);
@@ -137,7 +137,7 @@ bool ULoadAsyncAction::CreateDefaultJsonFile(const FString& Path)
 {
     UFileFunctionLibrary::GenerateDirectory(Path);
 
-    FRuntimeModelData EmptyData;
+    FModelData EmptyData;
     TSharedRef<FJsonObject> RootObject = EmptyData.Serialization();
 
     FString OutputString;
@@ -206,7 +206,7 @@ void ULoadAsyncAction::MergeJsonDataToMeshMap()
         FName MeshName = Pair.Key;
         FModelMeshData& MeshData = Pair.Value;
 
-        if (FRuntimeMeshData* FoundJsonData = LoadedJsonModelData.MeshData.Find(MeshName))
+        if (FMeshData* FoundJsonData = LoadedJsonModelData.MeshData.Find(MeshName))
         {
             MeshData.Data = *FoundJsonData;
         }
@@ -404,6 +404,5 @@ void ULoadAsyncAction::LoadTextureAsync(FString ImagePath)
 
 void ULoadAsyncAction::WriteLogAsync(const FString& Message) const
 {
-    const FString Line = FString::Printf(TEXT("[%s][LoadAsyncAction] %s"), *FDateTime::Now().ToString(), *Message);
-    UFileFunctionLibrary::AppendLineToFileAsync(Line, PATH_LOG);
+    UFileFunctionLibrary::WriteSimulatorLogAsync(TEXT("LoadAsyncAction"), Message);
 }

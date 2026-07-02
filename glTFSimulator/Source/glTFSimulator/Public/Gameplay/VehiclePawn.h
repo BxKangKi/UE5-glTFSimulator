@@ -4,8 +4,8 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Pawn.h"
-#include "Runtime/RuntimePlacementTypes.h"
-#include "RuntimeVehiclePawn.generated.h"
+#include "Gameplay/PlacementTypes.h"
+#include "VehiclePawn.generated.h"
 
 class UBoxComponent;
 class UPhysicalMaterial;
@@ -13,7 +13,7 @@ class UProceduralMeshComponent;
 class UStaticMesh;
 class UStaticMeshComponent;
 class UglTFRuntimeAsset;
-class URuntimeBuoyancyComponent;
+class UBuoyancyComponent;
 class USpringArmComponent;
 class UCameraComponent;
 class APlayerController;
@@ -22,45 +22,45 @@ class UWorld;
 struct FCollisionQueryParams;
 
 UCLASS(BlueprintType)
-class GLTFSIMULATOR_API ARuntimeVehiclePawn : public APawn
+class GLTFSIMULATOR_API AVehiclePawn : public APawn
 {
     GENERATED_BODY()
 
 public:
-    ARuntimeVehiclePawn();
+    AVehiclePawn();
 
-    UFUNCTION(BlueprintCallable, Category="Runtime Vehicle")
+    UFUNCTION(BlueprintCallable, Category="Vehicle")
     bool EnterVehicle(APlayerController* PlayerController, APawn* PreviousPawn);
 
-    UFUNCTION(BlueprintCallable, Category="Runtime Vehicle")
+    UFUNCTION(BlueprintCallable, Category="Vehicle")
     void ExitVehicle();
 
-    UFUNCTION(BlueprintPure, Category="Runtime Vehicle")
+    UFUNCTION(BlueprintPure, Category="Vehicle")
     bool IsOccupied() const { return IsValid(OccupyingController); }
 
-    UFUNCTION(BlueprintCallable, Category="Runtime Vehicle|Input")
+    UFUNCTION(BlueprintCallable, Category="Vehicle|Input")
     void SetDriveInput(float Throttle, float Steering);
 
-    UFUNCTION(BlueprintCallable, Category="Runtime Vehicle|Input")
+    UFUNCTION(BlueprintCallable, Category="Vehicle|Input")
     void SetThrottleInput(float Throttle);
 
-    UFUNCTION(BlueprintCallable, Category="Runtime Vehicle|Input")
+    UFUNCTION(BlueprintCallable, Category="Vehicle|Input")
     void SetSteeringInput(float Steering);
 
-    UFUNCTION(BlueprintCallable, Category="Runtime Vehicle|Input")
+    UFUNCTION(BlueprintCallable, Category="Vehicle|Input")
     void ClearDriveInput();
 
-    UFUNCTION(BlueprintPure, Category="Runtime Vehicle")
+    UFUNCTION(BlueprintPure, Category="Vehicle")
     APawn* GetStoredPawn() const { return StoredPawn.Get(); }
 
-    UFUNCTION(BlueprintCallable, Category="Runtime Vehicle|Model")
-    bool LoadVehicleModel(const FString& InFilePath, const FString& InRuntimeName);
+    UFUNCTION(BlueprintCallable, Category="Vehicle|Model")
+    bool LoadVehicleModel(const FString& InFilePath, const FString& InObjectName);
 
-    UFUNCTION(BlueprintCallable, Category="Runtime Vehicle|Physics")
+    UFUNCTION(BlueprintCallable, Category="Vehicle|Physics")
     void ResetVehiclePoseAboveGround();
 
-    UFUNCTION(BlueprintCallable, Category="Runtime Vehicle|Save")
-    FRuntimePlacedObjectRecord ToPlacementRecord(int32 VehicleRecordIndex = 0) const;
+    UFUNCTION(BlueprintCallable, Category="Vehicle|Save")
+    FPlacedObjectRecord ToPlacementRecord(int32 VehicleRecordIndex = 0) const;
 
 protected:
     virtual void BeginPlay() override;
@@ -78,7 +78,7 @@ private:
     TArray<TObjectPtr<UProceduralMeshComponent>> WheelMeshes;
 
     UPROPERTY(VisibleAnywhere)
-    TObjectPtr<URuntimeBuoyancyComponent> BuoyancyComponent;
+    TObjectPtr<UBuoyancyComponent> BuoyancyComponent;
 
     UPROPERTY(VisibleAnywhere)
     TObjectPtr<USpringArmComponent> SpringArm;
@@ -113,13 +113,17 @@ private:
     float SuspensionTraceExtra = 42.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle")
-    float SuspensionStrength = 29000.0f;
+    float SuspensionStrength = 8500.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle")
-    float SuspensionDamping = 10400.0f;
+    float SuspensionDamping = 4200.0f;
+
+    // Limits spring speed used by the damper so the suspension cannot inject a large impulse after a sharp contact.
+    UPROPERTY(EditAnywhere, Category="Vehicle|Suspension", meta=(ClampMin="0.0"))
+    float MaxSuspensionVelocity = 180.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Suspension", meta=(ClampMin="0.0"))
-    float SuspensionContactSmoothingSpeed = 14.0f;
+    float SuspensionContactSmoothingSpeed = 6.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Suspension")
     bool bUseSuspensionSweep = true;
@@ -128,61 +132,61 @@ private:
     float SuspensionSweepRadiusScale = 0.42f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle")
-    float MaxSuspensionForcePerWheel = 460000.0f;
+    float MaxSuspensionForcePerWheel = 95000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle")
-    float UprightTorqueDamping = 210000.0f;
+    float UprightTorqueDamping = 90000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle")
     float LoadedWheelVisualRestLengthRatio = 0.74f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Aero", meta=(ClampMin="0.0"))
-    float GroundedDownforceCoefficient = 0.024f;
+    float GroundedDownforceCoefficient = 0.006f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Aero", meta=(ClampMin="0.0"))
-    float MaxGroundedDownforce = 820000.0f;
+    float MaxGroundedDownforce = 180000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Aero", meta=(ClampMin="0.0"))
-    float AirborneDownforceCoefficient = 0.020f;
+    float AirborneDownforceCoefficient = 0.004f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Aero", meta=(ClampMin="0.0"))
-    float MaxAirborneDownforce = 620000.0f;
+    float MaxAirborneDownforce = 120000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Aero", meta=(ClampMin="0.0"))
-    float MinimumDownforceSpeed = 360.0f;
+    float MinimumDownforceSpeed = 650.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Aero", meta=(ClampMin="0.0"))
-    float FrontDownforceCoefficient = 0.013f;
+    float FrontDownforceCoefficient = 0.0025f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Aero", meta=(ClampMin="0.0"))
-    float MaxFrontDownforce = 280000.0f;
+    float MaxFrontDownforce = 45000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Aero", meta=(ClampMin="0.0"))
-    float ThrottleFrontDownforce = 85000.0f;
+    float ThrottleFrontDownforce = 15000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Pitch", meta=(ClampMin="0.0"))
-    float PitchStabilizationTorqueStrength = 420000.0f;
+    float PitchStabilizationTorqueStrength = 85000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Pitch", meta=(ClampMin="0.0"))
-    float PitchStabilizationTorqueDamping = 210000.0f;
+    float PitchStabilizationTorqueDamping = 65000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Pitch", meta=(ClampMin="0.0"))
-    float MaxPitchStabilizationTorque = 720000.0f;
+    float MaxPitchStabilizationTorque = 140000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Pitch", meta=(ClampMin="0.0", ClampMax="1.0"))
-    float DriveForceCenterOfMassHeightBlend = 0.68f;
+    float DriveForceCenterOfMassHeightBlend = 0.25f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Roll", meta=(ClampMin="0.0", ClampMax="1.0"))
-    float LateralForceCenterOfMassHeightBlend = 0.55f;
+    float LateralForceCenterOfMassHeightBlend = 0.18f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Roll", meta=(ClampMin="0.0"))
-    float RollStabilizationTorqueStrength = 380000.0f;
+    float RollStabilizationTorqueStrength = 60000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Roll", meta=(ClampMin="0.0"))
-    float RollStabilizationTorqueDamping = 190000.0f;
+    float RollStabilizationTorqueDamping = 50000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Roll", meta=(ClampMin="0.0"))
-    float MaxRollStabilizationTorque = 680000.0f;
+    float MaxRollStabilizationTorque = 120000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle")
     float EngineForce = 620000.0f;
@@ -209,13 +213,13 @@ private:
     float SteeringSpeedForFullAssist = 2600.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Steering", meta=(ClampMin="0.0"))
-    float SteeringYawRateAssist = 220000.0f;
+    float SteeringYawRateAssist = 65000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Steering", meta=(ClampMin="0.0"))
-    float SteeringYawDamping = 150000.0f;
+    float SteeringYawDamping = 90000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Steering", meta=(ClampMin="0.0"))
-    float MaxSteeringAssistTorque = 340000.0f;
+    float MaxSteeringAssistTorque = 120000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Steering", meta=(ClampMin="0.1"))
     float FrontSteeringGripMultiplier = 0.90f;
@@ -224,10 +228,10 @@ private:
     float RearSteeringGripMultiplier = 1.05f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Steering")
-    float LateralGrip = 0.86f;
+    float LateralGrip = 0.38f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Steering")
-    float MaxLateralGripForce = 640000.0f;
+    float MaxLateralGripForce = 160000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle")
     float RollingResistance = 0.018f;
@@ -248,16 +252,16 @@ private:
     float TireLongitudinalFriction = 1.18f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Tires", meta=(ClampMin="0.1"))
-    float TireLateralFriction = 1.08f;
+    float TireLateralFriction = 0.62f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Tires", meta=(ClampMin="0.1"))
-    float TireCorneringStiffness = 5.4f;
+    float TireCorneringStiffness = 2.2f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Tires", meta=(ClampMin="1.0"))
     float TireSlipReferenceSpeed = 260.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Tires", meta=(ClampMin="0.1", ClampMax="1.0"))
-    float HighSpeedLateralGripScale = 0.68f;
+    float HighSpeedLateralGripScale = 0.42f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Tires", meta=(ClampMin="100.0"))
     float HighSpeedLateralGripSpeed = 2600.0f;
@@ -281,26 +285,28 @@ private:
     float MaxAerodynamicDrag = 680000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Roll", meta=(ClampMin="0.0"))
-    float AntiRollBarStiffness = 420000.0f;
+    float AntiRollBarStiffness = 30000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Roll", meta=(ClampMin="0.0"))
-    float MaxAntiRollForce = 360000.0f;
+    float MaxAntiRollForce = 65000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Air", meta=(ClampMin="0.0"))
-    float AirborneAngularDampingTorque = 115000.0f;
+    float AirborneAngularDampingTorque = 60000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Air", meta=(ClampMin="0.0"))
-    float MaxAirborneAngularDampingTorque = 300000.0f;
+    float MaxAirborneAngularDampingTorque = 140000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Air", meta=(ClampMin="0.5"))
-    float MaxAngularVelocityRadians = 4.8f;
+    float MaxAngularVelocityRadians = 3.2f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Input", meta=(ClampMin="0.1"))
     float ThrottleInputInterpSpeed = 4.3f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Input", meta=(ClampMin="0.1"))
-    float SteeringInputInterpSpeed = 5.2f;
+    float SteeringInputInterpSpeed = 3.2f;
 
+    // Deprecated tuning placeholders kept for serialized Blueprint defaults.
+    // Forces are now applied once per tick because manual force-loop substepping caused suspension jitter.
     UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="0.004", ClampMax="0.05"))
     float MaxVehiclePhysicsSubstepSeconds = 0.0166667f;
 
@@ -310,8 +316,23 @@ private:
     UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="0.0", ClampMax="1.0"))
     float MinSuspensionHitNormalDot = 0.30f;
 
-    UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="100.0"))
-    float MaxSuspensionVelocity = 3200.0f;
+    UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="0.0", ClampMax="1.0"))
+    float SuspensionForceScale = 0.42f;
+
+    UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="0.1"))
+    float SuspensionForceInterpSpeed = 4.0f;
+
+    UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="1000.0"))
+    float MaxSuspensionForceChangePerSecond = 70000.0f;
+
+    UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="0.0", ClampMax="1.0"))
+    float TireLateralForceScale = 0.42f;
+
+    UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="0.1"))
+    float TireForceInterpSpeed = 5.0f;
+
+    UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="1000.0"))
+    float MaxLateralForceChangePerSecond = 110000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle")
     FVector BodyExtent = FVector(160.0f, 78.0f, 42.0f);
@@ -323,16 +344,16 @@ private:
     float MinimumBodyGroundClearance = 48.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle")
-    float ChassisAntiGroundStickStrength = 26000.0f;
+    float ChassisAntiGroundStickStrength = 3500.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle")
-    float ChassisAntiGroundStickDamping = 9200.0f;
+    float ChassisAntiGroundStickDamping = 2200.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle")
-    float MaxChassisAntiGroundStickForce = 260000.0f;
+    float MaxChassisAntiGroundStickForce = 28000.0f;
 
     UPROPERTY()
-    TObjectPtr<UglTFRuntimeAsset> RuntimeAsset;
+    TObjectPtr<UglTFRuntimeAsset> GltfAsset;
 
     UPROPERTY()
     TArray<TObjectPtr<UStaticMeshComponent>> LoadedBodyMeshComponents;
@@ -347,7 +368,7 @@ private:
     FString SourceFilePath;
 
     UPROPERTY()
-    FString RuntimeName = TEXT("Vehicle");
+    FString ObjectName = TEXT("Vehicle");
 
     UPROPERTY()
     FString BaseName = TEXT("Vehicle");
@@ -356,6 +377,8 @@ private:
 
     TArray<float> WheelSpinDegrees;
     TArray<float> WheelSpringLengths;
+    TArray<float> WheelSuspensionForces;
+    TArray<float> WheelLateralForces;
     TArray<bool> WheelGrounded;
 
     float ThrottleInput = 0.0f;

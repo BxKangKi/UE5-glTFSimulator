@@ -269,7 +269,7 @@ void UglTFStreamSubSystem::ProcessNextPathAsync()
     }
 
     bool bJsonExists = false;
-    FRuntimeModelData Metadata;
+    FModelData Metadata;
     if (TryLoadValidModelMetadata(GlbPath, Metadata, bJsonExists))
     {
         ModelMetadataMap.Add(GlbPath, Metadata);
@@ -284,7 +284,7 @@ void UglTFStreamSubSystem::ProcessNextPathAsync()
         }
         else
         {
-            WriteLogAsync(FString::Printf(TEXT("Runtime GLB load skipped by metadata range. GLB=%s Center=%s Size=%s"),
+            WriteLogAsync(FString::Printf(TEXT("Streaming GLB load skipped by metadata range. GLB=%s Center=%s Size=%s"),
                 *GlbPath,
                 *Metadata.Center.ToCompactString(),
                 *Metadata.Size.ToCompactString()));
@@ -341,7 +341,7 @@ void UglTFStreamSubSystem::WaitForCurrentActorAsync()
     }
 
     CacheActorMetadata(WaitingPath, Actor);
-    if (const FRuntimeModelData* Metadata = ModelMetadataMap.Find(WaitingPath))
+    if (const FModelData* Metadata = ModelMetadataMap.Find(WaitingPath))
     {
         if (!IsPlayerInsideModelRange(*Metadata))
         {
@@ -368,18 +368,18 @@ void UglTFStreamSubSystem::UpdateStreamingAsync()
             if (!MissingFilePaths.Contains(GlbPath))
             {
                 MissingFilePaths.Add(GlbPath);
-                WriteLogAsync(FString::Printf(TEXT("GLB file missing during runtime update. Skipped: %s"), *GlbPath));
+                WriteLogAsync(FString::Printf(TEXT("GLB file missing during streaming update. Skipped: %s"), *GlbPath));
             }
             DestroySpawnActor(GlbPath);
             continue;
         }
 
-        FRuntimeModelData Metadata;
+        FModelData Metadata;
         bool bJsonExists = false;
         if (TryLoadValidModelMetadata(GlbPath, Metadata, bJsonExists))
         {
             ModelMetadataMap.Add(GlbPath, Metadata);
-            WriteLogAsync(FString::Printf(TEXT("Runtime metadata refreshed. GLB=%s Center=%s Size=%s"),
+            WriteLogAsync(FString::Printf(TEXT("Streaming metadata refreshed. GLB=%s Center=%s Size=%s"),
                 *GlbPath,
                 *Metadata.Center.ToCompactString(),
                 *Metadata.Size.ToCompactString()));
@@ -390,7 +390,7 @@ void UglTFStreamSubSystem::UpdateStreamingAsync()
             }
             else
             {
-                WriteLogAsync(FString::Printf(TEXT("Runtime GLB load skipped during runtime update by metadata range. GLB=%s Center=%s Size=%s"),
+                WriteLogAsync(FString::Printf(TEXT("Streaming GLB load skipped during streaming update by metadata range. GLB=%s Center=%s Size=%s"),
                     *GlbPath,
                     *Metadata.Center.ToCompactString(),
                     *Metadata.Size.ToCompactString()));
@@ -585,7 +585,7 @@ ACharacterController* UglTFStreamSubSystem::SpawnReplacementPlayerCharacterForLo
 
     if (IsValid(PendingPlayerCharacter.Get()))
     {
-        PendingPlayerCharacter->PrepareForRuntimePawnReplacement();
+        PendingPlayerCharacter->PrepareForPawnReplacement();
         PendingPlayerCharacter->Destroy();
         PendingPlayerCharacter.Reset();
     }
@@ -616,7 +616,7 @@ ACharacterController* UglTFStreamSubSystem::SpawnReplacementPlayerCharacterForLo
     NewCharacter->SetActorEnableCollision(false);
     NewCharacter->Activate(false);
     NewCharacter->bIsLoaded = false;
-    NewCharacter->PrepareForRuntimeMeshReload();
+    NewCharacter->PrepareForMeshReload();
 
     PreviousPlayerCharacter = CurrentCharacter;
     PendingPlayerCharacter = NewCharacter;
@@ -677,7 +677,7 @@ void UglTFStreamSubSystem::DestroyPreviousPlayerCharacter()
 
     if (IsValid(OldCharacter) && OldCharacter != ActiveCharacter)
     {
-        OldCharacter->PrepareForRuntimePawnReplacement();
+        OldCharacter->PrepareForPawnReplacement();
         OldCharacter->Destroy();
     }
 
@@ -789,7 +789,7 @@ void UglTFStreamSubSystem::DeactivatePlayerCharacter()
     {
         // Never clear the player skeletal mesh to nullptr during world exit or character
         // streaming. AnimBP/ControlRig can still be evaluating on worker threads and may
-        // crash if the mesh suddenly has no bone container. Runtime character memory is
+        // crash if the mesh suddenly has no bone container. Generated character memory is
         // released by swapping to the next freshly generated glTFRuntime skeletal mesh or
         // by destroying the owning actor/world, not by installing an empty mesh.
         MeshComponent->SetAllBodiesSimulatePhysics(false);
@@ -859,10 +859,10 @@ void UglTFStreamSubSystem::PersistCurrentPlayerSelection()
     }
 }
 
-bool UglTFStreamSubSystem::TryLoadValidModelMetadata(const FString& GlbPath, FRuntimeModelData& OutModelData, bool& bOutJsonExists) const
+bool UglTFStreamSubSystem::TryLoadValidModelMetadata(const FString& GlbPath, FModelData& OutModelData, bool& bOutJsonExists) const
 {
     bOutJsonExists = false;
-    OutModelData = FRuntimeModelData();
+    OutModelData = FModelData();
 
     const FString JsonPath = FPaths::ChangeExtension(GlbPath, TEXT("json"));
     if (!FPaths::FileExists(JsonPath))
@@ -888,12 +888,12 @@ bool UglTFStreamSubSystem::TryLoadValidModelMetadata(const FString& GlbPath, FRu
     return IsValidModelMetadata(OutModelData);
 }
 
-bool UglTFStreamSubSystem::IsValidModelMetadata(const FRuntimeModelData& ModelData) const
+bool UglTFStreamSubSystem::IsValidModelMetadata(const FModelData& ModelData) const
 {
     return !ModelData.Size.IsNearlyZero(0.001f);
 }
 
-bool UglTFStreamSubSystem::IsPlayerInsideModelRange(const FRuntimeModelData& ModelData) const
+bool UglTFStreamSubSystem::IsPlayerInsideModelRange(const FModelData& ModelData) const
 {
     if (!IsValidModelMetadata(ModelData))
     {
@@ -980,7 +980,7 @@ void UglTFStreamSubSystem::CacheActorMetadata(const FString& GlbPath, const AglT
         return;
     }
 
-    const FRuntimeModelData Metadata = Actor->GetModelMetadata();
+    const FModelData Metadata = Actor->GetModelMetadata();
     if (IsValidModelMetadata(Metadata))
     {
         ModelMetadataMap.Add(GlbPath, Metadata);
@@ -1068,6 +1068,5 @@ void UglTFStreamSubSystem::ClearTimers()
 
 void UglTFStreamSubSystem::WriteLogAsync(const FString& Message) const
 {
-    const FString Line = FString::Printf(TEXT("[%s][glTFStreamSubSystem] %s"), *FDateTime::Now().ToString(), *Message);
-    UFileFunctionLibrary::AppendLineToFileAsync(Line, PATH_LOG);
+    UFileFunctionLibrary::WriteSimulatorLogAsync(TEXT("glTFStreamSubSystem"), Message);
 }

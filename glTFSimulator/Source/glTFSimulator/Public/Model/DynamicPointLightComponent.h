@@ -36,7 +36,7 @@ private:
     UPROPERTY(EditAnywhere, Category = "Optimization|Decal")
     bool bEnableLightDecalFallback = false;
 
-    /** 이 거리보다 멀어지면 라이트가 꺼집니다. */
+    /** Disables the light when the camera is farther than this distance. */
     UPROPERTY(EditAnywhere, Category = "Optimization", meta = (UIMin = "0.0", ClampMin = "0.0"))
     float CullingDistance = 10000.0f;
 

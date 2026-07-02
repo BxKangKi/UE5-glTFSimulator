@@ -17,7 +17,7 @@ struct FBoneMapWrapper
 };
 
 class ACharacterController;
-class glTFRuntimeAsset;
+class UglTFRuntimeAsset;
 
 // Multicast delegate used for the Blueprint output pin.
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FCharacterLoadCallback, bool, Result);
