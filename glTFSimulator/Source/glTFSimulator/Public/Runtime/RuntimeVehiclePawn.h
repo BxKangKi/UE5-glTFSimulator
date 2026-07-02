@@ -118,6 +118,14 @@ private:
     UPROPERTY(EditAnywhere, Category="Vehicle")
     float SuspensionDamping = 10400.0f;
 
+    UPROPERTY(EditAnywhere, Category="Vehicle|Suspension", meta=(ClampMin="0.0"))
+    float SuspensionContactSmoothingSpeed = 14.0f;
+
+    UPROPERTY(EditAnywhere, Category="Vehicle|Suspension")
+    bool bUseSuspensionSweep = true;
+
+    UPROPERTY(EditAnywhere, Category="Vehicle|Suspension", meta=(ClampMin="0.05", ClampMax="1.0"))
+    float SuspensionSweepRadiusScale = 0.42f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle")
     float MaxSuspensionForcePerWheel = 460000.0f;
@@ -292,6 +300,18 @@ private:
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Input", meta=(ClampMin="0.1"))
     float SteeringInputInterpSpeed = 5.2f;
+
+    UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="0.004", ClampMax="0.05"))
+    float MaxVehiclePhysicsSubstepSeconds = 0.0166667f;
+
+    UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="1", ClampMax="8"))
+    int32 MaxVehiclePhysicsSubsteps = 4;
+
+    UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="0.0", ClampMax="1.0"))
+    float MinSuspensionHitNormalDot = 0.30f;
+
+    UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="100.0"))
+    float MaxSuspensionVelocity = 3200.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle")
     FVector BodyExtent = FVector(160.0f, 78.0f, 42.0f);

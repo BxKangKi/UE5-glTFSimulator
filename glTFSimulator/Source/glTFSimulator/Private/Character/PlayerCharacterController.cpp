@@ -11,6 +11,7 @@
 #include "InputActionValue.h"
 #include "InputMappingContext.h"
 #include "InputCoreTypes.h"
+#include "Model/glTFStreamSubSystem.h"
 #include "Runtime/RuntimeGameplayManager.h"
 #include "Runtime/RuntimeCreatorHUDWidget.h"
 #include "Runtime/RuntimePauseMenuWidget.h"
@@ -33,6 +34,12 @@ APlayerCharacterController::APlayerCharacterController()
     if (DebugActionFinder.Succeeded())
     {
         DebugAction = DebugActionFinder.Object;
+    }
+
+    static ConstructorHelpers::FObjectFinder<UInputAction> ChangeCharacterActionFinder(TEXT("/Game/Input/Actions/IA_ChangeCharacter.IA_ChangeCharacter"));
+    if (ChangeCharacterActionFinder.Succeeded())
+    {
+        ChangeCharacterAction = ChangeCharacterActionFinder.Object;
     }
 
     static ConstructorHelpers::FClassFinder<UUserWidget> DebugWidgetFinder(TEXT("/Game/Blueprints/MainWorld/WBP_Debug"));
@@ -340,6 +347,10 @@ void APlayerCharacterController::BindConfiguredInputActions()
     {
         EnhancedInputComponent->BindAction(RuntimeToggleFirstPersonAction.Get(), ETriggerEvent::Started, this, &APlayerCharacterController::Input_RuntimeToggleFirstPersonPressed);
     }
+    if (ChangeCharacterAction)
+    {
+        EnhancedInputComponent->BindAction(ChangeCharacterAction.Get(), ETriggerEvent::Started, this, &APlayerCharacterController::Input_ChangeCharacterPressed);
+    }
     if (RuntimeToolbarScrollAction)
     {
         EnhancedInputComponent->BindAction(RuntimeToolbarScrollAction.Get(), ETriggerEvent::Triggered, this, &APlayerCharacterController::HandleToolbarScrollTriggered);
@@ -419,6 +430,7 @@ int32 APlayerCharacterController::CountAssignedEnhancedInputActions() const
     CountIfValid(FlyAction.Get());
     CountIfValid(RagdollAction.Get());
     CountIfValid(RuntimeToggleFirstPersonAction.Get());
+    CountIfValid(ChangeCharacterAction.Get());
     CountIfValid(RuntimeToolbarScrollAction.Get());
     CountIfValid(RuntimeToggleItemListAction.Get());
     CountIfValid(RuntimeSnapAction.Get());
@@ -515,6 +527,10 @@ void APlayerCharacterController::BindFallbackKeyInputs()
     if (ShouldBindFallbackKeyForAction(RuntimeToggleFirstPersonAction.Get()))
     {
         InputComponent->BindKey(EKeys::V, IE_Pressed, this, &APlayerCharacterController::Input_RuntimeToggleFirstPersonPressed);
+    }
+    if (ShouldBindFallbackKeyForAction(ChangeCharacterAction.Get()))
+    {
+        InputComponent->BindKey(EKeys::U, IE_Pressed, this, &APlayerCharacterController::Input_ChangeCharacterPressed);
     }
     if (ShouldBindFallbackKeyForAction(RuntimeToolbarScrollAction.Get()))
     {
@@ -840,6 +856,29 @@ void APlayerCharacterController::Input_RuntimeToggleFirstPersonPressed()
     if (ARuntimeGameplayManager* Manager = GetRuntimeGameplayManager())
     {
         Manager->InputToggleFirstPersonAction();
+    }
+}
+
+void APlayerCharacterController::Input_ChangeCharacterPressed()
+{
+    if (bRuntimeUIInputMode || !ConsumeRuntimeInput(LastRuntimeChangeCharacterInputTime))
+    {
+        return;
+    }
+
+    if (!IsValid(SubSystem))
+    {
+        SubSystem = UGameManagerSubSystem::GetSubSystem(this);
+    }
+
+    if (IsValid(SubSystem) && SubSystem->IsWorldLoading())
+    {
+        return;
+    }
+
+    if (UglTFStreamSubSystem* StreamSubSystem = UglTFStreamSubSystem::Get(this))
+    {
+        StreamSubSystem->CycleNextPlayerCharacter();
     }
 }
 

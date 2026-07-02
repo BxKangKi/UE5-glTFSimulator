@@ -10,7 +10,7 @@
 #include "Components/BoxComponent.h"
 #include "StreamAsyncAction.generated.h"
 
-class AStreamActor;
+class AglTFStreamActor;
 class UStaticMeshComponent;
 class UStaticMesh;
 class UInstancedStaticMeshComponent;
@@ -22,6 +22,10 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
     FOnUpdateCompleted,
     const FStreamAsyncWrapper &, MapWrapper);
 
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
+    FOnStreamProgress,
+    float, Progress);
+
 UCLASS()
 class GLTFSIMULATOR_API UStreamAsyncAction : public UBlueprintAsyncActionBase
 {
@@ -31,10 +35,13 @@ public:
     UPROPERTY(BlueprintAssignable)
     FOnUpdateCompleted Completed;
 
+    UPROPERTY(BlueprintAssignable)
+    FOnStreamProgress Progress;
+
     UFUNCTION(BlueprintCallable, meta = (WorldContext = "WorldContextObject"))
     static UStreamAsyncAction *StreamAsync(
         UObject *WorldContextObject,
-        AStreamActor *Actor,
+        AglTFStreamActor *Actor,
         const FVector &InPlayerLocation,
         const FglTFRuntimeStaticMeshConfig &StaticMeshConfig,
         float InDistance = 65536.0f,
@@ -83,6 +90,7 @@ private:
     int32 CurrentLoadIndex;
     int32 CurrentUnloadIndex;
     int32 ChunkSize;
+    int32 TotalOperationCount = 0;
 
     FTimerHandle ProcessTimerHandle;
     FglTFRuntimeStaticMeshConfig StaticMeshConfig;
@@ -101,4 +109,5 @@ private:
 
     void SpawnRuntimeComponents(const FName &NodeName, const FModelNodeData &NodeInfo, const FRuntimeMeshData &Data);
     void DestroyRuntimeComponents(const FName &NodeName);
+    void BroadcastProgress();
 };

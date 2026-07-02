@@ -147,6 +147,8 @@ void ACharacterController::BeginPlay()
 
 void ACharacterController::Load(const FString &Path)
 {
+    bIsLoaded = false;
+
     if (IsValid(Component.Get()))
     {
         // A new async mesh invalidates the previous waterline reference. The new
@@ -187,9 +189,8 @@ void ACharacterController::OnLoadCompleted(bool Result)
         Component->RequestWaterReferenceRefreshAfterMeshLoad();
     }
 
-    // bIsLoaded is used by WorldManager as a load-completion gate. Treat the
-    // default-mesh fallback as a completed load; otherwise LoadPlayerAsync loops
-    // forever and RuntimeGameplayManager never starts.
+    // bIsLoaded is used by glTFStreamSubSystem as a player load-completion gate. Treat the
+    // default-mesh fallback as a completed load; otherwise main-world startup can never finish.
     bIsLoaded = true;
 }
 

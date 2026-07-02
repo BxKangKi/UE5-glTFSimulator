@@ -12,13 +12,13 @@
 #include "Engine/World.h"
 #include "Engine/Texture.h"
 #include "Async/ParallelFor.h"
-#include "Model/StreamActor.h"
-#include "Model/SpawnActor.h"
+#include "Model/glTFStreamActor.h"
+#include "Model/AssetManageSubSystem.h"
 #include "TimerManager.h"
 
 UStreamAsyncAction *UStreamAsyncAction::StreamAsync(
     UObject *WorldContextObject,
-    AStreamActor *Actor,
+    AglTFStreamActor *Actor,
     const FVector &InPlayerLocation,
     const FglTFRuntimeStaticMeshConfig &StaticMeshConfig,
     float InDistance,
@@ -29,18 +29,14 @@ UStreamAsyncAction *UStreamAsyncAction::StreamAsync(
     if (IsValid(Actor))
     {
         Action->OwnerActor = Actor;
-        Action->NodeMap = Actor->NodeMap;
-        ASpawnActor *SpawnActor = Actor->SpawnActor;
-        if (IsValid(SpawnActor))
-        {
-            Action->MeshMap = SpawnActor->GetAllMeshMap();
-        }
-        Action->DecalLight = Actor->DecalLight;
-        Action->DynamicComponentMap = Actor->DynamicComponentMap;
-        Action->UnloadBoxMap = Actor->UnloadBoxMap; // Actor로부터 UnloadBoxMap 연동
-        Action->LoadedNodes = Actor->LoadedNodes;
-        Action->InstanceMap = Actor->InstanceMap;
-        Action->Asset = Actor->Asset;
+        Action->NodeMap = Actor->GetAllNodeMapRef();
+        Action->MeshMap = Actor->GetAllMeshMapRef();
+        Action->DecalLight = Actor->GetDecalLight();
+        Action->DynamicComponentMap = Actor->GetDynamicComponentMapRef();
+        Action->UnloadBoxMap = Actor->GetUnloadBoxMapRef();
+        Action->LoadedNodes = Actor->GetLoadedNodesRef();
+        Action->InstanceMap = Actor->GetInstanceMapRef();
+        Action->Asset = Actor->GetAsset();
     }
     Action->PlayerLocation = InPlayerLocation;
     Action->Distance = InDistance;
@@ -101,7 +97,9 @@ void UStreamAsyncAction::Activate()
 
     CurrentLoadIndex = 0;
     CurrentUnloadIndex = 0;
+    TotalOperationCount = PendingLoadNodes.Num() + PendingUnloadNodes.Num();
     bIsLoading = false;
+    BroadcastProgress();
 
     ProcessChunk();
 }
@@ -118,8 +116,10 @@ void UStreamAsyncAction::ProcessChunk()
     for (int32 i = CurrentUnloadIndex; i < UnloadEnd; ++i)
     {
         ProcessUnloadNode(PendingUnloadNodes[i]);
+        BroadcastProgress();
     }
     CurrentUnloadIndex = UnloadEnd;
+    BroadcastProgress();
 
     if (!bIsLoading && CurrentLoadIndex < PendingLoadNodes.Num())
     {
@@ -156,6 +156,7 @@ void UStreamAsyncAction::ProcessChunk()
         Wrapper.UnloadBoxMap = MoveTemp(UnloadBoxMap); // Wrapper 구조체로 데이터 이관
         Wrapper.DynamicComponentMap = MoveTemp(DynamicComponentMap); // Wrapper 구조체로 데이터 이관
 
+        Progress.Broadcast(1.0f);
         Completed.Broadcast(Wrapper);
         SetReadyToDestroy();
     }
@@ -224,6 +225,10 @@ void UStreamAsyncAction::ProcessUnloadNode(const FName &Name)
         }
         else
         {
+            if (UAssetManageSubSystem* AssetManager = UAssetManageSubSystem::Get(OwnerActor))
+            {
+                AssetManager->ReleaseStaticMesh(OwnerActor, ISMC->GetStaticMesh());
+            }
             FActorHelper::DestroyComponent(OwnerActor, ISMC);
             InstanceMap.Remove(Info->MeshName);
         }
@@ -251,11 +256,17 @@ void UStreamAsyncAction::SetStaticMesh(UStaticMesh *StaticMesh)
         return;
     }
 
+    UStaticMesh* MeshToUse = StaticMesh;
+    if (UAssetManageSubSystem* AssetManager = UAssetManageSubSystem::Get(OwnerActor))
+    {
+        MeshToUse = AssetManager->AcquireStaticMesh(OwnerActor, CurrentLoadingMesh, StaticMesh);
+    }
+
     UInstancedStaticMeshComponent *ISMC = InstanceMap.FindRef(CurrentLoadingMesh);
     if (!IsValid(ISMC))
     {
         ISMC = FActorHelper::AddStaticMeshComponent<UInstancedStaticMeshComponent>(
-            OwnerActor, OwnerActor->GetTransform(), StaticMesh);
+            OwnerActor, OwnerActor->GetTransform(), MeshToUse);
         if (IsValid(ISMC))
         {
             ISMC->SetRenderCustomDepth(true);
@@ -270,6 +281,13 @@ void UStreamAsyncAction::SetStaticMesh(UStaticMesh *StaticMesh)
     }
     else
     {
+        if (MeshToUse != StaticMesh)
+        {
+            if (UAssetManageSubSystem* AssetManager = UAssetManageSubSystem::Get(OwnerActor))
+            {
+                AssetManager->ReleaseStaticMesh(OwnerActor, MeshToUse);
+            }
+        }
         ResetLoadState();
     }
 }
@@ -356,6 +374,7 @@ void UStreamAsyncAction::AddTrasnform(const FName &Name, UInstancedStaticMeshCom
         FTransform Transform = NodeInfo->Transform;
         ISMC->AddInstance(Transform);
         LoadedNodes.Emplace(Name);
+        BroadcastProgress();
 
         if (const FModelMeshData *MeshData = MeshMap.Find(NodeInfo->MeshName))
         {
@@ -496,4 +515,17 @@ void UStreamAsyncAction::DestroyRuntimeComponents(const FName &NodeName)
 void UStreamAsyncAction::ResetLoadState()
 {
     bIsLoading = false;
+    BroadcastProgress();
+}
+
+void UStreamAsyncAction::BroadcastProgress()
+{
+    if (TotalOperationCount <= 0)
+    {
+        Progress.Broadcast(1.0f);
+        return;
+    }
+
+    const int32 CompletedOperations = FMath::Clamp(CurrentUnloadIndex + CurrentLoadIndex, 0, TotalOperationCount);
+    Progress.Broadcast(FMath::Clamp(static_cast<float>(CompletedOperations) / static_cast<float>(TotalOperationCount), 0.0f, 1.0f));
 }

@@ -3,6 +3,7 @@
 #include "Runtime/RuntimeVehiclePawn.h"
 
 #include "Camera/CameraComponent.h"
+#include "CollisionShape.h"
 #include "Character/CharacterComponent.h"
 #include "Character/CharacterController.h"
 #include "Character/PlayerCharacterController.h"
@@ -257,11 +258,25 @@ void ARuntimeVehiclePawn::ApplyVehicleBodyPhysicsSettings()
 void ARuntimeVehiclePawn::Tick(float DeltaSeconds)
 {
     Super::Tick(DeltaSeconds);
-    const float SafeDeltaTime = FMath::Clamp(DeltaSeconds, 0.0f, 0.05f);
-    SmoothedThrottleInput = FMath::FInterpTo(SmoothedThrottleInput, ThrottleInput, SafeDeltaTime, FMath::Max(0.1f, ThrottleInputInterpSpeed));
-    SmoothedSteeringInput = FMath::FInterpTo(SmoothedSteeringInput, SteeringInput, SafeDeltaTime, FMath::Max(0.1f, SteeringInputInterpSpeed));
-    ApplySuspensionAndDrive(SafeDeltaTime);
-    UpdateWheelVisuals(SafeDeltaTime);
+
+    const float SafeFrameDeltaTime = FMath::Clamp(DeltaSeconds, 0.0f, 0.10f);
+    if (SafeFrameDeltaTime <= 0.0f)
+    {
+        return;
+    }
+
+    SmoothedThrottleInput = FMath::FInterpTo(SmoothedThrottleInput, ThrottleInput, SafeFrameDeltaTime, FMath::Max(0.1f, ThrottleInputInterpSpeed));
+    SmoothedSteeringInput = FMath::FInterpTo(SmoothedSteeringInput, SteeringInput, SafeFrameDeltaTime, FMath::Max(0.1f, SteeringInputInterpSpeed));
+
+    const float TargetSubstep = FMath::Max(0.004f, MaxVehiclePhysicsSubstepSeconds);
+    const int32 SubstepCount = FMath::Clamp(FMath::CeilToInt(SafeFrameDeltaTime / TargetSubstep), 1, FMath::Max(1, MaxVehiclePhysicsSubsteps));
+    const float SubstepDeltaTime = SafeFrameDeltaTime / static_cast<float>(SubstepCount);
+    for (int32 StepIndex = 0; StepIndex < SubstepCount; ++StepIndex)
+    {
+        ApplySuspensionAndDrive(SubstepDeltaTime);
+    }
+
+    UpdateWheelVisuals(SafeFrameDeltaTime);
 }
 
 void ARuntimeVehiclePawn::SetDriveInput(float Throttle, float Steering)
@@ -1024,6 +1039,8 @@ void ARuntimeVehiclePawn::ApplySuspensionAndDrive(float DeltaSeconds)
         WheelState.LocalOffset = WheelOffsets[WheelIndex];
         WheelState.bFront = WheelState.LocalOffset.X >= AxleSplitX;
         WheelState.bRightSide = WheelState.LocalOffset.Y > 0.0f;
+        const bool bWasGrounded = WheelGrounded.IsValidIndex(WheelIndex) && WheelGrounded[WheelIndex];
+        const float PreviousSpringLength = WheelSpringLengths.IsValidIndex(WheelIndex) ? WheelSpringLengths[WheelIndex] : SuspensionRestLength;
         WheelGrounded[WheelIndex] = false;
         WheelSpringLengths[WheelIndex] = SuspensionRestLength;
 
@@ -1031,19 +1048,48 @@ void ARuntimeVehiclePawn::ApplySuspensionAndDrive(float DeltaSeconds)
         const FVector TraceStart = MountWorld + Up * FMath::Max(2.0f, SafeWheelRadius * 0.20f);
         const FVector TraceEnd = MountWorld - Up * (SuspensionRestLength + SuspensionTraceExtra + SafeWheelRadius);
         FHitResult Hit;
-        if (!World->LineTraceSingleByChannel(Hit, TraceStart, TraceEnd, ECC_Visibility, QueryParams))
+        bool bHasSuspensionHit = false;
+        if (bUseSuspensionSweep)
         {
-            WheelState.SpringLength = SuspensionRestLength;
+            const float SweepRadius = FMath::Clamp(SafeWheelRadius * SuspensionSweepRadiusScale, 2.0f, SafeWheelRadius * 0.9f);
+            bHasSuspensionHit = World->SweepSingleByChannel(
+                Hit,
+                TraceStart,
+                TraceEnd,
+                FQuat::Identity,
+                ECC_Visibility,
+                FCollisionShape::MakeSphere(SweepRadius),
+                QueryParams);
+        }
+        if (!bHasSuspensionHit)
+        {
+            bHasSuspensionHit = World->LineTraceSingleByChannel(Hit, TraceStart, TraceEnd, ECC_Visibility, QueryParams);
+        }
+        if (bHasSuspensionHit && FVector::DotProduct(Hit.ImpactNormal.GetSafeNormal(), Up) < FMath::Clamp(MinSuspensionHitNormalDot, 0.0f, 1.0f))
+        {
+            bHasSuspensionHit = false;
+        }
+
+        if (!bHasSuspensionHit)
+        {
+            const float RelaxedSpringLength = FMath::FInterpTo(PreviousSpringLength, SuspensionRestLength, DeltaSeconds, FMath::Max(0.1f, SuspensionContactSmoothingSpeed));
+            WheelState.SpringLength = RelaxedSpringLength;
             WheelState.MountWorld = MountWorld;
+            WheelSpringLengths[WheelIndex] = RelaxedSpringLength;
             continue;
         }
 
-        const float HitDistance = (Hit.ImpactPoint - MountWorld).Size();
-        const float SpringLength = FMath::Clamp(HitDistance - SafeWheelRadius, 0.0f, SuspensionRestLength);
+        const float HitDistance = FMath::Abs(FVector::DotProduct(MountWorld - Hit.ImpactPoint, Up));
+        const float RawSpringLength = FMath::Clamp(HitDistance - SafeWheelRadius, 0.0f, SuspensionRestLength);
+        const float SpringLength = bWasGrounded
+            ? FMath::FInterpTo(PreviousSpringLength, RawSpringLength, DeltaSeconds, FMath::Max(0.1f, SuspensionContactSmoothingSpeed))
+            : RawSpringLength;
         const float Compression = FMath::Max(0.0f, SuspensionRestLength - SpringLength);
-        const FVector PointVelocity = Body->GetPhysicsLinearVelocityAtPoint(MountWorld);
-        const float SuspensionVelocity = FVector::DotProduct(PointVelocity, Up);
-        float SuspensionForce = Compression * SuspensionStrength * MassScale - SuspensionVelocity * SuspensionDamping * MassScale;
+        const float RawSuspensionVelocity = bWasGrounded
+            ? (PreviousSpringLength - SpringLength) / FMath::Max(0.001f, DeltaSeconds)
+            : 0.0f;
+        const float SuspensionVelocity = FMath::Clamp(RawSuspensionVelocity, -FMath::Max(100.0f, MaxSuspensionVelocity), FMath::Max(100.0f, MaxSuspensionVelocity));
+        float SuspensionForce = Compression * SuspensionStrength * MassScale + SuspensionVelocity * SuspensionDamping * MassScale;
         SuspensionForce = FMath::Clamp(SuspensionForce, 0.0f, MaxSuspensionForcePerWheel * MassScale);
 
         if (SpringLength < 3.0f)

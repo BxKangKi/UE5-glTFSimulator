@@ -9,6 +9,8 @@
 
 class UInstancedStaticMeshComponent;
 class UBoxComponent;
+class UShapeComponent;
+class ULightComponent;
 
 UENUM(BlueprintType)
 enum class EColliderType : uint8
@@ -93,6 +95,9 @@ struct FRuntimeModelData
     FVector Center = FVector::ZeroVector;
 
     UPROPERTY()
+    FVector Size = FVector::ZeroVector;
+
+    UPROPERTY()
     TMap<FName, FRuntimeMeshData> MeshData;
 
     TSharedRef<FJsonObject> Serialization() const;
@@ -148,6 +153,9 @@ struct FLoadAsyncWrapper
 
     UPROPERTY()
     TMap<FName, FModelMeshData> MeshMap;
+
+    UPROPERTY()
+    FRuntimeModelData ModelData;
 };
 
 // [수정] 박스 컴포넌트까지 통합하여 관리하도록 그룹 구조체 확장

@@ -1,0 +1,487 @@
+// Copyright © 2026 BxKangKi. Licensed under the MIT License.
+// Copyright © 2026 Epic Games, Inc. All rights reserved.
+
+#include "Model/glTFStreamActor.h"
+
+#include "Components/BoxComponent.h"
+#include "Components/InstancedStaticMeshComponent.h"
+#include "Components/LightComponent.h"
+#include "Components/ShapeComponent.h"
+#include "Engine/Texture2D.h"
+#include "Engine/Texture2DArray.h"
+#include "glTFRuntimeFunctionLibrary.h"
+#include "HAL/FileManager.h"
+#include "IImageWrapper.h"
+#include "IImageWrapperModule.h"
+#include "Materials/MaterialInstance.h"
+#include "Materials/MaterialInstanceDynamic.h"
+#include "Materials/MaterialInterface.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
+#include "Model/LoadAsyncAction.h"
+#include "Model/StreamAsyncAction.h"
+#include "Model/AssetManageSubSystem.h"
+#include "Modules/ModuleManager.h"
+#include "System/FileFunctionLibrary.h"
+#include "System/GameManagerSubSystem.h"
+#include "System/MacroLibrary.h"
+#include "TimerManager.h"
+
+static bool IsTerrainLikeName(const FString& Name)
+{
+    return Name.Equals(TEXT("terrain"), ESearchCase::IgnoreCase)
+        || Name.Contains(TEXT("terrain"), ESearchCase::IgnoreCase);
+}
+
+void AglTFStreamActor::Init(const FString& Path)
+{
+    FilePath = Path;
+}
+
+void AglTFStreamActor::BeginPlay()
+{
+    Super::BeginPlay();
+
+    bIsLoaded = false;
+    bIsDestroyed = false;
+    bAsyncLoading = false;
+    LoadingStatus = 0.0f;
+    AssetLoadPhase = EGLTFStreamAssetPhase::None;
+
+    AllNodeMap.Empty();
+    AllMeshMap.Empty();
+    LoadedNodes.Empty();
+    InstanceMap.Empty();
+    UnloadBoxMap.Empty();
+    DynamicComponentMap.Empty();
+    ModelMetadata = FRuntimeModelData();
+    bHasModelMetadata = false;
+
+    LoadAssetAsync(EGLTFStreamAssetPhase::SizeScan);
+}
+
+void AglTFStreamActor::Destroyed()
+{
+    Super::Destroyed();
+    bIsDestroyed = true;
+    ReleaseRuntimeResources();
+    ReleaseAsset(glTFRuntimeAsset.Get());
+    glTFRuntimeAsset = nullptr;
+}
+
+void AglTFStreamActor::LoadAssetAsync(EGLTFStreamAssetPhase Phase)
+{
+    AssetLoadPhase = Phase;
+
+    FglTFRuntimeHttpResponse Delegate;
+    Delegate.BindDynamic(this, &AglTFStreamActor::OnAssetLoaded);
+
+    FglTFRuntimeConfig Config;
+    Config.bAllowExternalFiles = true;
+    UglTFRuntimeFunctionLibrary::glTFLoadAssetFromFilenameAsync(FilePath, false, Config, Delegate);
+}
+
+void AglTFStreamActor::OnAssetLoaded(UglTFRuntimeAsset* Asset)
+{
+    if (bIsDestroyed)
+    {
+        ReleaseAsset(Asset);
+        return;
+    }
+
+    if (!IsValid(Asset))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("AglTFStreamActor: failed to load asset: %s"), *FilePath);
+        bAsyncLoading = false;
+        return;
+    }
+
+    switch (AssetLoadPhase)
+    {
+        case EGLTFStreamAssetPhase::SizeScan:
+            StartSizeScan(Asset);
+            return;
+        case EGLTFStreamAssetPhase::Runtime:
+            glTFRuntimeAsset = Asset;
+            LoadingStatus = AllNodeMap.Num() == 0 ? 1.0f:
+            0.5f;
+            StartRuntimeStreaming();
+            return;
+        default:
+            break;
+    }
+
+    ReleaseAsset(Asset);
+}
+
+void AglTFStreamActor::StartSizeScan(UglTFRuntimeAsset* Asset)
+{
+    FglTFRuntimeStaticMeshConfig Config;
+    Config.Outer = this;
+    Config.CacheMode = EglTFRuntimeCacheMode::None;
+    Config.MaterialsConfig.CacheMode = EglTFRuntimeCacheMode::None;
+    Config.MaterialsConfig.bSkipLoad = true;
+    Config.MaterialsConfig.bLoadMipMaps = false;
+    Config.bAllowCPUAccess = false;
+    Config.bBuildLumenCards = false;
+    Config.bBuildNavCollision = false;
+    Config.bBuildSimpleCollision = false;
+    Config.bBuildComplexCollision = false;
+    Config.NormalsGenerationStrategy = EglTFRuntimeNormalsGenerationStrategy::Never;
+    Config.TangentsGenerationStrategy = EglTFRuntimeTangentsGenerationStrategy::Never;
+
+    const int32 SizeScanChunkSize = GetSizeScanChunkSize(Asset->GetNodes().Num());
+    const FString JsonPath = FPaths::ChangeExtension(FilePath, TEXT("json"));
+
+    ULoadAsyncAction* AsyncAction = ULoadAsyncAction::LoadAsync(this, Asset, Config, SizeScanChunkSize, JsonPath);
+    if (AsyncAction)
+    {
+        AsyncAction->Completed.AddDynamic(this, &AglTFStreamActor::OnChunksLoaded);
+        AsyncAction->Progress.AddDynamic(this, &AglTFStreamActor::OnSizeScanProgress);
+        AsyncAction->Activate();
+    }
+    else
+    {
+        ReleaseAsset(Asset);
+    }
+}
+
+int32 AglTFStreamActor::GetSizeScanChunkSize(int32 TotalNodeCount) const
+{
+    if (TotalNodeCount <= 0)
+    {
+        return 1;
+    }
+    return FMath::Max(1, ChunkSize);
+}
+
+void AglTFStreamActor::OnChunksLoaded(const FLoadAsyncWrapper& MapWrapper)
+{
+    if (bIsDestroyed)
+    {
+        return;
+    }
+
+#if WITH_EDITOR
+    UE_LOG(LogTemp, Warning, TEXT("AglTFStreamActor::OnChunksLoaded Executed."));
+#endif
+
+    AllNodeMap = MapWrapper.NodeMap;
+    AllMeshMap = MapWrapper.MeshMap;
+    ModelMetadata = MapWrapper.ModelData;
+    bHasModelMetadata = !ModelMetadata.Size.IsNearlyZero(0.001f);
+    LoadingStatus = 0.5f;
+
+    WriteLogAsync(FString::Printf(TEXT("Size scan completed. File=%s Center=%s Size=%s"),
+        *FilePath,
+        *ModelMetadata.Center.ToCompactString(),
+        *ModelMetadata.Size.ToCompactString()));
+
+    // The size-scan asset and its temporary meshes are no longer needed here.
+    // ULoadAsyncAction already clears its local asset pointer after calculating bounds.
+    if (IsPlayerInsideModelRange())
+    {
+        LoadAssetAsync(EGLTFStreamAssetPhase::Runtime);
+    }
+    else
+    {
+        bIsLoaded = true;
+        bAsyncLoading = false;
+        LoadingStatus = 1.0f;
+        WriteLogAsync(FString::Printf(TEXT("Runtime GLB load skipped because player is outside model range: %s"), *FilePath));
+    }
+}
+
+void AglTFStreamActor::ReleaseAsset(UglTFRuntimeAsset* Asset)
+{
+    if (IsValid(Asset))
+    {
+        Asset->ClearCache();
+        Asset->MarkAsGarbage();
+    }
+}
+
+void AglTFStreamActor::ReleaseRuntimeResources()
+{
+    UAssetManageSubSystem* AssetManager = UAssetManageSubSystem::Get(this);
+    for (TPair<FName, TObjectPtr<UInstancedStaticMeshComponent>>& Pair : InstanceMap)
+    {
+        UInstancedStaticMeshComponent* ISMC = Pair.Value.Get();
+        if (!IsValid(ISMC))
+        {
+            continue;
+        }
+
+        if (AssetManager)
+        {
+            AssetManager->ReleaseStaticMesh(this, ISMC->GetStaticMesh());
+        }
+        ISMC->DestroyComponent();
+    }
+    InstanceMap.Empty();
+    LoadedNodes.Empty();
+
+    for (TPair<FName, TObjectPtr<UBoxComponent>>& Pair : UnloadBoxMap)
+    {
+        if (IsValid(Pair.Value))
+        {
+            Pair.Value->DestroyComponent();
+        }
+    }
+    UnloadBoxMap.Empty();
+
+    for (TPair<FName, FRuntimeComponentGroup>& Pair : DynamicComponentMap)
+    {
+        for (UShapeComponent* Collider : Pair.Value.Colliders)
+        {
+            if (IsValid(Collider))
+            {
+                Collider->DestroyComponent();
+            }
+        }
+        for (ULightComponent* Light : Pair.Value.Lights)
+        {
+            if (IsValid(Light))
+            {
+                Light->DestroyComponent();
+            }
+        }
+    }
+    DynamicComponentMap.Empty();
+}
+
+void AglTFStreamActor::OnSizeScanProgress(float Progress)
+{
+    LoadingStatus = FMath::Clamp(Progress * 0.5f, 0.0f, 0.5f);
+}
+
+void AglTFStreamActor::OnStreamAsyncProgress(float Progress)
+{
+    LoadingStatus = FMath::Clamp(0.5f + Progress * 0.5f, 0.5f, 1.0f);
+}
+
+bool AglTFStreamActor::IsPlayerInsideModelRange() const
+{
+    if (!bHasModelMetadata || ModelMetadata.Size.IsNearlyZero(0.001f))
+    {
+        return true;
+    }
+
+    FVector PlayerLocation = FVector::ZeroVector;
+    if (UGameManagerSubSystem* GameSys = UGameManagerSubSystem::GetSubSystem(const_cast<AglTFStreamActor*>(this)))
+    {
+        PlayerLocation = GameSys->GetPlayerLocation();
+    }
+
+    constexpr float DistanceScale = 64.0f;
+    const float Radius = FMath::Max3(ModelMetadata.Size.X, ModelMetadata.Size.Y, ModelMetadata.Size.Z) * DistanceScale;
+    return FVector::DistSquared(PlayerLocation, ModelMetadata.Center) <= FMath::Square(FMath::Max(1.0f, Radius));
+}
+
+void AglTFStreamActor::WriteLogAsync(const FString& Message) const
+{
+    const FString Line = FString::Printf(TEXT("[%s][glTFStreamActor] %s"), *FDateTime::Now().ToString(), *Message);
+    UFileFunctionLibrary::AppendLineToFileAsync(Line, PATH_LOG);
+}
+
+void AglTFStreamActor::StartRuntimeStreaming()
+{
+    if (AllNodeMap.Num() == 0)
+    {
+        bIsLoaded = true;
+        bAsyncLoading = false;
+        LoadingStatus = 1.0f;
+        return;
+    }
+
+    AsyncTick();
+}
+
+FglTFRuntimeStaticMeshConfig AglTFStreamActor::BuildStreamingStaticMeshConfig()
+{
+    FglTFRuntimeStaticMeshConfig Config;
+    Config.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
+    Config.CollisionComplexity = ECollisionTraceFlag::CTF_UseComplexAsSimple;
+
+    TMap<EglTFRuntimeMaterialType, UMaterialInterface*> UberMaterialsOverrideMap;
+    UberMaterialsOverrideMap.Add(EglTFRuntimeMaterialType::Opaque, Default.Opaque);
+    UberMaterialsOverrideMap.Add(EglTFRuntimeMaterialType::Translucent, Default.Translucent);
+    UberMaterialsOverrideMap.Add(EglTFRuntimeMaterialType::TwoSided, Default.TwoSided);
+    UberMaterialsOverrideMap.Add(EglTFRuntimeMaterialType::TwoSidedTranslucent, Default.TranslucentTwoSided);
+    UberMaterialsOverrideMap.Add(EglTFRuntimeMaterialType::Masked, Default.Opaque);
+    UberMaterialsOverrideMap.Add(EglTFRuntimeMaterialType::TwoSidedMasked, Default.TwoSided);
+
+    Config.MaterialsConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
+    Config.MaterialsConfig.UberMaterialsOverrideMap = UberMaterialsOverrideMap;
+    Config.MaterialsConfig.UnlitOverrideMap = UberMaterialsOverrideMap;
+
+    TMap<FString, UMaterialInterface*> MaterialsOverrideByNameMap;
+    MaterialsOverrideByNameMap.Add(TEXT("glass"), Default.Glass);
+    MaterialsOverrideByNameMap.Add(TEXT("tinted_glass"), Default.TintedGlass);
+    MaterialsOverrideByNameMap.Add(TEXT("terrain"), Default.Terrain);
+    MaterialsOverrideByNameMap.Add(TEXT("Terrain"), Default.Terrain);
+    Config.MaterialsConfig.MaterialsOverrideByNameMap = MaterialsOverrideByNameMap;
+    Config.MaterialsConfig.bMaterialsOverrideMapInjectParams = true;
+    Config.MaterialsConfig.bGeneratesMipMaps = true;
+    Config.MaterialsConfig.SpecularFactor = 0.0f;
+    Config.MaterialsConfig.ImagesConfig.MaxWidth = 768;
+    Config.MaterialsConfig.ImagesConfig.MaxHeight = 768;
+    Config.MaterialsConfig.ImagesConfig.bCompressMips = true;
+    Config.MaterialsConfig.ImagesConfig.bStreaming = true;
+    Config.MaterialsConfig.bLoadMipMaps = true;
+    Config.Outer = this;
+    Config.bAllowCPUAccess = true;
+    Config.bBuildLumenCards = true;
+    Config.bBuildNavCollision = true;
+    return Config;
+}
+
+void AglTFStreamActor::AsyncTick()
+{
+    if (bIsDestroyed)
+    {
+        bAsyncLoading = false;
+        return;
+    }
+
+    if (!IsValid(glTFRuntimeAsset))
+    {
+        bAsyncLoading = false;
+        return;
+    }
+
+    if (AllNodeMap.Num() == 0)
+    {
+        bIsLoaded = true;
+        LoadingStatus = 1.0f;
+        bAsyncLoading = false;
+        return;
+    }
+
+    if (bAsyncLoading)
+    {
+        return;
+    }
+    bAsyncLoading = true;
+
+    FVector PlayerLoc = FVector::ZeroVector;
+    if (UGameManagerSubSystem* GameSys = UGameManagerSubSystem::GetSubSystem(this))
+    {
+        PlayerLoc = GameSys->GetPlayerLocation();
+    }
+
+    const int32 Size = FMath::Max(1, ChunkSize);
+    UStreamAsyncAction* AsyncAction = UStreamAsyncAction::StreamAsync(
+        this,
+        this,
+        PlayerLoc,
+        BuildStreamingStaticMeshConfig(),
+        StreamDistance,
+        Size);
+
+    if (AsyncAction)
+    {
+        AsyncAction->Completed.AddDynamic(this, &AglTFStreamActor::OnStreamAsyncCompleted);
+        AsyncAction->Progress.AddDynamic(this, &AglTFStreamActor::OnStreamAsyncProgress);
+        AsyncAction->Activate();
+    }
+    else
+    {
+        bAsyncLoading = false;
+    }
+}
+
+void AglTFStreamActor::UpdateProperties(const FStreamAsyncWrapper& Collection)
+{
+    AllNodeMap = Collection.NodeMap;
+    LoadedNodes = Collection.LoadedNodes;
+    InstanceMap = Collection.InstanceMap;
+    UnloadBoxMap = Collection.UnloadBoxMap;
+    DynamicComponentMap = Collection.DynamicComponentMap;
+}
+
+bool AglTFStreamActor::IsTerrainMaterial(const UMaterialInterface* Material) const
+{
+    const UMaterialInterface* CurrentMaterial = Material;
+    while (CurrentMaterial)
+    {
+        if (CurrentMaterial == Default.Terrain.Get() || IsTerrainLikeName(CurrentMaterial->GetName()))
+        {
+            return true;
+        }
+
+        const UMaterialInstance* MaterialInstance = Cast<UMaterialInstance>(CurrentMaterial);
+        CurrentMaterial = MaterialInstance ? MaterialInstance->Parent : nullptr;
+    }
+
+    return false;
+}
+
+void AglTFStreamActor::ApplyTerrainTextureArrayToLoadedMaterials()
+{
+    if (!RuntimeTerrainTextureArray)
+    {
+        return;
+    }
+
+    for (const TPair<FName, TObjectPtr<UInstancedStaticMeshComponent>>& Pair : InstanceMap)
+    {
+        UInstancedStaticMeshComponent* MeshComponent = Pair.Value.Get();
+        if (!IsValid(MeshComponent))
+        {
+            continue;
+        }
+
+        const bool bMeshNameLooksTerrain = IsTerrainLikeName(Pair.Key.ToString());
+        const int32 MaterialCount = MeshComponent->GetNumMaterials();
+        for (int32 MaterialIndex = 0; MaterialIndex < MaterialCount; ++MaterialIndex)
+        {
+            UMaterialInterface* Material = MeshComponent->GetMaterial(MaterialIndex);
+            if (!bMeshNameLooksTerrain && !IsTerrainMaterial(Material))
+            {
+                continue;
+            }
+
+            UMaterialInstanceDynamic* DynamicMaterial = Cast<UMaterialInstanceDynamic>(Material);
+            if (!DynamicMaterial)
+            {
+                UMaterialInterface* ParentMaterial = Material ? Material : Default.Terrain.Get();
+                if (!ParentMaterial)
+                {
+                    continue;
+                }
+                DynamicMaterial = UMaterialInstanceDynamic::Create(ParentMaterial, this);
+                if (DynamicMaterial)
+                {
+                    MeshComponent->SetMaterial(MaterialIndex, DynamicMaterial);
+                }
+            }
+
+            if (DynamicMaterial)
+            {
+                DynamicMaterial->SetTextureParameterValue(TEXT("baseColor"), RuntimeTerrainTextureArray);
+                DynamicMaterial->SetTextureParameterValue(TEXT("BaseColor"), RuntimeTerrainTextureArray);
+            }
+        }
+    }
+}
+
+void AglTFStreamActor::OnStreamAsyncCompleted(const FStreamAsyncWrapper& MapWrapper)
+{
+    if (bIsDestroyed)
+    {
+        return;
+    }
+
+    UpdateProperties(MapWrapper);
+    ApplyTerrainTextureArrayToLoadedMaterials();
+
+    bIsLoaded = true;
+    bAsyncLoading = false;
+    LoadingStatus = 1.0f;
+
+    if (UWorld* World = GetWorld())
+    {
+        World->GetTimerManager().SetTimerForNextTick(this, &AglTFStreamActor::AsyncTick);
+    }
+}

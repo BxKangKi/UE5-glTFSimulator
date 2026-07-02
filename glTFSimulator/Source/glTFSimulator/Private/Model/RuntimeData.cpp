@@ -113,6 +113,7 @@ TSharedRef<FJsonObject> FRuntimeModelData::Serialization() const
 {
     TSharedRef<FJsonObject> Json = MakeShared<FJsonObject>();
     FJsonHelper::SetVector(Json, Center);
+    FJsonHelper::SetVector(Json, Size, TEXT("Size"));
 
     // TMap 구조체 직렬화 자동화 적용 (이제 중복 루프 없이 한 줄로 처리됩니다)
     FJsonHelper::SetMap<FRuntimeMeshData>(Json, TEXT("MeshData"), MeshData, [](const FRuntimeMeshData &Item)
@@ -128,6 +129,7 @@ bool FRuntimeModelData::Deserialization(const TSharedPtr<FJsonObject> &Json)
 
     MeshData.Empty();
     FJsonHelper::TryGetVector(Json, Center);
+    FJsonHelper::TryGetVector(Json, Size, TEXT("Size"));
 
     // TMap 구조체 역직렬화 자동화 적용 (JSON의 Key가 FName으로 안전하게 복원됩니다)
     FJsonHelper::TryGetMap<FRuntimeMeshData>(Json, TEXT("MeshData"), MeshData, [](const TSharedPtr<FJsonObject> &Obj, FRuntimeMeshData &OutItem)

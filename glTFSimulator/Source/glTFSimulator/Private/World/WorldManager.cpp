@@ -7,10 +7,9 @@
 #include "System/FileFunctionLibrary.h"
 #include "System/MacroLibrary.h"
 #include "World/WorldData.h"
-#include "Model/StreamActor.h"
-#include "Model/SpawnActor.h"
+#include "Model/glTFStreamActor.h"
+#include "Model/glTFStreamSubSystem.h"
 #include "Components/PostProcessComponent.h"
-#include "Character/CharacterController.h"
 #include "Character/PlayerCharacterController.h"
 #include "Components/DirectionalLightComponent.h"
 #include "Components/StaticMeshComponent.h"
@@ -104,35 +103,19 @@ void AWorldManager::BeginPlay()
     }
     LoadWorldData();
     SpawnOcean();
-    SpawnPlayerAsync();
+    SpawnWorld();
+    LoadWorldAsync();
 }
 
-
-void AWorldManager::LoadSpawnActor(const FString &Path)
+void AWorldManager::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
-    UWorld *World = GetWorld();
-    if (!World || !SpawnActorClass)
+    if (IsValid(StreamSubSystem))
     {
-        UE_LOG(LogTemp, Warning, TEXT("WorldManager: SpawnActorClass가 유효하지 않습니다."));
-        return;
+        StreamSubSystem->StopMainWorldStreaming();
     }
-    FTransform SpawnTransform = GetActorTransform();
-    FActorSpawnParameters SpawnParams;
-    SpawnParams.Owner = this; // BP의 Owner 핀 연결 (Self)
-    SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::Undefined;
-    ASpawnActor *NewSpawnActor =
-        FActorHelper::SpawnActorDeferred<ASpawnActor>(
-            GetWorld(),
-            SpawnActorClass,
-            SpawnTransform,
-            SpawnParams);
-    if (NewSpawnActor)
-    {
-        NewSpawnActor->Init(Path);
-        NewSpawnActor->FinishSpawning(SpawnTransform);
-        SpawnActors.Emplace(NewSpawnActor);
-    }
+    Super::EndPlay(EndPlayReason);
 }
+
 
 void AWorldManager::SpawnOcean()
 {
@@ -174,40 +157,20 @@ bool AWorldManager::CheckOcean()
 
 void AWorldManager::SpawnWorld()
 {
-    if (IsValid(Data))
+    if (!IsValid(Data))
     {
-        TArray<FString> PathArray = UFileFunctionLibrary::GetFileNamesWithExtension(GetFilePath(MODEL_DIRECTORY), "glb");
-        for (const FString &Path : PathArray)
-        {
-            LoadSpawnActor(Path);
-        }
+        return;
     }
-}
 
-bool AWorldManager::SpawnPlayer()
-{
-    if (IsValid(Data) && IsValid(SubSystem))
+    StreamSubSystem = UglTFStreamSubSystem::Get(this);
+    if (IsValid(StreamSubSystem))
     {
-        ACharacterController *Ctrl = SubSystem->GetPlayerActor<ACharacterController>();
-        if (IsValid(Ctrl))
-        {
-            const FString Path = GetFilePath(PLAYER_DIRECTORY).Append(Data->Player);
-            Ctrl->Load(Path);
-            return true;
-        }
-    }
-    return false;
-}
-
-void AWorldManager::ActivatePlayer()
-{
-    if (IsValid(SubSystem))
-    {
-        ACharacterController *Ctrl = SubSystem->GetPlayerActor<ACharacterController>();
-        if (IsValid(Ctrl))
-        {
-            Ctrl->Activate(true);
-        }
+        StreamSubSystem->StartMainWorldStreaming(
+            this,
+            SpawnActorClass,
+            GetFilePath(MODEL_DIRECTORY),
+            GetFilePath(PLAYER_DIRECTORY),
+            Data->Player);
     }
 }
 
@@ -224,11 +187,8 @@ void AWorldManager::Tick(float DeltaSeconds)
 
 bool AWorldManager::CheckAllSpawnActorLoaded()
 {
-    const int32 Count = SpawnActors.Num();
-    if (Count == 0)
+    if (!IsValid(StreamSubSystem))
     {
-        // Empty worlds are valid. The old code returned false forever here, so
-        // LoadWorldAsync never advanced and RuntimeGameplayManager was never spawned.
         if (IsValid(SubSystem))
         {
             SubSystem->SetLoadingStatus(1.0f);
@@ -236,38 +196,12 @@ bool AWorldManager::CheckAllSpawnActorLoaded()
         return true;
     }
 
-    bool bAllLoaded = true;
-    float Percent = 0.0f;
-    for (const ASpawnActor *SpawnActor : SpawnActors)
-    {
-        if (!IsValid(SpawnActor))
-        {
-            bAllLoaded = false;
-            continue;
-        }
-
-        Percent += SpawnActor->GetLoadingStatus() / static_cast<float>(Count);
-        if (!SpawnActor->GetIsLoaded())
-        {
-            bAllLoaded = false;
-        }
-    }
+    const float Percent = StreamSubSystem->GetLoadingStatus();
     if (IsValid(SubSystem))
     {
         SubSystem->SetLoadingStatus(FMath::Clamp(Percent, 0.0f, 1.0f));
     }
-    return bAllLoaded;
-}
-
-bool AWorldManager::CheckPlayerLoaded()
-{
-    if (IsValid(Data) && IsValid(SubSystem))
-    {
-        ACharacterController *Ctrl = SubSystem->GetPlayerActor<ACharacterController>();
-        if (IsValid(Ctrl))
-            return Ctrl->bIsLoaded;
-    }
-    return false;
+    return StreamSubSystem->IsInitialWorldReady();
 }
 
 FString AWorldManager::GetFilePath(const FString &FileName)
@@ -293,6 +227,7 @@ void AWorldManager::LoadWorldData()
             SaveWorldData();
         }
         SubSystem->SetPlayerLocation(Data->PlayerLocation);
+        SubSystem->SetWorldData(Data);
     }
 }
 
@@ -307,60 +242,25 @@ void AWorldManager::SaveWorldData()
     }
 }
 
-// --- Spawn Player Async 섹션 ---
-void AWorldManager::SpawnPlayerAsync()
-{
-    // BP: DelayUntilNextTick 후 SpawnPlayer 호출
-    if (SpawnPlayer())
-    {
-        SpawnWorld();
-        LoadWorldAsync(); // 다음 단계로
-    }
-    else
-    {
-        // False일 경우 다음 틱에 재시도 (재귀 호출 대신 타이머 권장)
-        GetWorldTimerManager().SetTimerForNextTick(this, &AWorldManager::SpawnPlayerAsync);
-    }
-}
-
 // --- Load World Async 섹션 ---
 void AWorldManager::LoadWorldAsync()
 {
     if (CheckAllSpawnActorLoaded() && IsValid(SubSystem))
     {
         SubSystem->SetLoadingStatus(1.0f);
-        ActivatePlayer();
-        LoadPlayerAsync(); // 다음 단계로
-    }
-    else
-    {
-        // 다음 틱에 다시 체크
-        GetWorldTimerManager().SetTimerForNextTick(this, &AWorldManager::LoadWorldAsync);
-    }
-}
-
-// --- Load Player Async 섹션 ---
-void AWorldManager::LoadPlayerAsync()
-{
-    if (CheckPlayerLoaded())
-    {
-        // 모든 로딩 완료 시 루프들 시작
         AsyncTick();
         SaveTick();
-        
+
         // 로딩 위젯만 제거합니다. RemoveAllWidgets는 기존 Blueprint HUD까지 지워 Runtime HUD와 충돌을 일으킵니다.
         if (IsValid(LoadingWidgetInstance))
         {
             LoadingWidgetInstance->RemoveFromParent();
             LoadingWidgetInstance = nullptr;
         }
-        if (IsValid(SubSystem))
-        {
-            SubSystem->SetWorldLoading(false);
-        }
+        SubSystem->SetWorldLoading(false);
 
         SpawnRuntimeGameplayManager();
-        if ((!IsValid(SubSystem) || !SubSystem->GetGamePaused()))
+        if (!SubSystem->GetGamePaused())
         {
             if (APlayerCharacterController* PlayerController = Cast<APlayerCharacterController>(UGameplayStatics::GetPlayerController(this, 0)))
             {
@@ -370,9 +270,10 @@ void AWorldManager::LoadPlayerAsync()
     }
     else
     {
-        GetWorldTimerManager().SetTimerForNextTick(this, &AWorldManager::LoadPlayerAsync);
+        GetWorldTimerManager().SetTimerForNextTick(this, &AWorldManager::LoadWorldAsync);
     }
 }
+
 
 void AWorldManager::AsyncTick()
 {

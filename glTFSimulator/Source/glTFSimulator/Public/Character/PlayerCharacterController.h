@@ -101,6 +101,10 @@ public:
     UFUNCTION(BlueprintCallable, Category="Input|Character")
     void Input_RuntimeToggleFirstPersonPressed();
 
+    /** U key or assigned InputAction. Cycles through player GLB files managed by glTFStreamSubSystem. */
+    UFUNCTION(BlueprintCallable, Category="Input|Character")
+    void Input_ChangeCharacterPressed();
+
     /** Mouse wheel / Axis1D. Positive wheel selects the previous toolbar slot, negative selects the next slot. */
     UFUNCTION(BlueprintCallable, Category="Input|Runtime Toolbar")
     void Input_RuntimeToolbarScroll(float ScrollValue);
@@ -322,6 +326,10 @@ public:
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Character Actions", meta=(DisplayName="Toggle First Person Action"))
     TObjectPtr<UInputAction> RuntimeToggleFirstPersonAction;
 
+    /** Optional action for cycling the runtime player character mesh, usually U. */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Character Actions", meta=(DisplayName="Change Character Action"))
+    TObjectPtr<UInputAction> ChangeCharacterAction;
+
     /** Axis1D action for Minecraft-style 7-slot toolbar scroll. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Creator Toolbar", meta=(DisplayName="Toolbar Scroll Action"))
     TObjectPtr<UInputAction> RuntimeToolbarScrollAction;
@@ -412,6 +420,7 @@ private:
     double LastRuntimeSecondaryInputTime = -1.0;
     double LastRuntimeInteractInputTime = -1.0;
     double LastRuntimeToggleFirstPersonInputTime = -1.0;
+    double LastRuntimeChangeCharacterInputTime = -1.0;
     double LastRuntimeToggleItemListInputTime = -1.0;
     double LastRuntimeSnapInputTime = -1.0;
     double LastRuntimeDebugInputTime = -1.0;

@@ -16,6 +16,10 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
     FLoadAsyncCompleted,
     const FLoadAsyncWrapper &, MapWrapper);
 
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
+    FLoadAsyncProgress,
+    float, Progress);
+
 UCLASS(BlueprintType)
 class GLTFSIMULATOR_API ULoadAsyncAction : public UBlueprintAsyncActionBase
 {
@@ -36,6 +40,9 @@ public:
 
     UPROPERTY(BlueprintAssignable)
     FLoadAsyncCompleted Completed;  // 사용자 정의 델리게이트
+
+    UPROPERTY(BlueprintAssignable)
+    FLoadAsyncProgress Progress;
 
     virtual void Activate() override;
 
@@ -62,6 +69,7 @@ private:
     int32 MaxCount = 0;
     FName CurrentMeshName;
     int32 ChunkSize;
+    FRuntimeModelData GeneratedModelData;
 
     // [추가] JSON 비동기 처리를 위한 멤버 변수
     FString JsonFilePath;
@@ -81,6 +89,9 @@ private:
     // JSON 로드 및 병합 제어 함수
     void LoadJsonAsync();
     void MergeJsonDataToMeshMap();
+    void RefreshGeneratedModelData();
+    void SaveGeneratedJsonAsync() const;
+    void WriteLogAsync(const FString& Message) const;
     
     // [추가] 파일 유실 시 디폴트 파일 생성을 위한 내부 헬퍼 함수
     bool CreateDefaultJsonFile(const FString& Path);

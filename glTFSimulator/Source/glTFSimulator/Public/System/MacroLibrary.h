@@ -16,7 +16,7 @@
 #define DIRECTORY_SAVE TEXT("SaveData/")
 #define DIRECTORY_LOG TEXT("Logs")
 #define PATH_ROOT FPaths::Combine(DIRECTORY_USER, DIRECTORY_GAME, DIRECTORY_SAVE)
-#define PATH_LOG UStringFuntionLibrary::Append({FPaths::Combine(DIRECTORY_USER, DIRECTORY_GAME, DIRECTORY_LOG), TEXT("/log_"), FDateTime::Now().ToString(TEXT("%Y%m%d")), TEXT(".txt")})
+#define PATH_LOG FStringHelper::Append({FPaths::Combine(DIRECTORY_USER, DIRECTORY_GAME, DIRECTORY_LOG), TEXT("/log_"), FDateTime::Now().ToString(TEXT("%Y%m%d")), TEXT(".txt")})
 
 #define EMPTY_STR TEXT("")
 #define RAGDOLL TEXT("Ragdoll")
