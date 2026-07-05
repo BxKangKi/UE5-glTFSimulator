@@ -1,6 +1,6 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
-#include "Gameplay/PlacementTypes.h"
+#include "World/PlacementTypes.h"
 #include "UObject/UnrealType.h"
 
 namespace PlacementTypesInternal

@@ -13,10 +13,10 @@
 #include "InputCoreTypes.h"
 #include "Model/glTFStreamSubSystem.h"
 #include "System/GameManagerActor.h"
-#include "Gameplay/CreatorHUDWidget.h"
-#include "Gameplay/PauseMenuWidget.h"
-#include "Gameplay/SettingsMenuWidget.h"
-#include "Gameplay/VehiclePawn.h"
+#include "UI/CreatorHUDWidget.h"
+#include "UI/PauseMenuWidget.h"
+#include "UI/SettingsMenuWidget.h"
+#include "Vehicle/VehiclePawn.h"
 #include "System/GameManagerSubSystem.h"
 #include "TimerManager.h"
 #include "UObject/ConstructorHelpers.h"
@@ -78,10 +78,24 @@ void APlayerCharacterController::BeginPlay()
 
     if (bForceGameInputModeOnBeginPlay)
     {
-        ApplyGameInputMode();
+        if (IsValid(SubSystem) && SubSystem->IsWorldLoading())
+        {
+            ApplyLoadingInputMode(nullptr);
+        }
+        else
+        {
+            ApplyGameInputMode();
+        }
+
         GetWorldTimerManager().SetTimerForNextTick(FTimerDelegate::CreateWeakLambda(this, [this]()
         {
-            if (IsValid(SubSystem) && (SubSystem->GetGamePaused() || SubSystem->IsWorldLoading()))
+            if (IsValid(SubSystem) && SubSystem->IsWorldLoading())
+            {
+                ApplyLoadingInputMode(nullptr);
+                return;
+            }
+
+            if (IsValid(SubSystem) && SubSystem->GetGamePaused())
             {
                 return;
             }
@@ -189,6 +203,12 @@ void APlayerCharacterController::Tick(float DeltaSeconds)
 
 void APlayerCharacterController::ApplyGameInputMode()
 {
+    if (IsValid(SubSystem) && SubSystem->IsWorldLoading())
+    {
+        ApplyLoadingInputMode(nullptr);
+        return;
+    }
+
     bUIInputMode = false;
     UWidgetBlueprintLibrary::SetInputMode_GameOnly(this, false);
     bShowMouseCursor = !bHideMouseCursorDuringGameplay;
@@ -206,6 +226,21 @@ void APlayerCharacterController::ApplyUIInputMode(UUserWidget* WidgetToFocus)
         WidgetToFocus,
         EMouseLockMode::DoNotLock,
         true,
+        false);
+    bShowMouseCursor = true;
+    bEnableClickEvents = true;
+    bEnableMouseOverEvents = true;
+}
+
+void APlayerCharacterController::ApplyLoadingInputMode(UUserWidget* WidgetToFocus)
+{
+    bUIInputMode = true;
+    StopFallbackMovement();
+    UWidgetBlueprintLibrary::SetInputMode_GameAndUIEx(
+        this,
+        WidgetToFocus,
+        EMouseLockMode::DoNotLock,
+        false,
         false);
     bShowMouseCursor = true;
     bEnableClickEvents = true;
@@ -1247,10 +1282,17 @@ void APlayerCharacterController::ReturnToPauseMenuFromSettings()
 
 void APlayerCharacterController::ExitToStartWorldFromPauseMenu()
 {
+    // Backward-compatible Blueprint entry point. Gameplay exits now land on world selection.
+    ExitToWorldSelectionFromPauseMenu();
+}
+
+void APlayerCharacterController::ExitToWorldSelectionFromPauseMenu()
+{
     UGameManagerSubSystem* Manager = GetGameManager();
     if (IsValid(Manager))
     {
-        Manager->SaveScene();
+        Manager->PrepareForReturnToMenuLevel();
+        Manager->RequestWorldSelectionMenuOnNextStartWorld();
     }
 
     if (IsValid(SettingsMenuWidget))
@@ -1272,9 +1314,52 @@ void APlayerCharacterController::ExitToStartWorldFromPauseMenu()
     }
 
     ApplyGameInputMode();
-    if (ExitLevelName != NAME_None)
+
+    // The world list is hosted by StartWorld. StartActor consumes the request set above and opens the list widget.
+    static const FName LegacyWorldSelectionLevelName(TEXT("WorldSelectWorld"));
+    FName TargetLevelName = WorldSelectionLevelName;
+    if (TargetLevelName == NAME_None || TargetLevelName == LegacyWorldSelectionLevelName)
     {
-        UGameplayStatics::OpenLevel(this, ExitLevelName);
+        TargetLevelName = ExitLevelName;
+    }
+    if (TargetLevelName == NAME_None || TargetLevelName == LegacyWorldSelectionLevelName)
+    {
+        TargetLevelName = FName(TEXT("StartWorld"));
+    }
+
+    if (TargetLevelName != NAME_None)
+    {
+        UGameplayStatics::OpenLevel(this, TargetLevelName);
+    }
+}
+
+void APlayerCharacterController::ReturnToMainMenuFromWorldSelection()
+{
+    if (IsValid(SettingsMenuWidget))
+    {
+        SettingsMenuWidget->RemoveFromParent();
+    }
+    if (IsValid(PauseMenuWidget))
+    {
+        PauseMenuWidget->RemoveFromParent();
+    }
+
+    if (!IsValid(SubSystem))
+    {
+        SubSystem = UGameManagerSubSystem::GetSubSystem(this);
+    }
+    if (IsValid(SubSystem))
+    {
+        SubSystem->ClearWorldSelectionMenuRequest();
+        SubSystem->SetGamePaused(false);
+    }
+
+    ApplyGameInputMode();
+
+    const FName TargetLevelName = MainMenuLevelName != NAME_None ? MainMenuLevelName : FName(TEXT("StartWorld"));
+    if (TargetLevelName != NAME_None)
+    {
+        UGameplayStatics::OpenLevel(this, TargetLevelName);
     }
 }
 

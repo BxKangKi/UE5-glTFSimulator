@@ -5,31 +5,81 @@
 #include "GameFramework/Actor.h"
 #include "Engine/World.h"
 
-bool FPhysicsHelper::Raycast(AActor *Actor, const FVector &Start, const FVector &End, const FCollisionQueryParams &Params, FHitResult &HitResult)
+bool FPhysicsHelper::Raycast(UWorld* World, const FVector& Start, const FVector& End, const FCollisionQueryParams& Params, FHitResult& HitResult)
 {
-    if (!IsValid(Actor))
-        return false;
-    UWorld *World = Actor->GetWorld();
-    if (!IsValid(World))
-        return false;
-    return World->LineTraceSingleByChannel(HitResult, Start, End, ECC_Visibility, Params);
+    return Raycast(World, Start, End, ECC_Visibility, Params, HitResult);
 }
 
-bool FPhysicsHelper::Raycast(AActor *Actor, const FVector &Start, const FVector &End, FHitResult &HitResult, const bool bIncludeSelf)
+bool FPhysicsHelper::Raycast(UWorld* World, const FVector& Start, const FVector& End, ECollisionChannel Channel, const FCollisionQueryParams& Params, FHitResult& HitResult)
 {
-    FCollisionQueryParams Params;
-    Params.AddIgnoredActor(Actor);
+    HitResult = FHitResult();
+
+    if (!IsValid(World))
+    {
+        return false;
+    }
+
+    return World->LineTraceSingleByChannel(HitResult, Start, End, Channel, Params);
+}
+
+bool FPhysicsHelper::Raycast(const UObject* WorldContextObject, const FVector& Start, const FVector& End, const FCollisionQueryParams& Params, FHitResult& HitResult)
+{
+    return Raycast(WorldContextObject, Start, End, ECC_Visibility, Params, HitResult);
+}
+
+bool FPhysicsHelper::Raycast(const UObject* WorldContextObject, const FVector& Start, const FVector& End, ECollisionChannel Channel, const FCollisionQueryParams& Params, FHitResult& HitResult)
+{
+    HitResult = FHitResult();
+
+    if (!IsValid(WorldContextObject))
+    {
+        return false;
+    }
+
+    return Raycast(WorldContextObject->GetWorld(), Start, End, Channel, Params, HitResult);
+}
+
+bool FPhysicsHelper::Raycast(const AActor* Actor, const FVector& Start, const FVector& End, const FCollisionQueryParams& Params, FHitResult& HitResult)
+{
+    return Raycast(Actor, Start, End, ECC_Visibility, Params, HitResult);
+}
+
+bool FPhysicsHelper::Raycast(const AActor* Actor, const FVector& Start, const FVector& End, ECollisionChannel Channel, const FCollisionQueryParams& Params, FHitResult& HitResult)
+{
+    HitResult = FHitResult();
+
+    if (!IsValid(Actor))
+    {
+        return false;
+    }
+
+    return Raycast(Actor->GetWorld(), Start, End, Channel, Params, HitResult);
+}
+
+bool FPhysicsHelper::Raycast(const AActor* Actor, const FVector& Start, const FVector& End, FHitResult& HitResult, bool bIncludeSelf)
+{
+    FCollisionQueryParams Params(SCENE_QUERY_STAT(PhysicsHelperRaycast), false);
+    if (!bIncludeSelf && IsValid(Actor))
+    {
+        Params.AddIgnoredActor(Actor);
+    }
     return Raycast(Actor, Start, End, Params, HitResult);
 }
 
-
-bool FPhysicsHelper::Raycast(AActor *Actor, const FVector &Start, const FVector &Direction, const float Length, FHitResult &HitResult, const bool bIncludeSelf)
+bool FPhysicsHelper::Raycast(const AActor* Actor, const FVector& Start, const FVector& Direction, float Length, FHitResult& HitResult, bool bIncludeSelf)
 {
-    const FVector End = Start + (Length * Direction);
+    const FVector SafeDirection = Direction.GetSafeNormal();
+    if (SafeDirection.IsNearlyZero() || Length <= 0.0f)
+    {
+        HitResult = FHitResult();
+        return false;
+    }
+
+    const FVector End = Start + SafeDirection * Length;
     return Raycast(Actor, Start, End, HitResult, bIncludeSelf);
 }
 
-bool FPhysicsHelper::Raycast(AActor *Actor, const FVector &Start, const FVector &End, const bool bIncludeSelf)
+bool FPhysicsHelper::Raycast(const AActor* Actor, const FVector& Start, const FVector& End, bool bIncludeSelf)
 {
     FHitResult HitResult;
     return Raycast(Actor, Start, End, HitResult, bIncludeSelf);

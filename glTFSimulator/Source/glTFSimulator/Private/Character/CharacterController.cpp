@@ -150,6 +150,7 @@ void ACharacterController::BeginPlay()
 void ACharacterController::Load(const FString &Path)
 {
     bIsLoaded = false;
+    LoadProgress = 0.0f;
 
     PrepareForMeshReload();
 
@@ -160,13 +161,21 @@ void ACharacterController::Load(const FString &Path)
         Component->InvalidateWaterReferenceForPendingMeshLoad();
     }
 
+    if (IsValid(ActiveLoadAction.Get()))
+    {
+        ActiveLoadAction->CancelAndRelease();
+        ActiveLoadAction = nullptr;
+    }
+
     // 1. Create a fresh glTFRuntime asset load action and pass WorldContextObject, Owner, and Path.
     UCharacterLoadAsyncAction *LoadAction = UCharacterLoadAsyncAction::LoadCharacterAsync(this, this, Path);
     if (LoadAction)
     {
+        ActiveLoadAction = LoadAction;
         // 2. Connect completed delegate (Optional)
         // Optional hook for UI/state work after loading completes.
         LoadAction->OnCompleted.AddDynamic(this, &ACharacterController::OnLoadCompleted);
+        LoadAction->OnProgress.AddDynamic(this, &ACharacterController::OnLoadProgress);
         // 3. Start async loading
         // Activate() runs glTF loading, BoneMap loading, and mesh creation in order.
         LoadAction->Activate();
@@ -174,11 +183,19 @@ void ACharacterController::Load(const FString &Path)
     else
     {
         RestoreAfterMeshReload();
+        LoadProgress = 1.0f;
     }
+}
+
+void ACharacterController::OnLoadProgress(float Progress)
+{
+    LoadProgress = FMath::Max(LoadProgress, FMath::Clamp(Progress, 0.0f, 1.0f));
 }
 
 void ACharacterController::OnLoadCompleted(bool Result)
 {
+    ActiveLoadAction = nullptr;
+
     if (!Result)
     {
         USkeletalMeshComponent *MeshComp = GetMesh();
@@ -201,6 +218,7 @@ void ACharacterController::OnLoadCompleted(bool Result)
 
     // bIsLoaded is used by glTFStreamSubSystem as a player load-completion gate. Treat the
     // default-mesh fallback as a completed load; otherwise main-world startup can never finish.
+    LoadProgress = 1.0f;
     bIsLoaded = true;
 }
 
@@ -259,6 +277,12 @@ void ACharacterController::RestoreAfterMeshReload()
 
 void ACharacterController::PrepareForPawnReplacement()
 {
+    if (IsValid(ActiveLoadAction.Get()))
+    {
+        ActiveLoadAction->CancelAndRelease();
+        ActiveLoadAction = nullptr;
+    }
+
     Activate(false);
     PrepareForMeshReload();
 

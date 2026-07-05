@@ -6,11 +6,12 @@
 
 int FMathHelper::Sign(const float value)
 {
-    if (value > 0.0f)
-        return 1;
-    else if (value < 0.0f)
-        return -1;
-    return 0;
+    if (FMath::IsNearlyZero(value))
+    {
+        return 0;
+    }
+
+    return value > 0.0f ? 1 : -1;
 }
 
 FVector FMathHelper::Pow(const FVector &vec, const float exp)
@@ -20,16 +21,19 @@ FVector FMathHelper::Pow(const FVector &vec, const float exp)
 
 float FMathHelper::ClampLerp(const float a, const float b, const float t, const float min, const float max, const float threshold)
 {
-    float result = FMath::Lerp(a, b, t);
-    if (result - threshold < min)
+    const float Result = FMath::Lerp(a, b, t);
+    const float SafeMin = FMath::Min(min, max);
+    const float SafeMax = FMath::Max(min, max);
+
+    if (Result - threshold < SafeMin)
     {
-        result = min;
+        return SafeMin;
     }
-    else if (result + threshold > max)
+    if (Result + threshold > SafeMax)
     {
-        result = max;
+        return SafeMax;
     }
-    return result;
+    return Result;
 }
 
 FRotator FMathHelper::Slerp(const FRotator &a, const FRotator &b, const float t)
@@ -48,7 +52,7 @@ float FMathHelper::ClampAngle(const float angle)
 
 float FMathHelper::Saturate(const float x)
 {
-    return (x > 1.0f) ? 1.0f : ((x < 0.0f) ? 0.0f : x);
+    return FMath::Clamp(x, 0.0f, 1.0f);
 }
 
 float FMathHelper::LengthYZ(const FVector &Vec)
@@ -63,5 +67,11 @@ float FMathHelper::LengthXZ(const FVector &Vec)
 
 float FMathHelper::Unlerp(const float a, const float b, const float x)
 {
-    return FMath::Clamp((x - a) / (b - a), 0.0f, 1.0f);
+    const float Denominator = b - a;
+    if (FMath::IsNearlyZero(Denominator))
+    {
+        return x >= b ? 1.0f : 0.0f;
+    }
+
+    return FMath::Clamp((x - a) / Denominator, 0.0f, 1.0f);
 }

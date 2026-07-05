@@ -1,6 +1,6 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
-#include "Gameplay/SettingsMenuWidget.h"
+#include "UI/SettingsMenuWidget.h"
 #include "Blueprint/WidgetTree.h"
 #include "Character/PlayerCharacterController.h"
 #include "Components/Button.h"

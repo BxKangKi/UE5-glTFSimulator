@@ -3,7 +3,7 @@
 // Mesh authoring note: the code below intentionally contains dense comments because these paths are edited from Blueprint-facing runtime tools.
 // Mesh authoring note: each changed block explains what state it reads, what state it writes, and why that state is needed during live polygon editing.
 
-#include "Gameplay/EditableMeshActor.h"
+#include "Model/EditableMeshActor.h"
 #include "Components/SceneComponent.h"
 #include "Engine/EngineTypes.h"
 #include "Materials/MaterialInterface.h"

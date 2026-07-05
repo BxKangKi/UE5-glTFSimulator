@@ -4,8 +4,8 @@
 
 #include "CoreMinimal.h"
 #include "Kismet/BlueprintFunctionLibrary.h"
-#include "Gameplay/PlacementTypes.h"
-#include "GLTFSaveLibrary.generated.h"
+#include "World/PlacementTypes.h"
+#include "glTFSaveLibrary.generated.h"
 
 UCLASS()
 class GLTFSIMULATOR_API UGLTFSaveLibrary : public UBlueprintFunctionLibrary

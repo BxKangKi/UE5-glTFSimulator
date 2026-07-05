@@ -5,7 +5,8 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
-#include "Model/Data.h"
+#include "HAL/ThreadSafeCounter.h"
+#include "Model/ModelData.h"
 #include "Model/StreamDefaultAsset.h"
 #include "glTFRuntimeParser.h"
 #include "glTFStreamActor.generated.h"
@@ -13,6 +14,8 @@
 class UBoxComponent;
 class UInstancedStaticMeshComponent;
 class UglTFRuntimeAsset;
+class ULoadAsyncAction;
+class UStreamAsyncAction;
 class UTexture;
 struct FLoadAsyncWrapper;
 struct FStreamAsyncWrapper;
@@ -44,6 +47,8 @@ public:
 
     UFUNCTION(BlueprintCallable)
     UglTFRuntimeAsset* GetAsset() const { return glTFAsset; }
+
+    void ReleaseRuntimeResourcesForWorldExit();
 
     bool HasModelMetadata() const { return bHasModelMetadata; }
     const FModelData& GetModelMetadata() const { return ModelMetadata; }
@@ -104,11 +109,18 @@ public:
 
 protected:
     virtual void BeginPlay() override;
+    virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
     virtual void Destroyed() override;
 
 private:
     UPROPERTY()
     TObjectPtr<UglTFRuntimeAsset> glTFAsset;
+
+    UPROPERTY()
+    TObjectPtr<ULoadAsyncAction> ActiveSizeScanAction;
+
+    UPROPERTY()
+    TObjectPtr<UStreamAsyncAction> ActiveStreamAction;
 
     UPROPERTY()
     TMap<FName, FModelNodeData> AllNodeMap;
@@ -136,9 +148,13 @@ private:
     bool bIsDestroyed = false;
     float LoadingStatus = 0.0f;
     EGLTFStreamAssetPhase AssetLoadPhase = EGLTFStreamAssetPhase::None;
+    TSharedPtr<FThreadSafeCounter, ESPMode::ThreadSafe> ActiveAssetLoadCancelToken;
+    int32 AssetLoadRequestSerial = 0;
 
     void LoadAssetAsync(EGLTFStreamAssetPhase Phase);
+    void CancelActiveAssetLoad();
     void StartSizeScan(UglTFRuntimeAsset* Asset);
+    void CancelActiveAsyncActions();
     void ReleaseAsset(UglTFRuntimeAsset* Asset);
     void ReleaseStreamingResources();
     void StartStreaming();

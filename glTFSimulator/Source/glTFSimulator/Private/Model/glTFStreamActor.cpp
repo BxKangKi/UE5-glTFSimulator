@@ -3,6 +3,7 @@
 
 #include "Model/glTFStreamActor.h"
 
+#include "Async/Async.h"
 #include "Components/BoxComponent.h"
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Components/LightComponent.h"
@@ -10,22 +11,27 @@
 #include "Engine/Texture2D.h"
 #include "Engine/Texture.h"
 #include "glTFRuntimeFunctionLibrary.h"
+#include "glTFRuntimeAsset.h"
+#include "glTFRuntimeParser.h"
 #include "HAL/FileManager.h"
 #include "IImageWrapper.h"
 #include "IImageWrapperModule.h"
 #include "Materials/MaterialInstance.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Materials/MaterialInterface.h"
+#include "Misc/CoreMisc.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Model/LoadAsyncAction.h"
 #include "Model/StreamAsyncAction.h"
-#include "Model/AssetManageSubSystem.h"
+#include "System/AssetManageSubSystem.h"
 #include "Modules/ModuleManager.h"
 #include "System/FileFunctionLibrary.h"
 #include "System/GameManagerSubSystem.h"
 #include "System/MacroLibrary.h"
 #include "TimerManager.h"
+
+static constexpr int32 RuntimeMaxTextureDimension = 1024;
 
 static bool IsTerrainLikeName(const FString& Name)
 {
@@ -47,6 +53,10 @@ void AglTFStreamActor::BeginPlay()
     bAsyncLoading = false;
     LoadingStatus = 0.0f;
     AssetLoadPhase = EGLTFStreamAssetPhase::None;
+    ActiveSizeScanAction = nullptr;
+    ActiveStreamAction = nullptr;
+    CancelActiveAssetLoad();
+    AssetLoadRequestSerial = 0;
 
     AllNodeMap.Empty();
     AllMeshMap.Empty();
@@ -60,25 +70,151 @@ void AglTFStreamActor::BeginPlay()
     LoadAssetAsync(EGLTFStreamAssetPhase::SizeScan);
 }
 
+void AglTFStreamActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+    ReleaseRuntimeResourcesForWorldExit();
+    Super::EndPlay(EndPlayReason);
+}
+
 void AglTFStreamActor::Destroyed()
 {
+    ReleaseRuntimeResourcesForWorldExit();
     Super::Destroyed();
+}
+
+void AglTFStreamActor::ReleaseRuntimeResourcesForWorldExit()
+{
+    if (UWorld* World = GetWorld())
+    {
+        World->GetTimerManager().ClearAllTimersForObject(this);
+    }
+
+    CancelActiveAssetLoad();
+    CancelActiveAsyncActions();
+
     bIsDestroyed = true;
+    bAsyncLoading = false;
+    bIsLoaded = false;
+    LoadingStatus = 1.0f;
+
     ReleaseStreamingResources();
     ReleaseAsset(glTFAsset.Get());
     glTFAsset = nullptr;
+
+    AllNodeMap.Empty();
+    AllMeshMap.Empty();
+    LoadedNodes.Empty();
+    InstanceMap.Empty();
+    UnloadBoxMap.Empty();
+    DynamicComponentMap.Empty();
+    ModelMetadata = FModelData();
+    bHasModelMetadata = false;
+    FilePath.Reset();
+    ActiveSizeScanAction = nullptr;
+    ActiveStreamAction = nullptr;
+    AssetLoadPhase = EGLTFStreamAssetPhase::None;
 }
 
 void AglTFStreamActor::LoadAssetAsync(EGLTFStreamAssetPhase Phase)
 {
+    CancelActiveAssetLoad();
     AssetLoadPhase = Phase;
 
-    FglTFRuntimeHttpResponse Delegate;
-    Delegate.BindDynamic(this, &AglTFStreamActor::OnAssetLoaded);
+    if (bIsDestroyed || FilePath.IsEmpty())
+    {
+        bAsyncLoading = false;
+        return;
+    }
+
+    // Keep glTF parsing asynchronous while avoiding glTFRuntime's built-in filename async
+    // helper. The plugin helper creates an internal unreferenced UglTFRuntimeAsset before
+    // parsing completes, then calls SetParser() later on the game thread. During world
+    // teardown that raw UObject can be collected. This path parses on a background thread and
+    // creates/touches UObjects only after the actor, request serial, path, phase and cancel
+    // token are still current on the game thread.
+    const int32 RequestId = AssetLoadRequestSerial;
+    const FString RequestedFilePath = FilePath;
 
     FglTFRuntimeConfig Config;
     Config.bAllowExternalFiles = true;
-    UglTFRuntimeFunctionLibrary::glTFLoadAssetFromFilenameAsync(FilePath, false, Config, Delegate);
+
+    TWeakObjectPtr<AglTFStreamActor> WeakThis(this);
+    TSharedPtr<FThreadSafeCounter, ESPMode::ThreadSafe> CancelToken = MakeShared<FThreadSafeCounter, ESPMode::ThreadSafe>(0);
+    ActiveAssetLoadCancelToken = CancelToken;
+
+    AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [WeakThis, RequestedFilePath, Phase, RequestId, Config, CancelToken]()
+    {
+        if (!CancelToken.IsValid() || CancelToken->GetValue() != 0)
+        {
+            return;
+        }
+
+        TSharedPtr<FglTFRuntimeParser> Parser = FglTFRuntimeParser::FromFilename(RequestedFilePath, Config);
+
+        if (!CancelToken.IsValid() || CancelToken->GetValue() != 0)
+        {
+            return;
+        }
+
+        AsyncTask(ENamedThreads::GameThread, [WeakThis, RequestedFilePath, Phase, RequestId, Config, Parser, CancelToken]()
+        {
+            AglTFStreamActor* StrongThis = WeakThis.Get();
+            const bool bRequestStillCurrent =
+                CancelToken.IsValid() &&
+                CancelToken->GetValue() == 0 &&
+                IsValid(StrongThis) &&
+                !StrongThis->bIsDestroyed &&
+                StrongThis->ActiveAssetLoadCancelToken == CancelToken &&
+                StrongThis->AssetLoadRequestSerial == RequestId &&
+                StrongThis->AssetLoadPhase == Phase &&
+                StrongThis->FilePath == RequestedFilePath &&
+                !IsGarbageCollecting();
+
+            if (!bRequestStillCurrent)
+            {
+                return;
+            }
+
+            UglTFRuntimeAsset* LoadedAsset = nullptr;
+            if (Parser.IsValid())
+            {
+                LoadedAsset = NewObject<UglTFRuntimeAsset>(StrongThis);
+                if (LoadedAsset)
+                {
+                    LoadedAsset->RuntimeContextObject = Config.RuntimeContextObject;
+                    LoadedAsset->RuntimeContextString = Config.RuntimeContextString;
+                    if (!LoadedAsset->SetParser(Parser.ToSharedRef()))
+                    {
+                        StrongThis->ReleaseAsset(LoadedAsset);
+                        LoadedAsset = nullptr;
+                    }
+                }
+            }
+
+            StrongThis = WeakThis.Get();
+            if (!IsValid(StrongThis) || StrongThis->bIsDestroyed || StrongThis->ActiveAssetLoadCancelToken != CancelToken ||
+                StrongThis->AssetLoadRequestSerial != RequestId || CancelToken->GetValue() != 0 ||
+                StrongThis->AssetLoadPhase != Phase || StrongThis->FilePath != RequestedFilePath)
+            {
+                if (LoadedAsset)
+                {
+                    if (IsValid(StrongThis))
+                    {
+                        StrongThis->ReleaseAsset(LoadedAsset);
+                    }
+                    else
+                    {
+                        LoadedAsset->ClearCache();
+                        LoadedAsset->MarkAsGarbage();
+                    }
+                }
+                return;
+            }
+
+            StrongThis->ActiveAssetLoadCancelToken.Reset();
+            StrongThis->OnAssetLoaded(LoadedAsset);
+        });
+    });
 }
 
 void AglTFStreamActor::OnAssetLoaded(UglTFRuntimeAsset* Asset)
@@ -134,6 +270,7 @@ void AglTFStreamActor::StartSizeScan(UglTFRuntimeAsset* Asset)
     const FString JsonPath = FPaths::ChangeExtension(FilePath, TEXT("json"));
 
     ULoadAsyncAction* AsyncAction = ULoadAsyncAction::LoadAsync(this, Asset, Config, SizeScanChunkSize, JsonPath);
+    ActiveSizeScanAction = AsyncAction;
     if (AsyncAction)
     {
         AsyncAction->Completed.AddDynamic(this, &AglTFStreamActor::OnChunksLoaded);
@@ -142,6 +279,7 @@ void AglTFStreamActor::StartSizeScan(UglTFRuntimeAsset* Asset)
     }
     else
     {
+        ActiveSizeScanAction = nullptr;
         ReleaseAsset(Asset);
     }
 }
@@ -157,6 +295,8 @@ int32 AglTFStreamActor::GetSizeScanChunkSize(int32 TotalNodeCount) const
 
 void AglTFStreamActor::OnChunksLoaded(const FLoadAsyncWrapper& MapWrapper)
 {
+    ActiveSizeScanAction = nullptr;
+
     if (bIsDestroyed)
     {
         return;
@@ -192,11 +332,42 @@ void AglTFStreamActor::OnChunksLoaded(const FLoadAsyncWrapper& MapWrapper)
     }
 }
 
+void AglTFStreamActor::CancelActiveAssetLoad()
+{
+    if (ActiveAssetLoadCancelToken.IsValid())
+    {
+        ActiveAssetLoadCancelToken->Set(1);
+        ActiveAssetLoadCancelToken.Reset();
+    }
+
+    ++AssetLoadRequestSerial;
+}
+
+void AglTFStreamActor::CancelActiveAsyncActions()
+{
+    if (IsValid(ActiveSizeScanAction.Get()))
+    {
+        ActiveSizeScanAction->CancelAndRelease();
+    }
+    ActiveSizeScanAction = nullptr;
+
+    if (IsValid(ActiveStreamAction.Get()))
+    {
+        ActiveStreamAction->CancelAndRelease();
+    }
+    ActiveStreamAction = nullptr;
+}
+
 void AglTFStreamActor::ReleaseAsset(UglTFRuntimeAsset* Asset)
 {
     if (IsValid(Asset))
     {
         Asset->ClearCache();
+        if (Asset->IsRooted())
+        {
+            Asset->RemoveFromRoot();
+        }
+        Asset->ClearFlags(RF_Public | RF_Standalone);
         Asset->MarkAsGarbage();
     }
 }
@@ -216,6 +387,14 @@ void AglTFStreamActor::ReleaseStreamingResources()
         {
             AssetManager->ReleaseStaticMesh(this, ISMC->GetStaticMesh());
         }
+        ISMC->ClearInstances();
+        const int32 MaterialCount = ISMC->GetNumMaterials();
+        for (int32 MaterialIndex = 0; MaterialIndex < MaterialCount; ++MaterialIndex)
+        {
+            ISMC->SetMaterial(MaterialIndex, nullptr);
+        }
+        ISMC->SetStaticMesh(nullptr);
+        ISMC->UnregisterComponent();
         ISMC->DestroyComponent();
     }
     InstanceMap.Empty();
@@ -352,16 +531,16 @@ FglTFRuntimeStaticMeshConfig AglTFStreamActor::BuildStreamingStaticMeshConfig()
         Config.MaterialsConfig.CustomTextureParams.Add(TEXT("TerrainTextures"), TerrainTextureOverride.Get());
     }
 
-    Config.MaterialsConfig.bGeneratesMipMaps = true;
+    Config.MaterialsConfig.bGeneratesMipMaps = false;
     Config.MaterialsConfig.SpecularFactor = 0.0f;
-    Config.MaterialsConfig.ImagesConfig.MaxWidth = 2048;
-    Config.MaterialsConfig.ImagesConfig.MaxHeight = 2048;
-    Config.MaterialsConfig.ImagesConfig.bCompressMips = true;
-    Config.MaterialsConfig.ImagesConfig.bStreaming = true;
-    Config.MaterialsConfig.bLoadMipMaps = true;
+    Config.MaterialsConfig.ImagesConfig.MaxWidth = RuntimeMaxTextureDimension;
+    Config.MaterialsConfig.ImagesConfig.MaxHeight = RuntimeMaxTextureDimension;
+    Config.MaterialsConfig.ImagesConfig.bCompressMips = false;
+    Config.MaterialsConfig.ImagesConfig.bStreaming = false;
+    Config.MaterialsConfig.bLoadMipMaps = false;
     Config.Outer = this;
     Config.bAllowCPUAccess = true;
-    Config.bBuildLumenCards = true;
+    Config.bBuildLumenCards = false;
     Config.bBuildNavCollision = true;
     return Config;
 }
@@ -409,6 +588,7 @@ void AglTFStreamActor::AsyncTick()
         StreamDistance,
         Size);
 
+    ActiveStreamAction = AsyncAction;
     if (AsyncAction)
     {
         AsyncAction->Completed.AddDynamic(this, &AglTFStreamActor::OnStreamAsyncCompleted);
@@ -417,6 +597,7 @@ void AglTFStreamActor::AsyncTick()
     }
     else
     {
+        ActiveStreamAction = nullptr;
         bAsyncLoading = false;
     }
 }
@@ -498,6 +679,8 @@ void AglTFStreamActor::ApplyTerrainTextureOverrideToLoadedMaterials()
 
 void AglTFStreamActor::OnStreamAsyncCompleted(const FStreamAsyncWrapper& MapWrapper)
 {
+    ActiveStreamAction = nullptr;
+
     if (bIsDestroyed)
     {
         return;

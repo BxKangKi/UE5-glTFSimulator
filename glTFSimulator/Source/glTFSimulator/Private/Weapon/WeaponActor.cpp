@@ -1,6 +1,7 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
-#include "Gameplay/WeaponActor.h"
+#include "Weapon/WeaponActor.h"
+#include "System/PhysicsHelper.h"
 #include "Camera/CameraComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "DrawDebugHelpers.h"
@@ -63,7 +64,19 @@ AWeaponActor::AWeaponActor()
     SetRootComponent(Root);
 }
 
+void AWeaponActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+    ReleaseRuntimeResources();
+    Super::EndPlay(EndPlayReason);
+}
+
 void AWeaponActor::Destroyed()
+{
+    ReleaseRuntimeResources();
+    Super::Destroyed();
+}
+
+void AWeaponActor::ReleaseRuntimeResources()
 {
     ClearLoadedComponents();
     if (IsValid(GltfAsset))
@@ -72,19 +85,42 @@ void AWeaponActor::Destroyed()
         GltfAsset->MarkAsGarbage();
         GltfAsset = nullptr;
     }
-    Super::Destroyed();
 }
 
 void AWeaponActor::ClearLoadedComponents()
 {
+    TSet<UStaticMesh*> MeshesToRelease;
+
     for (UStaticMeshComponent* Component : MeshComponents)
     {
         if (IsValid(Component))
         {
+            if (UStaticMesh* Mesh = Component->GetStaticMesh())
+            {
+                MeshesToRelease.Add(Mesh);
+            }
+            Component->SetStaticMesh(nullptr);
             Component->UnregisterComponent();
             Component->DestroyComponent();
         }
     }
+
+    for (const TPair<int32, TObjectPtr<UStaticMesh>>& Pair : MeshCache)
+    {
+        if (UStaticMesh* Mesh = Pair.Value.Get())
+        {
+            MeshesToRelease.Add(Mesh);
+        }
+    }
+
+    for (UStaticMesh* Mesh : MeshesToRelease)
+    {
+        if (IsValid(Mesh) && !Mesh->IsAsset())
+        {
+            Mesh->MarkAsGarbage();
+        }
+    }
+
     MeshComponents.Empty();
     MeshCache.Empty();
 }
@@ -177,6 +213,12 @@ UStaticMesh* AWeaponActor::LoadMeshByIndex(int32 MeshIndex)
     MeshConfig.Outer = this;
     MeshConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
     MeshConfig.MaterialsConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
+    MeshConfig.MaterialsConfig.bGeneratesMipMaps = false;
+    MeshConfig.MaterialsConfig.ImagesConfig.MaxWidth = 1024;
+    MeshConfig.MaterialsConfig.ImagesConfig.MaxHeight = 1024;
+    MeshConfig.MaterialsConfig.ImagesConfig.bCompressMips = false;
+    MeshConfig.MaterialsConfig.ImagesConfig.bStreaming = false;
+    MeshConfig.MaterialsConfig.bLoadMipMaps = false;
     {
         const TMap<EglTFRuntimeMaterialType, UMaterialInterface*> LitOverrides = BuildWeaponLitGltfMaterialOverrides();
         if (LitOverrides.Num() > 0)
@@ -265,7 +307,7 @@ void AWeaponActor::Fire(AController* InstigatorController)
     }
 
     FHitResult Hit;
-    World->LineTraceSingleByChannel(Hit, ViewLocation, End, ECC_Visibility, Params);
+    FPhysicsHelper::Raycast(this, ViewLocation, End, Params, Hit);
     const FVector TraceEnd = Hit.bBlockingHit ? Hit.ImpactPoint : End;
     DrawDebugLine(World, GetMuzzleWorldLocation(), TraceEnd, FColor::Red, false, 1.0f, 0, 2.0f);
 

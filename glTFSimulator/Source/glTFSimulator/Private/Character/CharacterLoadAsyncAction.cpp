@@ -2,12 +2,17 @@
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
 #include "Character/CharacterLoadAsyncAction.h"
+#include "Async/Async.h"
 #include "System/FileFunctionLibrary.h"
 #include "System/MacroLibrary.h"
 #include "Character/CharacterController.h"
 #include "Character/CharacterFunctionLibrary.h"
 #include "JsonObjectConverter.h"
 #include "glTFRuntimeFunctionLibrary.h"
+#include "glTFRuntimeAsset.h"
+#include "glTFRuntimeParser.h"
+#include "Engine/SkeletalMesh.h"
+#include "Misc/CoreMisc.h"
 
 UCharacterLoadAsyncAction *UCharacterLoadAsyncAction::LoadCharacterAsync(UObject *WorldContextObject, ACharacterController *InOwner, FString InPath)
 {
@@ -20,12 +25,18 @@ UCharacterLoadAsyncAction *UCharacterLoadAsyncAction::LoadCharacterAsync(UObject
 
 void UCharacterLoadAsyncAction::Activate()
 {
+    bCancelled = false;
+    bFinished = false;
+    bMeshLoadInFlight = false;
+    CancelActiveAssetLoad();
     CurrentLoadedAsset = nullptr;
+    OnProgress.Broadcast(0.0f);
 
     if (!OwnerCharacter.IsValid() || !UFileFunctionLibrary::CheckFile(FilePath))
     {
+        OnProgress.Broadcast(1.0f);
         OnCompleted.Broadcast(false);
-        SetReadyToDestroy();
+        FinishAndRelease();
         return;
     }
     LoadAssetAsync();
@@ -33,24 +44,137 @@ void UCharacterLoadAsyncAction::Activate()
 
 void UCharacterLoadAsyncAction::LoadAssetAsync()
 {
+    if (bCancelled)
+    {
+        FinishAndRelease();
+        return;
+    }
+
+    CancelActiveAssetLoad();
+
     // Character changes must rebuild the full runtime character path every time:
     // fresh glTFAsset -> bone map -> skeletal mesh -> generated/merged PhysicsAsset.
-    FglTFRuntimeHttpResponse AssetLoadedDelegate;
-    AssetLoadedDelegate.BindDynamic(this, &UCharacterLoadAsyncAction::OnglTFAssetLoaded);
+    // Parsing remains asynchronous. UObjects are created and SetParser() is called only
+    // on the game thread after the owner, path, request serial and cancellation token are
+    // still current, so cancelling during load prevents all owner mutation and callbacks.
+    const int32 RequestId = AssetLoadRequestSerial;
+    const FString RequestedFilePath = FilePath;
+
     FglTFRuntimeConfig Config;
     Config.TransformBaseType = EglTFRuntimeTransformBaseType::YForward;
     Config.bAllowExternalFiles = true;
-    UglTFRuntimeFunctionLibrary::glTFLoadAssetFromFilenameAsync(FilePath, false, Config, AssetLoadedDelegate);
+
+    TWeakObjectPtr<UCharacterLoadAsyncAction> WeakThis(this);
+    TSharedPtr<FThreadSafeCounter, ESPMode::ThreadSafe> CancelToken = MakeShared<FThreadSafeCounter, ESPMode::ThreadSafe>(0);
+    AssetLoadCancelToken = CancelToken;
+
+    AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [WeakThis, RequestedFilePath, RequestId, Config, CancelToken]()
+    {
+        if (!CancelToken.IsValid() || CancelToken->GetValue() != 0)
+        {
+            return;
+        }
+
+        TSharedPtr<FglTFRuntimeParser> Parser = FglTFRuntimeParser::FromFilename(RequestedFilePath, Config);
+
+        if (!CancelToken.IsValid() || CancelToken->GetValue() != 0)
+        {
+            return;
+        }
+
+        AsyncTask(ENamedThreads::GameThread, [WeakThis, RequestedFilePath, RequestId, Config, Parser, CancelToken]()
+        {
+            UCharacterLoadAsyncAction* StrongThis = WeakThis.Get();
+            const bool bRequestStillCurrent =
+                CancelToken.IsValid() &&
+                CancelToken->GetValue() == 0 &&
+                IsValid(StrongThis) &&
+                !StrongThis->bCancelled &&
+                !StrongThis->bFinished &&
+                StrongThis->AssetLoadCancelToken == CancelToken &&
+                StrongThis->AssetLoadRequestSerial == RequestId &&
+                StrongThis->OwnerCharacter.IsValid() &&
+                StrongThis->FilePath == RequestedFilePath &&
+                !IsGarbageCollecting();
+
+            if (!bRequestStillCurrent)
+            {
+                return;
+            }
+
+            UglTFRuntimeAsset* LoadedAsset = nullptr;
+            if (Parser.IsValid())
+            {
+                UObject* AssetOuter = StrongThis->OwnerCharacter.Get();
+                LoadedAsset = NewObject<UglTFRuntimeAsset>(AssetOuter ? AssetOuter : StrongThis);
+                if (LoadedAsset)
+                {
+                    LoadedAsset->RuntimeContextObject = Config.RuntimeContextObject;
+                    LoadedAsset->RuntimeContextString = Config.RuntimeContextString;
+                    if (!LoadedAsset->SetParser(Parser.ToSharedRef()))
+                    {
+                        LoadedAsset->ClearCache();
+                        LoadedAsset->MarkAsGarbage();
+                        LoadedAsset = nullptr;
+                    }
+                }
+            }
+
+            StrongThis = WeakThis.Get();
+            if (!IsValid(StrongThis) || StrongThis->bCancelled || StrongThis->bFinished || StrongThis->AssetLoadCancelToken != CancelToken ||
+                StrongThis->AssetLoadRequestSerial != RequestId || CancelToken->GetValue() != 0 ||
+                !StrongThis->OwnerCharacter.IsValid() || StrongThis->FilePath != RequestedFilePath)
+            {
+                if (IsValid(LoadedAsset))
+                {
+                    LoadedAsset->ClearCache();
+                    LoadedAsset->MarkAsGarbage();
+                }
+                return;
+            }
+
+            StrongThis->AssetLoadCancelToken.Reset();
+            StrongThis->OnglTFAssetLoaded(LoadedAsset);
+        });
+    });
 }
 
 void UCharacterLoadAsyncAction::OnglTFAssetLoaded(UglTFRuntimeAsset *Asset)
 {
-    if (!Asset)
+    if (bCancelled)
     {
-        OnCompleted.Broadcast(false);
-        SetReadyToDestroy();
+        if (IsValid(Asset))
+        {
+            Asset->ClearCache();
+            if (Asset->IsRooted())
+            {
+                Asset->RemoveFromRoot();
+            }
+            Asset->ClearFlags(RF_Public | RF_Standalone);
+            Asset->MarkAsGarbage();
+        }
+        FinishAndRelease();
         return;
     }
+
+    if (!Asset)
+    {
+        OnProgress.Broadcast(1.0f);
+        OnCompleted.Broadcast(false);
+        FinishAndRelease();
+        return;
+    }
+
+    if (!OwnerCharacter.IsValid())
+    {
+        CurrentLoadedAsset = Asset;
+        OnProgress.Broadcast(1.0f);
+        OnCompleted.Broadcast(false);
+        FinishAndRelease();
+        return;
+    }
+
+    OnProgress.Broadcast(0.25f);
     CurrentLoadedAsset = Asset;
     LoadBoneMapAsync();
 }
@@ -78,10 +202,17 @@ void UCharacterLoadAsyncAction::LoadBoneMapAsync()
         {
             if (UCharacterLoadAsyncAction* StrongThis = WeakThis.Get())
             {
+                if (StrongThis->bCancelled || StrongThis->bFinished)
+                {
+                    StrongThis->FinishAndRelease();
+                    return;
+                }
+
                 if (!StrongThis->CurrentLoadedAsset || !StrongThis->OwnerCharacter.IsValid())
                 {
+                    StrongThis->OnProgress.Broadcast(1.0f);
                     StrongThis->OnCompleted.Broadcast(false);
-                    StrongThis->SetReadyToDestroy();
+                    StrongThis->FinishAndRelease();
                     return;
                 }
                 ACharacterController *Owner = StrongThis->OwnerCharacter.Get();
@@ -89,10 +220,12 @@ void UCharacterLoadAsyncAction::LoadBoneMapAsync()
                 UMaterialInterface *Material = Owner->DefaultAsset.Material;
                 if (!IsValid(Skeleton) || !IsValid(Material))
                 {
+                    StrongThis->OnProgress.Broadcast(1.0f);
                     StrongThis->OnCompleted.Broadcast(false);
-                    StrongThis->SetReadyToDestroy();
+                    StrongThis->FinishAndRelease();
                     return;
                 }
+                StrongThis->OnProgress.Broadcast(0.45f);
                 // Merge skeleton and set up mesh loading.
                 FglTFRuntimeSkeletalMeshConfig Config;
                 Config.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
@@ -119,13 +252,13 @@ void UCharacterLoadAsyncAction::LoadBoneMapAsync()
                 UberMaterialsOverrideMap.Add(EglTFRuntimeMaterialType::TwoSidedMasked, Material);
                 Config.MaterialsConfig.UberMaterialsOverrideMap = UberMaterialsOverrideMap;
                 Config.MaterialsConfig.UnlitOverrideMap = UberMaterialsOverrideMap;
-                Config.MaterialsConfig.bGeneratesMipMaps = true;
+                Config.MaterialsConfig.bGeneratesMipMaps = false;
                 Config.MaterialsConfig.SpecularFactor = 0.0f;
                 Config.MaterialsConfig.ImagesConfig.MaxWidth = 1024;
                 Config.MaterialsConfig.ImagesConfig.MaxHeight = 1024;
-                Config.MaterialsConfig.ImagesConfig.bCompressMips = true;
-                Config.MaterialsConfig.ImagesConfig.bStreaming = true;
-                Config.MaterialsConfig.bLoadMipMaps = true;
+                Config.MaterialsConfig.ImagesConfig.bCompressMips = false;
+                Config.MaterialsConfig.ImagesConfig.bStreaming = false;
+                Config.MaterialsConfig.bLoadMipMaps = false;
                 Config.bIgnoreMissingBones = true;
                 Config.Outer = Owner;
                 Config.bIgnoreEmptyMorphTargets = true;
@@ -143,6 +276,8 @@ void UCharacterLoadAsyncAction::LoadBoneMapAsync()
                 Config.Skeleton = MergedSkel;
                 FglTFRuntimeSkeletalMeshAsync MeshDelegate;
                 MeshDelegate.BindDynamic(StrongThis, &UCharacterLoadAsyncAction::OnMeshLoaded);
+                StrongThis->OnProgress.Broadcast(0.65f);
+                StrongThis->bMeshLoadInFlight = true;
                 StrongThis->CurrentLoadedAsset->LoadSkeletalMeshRecursiveAsync(TEXT(""), {}, MeshDelegate, Config, EglTFRuntimeRecursiveMode::Ignore);
             }
         }); });
@@ -150,6 +285,20 @@ void UCharacterLoadAsyncAction::LoadBoneMapAsync()
 
 void UCharacterLoadAsyncAction::OnMeshLoaded(USkeletalMesh *SkeletalMesh)
 {
+    bMeshLoadInFlight = false;
+
+    if (bCancelled || bFinished)
+    {
+        if (IsValid(SkeletalMesh) && !SkeletalMesh->IsAsset())
+        {
+            SkeletalMesh->MarkAsGarbage();
+        }
+        FinishAndRelease();
+        return;
+    }
+
+    OnProgress.Broadcast(1.0f);
+
     if (SkeletalMesh && OwnerCharacter.IsValid())
     {
         FinalizePhysics(SkeletalMesh);
@@ -157,10 +306,14 @@ void UCharacterLoadAsyncAction::OnMeshLoaded(USkeletalMesh *SkeletalMesh)
     }
     else
     {
+        if (IsValid(SkeletalMesh) && !SkeletalMesh->IsAsset())
+        {
+            SkeletalMesh->MarkAsGarbage();
+        }
         OnCompleted.Broadcast(false);
     }
 
-    SetReadyToDestroy();
+    FinishAndRelease();
 }
 
 void UCharacterLoadAsyncAction::FinalizePhysics(USkeletalMesh *SkeletalMesh)
@@ -180,6 +333,70 @@ void UCharacterLoadAsyncAction::FinalizePhysics(USkeletalMesh *SkeletalMesh)
         UCharacterFunctionLibrary::BlendRagdoll(*MeshComp, 0.0f);
     }
 }
+
+
+void UCharacterLoadAsyncAction::CancelActiveAssetLoad()
+{
+    if (AssetLoadCancelToken.IsValid())
+    {
+        AssetLoadCancelToken->Set(1);
+        AssetLoadCancelToken.Reset();
+    }
+
+    ++AssetLoadRequestSerial;
+}
+
+void UCharacterLoadAsyncAction::ReleaseCurrentAsset()
+{
+    if (IsValid(CurrentLoadedAsset))
+    {
+        CurrentLoadedAsset->ClearCache();
+        if (CurrentLoadedAsset->IsRooted())
+        {
+            CurrentLoadedAsset->RemoveFromRoot();
+        }
+        CurrentLoadedAsset->ClearFlags(RF_Public | RF_Standalone);
+        CurrentLoadedAsset->MarkAsGarbage();
+    }
+    CurrentLoadedAsset = nullptr;
+}
+
+void UCharacterLoadAsyncAction::CancelAndRelease()
+{
+    bCancelled = true;
+    CancelActiveAssetLoad();
+    OnCompleted.Clear();
+    OnProgress.Clear();
+    OwnerCharacter.Reset();
+    FilePath.Reset();
+
+    // If glTFRuntime is already generating the skeletal mesh, keep this action and its
+    // runtime asset alive until OnMeshLoaded returns. The cancel state prevents owner
+    // mutation or delegate broadcasts, while avoiding use-after-free in the plugin task.
+    if (!bMeshLoadInFlight)
+    {
+        FinishAndRelease();
+    }
+}
+
+void UCharacterLoadAsyncAction::FinishAndRelease()
+{
+    if (bFinished)
+    {
+        return;
+    }
+
+    bFinished = true;
+    bCancelled = true;
+    CancelActiveAssetLoad();
+    ReleaseCurrentAsset();
+    OnCompleted.Clear();
+    OnProgress.Clear();
+    OwnerCharacter.Reset();
+    FilePath.Reset();
+    SetReadyToDestroy();
+}
+
 
 bool UCharacterLoadAsyncAction::CheckRootBoneName(UglTFRuntimeAsset *Asset)
 {

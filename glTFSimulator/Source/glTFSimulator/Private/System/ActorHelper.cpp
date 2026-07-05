@@ -9,6 +9,12 @@
 
 void FActorHelper::DestroyComponent(AActor *Actor, UActorComponent *Comp)
 {
+    if (!IsValid(Actor) || !IsValid(Comp))
+    {
+        return;
+    }
+
+    // Remove, unregister, and destroy in one guarded helper so callers do not duplicate lifecycle checks.
     Actor->RemoveInstanceComponent(Comp);
     Comp->UnregisterComponent();
     Comp->DestroyComponent();
@@ -16,16 +22,21 @@ void FActorHelper::DestroyComponent(AActor *Actor, UActorComponent *Comp)
 
 UBoxComponent *FActorHelper::AddBoxComponent(AActor *Actor, const FTransform &Transform, const FVector &Size, const FName &Profile)
 {
-    if (!IsValid(Actor))
+    if (!IsValid(Actor) || !IsValid(Actor->GetRootComponent()))
+    {
         return nullptr;
+    }
+
     UBoxComponent *BoxCollider = NewObject<UBoxComponent>(Actor);
+    if (!IsValid(BoxCollider))
+    {
+        return nullptr;
+    }
+
     Actor->AddInstanceComponent(BoxCollider);
-    // Attach the box collider to the root component.
     BoxCollider->SetupAttachment(Actor->GetRootComponent());
     BoxCollider->SetWorldTransform(Transform);
-    // Set the collider size, for example 100x100x100.
     BoxCollider->InitBoxExtent(Size);
-    // Enable the collider.
     BoxCollider->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
     BoxCollider->SetCollisionProfileName(Profile);
     BoxCollider->RegisterComponent();
@@ -37,12 +48,22 @@ void FActorHelper::ChangeParent(USceneComponent *Child,
                                              const FDetachmentTransformRules &DetachRules,
                                              const FAttachmentTransformRules &AttachRules)
 {
+    if (!IsValid(Child) || !IsValid(Parent))
+    {
+        return;
+    }
+
     Child->DetachFromComponent(DetachRules);
     Child->AttachToComponent(Parent, AttachRules, NAME_None);
 }
 
 void FActorHelper::DetachParent(USceneComponent *Child, const FDetachmentTransformRules &DetachRules)
 {
+    if (!IsValid(Child))
+    {
+        return;
+    }
+
     Child->DetachFromComponent(DetachRules);
 }
 
@@ -50,5 +71,10 @@ void FActorHelper::AttachParent(USceneComponent *Child,
                                              USceneComponent *Parent,
                                              const FAttachmentTransformRules &AttachRules)
 {
+    if (!IsValid(Child) || !IsValid(Parent))
+    {
+        return;
+    }
+
     Child->AttachToComponent(Parent, AttachRules, NAME_None);
 }

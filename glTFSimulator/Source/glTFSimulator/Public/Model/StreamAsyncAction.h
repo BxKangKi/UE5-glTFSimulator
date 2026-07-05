@@ -5,7 +5,7 @@
 
 #include "CoreMinimal.h"
 #include "Kismet/BlueprintAsyncActionBase.h"
-#include "Model/Data.h"
+#include "Model/ModelData.h"
 #include "glTFRuntimeAsset.h"
 #include "Components/BoxComponent.h"
 #include "StreamAsyncAction.generated.h"
@@ -49,6 +49,8 @@ public:
 
     virtual void Activate() override;
 
+    void CancelAndRelease();
+
 private:
     UPROPERTY()
     TObjectPtr<UObject> WorldContextObject;
@@ -84,6 +86,7 @@ private:
 
     FVector CurrentSize;
     bool bIsLoading = false;
+    bool bAbortRequested = false;
     FName CurrentLoadingNode;
     FName CurrentLoadingMesh;
 
@@ -101,6 +104,7 @@ private:
     void SetStaticMesh(UStaticMesh *StaticMesh);
 
     void ProcessChunk();
+    void AbortAndRelease(UStaticMesh* OrphanedMesh = nullptr);
     void ResetLoadState();
     void LoadStaticMeshAsync(const FName &Name);
     void AddTrasnform(const FName &Name, UInstancedStaticMeshComponent *ISMC);
@@ -110,4 +114,5 @@ private:
     void SpawnStreamComponents(const FName &NodeName, const FModelNodeData &NodeInfo, const FMeshData &Data);
     void DestroyStreamComponents(const FName &NodeName);
     void BroadcastProgress();
+    void ReleaseActionReferences();
 };

@@ -11,9 +11,10 @@
 #include "Model/DynamicPointLightComponent.h"
 #include "Engine/World.h"
 #include "Engine/Texture.h"
+#include "Engine/StaticMesh.h"
 #include "Async/ParallelFor.h"
 #include "Model/glTFStreamActor.h"
-#include "Model/AssetManageSubSystem.h"
+#include "System/AssetManageSubSystem.h"
 #include "TimerManager.h"
 
 UStreamAsyncAction *UStreamAsyncAction::StreamAsync(
@@ -46,11 +47,72 @@ UStreamAsyncAction *UStreamAsyncAction::StreamAsync(
     return Action;
 }
 
+
+void UStreamAsyncAction::CancelAndRelease()
+{
+    AbortAndRelease();
+}
+
+void UStreamAsyncAction::AbortAndRelease(UStaticMesh* OrphanedMesh)
+{
+    bAbortRequested = true;
+
+    if (IsValid(OrphanedMesh) && !OrphanedMesh->IsAsset())
+    {
+        OrphanedMesh->ClearFlags(RF_Standalone);
+        OrphanedMesh->MarkAsGarbage();
+    }
+
+    if (IsValid(Asset))
+    {
+        Asset->ClearCache();
+    }
+
+    UWorld* World = nullptr;
+    if (IsValid(OwnerActor))
+    {
+        World = OwnerActor->GetWorld();
+    }
+    else if (IsValid(WorldContextObject))
+    {
+        World = WorldContextObject->GetWorld();
+    }
+
+    if (World)
+    {
+        World->GetTimerManager().ClearTimer(ProcessTimerHandle);
+    }
+
+    Progress.Clear();
+    Completed.Clear();
+
+    NodeMap.Empty();
+    MeshMap.Empty();
+    LoadedNodes.Empty();
+    InstanceMap.Empty();
+    DynamicComponentMap.Empty();
+    UnloadBoxMap.Empty();
+    PendingLoadNodes.Empty();
+    PendingUnloadNodes.Empty();
+
+    Asset = nullptr;
+    OwnerActor = nullptr;
+    WorldContextObject = nullptr;
+    PendingComp = nullptr;
+    DecalLight = nullptr;
+    CurrentLoadingNode = NAME_None;
+    CurrentLoadingMesh = NAME_None;
+    bIsLoading = false;
+    SetReadyToDestroy();
+}
+
 void UStreamAsyncAction::Activate()
 {
+    bAbortRequested = false;
+
     if (!IsValid(OwnerActor) || !IsValid(WorldContextObject) || NodeMap.Num() == 0)
     {
-        SetReadyToDestroy();
+        AbortAndRelease();
         return;
     }
 
@@ -104,11 +166,38 @@ void UStreamAsyncAction::Activate()
     ProcessChunk();
 }
 
+void UStreamAsyncAction::ReleaseActionReferences()
+{
+    UWorld* World = IsValid(OwnerActor) ? OwnerActor->GetWorld() : (IsValid(WorldContextObject) ? WorldContextObject->GetWorld() : nullptr);
+    if (World)
+    {
+        World->GetTimerManager().ClearTimer(ProcessTimerHandle);
+    }
+
+    Asset = nullptr;
+    OwnerActor = nullptr;
+    WorldContextObject = nullptr;
+    PendingComp = nullptr;
+    PendingLoadNodes.Empty();
+    PendingUnloadNodes.Empty();
+    NodeMap.Empty();
+    MeshMap.Empty();
+    LoadedNodes.Empty();
+    InstanceMap.Empty();
+    DynamicComponentMap.Empty();
+    UnloadBoxMap.Empty();
+    DecalLight = nullptr;
+    CurrentLoadingNode = NAME_None;
+    CurrentLoadingMesh = NAME_None;
+    bIsLoading = false;
+    bAbortRequested = true;
+}
+
 void UStreamAsyncAction::ProcessChunk()
 {
-    if (!IsValid(OwnerActor))
+    if (bAbortRequested || !IsValid(OwnerActor))
     {
-        SetReadyToDestroy();
+        AbortAndRelease();
         return;
     }
 
@@ -158,6 +247,7 @@ void UStreamAsyncAction::ProcessChunk()
 
         Progress.Broadcast(1.0f);
         Completed.Broadcast(Wrapper);
+        ReleaseActionReferences();
         SetReadyToDestroy();
     }
     else
@@ -173,6 +263,11 @@ void UStreamAsyncAction::ProcessChunk()
 
 bool UStreamAsyncAction::ProcessLoadNode(const FName &Name)
 {
+    if (bAbortRequested)
+    {
+        return false;
+    }
+
     if (FModelNodeData *Info = NodeMap.Find(Name))
     {
         if (LoadedNodes.Contains(Name))
@@ -200,6 +295,11 @@ bool UStreamAsyncAction::ProcessLoadNode(const FName &Name)
 
 void UStreamAsyncAction::ProcessUnloadNode(const FName &Name)
 {
+    if (bAbortRequested || !IsValid(OwnerActor.Get()))
+    {
+        return;
+    }
+
     FModelNodeData *Info = NodeMap.Find(Name);
     if (!Info)
         return;
@@ -250,9 +350,9 @@ void UStreamAsyncAction::ProcessUnloadNode(const FName &Name)
 
 void UStreamAsyncAction::SetStaticMesh(UStaticMesh *StaticMesh)
 {
-    if (!IsValid(OwnerActor) || !IsValid(StaticMesh))
+    if (bAbortRequested || !IsValid(OwnerActor) || !IsValid(StaticMesh))
     {
-        ResetLoadState();
+        AbortAndRelease(StaticMesh);
         return;
     }
 
@@ -320,6 +420,12 @@ static UTexture* FindTerrainTextureOverrideParam(const FglTFRuntimeStaticMeshCon
 
 void UStreamAsyncAction::LoadStaticMeshAsync(const FName &MeshName)
 {
+    if (bAbortRequested || !IsValid(Asset))
+    {
+        AbortAndRelease();
+        return;
+    }
+
     if (FModelMeshData *Mesh = MeshMap.Find(MeshName))
     {
         TArray<int32> LocalIndices;
@@ -369,6 +475,12 @@ void UStreamAsyncAction::LoadStaticMeshAsync(const FName &MeshName)
 
 void UStreamAsyncAction::AddTrasnform(const FName &Name, UInstancedStaticMeshComponent *ISMC)
 {
+    if (bAbortRequested || !IsValid(OwnerActor.Get()))
+    {
+        ResetLoadState();
+        return;
+    }
+
     if (FModelNodeData *NodeInfo = NodeMap.Find(Name))
     {
         FTransform Transform = NodeInfo->Transform;

@@ -16,7 +16,9 @@ struct FActorHelper
     static T *SpawnActorDeferred(UWorld *World, UClass *Class, FTransform const &Transform, FActorSpawnParameters Params)
     {
         if (!IsValid(World) || !IsValid(Class))
+        {
             return nullptr;
+        }
         static_assert(TIsDerivedFrom<T, AActor>::Value, "T must be a AActor");
         return World->SpawnActorDeferred<T>(Class, Transform, Params.Owner, Params.Instigator, Params.SpawnCollisionHandlingOverride);
     }
@@ -31,11 +33,17 @@ struct FActorHelper
     {
         // Compile-time check that T derives from UStaticMeshComponent.
         static_assert(TIsDerivedFrom<T, UStaticMeshComponent>::Value, "T must be a UStaticMeshComponent");
-        if (!IsValid(Actor))
+        if (!IsValid(Actor) || !IsValid(Actor->GetRootComponent()))
+        {
             return nullptr;
+        }
+
         T *StaticMesh = NewObject<T>(Actor);
-        if (!StaticMesh)
+        if (!IsValid(StaticMesh))
+        {
             return nullptr;
+        }
+
         Actor->AddInstanceComponent(StaticMesh);
         StaticMesh->SetupAttachment(Actor->GetRootComponent());
         StaticMesh->SetWorldTransform(Transform);

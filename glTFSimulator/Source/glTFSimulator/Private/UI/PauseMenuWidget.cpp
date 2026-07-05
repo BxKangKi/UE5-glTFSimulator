@@ -1,6 +1,6 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
-#include "Gameplay/PauseMenuWidget.h"
+#include "UI/PauseMenuWidget.h"
 #include "Blueprint/WidgetTree.h"
 #include "Character/PlayerCharacterController.h"
 #include "Components/Button.h"
@@ -93,6 +93,6 @@ void UPauseMenuWidget::ExitFromUI()
 {
     if (APlayerCharacterController* PlayerController = Cast<APlayerCharacterController>(GetOwningPlayer()))
     {
-        PlayerController->ExitToStartWorldFromPauseMenu();
+        PlayerController->ExitToWorldSelectionFromPauseMenu();
     }
 }

@@ -5,7 +5,7 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/PlayerController.h"
-#include "Gameplay/CreatorHUDWidget.h"
+#include "UI/CreatorHUDWidget.h"
 #include "System/GameManagerActor.h"
 #include "PlayerCharacterController.generated.h"
 
@@ -148,6 +148,10 @@ public:
     UFUNCTION(BlueprintCallable, Category="Input|Mouse")
     void ApplyUIInputMode(UUserWidget* WidgetToFocus);
 
+    /** Loading-screen input mode: cursor visible, never locked, never hidden during capture. */
+    UFUNCTION(BlueprintCallable, Category="Input|Mouse")
+    void ApplyLoadingInputMode(UUserWidget* WidgetToFocus);
+
     /** Applies all Enhanced Input Mapping Context assets assigned in this controller or its Blueprint subclass. */
     UFUNCTION(BlueprintCallable, Category="Input|Enhanced Input")
     void ApplyConfiguredInputMappingContexts();
@@ -253,7 +257,15 @@ public:
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Pause")
     int32 SettingsMenuZOrder = 110;
 
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Pause")
+    // Leaving a gameplay world returns to StartWorld, then StartActor opens the world-selection widget.
+    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Pause|Navigation")
+    FName WorldSelectionLevelName = TEXT("StartWorld");
+
+    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Pause|Navigation")
+    FName MainMenuLevelName = TEXT("StartWorld");
+
+    // Legacy property kept for older Blueprint assets. New code uses WorldSelectionLevelName.
+    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Pause|Navigation", meta=(DeprecatedProperty, DeprecationMessage="Use WorldSelectionLevelName instead."))
     FName ExitLevelName = TEXT("StartWorld");
 
     UFUNCTION(BlueprintCallable, Category="Pause")
@@ -274,8 +286,16 @@ public:
     UFUNCTION(BlueprintCallable, Category="Pause")
     void ReturnToPauseMenuFromSettings();
 
-    UFUNCTION(BlueprintCallable, Category="Pause")
+    // Legacy wrapper. It now routes gameplay exits to the world-selection screen.
+    UFUNCTION(BlueprintCallable, Category="Pause|Navigation")
     void ExitToStartWorldFromPauseMenu();
+
+    UFUNCTION(BlueprintCallable, Category="Pause|Navigation")
+    void ExitToWorldSelectionFromPauseMenu();
+
+    // Assign this to the Back button on the world-selection widget.
+    UFUNCTION(BlueprintCallable, Category="Pause|Navigation")
+    void ReturnToMainMenuFromWorldSelection();
 
     UFUNCTION(BlueprintPure, Category="Pause")
     UUserWidget* GetPauseMenuWidget() const { return PauseMenuWidget.Get(); }

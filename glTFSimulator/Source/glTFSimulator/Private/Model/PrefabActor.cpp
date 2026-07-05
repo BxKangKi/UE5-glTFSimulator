@@ -1,6 +1,6 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
-#include "Gameplay/PrefabActor.h"
+#include "World/PrefabActor.h"
 #include "Components/StaticMeshComponent.h"
 #include "Engine/StaticMesh.h"
 #include "glTFRuntimeAsset.h"
@@ -100,7 +100,19 @@ APrefabActor::APrefabActor()
     SetRootComponent(Root);
 }
 
+void APrefabActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+    ReleaseRuntimeResources();
+    Super::EndPlay(EndPlayReason);
+}
+
 void APrefabActor::Destroyed()
+{
+    ReleaseRuntimeResources();
+    Super::Destroyed();
+}
+
+void APrefabActor::ReleaseRuntimeResources()
 {
     ClearLoadedComponents();
     if (IsValid(GltfAsset))
@@ -109,19 +121,42 @@ void APrefabActor::Destroyed()
         GltfAsset->MarkAsGarbage();
         GltfAsset = nullptr;
     }
-    Super::Destroyed();
 }
 
 void APrefabActor::ClearLoadedComponents()
 {
+    TSet<UStaticMesh*> MeshesToRelease;
+
     for (UStaticMeshComponent* Component : MeshComponents)
     {
         if (IsValid(Component))
         {
+            if (UStaticMesh* Mesh = Component->GetStaticMesh())
+            {
+                MeshesToRelease.Add(Mesh);
+            }
+            Component->SetStaticMesh(nullptr);
             Component->UnregisterComponent();
             Component->DestroyComponent();
         }
     }
+
+    for (const TPair<int32, TObjectPtr<UStaticMesh>>& Pair : MeshCache)
+    {
+        if (UStaticMesh* Mesh = Pair.Value.Get())
+        {
+            MeshesToRelease.Add(Mesh);
+        }
+    }
+
+    for (UStaticMesh* Mesh : MeshesToRelease)
+    {
+        if (IsValid(Mesh) && !Mesh->IsAsset())
+        {
+            Mesh->MarkAsGarbage();
+        }
+    }
+
     MeshComponents.Empty();
     MeshCache.Empty();
     bLoaded = false;
@@ -198,6 +233,12 @@ UStaticMesh* APrefabActor::LoadMeshByIndex(int32 MeshIndex)
     MeshConfig.Outer = this;
     MeshConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
     MeshConfig.MaterialsConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
+    MeshConfig.MaterialsConfig.bGeneratesMipMaps = false;
+    MeshConfig.MaterialsConfig.ImagesConfig.MaxWidth = 1024;
+    MeshConfig.MaterialsConfig.ImagesConfig.MaxHeight = 1024;
+    MeshConfig.MaterialsConfig.ImagesConfig.bCompressMips = false;
+    MeshConfig.MaterialsConfig.ImagesConfig.bStreaming = false;
+    MeshConfig.MaterialsConfig.bLoadMipMaps = false;
     {
         const TMap<EglTFRuntimeMaterialType, UMaterialInterface*> LitOverrides = BuildLitGltfMaterialOverrides();
         if (LitOverrides.Num() > 0)

@@ -6,7 +6,7 @@
 #include "GameFramework/Actor.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "TimerManager.h"
-#include "Gameplay/PlacementTypes.h"
+#include "World/PlacementTypes.h"
 #include "GameManagerSubSystem.generated.h"
 
 class APrefabActor;
@@ -25,6 +25,8 @@ class UglTFStreamSubSystem;
 class UGameSettings;
 class UPostProcessComponent;
 class AGameManagerActor;
+class UAssetManageSubSystem;
+class UWorld;
 
 UENUM(BlueprintType)
 enum class EToolMode : uint8
@@ -97,6 +99,14 @@ public:
     static UGameManagerSubSystem* GetSubSystem(const UObject* WorldContextObject);
     UFUNCTION(BlueprintPure, Category="Game", meta=(WorldContext="WorldContextObject"))
     static UGameManagerSubSystem* FindGameManager(const UObject* WorldContextObject);
+
+    // Opens StartWorld and asks its StartActor to show the world-selection widget after travel.
+    UFUNCTION(BlueprintCallable, Category="Game|Lifecycle", meta=(WorldContext="WorldContextObject"))
+    static void OpenWorldSelectionScreen(const UObject* WorldContextObject, FName WorldSelectionLevelName = NAME_None);
+
+    // Opens the main menu from the world-selection screen. Bind this to the world-selection Back button when you want to reload StartWorld.
+    UFUNCTION(BlueprintCallable, Category="Game|Lifecycle", meta=(WorldContext="WorldContextObject"))
+    static void OpenMainMenuFromWorldSelection(const UObject* WorldContextObject, FName MainMenuLevelName = NAME_None);
 
     UFUNCTION(BlueprintCallable, Category="Game|Lifecycle")
     void StartGameManager(class AGameManagerActor* InConfigActor);
@@ -414,6 +424,36 @@ public:
     UFUNCTION(BlueprintCallable, Category="Game|World")
     void StopWorldSystems();
 
+    /** Saves the active scene, stops runtime streaming, and marks a full purge for menu/world-selection level travel. */
+    UFUNCTION(BlueprintCallable, Category="Game|Lifecycle")
+    void PrepareForReturnToMenuLevel();
+
+    /** Legacy wrapper kept for older Blueprint calls. Use PrepareForReturnToMenuLevel(). */
+    UFUNCTION(BlueprintCallable, Category="Game|Lifecycle")
+    void PrepareForReturnToStartWorld();
+
+    /** Releases runtime main-world actors/assets that can otherwise survive a level transition through GameInstance subsystems. */
+    UFUNCTION(BlueprintCallable, Category="Game|Lifecycle")
+    void ReleaseMainWorldRuntimeMemory(bool bForceGarbageCollection = true);
+
+    UFUNCTION(BlueprintPure, Category="Game|Lifecycle")
+    bool HasPendingMainWorldRuntimePurge() const { return bPendingMainWorldRuntimePurge; }
+
+    /** Requests that StartWorld opens directly on the world-selection widget after the next level travel. */
+    UFUNCTION(BlueprintCallable, Category="Game|Lifecycle")
+    void RequestWorldSelectionMenuOnNextStartWorld();
+
+    /** Consumes and clears the pending StartWorld world-selection request. */
+    UFUNCTION(BlueprintCallable, Category="Game|Lifecycle")
+    bool ConsumeWorldSelectionMenuRequest();
+
+    /** Clears the pending StartWorld world-selection request. */
+    UFUNCTION(BlueprintCallable, Category="Game|Lifecycle")
+    void ClearWorldSelectionMenuRequest();
+
+    UFUNCTION(BlueprintPure, Category="Game|Lifecycle")
+    bool ShouldOpenWorldSelectionMenuOnNextStartWorld() const { return bOpenWorldSelectionMenuOnNextStartWorld; }
+
 
     /** Returns the gameplay-owned world data object that drives time, sky, player position, and save data. */
     UFUNCTION(BlueprintPure, Category="Game|World")
@@ -542,6 +582,9 @@ private:
     bool bWorldBootstrapStarted = false;
     bool bWorldLoadCompleted = false;
     bool bSpawnedWorldManager = false;
+    bool bPendingMainWorldRuntimePurge = false;
+    bool bOpenWorldSelectionMenuOnNextStartWorld = false;
+    FDelegateHandle PostLoadMapCleanupHandle;
 
     // Legacy placement distance kept so older Blueprint defaults do not lose the property.
     // The center-crosshair cursor now uses CrosshairCollisionTraceDistance and FreeSpacePlacementDistance below.
@@ -662,6 +705,13 @@ private:
     FTimerHandle WorldDataSaveTimerHandle;
 
     void ClearTransientRuntimeReferences();
+    void DestroyTrackedRuntimeActors();
+    void ResetWorldRuntimeReferences();
+    void RequestRuntimeGarbageCollection(const TCHAR* Reason) const;
+    UAssetManageSubSystem* GetAssetManagerSubsystem() const;
+    void RequestPostLoadRuntimeMemoryCleanup();
+    void HandlePostLoadMapRuntimeCleanup(UWorld* LoadedWorld);
+    void RunPostLoadRuntimeMemoryCleanup();
     void ScanAssetFolders();
     void EnsureAssetFolders() const;
     FString GetWorldRootPath() const;

@@ -13,7 +13,7 @@
 #include "HAL/FileManager.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
-#include "Model/AssetManageSubSystem.h"
+#include "System/AssetManageSubSystem.h"
 #include "Model/glTFStreamActor.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
@@ -96,23 +96,47 @@ void UglTFStreamSubSystem::StartMainWorldStreaming(AActor* InOwnerActor, TSubcla
         PlayerGlbFilePaths.Num(),
         *InitialPlayerName));
 
+    BeginInitialPlayerStreamingIfNeeded();
     ScheduleProcessNextPath();
 }
 
 void UglTFStreamSubSystem::StopMainWorldStreaming()
 {
     ClearTimers();
+    bActive = false;
 
     for (TPair<FString, TObjectPtr<AglTFStreamActor>>& Pair : SpawnActorMap)
     {
         if (IsValid(Pair.Value))
         {
+            Pair.Value->ReleaseRuntimeResourcesForWorldExit();
             Pair.Value->Destroy();
         }
     }
     SpawnActorMap.Empty();
-    DestroyPreviousPlayerCharacter();
+
     DeactivatePlayerCharacter();
+
+    if (ACharacterController* PendingCharacter = PendingPlayerCharacter.Get())
+    {
+        if (IsValid(PendingCharacter))
+        {
+            PendingCharacter->PrepareForPawnReplacement();
+            PendingCharacter->Destroy();
+        }
+    }
+
+    DestroyPreviousPlayerCharacter();
+
+    if (ACharacterController* ActiveCharacter = ActivePlayerCharacter.Get())
+    {
+        if (IsValid(ActiveCharacter))
+        {
+            ActiveCharacter->PrepareForPawnReplacement();
+            ActiveCharacter->Destroy();
+        }
+    }
+
     GlbFilePaths.Empty();
     PlayerGlbFilePaths.Empty();
     CurrentPlayerPath.Reset();
@@ -132,9 +156,16 @@ void UglTFStreamSubSystem::StopMainWorldStreaming()
     bInitialPlayerLoadStarted = false;
     bWaitingForPlayerLoad = false;
     bPlayerActivated = false;
-    bActive = false;
 
-    if (UAssetManageSubSystem* AssetManager = UAssetManageSubSystem::Get(OwnerActor))
+    UAssetManageSubSystem* AssetManager = UAssetManageSubSystem::Get(OwnerActor);
+    if (!AssetManager)
+    {
+        if (UGameInstance* GameInstance = GetGameInstance())
+        {
+            AssetManager = GameInstance->GetSubsystem<UAssetManageSubSystem>();
+        }
+    }
+    if (AssetManager)
     {
         AssetManager->DeactivateAndRelease();
     }
@@ -194,12 +225,12 @@ bool UglTFStreamSubSystem::IsPlayerLoaded() const
 
 bool UglTFStreamSubSystem::IsInitialWorldReady()
 {
+    BeginInitialPlayerStreamingIfNeeded();
+
     if (!AreInitialModelsReady())
     {
         return false;
     }
-
-    BeginInitialPlayerStreamingIfNeeded();
 
     const bool bReady = IsPlayerLoaded();
     if (bReady)
@@ -232,8 +263,21 @@ float UglTFStreamSubSystem::GetLoadingStatus() const
         }
     }
 
-    ++WorkItemCount;
-    Total += IsPlayerLoaded() ? 1.0f : 0.0f;
+    const bool bHasPlayerLoadWork = PlayerGlbFilePaths.Num() > 0;
+    if (bHasPlayerLoadWork)
+    {
+        ++WorkItemCount;
+        float PlayerLoadProgress = IsPlayerLoaded() ? 1.0f : 0.0f;
+        if (PlayerLoadProgress < 1.0f)
+        {
+            const ACharacterController* Ctrl = GetPlayerCharacter();
+            if (IsValid(Ctrl))
+            {
+                PlayerLoadProgress = Ctrl->GetLoadProgress();
+            }
+        }
+        Total += FMath::Clamp(PlayerLoadProgress, 0.0f, 1.0f);
+    }
 
     if (WorkItemCount <= 0)
     {
@@ -469,13 +513,8 @@ void UglTFStreamSubSystem::BeginInitialPlayerStreamingIfNeeded()
         return;
     }
 
-    if (!AreInitialModelsReady())
-    {
-        return;
-    }
-
     bInitialPlayerLoadStarted = true;
-    WriteLogAsync(TEXT("Initial player streaming starts after initial world GLB loading is complete"));
+    WriteLogAsync(TEXT("Initial player streaming starts in parallel with initial world GLB loading"));
     StartPlayerStreaming();
 }
 
@@ -967,6 +1006,7 @@ void UglTFStreamSubSystem::DestroySpawnActor(const FString& GlbPath)
 
     if (IsValid(ActorPtr->Get()))
     {
+        ActorPtr->Get()->ReleaseRuntimeResourcesForWorldExit();
         ActorPtr->Get()->Destroy();
         WriteLogAsync(FString::Printf(TEXT("SpawnActor destroyed because player is outside model range: %s"), *GlbPath));
     }
@@ -1052,17 +1092,14 @@ void UglTFStreamSubSystem::ScheduleWaitForPlayerLoad()
 
 void UglTFStreamSubSystem::ClearTimers()
 {
-    if (!IsValid(OwnerActor))
-    {
-        return;
-    }
-
-    if (UWorld* World = OwnerActor->GetWorld())
+    UWorld* World = IsValid(OwnerActor) ? OwnerActor->GetWorld() : GetWorld();
+    if (World)
     {
         World->GetTimerManager().ClearTimer(TimerHandle_ProcessPath);
         World->GetTimerManager().ClearTimer(TimerHandle_WaitActor);
         World->GetTimerManager().ClearTimer(TimerHandle_UpdateStreaming);
         World->GetTimerManager().ClearTimer(TimerHandle_WaitPlayer);
+        World->GetTimerManager().ClearAllTimersForObject(this);
     }
 }
 

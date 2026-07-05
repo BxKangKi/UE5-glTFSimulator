@@ -1,6 +1,6 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
-#include "Gameplay/GLTFSaveLibrary.h"
+#include "Model/glTFSaveLibrary.h"
 
 #include "HAL/FileManager.h"
 #include "Misc/FileHelper.h"

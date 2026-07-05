@@ -4,7 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
-#include "Gameplay/PlacementTypes.h"
+#include "World/PlacementTypes.h"
 #include "PrefabActor.generated.h"
 
 class UglTFRuntimeAsset;
@@ -70,6 +70,7 @@ public:
     bool IsPrefabLoaded() const { return bLoaded; }
 
 protected:
+    virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
     virtual void Destroyed() override;
 
 private:
@@ -103,4 +104,5 @@ private:
     void ApplyConfigToMeshComponent(UStaticMeshComponent* MeshComponent) const;
     UStaticMesh* LoadMeshByIndex(int32 MeshIndex);
     void ClearLoadedComponents();
+    void ReleaseRuntimeResources();
 };

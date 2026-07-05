@@ -4,7 +4,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Model/Data.h"
+#include "Model/ModelData.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "glTFStreamSubSystem.generated.h"
 

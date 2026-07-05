@@ -51,6 +51,7 @@ public:
     FString GetSourceFilePath() const { return SourceFilePath; }
 
 protected:
+    virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
     virtual void Destroyed() override;
 
 private:
@@ -77,4 +78,5 @@ private:
     UStaticMesh* LoadMeshByIndex(int32 MeshIndex);
     FVector GetMuzzleWorldLocation() const;
     void ClearLoadedComponents();
+    void ReleaseRuntimeResources();
 };

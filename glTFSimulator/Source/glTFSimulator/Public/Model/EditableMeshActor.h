@@ -4,7 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
-#include "Gameplay/PlacementTypes.h"
+#include "World/PlacementTypes.h"
 #include "EditableMeshActor.generated.h"
 
 class UMaterialInterface;

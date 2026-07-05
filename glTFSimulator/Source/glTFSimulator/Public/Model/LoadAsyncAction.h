@@ -5,7 +5,7 @@
 
 #include "CoreMinimal.h"
 #include "Kismet/BlueprintAsyncActionBase.h"
-#include "Model/Data.h"
+#include "Model/ModelData.h"
 #include "glTFRuntimeAsset.h"
 #include "Dom/JsonObject.h" // Required for FJsonObject handling.
 #include "LoadAsyncAction.generated.h"
@@ -46,6 +46,8 @@ public:
 
     virtual void Activate() override;
 
+    void CancelAndRelease();
+
 private:
     UPROPERTY()
     TObjectPtr<UObject> WorldContextObject;
@@ -69,6 +71,7 @@ private:
     int32 MaxCount = 0;
     FName CurrentMeshName;
     int32 ChunkSize;
+    bool bCancelled = false;
     FModelData GeneratedModelData;
 
     // Members used for asynchronous JSON processing.
@@ -92,6 +95,7 @@ private:
     void RefreshGeneratedModelData();
     void SaveGeneratedJsonAsync() const;
     void WriteLogAsync(const FString& Message) const;
+    void ReleaseActionReferences();
     
     // Internal helper that creates a default file when the source file is missing.
     bool CreateDefaultJsonFile(const FString& Path);

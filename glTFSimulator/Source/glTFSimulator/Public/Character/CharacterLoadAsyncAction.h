@@ -4,6 +4,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "HAL/ThreadSafeCounter.h"
 #include "Kismet/BlueprintAsyncActionBase.h"
 #include "CharacterLoadAsyncAction.generated.h"
 
@@ -21,6 +22,7 @@ class UglTFRuntimeAsset;
 
 // Multicast delegate used for the Blueprint output pin.
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FCharacterLoadCallback, bool, Result);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FCharacterLoadProgress, float, Progress);
 
 UCLASS()
 class GLTFSIMULATOR_API UCharacterLoadAsyncAction : public UBlueprintAsyncActionBase
@@ -33,9 +35,13 @@ public:
     static UCharacterLoadAsyncAction *LoadCharacterAsync(UObject *WorldContextObject, ACharacterController *InOwner, FString InPath);
 
     virtual void Activate() override;
+    void CancelAndRelease();
 
     UPROPERTY(BlueprintAssignable)
     FCharacterLoadCallback OnCompleted;
+
+    UPROPERTY(BlueprintAssignable)
+    FCharacterLoadProgress OnProgress;
 
 private:
     // Variables that keep async load state between steps.
@@ -43,6 +49,11 @@ private:
     FString FilePath;
     UPROPERTY()
     UglTFRuntimeAsset *CurrentLoadedAsset;
+    TSharedPtr<FThreadSafeCounter, ESPMode::ThreadSafe> AssetLoadCancelToken;
+    int32 AssetLoadRequestSerial = 0;
+    bool bCancelled = false;
+    bool bFinished = false;
+    bool bMeshLoadInFlight = false;
     // Internal callbacks for each async step.
     UFUNCTION()
     void LoadAssetAsync();
@@ -54,4 +65,7 @@ private:
     // Helper functions ported from the previous flow.
     bool CheckRootBoneName(UglTFRuntimeAsset *Asset);
     void FinalizePhysics(USkeletalMesh *SkeletalMesh);
+    void ReleaseCurrentAsset();
+    void CancelActiveAssetLoad();
+    void FinishAndRelease();
 };

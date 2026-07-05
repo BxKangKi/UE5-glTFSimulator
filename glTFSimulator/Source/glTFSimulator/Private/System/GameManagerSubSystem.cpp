@@ -3,22 +3,24 @@
 
 #include "System/GameManagerSubSystem.h"
 #include "System/GameManagerActor.h"
-#include "Gameplay/EditableMeshActor.h"
-#include "Gameplay/PrefabActor.h"
-#include "Gameplay/VehiclePawn.h"
-#include "Gameplay/WeaponActor.h"
+#include "Model/EditableMeshActor.h"
+#include "World/PrefabActor.h"
+#include "Vehicle/VehiclePawn.h"
+#include "Weapon/WeaponActor.h"
 #include "Model/glTFStreamActor.h"
 #include "World/WorldManager.h"
 #include "ProceduralMeshComponent.h"
 #include "System/MacroLibrary.h"
+#include "System/PhysicsHelper.h"
 #include "Setting/GameSettings.h"
 #include "World/WorldData.h"
 #include "Kismet/GameplayStatics.h"
 #include "GameFramework/GameUserSettings.h"
 #include "System/SystemInfoFunctionLibrary.h"
 #include "Components/PostProcessComponent.h"
-#include "Gameplay/GLTFSaveLibrary.h"
+#include "Model/glTFSaveLibrary.h"
 #include "Model/glTFStreamSubSystem.h"
+#include "System/AssetManageSubSystem.h"
 #include "World/WorldData.h"
 #include "Character/CharacterController.h"
 #include "Character/CharacterComponent.h"
@@ -30,13 +32,19 @@
 #include "Components/SceneComponent.h"
 #include "Materials/MaterialInterface.h"
 #include "Engine/World.h"
+#include "Engine/Engine.h"
 #include "EngineUtils.h"
 #include "GameFramework/PlayerController.h"
+#include "GameFramework/Pawn.h"
 #include "HAL/FileManager.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
+#include "RenderingThread.h"
+#include "UObject/UObjectGlobals.h"
+#include "UObject/GarbageCollection.h"
+#include "Engine/GameInstance.h"
 
 static constexpr int32 ToolbarSlotCount = 7;
 #define MODEL_DIRECTORY TEXT("/model/")
@@ -47,6 +55,7 @@ UGameManagerSubSystem::UGameManagerSubSystem()
 {
     bIsGamePaused = false;
     bIsWorldLoading = false;
+    bIsGamePaused = false;
     LoadingStatus = 0;
     TotalSumFPS = 0;
     TotalCountFPS = 0;
@@ -69,6 +78,14 @@ void UGameManagerSubSystem::Initialize(FSubsystemCollectionBase &Collection)
 {
     Super::Initialize(Collection);
     GameSettings = UGameSettings::CreateSettingsData(this);
+
+    if (!PostLoadMapCleanupHandle.IsValid())
+    {
+        PostLoadMapCleanupHandle = FCoreUObjectDelegates::PostLoadMapWithWorld.AddUObject(
+            this,
+            &UGameManagerSubSystem::HandlePostLoadMapRuntimeCleanup);
+    }
+
     // Runs when the game instance is created; place initialization here.
 }
 
@@ -76,6 +93,13 @@ void UGameManagerSubSystem::Deinitialize()
 {
     // Runs when the game instance shuts down; clean up runtime actors owned by the subsystem.
     StopGameManager(EEndPlayReason::Destroyed);
+
+    if (PostLoadMapCleanupHandle.IsValid())
+    {
+        FCoreUObjectDelegates::PostLoadMapWithWorld.Remove(PostLoadMapCleanupHandle);
+        PostLoadMapCleanupHandle.Reset();
+    }
+
     Super::Deinitialize();
 }
 
@@ -115,6 +139,18 @@ void UGameManagerSubSystem::SetWorldLoading(bool bLoading)
     if (bIsWorldLoading)
     {
         SetGamePaused(false);
+    }
+
+    if (APlayerCharacterController* PlayerController = Cast<APlayerCharacterController>(UGameplayStatics::GetPlayerController(this, 0)))
+    {
+        if (bIsWorldLoading)
+        {
+            PlayerController->ApplyLoadingInputMode(LoadingWidgetInstance.Get());
+        }
+        else if (!GetGamePaused())
+        {
+            PlayerController->ApplyGameInputMode();
+        }
     }
 }
 
@@ -344,20 +380,85 @@ void UGameManagerSubSystem::StartGameManager(AGameManagerActor* InConfigActor)
 
 void UGameManagerSubSystem::StopGameManager(const EEndPlayReason::Type EndPlayReason)
 {
+    const bool bHadActiveMainWorld = bManagerStarted
+        || bWorldBootstrapStarted
+        || IsValid(StreamSubSystem)
+        || IsValid(WorldManagerActor)
+        || IsValid(OceanActor)
+        || IsValid(LoadingWidgetInstance)
+        || SpawnedPrefabs.Num() > 0
+        || SpawnedGeneratedMeshes.Num() > 0
+        || SpawnedVehicles.Num() > 0
+        || IsValid(CurrentEditableActor)
+        || IsValid(PendingEmptyObjectPreviewActor)
+        || IsValid(EquippedWeapon);
+
     if (UWorld* World = GetWorld())
     {
-        // Clear both known handles and any next-tick timers that were bound to this subsystem.
         World->GetTimerManager().ClearTimer(SceneAutoSaveTimerHandle);
         World->GetTimerManager().ClearTimer(WorldDataSaveTimerHandle);
         World->GetTimerManager().ClearAllTimersForObject(this);
     }
 
-    if (bSaveSceneOnEndPlay && EndPlayReason != EEndPlayReason::Destroyed)
+    if (bHadActiveMainWorld && bSaveSceneOnEndPlay && EndPlayReason != EEndPlayReason::Destroyed)
     {
         SaveScene();
     }
 
+    ReleaseMainWorldRuntimeMemory(false);
+}
+
+void UGameManagerSubSystem::PrepareForReturnToMenuLevel()
+{
+    SaveScene();
+    SaveWorldData();
+
+    // The old gameplay world will still exist until OpenLevel finishes. Do the destructive release now,
+    // then run the expensive full purge once the menu/world-selection level has loaded.
+    RequestPostLoadRuntimeMemoryCleanup();
+    ReleaseMainWorldRuntimeMemory(false);
+}
+
+void UGameManagerSubSystem::PrepareForReturnToStartWorld()
+{
+    // Backward-compatible Blueprint entry point. The cleanup path is no longer tied to StartWorld.
+    PrepareForReturnToMenuLevel();
+}
+
+void UGameManagerSubSystem::RequestWorldSelectionMenuOnNextStartWorld()
+{
+    bOpenWorldSelectionMenuOnNextStartWorld = true;
+}
+
+bool UGameManagerSubSystem::ConsumeWorldSelectionMenuRequest()
+{
+    const bool bShouldOpenWorldSelection = bOpenWorldSelectionMenuOnNextStartWorld;
+    bOpenWorldSelectionMenuOnNextStartWorld = false;
+    return bShouldOpenWorldSelection;
+}
+
+void UGameManagerSubSystem::ClearWorldSelectionMenuRequest()
+{
+    bOpenWorldSelectionMenuOnNextStartWorld = false;
+}
+
+void UGameManagerSubSystem::ReleaseMainWorldRuntimeMemory(bool bForceGarbageCollection)
+{
+    // GameInstance subsystems survive level travel, so every UPROPERTY reference held here can keep
+    // gameplay-world actors, generated meshes/textures, glTF assets, and async-load state reachable.
+    SetWorldLoading(false);
+    SetGamePaused(false);
+    HideLoadingWidget();
+
+    if (UWorld* World = GetWorld())
+    {
+        World->GetTimerManager().ClearTimer(SceneAutoSaveTimerHandle);
+        World->GetTimerManager().ClearTimer(WorldDataSaveTimerHandle);
+        World->GetTimerManager().ClearAllTimersForObject(this);
+    }
+
     StopWorldSystems();
+    DestroyTrackedRuntimeActors();
 
     ClearPlacementGridMesh();
     if (IsValid(PlacementGridComponent))
@@ -365,14 +466,175 @@ void UGameManagerSubSystem::StopGameManager(const EEndPlayReason::Type EndPlayRe
         PlacementGridComponent->DestroyComponent();
         PlacementGridComponent = nullptr;
     }
+
+    if (UAssetManageSubSystem* AssetManager = GetAssetManagerSubsystem())
+    {
+        AssetManager->DeactivateAndRelease();
+    }
+
     Root = nullptr;
     ConfigActor = nullptr;
     ClearTransientRuntimeReferences();
+    ResetWorldRuntimeReferences();
+
     bManagerStarted = false;
     bWorldBootstrapStarted = false;
     bWorldLoadCompleted = false;
+    bSpawnedWorldManager = false;
+    bIsWorldLoading = false;
+    bIsGamePaused = false;
+    LoadingStatus = 0;
+
+    if (bForceGarbageCollection)
+    {
+        RequestRuntimeGarbageCollection(TEXT("ReleaseMainWorldRuntimeMemory"));
+        bPendingMainWorldRuntimePurge = false;
+    }
 }
 
+void UGameManagerSubSystem::DestroyTrackedRuntimeActors()
+{
+    APawn* CurrentPlayerPawn = UGameplayStatics::GetPlayerPawn(this, 0);
+
+    auto DestroyActorIfValid = [CurrentPlayerPawn](AActor* Actor)
+    {
+        if (IsValid(Actor) && !Actor->IsActorBeingDestroyed() && Actor != CurrentPlayerPawn)
+        {
+            Actor->Destroy();
+        }
+    };
+
+    DestroyActorIfValid(PendingEmptyObjectPreviewActor.Get());
+    if (CurrentEditableActor.Get() != PendingEmptyObjectPreviewActor.Get())
+    {
+        DestroyActorIfValid(CurrentEditableActor.Get());
+    }
+    DestroyActorIfValid(EquippedWeapon.Get());
+
+    for (APrefabActor* Prefab : SpawnedPrefabs)
+    {
+        DestroyActorIfValid(Prefab);
+    }
+    for (AEditableMeshActor* MeshActor : SpawnedGeneratedMeshes)
+    {
+        DestroyActorIfValid(MeshActor);
+    }
+    for (AVehiclePawn* Vehicle : SpawnedVehicles)
+    {
+        if (IsValid(Vehicle))
+        {
+            if (Vehicle->IsOccupied())
+            {
+                Vehicle->ExitVehicle();
+            }
+            DestroyActorIfValid(Vehicle);
+        }
+    }
+
+    if (ACharacterController* PlayerCharacter = Cast<ACharacterController>(CurrentPlayerPawn))
+    {
+        PlayerCharacter->PrepareForPawnReplacement();
+    }
+
+    PendingEmptyObjectPreviewActor = nullptr;
+    CurrentEditableActor = nullptr;
+    EquippedWeapon = nullptr;
+    SpawnedPrefabs.Reset();
+    SpawnedGeneratedMeshes.Reset();
+    SpawnedVehicles.Reset();
+}
+
+void UGameManagerSubSystem::ResetWorldRuntimeReferences()
+{
+    PlayerActor = nullptr;
+    CurrentCamera = nullptr;
+    PostProcess = nullptr;
+    CurrentWorldData = nullptr;
+    ActiveWorldData = nullptr;
+    WorldManagerActor = nullptr;
+    OceanActor = nullptr;
+    StreamSubSystem = nullptr;
+    LoadingWidgetInstance = nullptr;
+}
+
+void UGameManagerSubSystem::RequestRuntimeGarbageCollection(const TCHAR* Reason) const
+{
+    if (IsGarbageCollecting())
+    {
+        return;
+    }
+
+    FlushRenderingCommands();
+    CollectGarbage(RF_NoFlags, true);
+    FlushRenderingCommands();
+
+    UE_LOG(LogTemp, Display, TEXT("[Gameplay] Runtime memory cleanup completed: %s"), Reason ? Reason : TEXT("Unknown"));
+}
+
+UAssetManageSubSystem* UGameManagerSubSystem::GetAssetManagerSubsystem() const
+{
+    if (UGameInstance* GameInstance = GetGameInstance())
+    {
+        return GameInstance->GetSubsystem<UAssetManageSubSystem>();
+    }
+    return nullptr;
+}
+
+void UGameManagerSubSystem::RequestPostLoadRuntimeMemoryCleanup()
+{
+    bPendingMainWorldRuntimePurge = true;
+}
+
+void UGameManagerSubSystem::HandlePostLoadMapRuntimeCleanup(UWorld* LoadedWorld)
+{
+    if (!bPendingMainWorldRuntimePurge)
+    {
+        return;
+    }
+
+    if (LoadedWorld)
+    {
+        LoadedWorld->GetTimerManager().SetTimerForNextTick(
+            FTimerDelegate::CreateUObject(this, &UGameManagerSubSystem::RunPostLoadRuntimeMemoryCleanup));
+        return;
+    }
+
+    RunPostLoadRuntimeMemoryCleanup();
+}
+
+void UGameManagerSubSystem::RunPostLoadRuntimeMemoryCleanup()
+{
+    if (!bPendingMainWorldRuntimePurge)
+    {
+        return;
+    }
+    bPendingMainWorldRuntimePurge = false;
+
+    // GameInstance subsystems survive OpenLevel. After a menu/world-selection level is active, clear any last
+    // runtime references/caches that could keep gameplay glTF actors, generated assets, or render
+    // resources alive, then run a full purge with render-thread synchronization.
+    UglTFStreamSubSystem* GlobalStreamSubSystem = nullptr;
+    if (UGameInstance* GameInstance = GetGameInstance())
+    {
+        GlobalStreamSubSystem = GameInstance->GetSubsystem<UglTFStreamSubSystem>();
+    }
+    if (GlobalStreamSubSystem)
+    {
+        GlobalStreamSubSystem->StopMainWorldStreaming();
+    }
+
+    if (UAssetManageSubSystem* AssetManager = GetAssetManagerSubsystem())
+    {
+        AssetManager->DeactivateAndRelease();
+    }
+
+    HideLoadingWidget();
+    ClearPlacementGridMesh();
+    ClearTransientRuntimeReferences();
+    ResetWorldRuntimeReferences();
+
+    RequestRuntimeGarbageCollection(TEXT("PostLoadMapRuntimeCleanup"));
+}
 
 
 void UGameManagerSubSystem::InitializeWorldSystems(UWorldData* InWorldData, const FString& InModelDirectory, const FString& InPlayerDirectory, const FString& InInitialPlayerName)
@@ -394,6 +656,12 @@ void UGameManagerSubSystem::StopWorldSystems()
         StreamSubSystem->StopMainWorldStreaming();
         StreamSubSystem = nullptr;
     }
+    else if (UglTFStreamSubSystem* GlobalStreamSubSystem = UglTFStreamSubSystem::Get(this))
+    {
+        // GameInstance subsystems persist after map travel. If our cached pointer was already cleared,
+        // still force-stop the global streaming subsystem so glTF assets cannot stay resident.
+        GlobalStreamSubSystem->StopMainWorldStreaming();
+    }
 
     if (IsValid(OceanActor))
     {
@@ -410,6 +678,15 @@ void UGameManagerSubSystem::StopWorldSystems()
         }
         WorldManagerActor = nullptr;
     }
+
+    if (UAssetManageSubSystem* AssetManager = GetAssetManagerSubsystem())
+    {
+        AssetManager->DeactivateAndRelease();
+    }
+
+    bSpawnedWorldManager = false;
+    ActiveWorldData = nullptr;
+    SetWorldData(nullptr);
 }
 
 bool UGameManagerSubSystem::AreWorldSystemsReady() const
@@ -604,6 +881,10 @@ void UGameManagerSubSystem::ShowLoadingWidget()
     if (IsValid(LoadingWidgetInstance))
     {
         LoadingWidgetInstance->AddToViewport(0);
+        if (APlayerCharacterController* PlayerController = Cast<APlayerCharacterController>(UGameplayStatics::GetPlayerController(this, 0)))
+        {
+            PlayerController->ApplyLoadingInputMode(LoadingWidgetInstance.Get());
+        }
     }
 }
 
@@ -705,8 +986,21 @@ void UGameManagerSubSystem::TickGameManager(float DeltaSeconds)
 
 void UGameManagerSubSystem::ClearTransientRuntimeReferences()
 {
-    // Drop references to runtime objects before the subsystem is destroyed by GC.
-    // UObject-owned actors/components are destroyed by the world, but the subsystem should not keep stale references across PIE sessions.
+    // GameInstanceSubsystems persist across level travel. Drop every strong reference to
+    // MainWorld actors, components, generated assets, UI, and world data so GC can reclaim them
+    // after the old UWorld is unloaded.
+    PlayerActor = nullptr;
+    CurrentCamera = nullptr;
+    PostProcess = nullptr;
+    CurrentWorldData = nullptr;
+    ActiveWorldData = nullptr;
+    LoadingWidgetInstance = nullptr;
+    StreamSubSystem = nullptr;
+    OceanActor = nullptr;
+    WorldManagerActor = nullptr;
+    Root = nullptr;
+    PlacementGridComponent = nullptr;
+
     CurrentEditableActor = nullptr;
     PendingEmptyObjectPreviewActor = nullptr;
     EquippedWeapon = nullptr;
@@ -721,13 +1015,47 @@ void UGameManagerSubSystem::ClearTransientRuntimeReferences()
     ToolbarSlots.Reset();
     bToolbarInitialized = false;
 
+    CurrentWorldName.Reset();
+    PlayerLocation = FVector::ZeroVector;
+    SelectedToolbarSlotIndex = 0;
+    CurrentPrefabIndex = 0;
+    CurrentWeaponIndex = 0;
+    CurrentMode = EToolMode::None;
+    bSnapToGrid = false;
+    bFirstPerson = false;
+    bItemListWindowOpen = false;
+
+    LastPreviewLocation = FVector::ZeroVector;
+    PendingEmptyObjectLocation = FVector::ZeroVector;
+    PendingVertexLocation = FVector::ZeroVector;
+    bHasPendingEmptyObjectLocation = false;
+    bHasPendingVertexLocation = false;
+    LastVertexDistance = 0.0f;
+
     LastTraceHit = FHitResult();
     bLastTraceBlockingHit = false;
     bLastTraceHasPlacementLocation = false;
     bLastTraceUsedFreeSpace = false;
+    LastTraceStart = FVector::ZeroVector;
+    LastTraceDirection = FVector::ForwardVector;
     LastSaveMessage.Reset();
     bSavedSceneLoaded = false;
     bIsSavingScene = false;
+
+    HighlightedEditableVertexIndex = INDEX_NONE;
+    bMovingHighlightedEditableVertex = false;
+    bPrimaryVertexPressActive = false;
+    bPrimaryVertexDragActive = false;
+    PressedEditableVertexIndex = INDEX_NONE;
+    ConnectedEditableVertexSourceIndex = INDEX_NONE;
+    PrimaryVertexPressStartTime = 0.0;
+    PrimaryVertexPressStartLocation = FVector::ZeroVector;
+    bCurrentEditableActorWasExisting = false;
+    bHasOriginalEditableMeshRecord = false;
+    OriginalEditableMeshRecord = FGeneratedMeshRecord();
+    CachedPlacementGridCenter = FVector::ZeroVector;
+    CachedPlacementGridRadius = 0.0f;
+    bPlacementGridBuilt = false;
 }
 
 void UGameManagerSubSystem::EnsureAssetFolders() const
@@ -1240,6 +1568,47 @@ UGameManagerSubSystem* UGameManagerSubSystem::FindGameManager(const UObject* Wor
     return GetSubSystem(WorldContextObject);
 }
 
+void UGameManagerSubSystem::OpenWorldSelectionScreen(const UObject* WorldContextObject, FName WorldSelectionLevelName)
+{
+    if (!WorldContextObject)
+    {
+        return;
+    }
+
+    if (UGameManagerSubSystem* Manager = FindGameManager(WorldContextObject))
+    {
+        Manager->PrepareForReturnToMenuLevel();
+        Manager->RequestWorldSelectionMenuOnNextStartWorld();
+    }
+
+    // The project uses the StartWorld map for both the main menu and the world-selection widget.
+    // StartActor consumes the pending request above and opens the level menu after StartWorld loads.
+    static const FName LegacyWorldSelectionLevelName(TEXT("WorldSelectWorld"));
+    const FName TargetLevelName = (WorldSelectionLevelName != NAME_None && WorldSelectionLevelName != LegacyWorldSelectionLevelName)
+        ? WorldSelectionLevelName
+        : FName(TEXT("StartWorld"));
+    UGameplayStatics::OpenLevel(WorldContextObject, TargetLevelName);
+}
+
+void UGameManagerSubSystem::OpenMainMenuFromWorldSelection(const UObject* WorldContextObject, FName MainMenuLevelName)
+{
+    if (!WorldContextObject)
+    {
+        return;
+    }
+
+    if (UGameManagerSubSystem* Manager = FindGameManager(WorldContextObject))
+    {
+        Manager->ClearWorldSelectionMenuRequest();
+        Manager->SetGamePaused(false);
+    }
+
+    const FName TargetLevelName = MainMenuLevelName != NAME_None
+        ? MainMenuLevelName
+        : FName(TEXT("StartWorld"));
+    UGameplayStatics::OpenLevel(WorldContextObject, TargetLevelName);
+}
+
 FVector UGameManagerSubSystem::GetPendingPlacementSelection() const
 {
     if (bHasPendingVertexLocation)
@@ -1587,7 +1956,7 @@ bool UGameManagerSubSystem::TracePlacementLocation(FVector& OutLocation, FHitRes
     {
         // Anything beyond this end point is treated as empty air, even if a far-away wall exists behind it.
         const FVector CollisionEnd = Start + Direction * SafeCollisionDistance;
-        bHit = World->LineTraceSingleByChannel(OutHit, Start, CollisionEnd, ECC_Visibility, Params);
+        bHit = FPhysicsHelper::Raycast(World, Start, CollisionEnd, Params, OutHit);
     }
 
     if (bHit)

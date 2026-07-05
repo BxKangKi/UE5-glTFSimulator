@@ -19,6 +19,7 @@ class UCameraComponent;
 class UBuoyancyComponent;
 class UPrimitiveComponent;
 class UAnimInstance;
+class UCharacterLoadAsyncAction;
 
 UCLASS()
 class GLTFSIMULATOR_API ACharacterController : public ACharacter, public IWaterInteract
@@ -63,6 +64,8 @@ public:
     bool IsFirstPersonMode() const { return bFirstPersonMode; }
     UPROPERTY(BlueprintReadOnly)
     bool bIsLoaded; // Current glTF file path.
+    UFUNCTION(BlueprintPure, Category="Character|Loading")
+    float GetLoadProgress() const { return LoadProgress; }
     UPROPERTY(BlueprintReadOnly)
     bool bIsMoveable; // Current glTF file path.
     UPROPERTY(EditAnywhere, BlueprintReadWrite)
@@ -101,11 +104,15 @@ protected:
     // Only the feature toggle remains user-editable.
     UFUNCTION()
     void OnLoadCompleted(bool Result);
+    UFUNCTION()
+    void OnLoadProgress(float Progress);
 private:
     UPROPERTY()
     TObjectPtr<UCharacterMovementComponent> Movement;
     UPROPERTY()
     TObjectPtr<UGameManagerSubSystem> SubSystem;
+    UPROPERTY()
+    TObjectPtr<UCharacterLoadAsyncAction> ActiveLoadAction;
     void SetWaterState(bool bValue, float Level, bool bForceRagdollWaterState = false);
     bool FindDirectWaterLevel(float& OutLevel) const;
     void ClearDryWaterState(float Level, bool bUpdateMovementMode);
@@ -113,6 +120,8 @@ private:
     int32 CharacterStateBit = 0;
     FVector RawMoveInput;
     float WaterLevel = 0.0f;
+    UPROPERTY(Transient)
+    float LoadProgress = 0.0f;
     double LastPhysicsObjectImpactTime = -1.0;
     bool bFirstPersonMode = false;
     bool bWaterStateFromOverlap = false;

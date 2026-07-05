@@ -7,11 +7,18 @@
 #include "CollisionQueryParams.h"
 
 class AActor;
+class UObject;
+class UWorld;
 
 struct FPhysicsHelper
 {
-    static bool Raycast(AActor *Actor, const FVector &Start, const FVector &End, const FCollisionQueryParams &Params, FHitResult &HitResult);
-    static bool Raycast(AActor *Actor, const FVector &Start, const FVector &End, FHitResult &HitResult, const bool bIncludeSelf = false);
-    static bool Raycast(AActor *Actor, const FVector &Start, const FVector &Direction, const float Length, FHitResult &HitResult, const bool bIncludeSelf = false);
-    static bool Raycast(AActor *Actor, const FVector &Start, const FVector &End, const bool bIncludeSelf = false);
+    static bool Raycast(UWorld* World, const FVector& Start, const FVector& End, const FCollisionQueryParams& Params, FHitResult& HitResult);
+    static bool Raycast(UWorld* World, const FVector& Start, const FVector& End, ECollisionChannel Channel, const FCollisionQueryParams& Params, FHitResult& HitResult);
+    static bool Raycast(const UObject* WorldContextObject, const FVector& Start, const FVector& End, const FCollisionQueryParams& Params, FHitResult& HitResult);
+    static bool Raycast(const UObject* WorldContextObject, const FVector& Start, const FVector& End, ECollisionChannel Channel, const FCollisionQueryParams& Params, FHitResult& HitResult);
+    static bool Raycast(const AActor* Actor, const FVector& Start, const FVector& End, const FCollisionQueryParams& Params, FHitResult& HitResult);
+    static bool Raycast(const AActor* Actor, const FVector& Start, const FVector& End, ECollisionChannel Channel, const FCollisionQueryParams& Params, FHitResult& HitResult);
+    static bool Raycast(const AActor* Actor, const FVector& Start, const FVector& End, FHitResult& HitResult, bool bIncludeSelf = false);
+    static bool Raycast(const AActor* Actor, const FVector& Start, const FVector& Direction, float Length, FHitResult& HitResult, bool bIncludeSelf = false);
+    static bool Raycast(const AActor* Actor, const FVector& Start, const FVector& End, bool bIncludeSelf = false);
 };

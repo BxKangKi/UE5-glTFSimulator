@@ -5,6 +5,7 @@
 
 #include "Async/Async.h"
 #include "Dom/JsonObject.h"
+#include "Engine/StaticMesh.h"
 #include "Engine/Texture2D.h"
 #include "Engine/World.h"
 #include "HAL/FileManager.h"
@@ -25,9 +26,39 @@
 
 namespace
 {
+    constexpr int32 RuntimeMaxTextureDimension = 1024;
+
     static bool IsValidModelBounds(const FModelData& ModelData)
     {
         return !ModelData.Size.IsNearlyZero(0.001f);
+    }
+
+    static void ResizeRGBA8Texture(const TArray<uint8>& SourcePixels, int32 SourceWidth, int32 SourceHeight, int32 TargetWidth, int32 TargetHeight, TArray<uint8>& OutPixels)
+    {
+        OutPixels.Reset();
+        if (SourceWidth <= 0 || SourceHeight <= 0 || TargetWidth <= 0 || TargetHeight <= 0 || SourcePixels.Num() < SourceWidth * SourceHeight * 4)
+        {
+            return;
+        }
+
+        OutPixels.SetNumUninitialized(TargetWidth * TargetHeight * 4);
+        const float XScale = static_cast<float>(SourceWidth) / static_cast<float>(TargetWidth);
+        const float YScale = static_cast<float>(SourceHeight) / static_cast<float>(TargetHeight);
+
+        for (int32 Y = 0; Y < TargetHeight; ++Y)
+        {
+            const int32 SourceY = FMath::Clamp(FMath::FloorToInt((static_cast<float>(Y) + 0.5f) * YScale), 0, SourceHeight - 1);
+            for (int32 X = 0; X < TargetWidth; ++X)
+            {
+                const int32 SourceX = FMath::Clamp(FMath::FloorToInt((static_cast<float>(X) + 0.5f) * XScale), 0, SourceWidth - 1);
+                const int32 SourceIndex = (SourceY * SourceWidth + SourceX) * 4;
+                const int32 TargetIndex = (Y * TargetWidth + X) * 4;
+                OutPixels[TargetIndex + 0] = SourcePixels[SourceIndex + 0];
+                OutPixels[TargetIndex + 1] = SourcePixels[SourceIndex + 1];
+                OutPixels[TargetIndex + 2] = SourcePixels[SourceIndex + 2];
+                OutPixels[TargetIndex + 3] = SourcePixels[SourceIndex + 3];
+            }
+        }
     }
 }
 
@@ -50,10 +81,13 @@ ULoadAsyncAction *ULoadAsyncAction::LoadAsync(
 
 void ULoadAsyncAction::Activate()
 {
+    bCancelled = false;
+
     if (!IsValid(WorldContextObject) || !IsValid(Asset))
     {
         UE_LOG(LogTemp, Error, TEXT("Activate - WorldContextObject or Asset is not valid"));
         WriteLogAsync(TEXT("LoadAsyncAction Activate failed: WorldContextObject or Asset is invalid"));
+        ReleaseActionReferences();
         SetReadyToDestroy();
         return;
     }
@@ -70,15 +104,38 @@ void ULoadAsyncAction::Activate()
 void ULoadAsyncAction::LoadJsonAsync()
 {
     const FString LocalJsonPath = JsonFilePath;
+    TWeakObjectPtr<ULoadAsyncAction> WeakThis(this);
 
-    AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [this, LocalJsonPath]()
+    AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [WeakThis, LocalJsonPath]()
     {
+        auto WriteLoadLog = [](const FString& Message)
+        {
+            UFileFunctionLibrary::WriteSimulatorLogAsync(TEXT("LoadAsyncAction"), Message);
+        };
+
+        auto CreateDefaultJson = [](const FString& Path) -> bool
+        {
+            UFileFunctionLibrary::GenerateDirectory(Path);
+
+            FModelData EmptyData;
+            TSharedRef<FJsonObject> RootObject = EmptyData.Serialization();
+
+            FString OutputString;
+            TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutputString);
+            if (FJsonSerializer::Serialize(RootObject, Writer))
+            {
+                return FFileHelper::SaveStringToFile(OutputString, *Path, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+            }
+
+            return false;
+        };
+
         if (!FPaths::FileExists(LocalJsonPath))
         {
-            WriteLogAsync(FString::Printf(TEXT("JSON file not found. Creating default JSON: %s"), *LocalJsonPath));
-            if (!CreateDefaultJsonFile(LocalJsonPath))
+            WriteLoadLog(FString::Printf(TEXT("JSON file not found. Creating default JSON: %s"), *LocalJsonPath));
+            if (!CreateDefaultJson(LocalJsonPath))
             {
-                WriteLogAsync(FString::Printf(TEXT("Failed to create default JSON: %s"), *LocalJsonPath));
+                WriteLoadLog(FString::Printf(TEXT("Failed to create default JSON: %s"), *LocalJsonPath));
             }
         }
 
@@ -117,18 +174,31 @@ void ULoadAsyncAction::LoadJsonAsync()
             }
             else
             {
-                WriteLogAsync(FString::Printf(TEXT("JSON is damaged or unreadable: %s"), *LocalJsonPath));
+                WriteLoadLog(FString::Printf(TEXT("JSON is damaged or unreadable: %s"), *LocalJsonPath));
             }
         }
         else
         {
-            WriteLogAsync(FString::Printf(TEXT("Failed to read JSON: %s"), *LocalJsonPath));
+            WriteLoadLog(FString::Printf(TEXT("Failed to read JSON: %s"), *LocalJsonPath));
         }
 
-        AsyncTask(ENamedThreads::GameThread, [this, TemporaryModelData]()
+        AsyncTask(ENamedThreads::GameThread, [WeakThis, TemporaryModelData]()
         {
-            LoadedJsonModelData = TemporaryModelData;
-            ProcessChunk();
+            ULoadAsyncAction* StrongThis = WeakThis.Get();
+            if (!StrongThis)
+            {
+                return;
+            }
+
+            if (StrongThis->bCancelled || !IsValid(StrongThis->WorldContextObject.Get()))
+            {
+                StrongThis->ReleaseActionReferences();
+                StrongThis->SetReadyToDestroy();
+                return;
+            }
+
+            StrongThis->LoadedJsonModelData = TemporaryModelData;
+            StrongThis->ProcessChunk();
         });
     });
 }
@@ -152,10 +222,18 @@ bool ULoadAsyncAction::CreateDefaultJsonFile(const FString& Path)
 
 void ULoadAsyncAction::ProcessChunk()
 {
+    if (bCancelled)
+    {
+        ReleaseActionReferences();
+        SetReadyToDestroy();
+        return;
+    }
+
     if (!IsValid(WorldContextObject))
     {
         FLoadAsyncWrapper Wrapper;
         Completed.Broadcast(Wrapper);
+        ReleaseActionReferences();
         SetReadyToDestroy();
         return;
     }
@@ -171,27 +249,57 @@ void ULoadAsyncAction::ProcessChunk()
         RefreshGeneratedModelData();
         SaveGeneratedJsonAsync();
 
-        if (IsValid(Asset))
-        {
-            Asset->ClearCache();
-            Asset->MarkAsGarbage();
-            Asset = nullptr;
-        }
-
-        UWorld *World = WorldContextObject->GetWorld();
-        if (IsValid(World))
-        {
-            World->GetTimerManager().ClearTimer(ProcessTimerHandle);
-        }
-
         FLoadAsyncWrapper Wrapper;
         Wrapper.NodeMap = MoveTemp(NodeMap);
         Wrapper.MeshMap = MoveTemp(MeshMap);
         Wrapper.ModelData = GeneratedModelData;
         Progress.Broadcast(1.0f);
         Completed.Broadcast(Wrapper);
+        ReleaseActionReferences();
         SetReadyToDestroy();
     }
+}
+
+void ULoadAsyncAction::CancelAndRelease()
+{
+    bCancelled = true;
+    ReleaseActionReferences();
+    SetReadyToDestroy();
+}
+
+void ULoadAsyncAction::ReleaseActionReferences()
+{
+    bCancelled = true;
+
+    if (UWorld* World = IsValid(WorldContextObject.Get()) ? WorldContextObject->GetWorld() : nullptr)
+    {
+        World->GetTimerManager().ClearTimer(ProcessTimerHandle);
+    }
+
+    if (IsValid(Asset))
+    {
+        Asset->ClearCache();
+        if (Asset->IsRooted())
+        {
+            Asset->RemoveFromRoot();
+        }
+        Asset->ClearFlags(RF_Public | RF_Standalone);
+        Asset->MarkAsGarbage();
+    }
+
+    Completed.Clear();
+    Progress.Clear();
+    Asset = nullptr;
+    WorldContextObject = nullptr;
+    Nodes.Empty();
+    MeshMap.Empty();
+    NodeMap.Empty();
+    LoadedJsonModelData = FModelData();
+    GeneratedModelData = FModelData();
+    CurrentMeshName = NAME_None;
+    CurrentIndex = 0;
+    MaxCount = 0;
+    JsonFilePath.Reset();
 }
 
 void ULoadAsyncAction::MergeJsonDataToMeshMap()
@@ -267,6 +375,13 @@ void ULoadAsyncAction::SaveGeneratedJsonAsync() const
 
 void ULoadAsyncAction::CalculateSize()
 {
+    if (bCancelled || !IsValid(Asset))
+    {
+        ReleaseActionReferences();
+        SetReadyToDestroy();
+        return;
+    }
+
     FString Prefix = FStringHelper::GetTextBeforeChar(CurrentNode.Name, ';');
     FString Suffix = FStringHelper::GetTextAfterChar(CurrentNode.Name, ';');
     CurrentMeshName = FName(Prefix);
@@ -320,6 +435,17 @@ void ULoadAsyncAction::UpdateModelNodeData()
 
 void ULoadAsyncAction::GetStaticMesh(UStaticMesh *StaticMesh)
 {
+    if (bCancelled)
+    {
+        if (IsValid(StaticMesh) && !StaticMesh->IsAsset())
+        {
+            StaticMesh->MarkAsGarbage();
+        }
+        ReleaseActionReferences();
+        SetReadyToDestroy();
+        return;
+    }
+
     if (FModelMeshData *Info = MeshMap.Find(CurrentMeshName))
     {
         Info->LOD0 = CurrentNode.MeshIndex;
@@ -330,7 +456,7 @@ void ULoadAsyncAction::GetStaticMesh(UStaticMesh *StaticMesh)
         }
     }
 
-    if (StaticMesh)
+    if (IsValid(StaticMesh) && !StaticMesh->IsAsset())
     {
         StaticMesh->MarkAsGarbage();
         StaticMesh = nullptr;
@@ -341,6 +467,13 @@ void ULoadAsyncAction::GetStaticMesh(UStaticMesh *StaticMesh)
 
 void ULoadAsyncAction::UpdateNext()
 {
+    if (bCancelled || !IsValid(WorldContextObject.Get()))
+    {
+        ReleaseActionReferences();
+        SetReadyToDestroy();
+        return;
+    }
+
     ++CurrentIndex;
     CurrentMeshName = NAME_None;
 
@@ -351,11 +484,16 @@ void ULoadAsyncAction::UpdateNext()
 
     if (CurrentIndex % ChunkSize == 0)
     {
-        UWorld *World = WorldContextObject->GetWorld();
+        UWorld *World = IsValid(WorldContextObject.Get()) ? WorldContextObject->GetWorld() : nullptr;
         if (IsValid(World))
         {
             ProcessTimerHandle = World->GetTimerManager().SetTimerForNextTick(
                 FTimerDelegate::CreateUObject(this, &ULoadAsyncAction::ProcessChunk));
+        }
+        else
+        {
+            ReleaseActionReferences();
+            SetReadyToDestroy();
         }
     }
     else
@@ -366,7 +504,8 @@ void ULoadAsyncAction::UpdateNext()
 
 void ULoadAsyncAction::LoadTextureAsync(FString ImagePath)
 {
-    AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [ImagePath, this]()
+    TWeakObjectPtr<ULoadAsyncAction> WeakThis(this);
+    AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [ImagePath, WeakThis]()
     {
         TArray<uint8> RawFileData;
         if (!FFileHelper::LoadFileToArray(RawFileData, *ImagePath))
@@ -386,13 +525,38 @@ void ULoadAsyncAction::LoadTextureAsync(FString ImagePath)
                 int32 Width = ImageWrapper->GetWidth();
                 int32 Height = ImageWrapper->GetHeight();
 
-                AsyncTask(ENamedThreads::GameThread, [=]()
+                const int32 LargestDimension = FMath::Max(Width, Height);
+                if (LargestDimension > RuntimeMaxTextureDimension)
                 {
+                    const float ResizeScale = static_cast<float>(RuntimeMaxTextureDimension) / static_cast<float>(LargestDimension);
+                    const int32 TargetWidth = FMath::Max(1, FMath::RoundToInt(static_cast<float>(Width) * ResizeScale));
+                    const int32 TargetHeight = FMath::Max(1, FMath::RoundToInt(static_cast<float>(Height) * ResizeScale));
+
+                    TArray<uint8> ResizedRGBA;
+                    ResizeRGBA8Texture(UncompressedRGBA, Width, Height, TargetWidth, TargetHeight, ResizedRGBA);
+                    if (ResizedRGBA.Num() == TargetWidth * TargetHeight * 4)
+                    {
+                        UncompressedRGBA = MoveTemp(ResizedRGBA);
+                        Width = TargetWidth;
+                        Height = TargetHeight;
+                    }
+                }
+
+                AsyncTask(ENamedThreads::GameThread, [WeakThis, Width, Height, PixelData = MoveTemp(UncompressedRGBA)]() mutable
+                {
+                    if (ULoadAsyncAction* StrongThis = WeakThis.Get())
+                    {
+                        if (StrongThis->bCancelled)
+                        {
+                            return;
+                        }
+                    }
+
                     UTexture2D* NewTexture = UTexture2D::CreateTransient(Width, Height, PF_R8G8B8A8);
-                    if (NewTexture)
+                    if (NewTexture && PixelData.Num() == Width * Height * 4)
                     {
                         void* TextureData = NewTexture->GetPlatformData()->Mips[0].BulkData.Lock(LOCK_READ_WRITE);
-                        FMemory::Memcpy(TextureData, UncompressedRGBA.GetData(), UncompressedRGBA.Num());
+                        FMemory::Memcpy(TextureData, PixelData.GetData(), PixelData.Num());
                         NewTexture->GetPlatformData()->Mips[0].BulkData.Unlock();
                         NewTexture->UpdateResource();
                     }

@@ -1,13 +1,13 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
-#include "Gameplay/CreatorHUDWidget.h"
+#include "UI/CreatorHUDWidget.h"
 
 #include "Blueprint/WidgetTree.h"
 #include "Components/Border.h"
 #include "Components/ScrollBox.h"
 #include "Components/TextBlock.h"
 #include "Components/UniformGridPanel.h"
-#include "Gameplay/EditableMeshActor.h"
+#include "Model/EditableMeshActor.h"
 
 static FString MakeKindLabel(EToolbarItemKind Kind)
 {
