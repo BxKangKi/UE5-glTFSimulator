@@ -402,22 +402,6 @@ FORCEINLINE float CalculateLODScreenSize(int32 i, int32 N)
     return FMath::Lerp(StartValue, EndValue, Alpha);
 }
 
-static bool ShouldInjectTerrainTextureOverrideForMesh(const FName& MeshName)
-{
-    const FString MeshNameString = MeshName.ToString();
-    return MeshNameString.Equals(TEXT("terrain"), ESearchCase::IgnoreCase)
-        || MeshNameString.Contains(TEXT("terrain"), ESearchCase::IgnoreCase);
-}
-
-static UTexture* FindTerrainTextureOverrideParam(const FglTFRuntimeStaticMeshConfig& Config)
-{
-    if (UTexture* const* Texture = Config.MaterialsConfig.CustomTextureParams.Find(TEXT("TerrainTextures")))
-    {
-        return *Texture;
-    }
-    return nullptr;
-}
-
 void UStreamAsyncAction::LoadStaticMeshAsync(const FName &MeshName)
 {
     if (bAbortRequested || !IsValid(Asset))
@@ -450,18 +434,6 @@ void UStreamAsyncAction::LoadStaticMeshAsync(const FName &MeshName)
         Config.bBuildSimpleCollision = Mesh->Data.bSimpleCollision;
         Config.LODScreenSize = LODScreenSize;
         Config.LODScreenSizeMultiplier = 1.0f;
-
-        UTexture* TerrainTextureOverride = FindTerrainTextureOverrideParam(StaticMeshConfig);
-        if (TerrainTextureOverride && ShouldInjectTerrainTextureOverrideForMesh(MeshName))
-        {
-            Config.MaterialsConfig.CustomTextureParams.Add(TEXT("baseColor"), TerrainTextureOverride);
-            Config.MaterialsConfig.CustomTextureParams.Add(TEXT("BaseColor"), TerrainTextureOverride);
-        }
-        else
-        {
-            Config.MaterialsConfig.CustomTextureParams.Remove(TEXT("baseColor"));
-            Config.MaterialsConfig.CustomTextureParams.Remove(TEXT("BaseColor"));
-        }
 
         FglTFRuntimeStaticMeshAsync Callback;
         Callback.BindDynamic(this, &UStreamAsyncAction::SetStaticMesh);

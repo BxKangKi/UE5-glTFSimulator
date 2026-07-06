@@ -71,7 +71,8 @@ protected:
 
 private:
     void InitializeStartScreenAfterBlueprintBeginPlay();
-    UUserWidget* CreateAndAddMenuWidget(TSubclassOf<UUserWidget> WidgetClass, const TCHAR* DebugWidgetName);
+    UClass* ResolveMenuWidgetClass(TSubclassOf<UUserWidget> WidgetClass, const TCHAR* DefaultWidgetClassPath, const TCHAR* DebugWidgetName) const;
+    UUserWidget* CreateAndAddMenuWidget(TSubclassOf<UUserWidget> WidgetClass, const TCHAR* DefaultWidgetClassPath, const TCHAR* DebugWidgetName);
     void RemoveTrackedMenuWidgets();
     void RemoveAllMenuWidgets();
     void ApplyMenuInputMode(UUserWidget* FocusWidget) const;

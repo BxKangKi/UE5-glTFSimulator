@@ -79,10 +79,6 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite)
     FStreamDefaultAsset Default;
 
-    /** Optional texture used by custom terrain materials. Leave empty to use the original glTF material textures. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite)
-    TObjectPtr<UTexture> TerrainTextureOverride;
-
     UPROPERTY(EditAnywhere, BlueprintReadOnly)
     TObjectPtr<UMaterialInterface> DecalLight;
 
@@ -160,8 +156,6 @@ private:
     void StartStreaming();
     void AsyncTick();
     void UpdateProperties(const FStreamAsyncWrapper& Collection);
-    void ApplyTerrainTextureOverrideToLoadedMaterials();
-    bool IsTerrainMaterial(const UMaterialInterface* Material) const;
     bool IsPlayerInsideModelRange() const;
     void WriteLogAsync(const FString& Message) const;
     FglTFRuntimeStaticMeshConfig BuildStreamingStaticMeshConfig();

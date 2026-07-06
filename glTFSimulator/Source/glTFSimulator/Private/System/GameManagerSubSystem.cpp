@@ -564,10 +564,17 @@ void UGameManagerSubSystem::RequestRuntimeGarbageCollection(const TCHAR* Reason)
         return;
     }
 
-    FlushRenderingCommands();
-    CollectGarbage(RF_NoFlags, true);
-    FlushRenderingCommands();
+    // Do not run a synchronous full GC while a menu level is still finishing its load.
+    // FlushRenderingCommands + CollectGarbage can look like a hard stop around the editor/game
+    // loading-progress phase when a large glTF world has just been released. Queue the purge instead.
+    if (GEngine)
+    {
+        GEngine->ForceGarbageCollection(true);
+        UE_LOG(LogTemp, Display, TEXT("[Gameplay] Runtime memory cleanup queued: %s"), Reason ? Reason : TEXT("Unknown"));
+        return;
+    }
 
+    CollectGarbage(RF_NoFlags, true);
     UE_LOG(LogTemp, Display, TEXT("[Gameplay] Runtime memory cleanup completed: %s"), Reason ? Reason : TEXT("Unknown"));
 }
 

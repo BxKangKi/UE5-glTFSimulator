@@ -31,13 +31,7 @@
 #include "System/MacroLibrary.h"
 #include "TimerManager.h"
 
-static constexpr int32 RuntimeMaxTextureDimension = 1024;
-
-static bool IsTerrainLikeName(const FString& Name)
-{
-    return Name.Equals(TEXT("terrain"), ESearchCase::IgnoreCase)
-        || Name.Contains(TEXT("terrain"), ESearchCase::IgnoreCase);
-}
+static constexpr int32 GltfStreamTextureDimensionLimit = 1024;
 
 void AglTFStreamActor::Init(const FString& Path)
 {
@@ -525,16 +519,10 @@ FglTFRuntimeStaticMeshConfig AglTFStreamActor::BuildStreamingStaticMeshConfig()
         Config.MaterialsConfig.bMaterialsOverrideMapInjectParams = true;
     }
 
-    if (IsValid(TerrainTextureOverride.Get()))
-    {
-        // StreamAsyncAction injects this texture only for terrain-like meshes so normal glTF textures keep their source maps.
-        Config.MaterialsConfig.CustomTextureParams.Add(TEXT("TerrainTextures"), TerrainTextureOverride.Get());
-    }
-
     Config.MaterialsConfig.bGeneratesMipMaps = false;
     Config.MaterialsConfig.SpecularFactor = 0.0f;
-    Config.MaterialsConfig.ImagesConfig.MaxWidth = RuntimeMaxTextureDimension;
-    Config.MaterialsConfig.ImagesConfig.MaxHeight = RuntimeMaxTextureDimension;
+    Config.MaterialsConfig.ImagesConfig.MaxWidth = GltfStreamTextureDimensionLimit;
+    Config.MaterialsConfig.ImagesConfig.MaxHeight = GltfStreamTextureDimensionLimit;
     Config.MaterialsConfig.ImagesConfig.bCompressMips = false;
     Config.MaterialsConfig.ImagesConfig.bStreaming = false;
     Config.MaterialsConfig.bLoadMipMaps = false;
@@ -611,72 +599,6 @@ void AglTFStreamActor::UpdateProperties(const FStreamAsyncWrapper& Collection)
     DynamicComponentMap = Collection.DynamicComponentMap;
 }
 
-bool AglTFStreamActor::IsTerrainMaterial(const UMaterialInterface* Material) const
-{
-    const UMaterialInterface* CurrentMaterial = Material;
-    while (CurrentMaterial)
-    {
-        if (CurrentMaterial == Default.Terrain.Get() || IsTerrainLikeName(CurrentMaterial->GetName()))
-        {
-            return true;
-        }
-
-        const UMaterialInstance* MaterialInstance = Cast<UMaterialInstance>(CurrentMaterial);
-        CurrentMaterial = MaterialInstance ? MaterialInstance->Parent : nullptr;
-    }
-
-    return false;
-}
-
-void AglTFStreamActor::ApplyTerrainTextureOverrideToLoadedMaterials()
-{
-    if (!IsValid(TerrainTextureOverride.Get()))
-    {
-        return;
-    }
-
-    for (const TPair<FName, TObjectPtr<UInstancedStaticMeshComponent>>& Pair : InstanceMap)
-    {
-        UInstancedStaticMeshComponent* MeshComponent = Pair.Value.Get();
-        if (!IsValid(MeshComponent))
-        {
-            continue;
-        }
-
-        const bool bMeshNameLooksTerrain = IsTerrainLikeName(Pair.Key.ToString());
-        const int32 MaterialCount = MeshComponent->GetNumMaterials();
-        for (int32 MaterialIndex = 0; MaterialIndex < MaterialCount; ++MaterialIndex)
-        {
-            UMaterialInterface* Material = MeshComponent->GetMaterial(MaterialIndex);
-            if (!bMeshNameLooksTerrain && !IsTerrainMaterial(Material))
-            {
-                continue;
-            }
-
-            UMaterialInstanceDynamic* DynamicMaterial = Cast<UMaterialInstanceDynamic>(Material);
-            if (!DynamicMaterial)
-            {
-                UMaterialInterface* ParentMaterial = Material ? Material : Default.Terrain.Get();
-                if (!ParentMaterial)
-                {
-                    continue;
-                }
-                DynamicMaterial = UMaterialInstanceDynamic::Create(ParentMaterial, this);
-                if (DynamicMaterial)
-                {
-                    MeshComponent->SetMaterial(MaterialIndex, DynamicMaterial);
-                }
-            }
-
-            if (DynamicMaterial)
-            {
-                DynamicMaterial->SetTextureParameterValue(TEXT("baseColor"), TerrainTextureOverride.Get());
-                DynamicMaterial->SetTextureParameterValue(TEXT("BaseColor"), TerrainTextureOverride.Get());
-            }
-        }
-    }
-}
-
 void AglTFStreamActor::OnStreamAsyncCompleted(const FStreamAsyncWrapper& MapWrapper)
 {
     ActiveStreamAction = nullptr;
@@ -687,8 +609,6 @@ void AglTFStreamActor::OnStreamAsyncCompleted(const FStreamAsyncWrapper& MapWrap
     }
 
     UpdateProperties(MapWrapper);
-    ApplyTerrainTextureOverrideToLoadedMaterials();
-
     bIsLoaded = true;
     bAsyncLoading = false;
     LoadingStatus = 1.0f;

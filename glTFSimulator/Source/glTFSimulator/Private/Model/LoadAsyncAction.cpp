@@ -26,7 +26,7 @@
 
 namespace
 {
-    constexpr int32 RuntimeMaxTextureDimension = 1024;
+    constexpr int32 LoadAsyncTextureDimensionLimit = 1024;
 
     static bool IsValidModelBounds(const FModelData& ModelData)
     {
@@ -526,9 +526,9 @@ void ULoadAsyncAction::LoadTextureAsync(FString ImagePath)
                 int32 Height = ImageWrapper->GetHeight();
 
                 const int32 LargestDimension = FMath::Max(Width, Height);
-                if (LargestDimension > RuntimeMaxTextureDimension)
+                if (LargestDimension > LoadAsyncTextureDimensionLimit)
                 {
-                    const float ResizeScale = static_cast<float>(RuntimeMaxTextureDimension) / static_cast<float>(LargestDimension);
+                    const float ResizeScale = static_cast<float>(LoadAsyncTextureDimensionLimit) / static_cast<float>(LargestDimension);
                     const int32 TargetWidth = FMath::Max(1, FMath::RoundToInt(static_cast<float>(Width) * ResizeScale));
                     const int32 TargetHeight = FMath::Max(1, FMath::RoundToInt(static_cast<float>(Height) * ResizeScale));
 
