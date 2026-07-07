@@ -108,6 +108,14 @@ public:
     UFUNCTION(BlueprintCallable, Category="Game|Lifecycle", meta=(WorldContext="WorldContextObject"))
     static void OpenMainMenuFromWorldSelection(const UObject* WorldContextObject, FName MainMenuLevelName = NAME_None);
 
+    // Clears editor-only undo transactions before menu-triggered map travel. No-op outside editor builds.
+    UFUNCTION(BlueprintCallable, Category="Game|Lifecycle", meta=(WorldContext="WorldContextObject"))
+    static void ResetEditorTransactionBufferForWorldTravel(const UObject* WorldContextObject, const FString& Reason);
+
+    // Blueprint-safe wrapper for widgets that still perform OpenLevel in Blueprint.
+    UFUNCTION(BlueprintCallable, Category="Game|Lifecycle", meta=(WorldContext="WorldContextObject"))
+    static void PrepareForWorldTravelFromUI(const UObject* WorldContextObject);
+
     UFUNCTION(BlueprintCallable, Category="Game|Lifecycle")
     void StartGameManager(class AGameManagerActor* InConfigActor);
 

@@ -1,7 +1,6 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
-
 using UnrealBuildTool;
 
 public class glTFSimulator : ModuleRules
@@ -9,23 +8,24 @@ public class glTFSimulator : ModuleRules
     public glTFSimulator(ReadOnlyTargetRules Target) : base(Target)
     {
         PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
+
         PublicDependencyModuleNames.AddRange(
             new string[]
             {
                 "Core",
-                "EnhancedInput"
+                "CoreUObject",
+                "Engine",
+                "EnhancedInput",
+                "UMG"
             });
 
         PrivateDependencyModuleNames.AddRange(
             new string[]
             {
-                "CoreUObject",
-                "Engine",
                 "InputCore",
                 "Json",
                 "IKRig",
                 "Niagara",
-                "UMG",
                 "RHI",
                 "Slate",
                 "SlateCore",
@@ -35,11 +35,12 @@ public class glTFSimulator : ModuleRules
                 "RenderCore",
                 "glTFRuntime"
             });
-        
 
-        // Uncomment if you are using online features
-        // PrivateDependencyModuleNames.Add("OnlineSubsystem");
-
-        // To include OnlineSubsystemSteam, add it to the plugins section in your uproject file with the Enabled attribute set to true
+        if (Target.bBuildEditor)
+        {
+            // Editor-only transaction reset is used to prevent PIE world leaks caused by REINST widget objects
+            // being retained in the editor undo buffer during level travel.
+            PrivateDependencyModuleNames.Add("UnrealEd");
+        }
     }
 }

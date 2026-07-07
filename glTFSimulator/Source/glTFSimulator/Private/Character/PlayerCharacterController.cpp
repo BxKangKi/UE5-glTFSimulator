@@ -1170,11 +1170,18 @@ UUserWidget* APlayerCharacterController::CreateSettingsMenu()
 
     if (IsValid(SettingsMenuWidget))
     {
+        if (USettingsMenuWidget* SettingsWidget = Cast<USettingsMenuWidget>(SettingsMenuWidget.Get()))
+        {
+            // Re-opened settings menus must show the latest saved/runtime values, not stale pending edits.
+            SettingsWidget->InitializeSettingsFromSavedData();
+        }
+
         SettingsMenuWidget->SetVisibility(ESlateVisibility::Visible);
         if (!SettingsMenuWidget->IsInViewport())
         {
             SettingsMenuWidget->AddToViewport(SettingsMenuZOrder);
         }
+
         return SettingsMenuWidget.Get();
     }
 
@@ -1329,6 +1336,7 @@ void APlayerCharacterController::ExitToWorldSelectionFromPauseMenu()
 
     if (TargetLevelName != NAME_None)
     {
+        UGameManagerSubSystem::ResetEditorTransactionBufferForWorldTravel(this, TEXT("Pause menu exit to world selection"));
         UGameplayStatics::OpenLevel(this, TargetLevelName);
     }
 }
@@ -1359,6 +1367,7 @@ void APlayerCharacterController::ReturnToMainMenuFromWorldSelection()
     const FName TargetLevelName = MainMenuLevelName != NAME_None ? MainMenuLevelName : FName(TEXT("StartWorld"));
     if (TargetLevelName != NAME_None)
     {
+        UGameManagerSubSystem::ResetEditorTransactionBufferForWorldTravel(this, TEXT("Return to main menu from world selection"));
         UGameplayStatics::OpenLevel(this, TargetLevelName);
     }
 }

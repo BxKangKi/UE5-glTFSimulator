@@ -1,36 +1,182 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
 #include "UI/SettingsMenuWidget.h"
+
 #include "Blueprint/WidgetTree.h"
 #include "Character/PlayerCharacterController.h"
-#include "Components/Button.h"
+#include "Components/ContentWidget.h"
+#include "Components/PanelWidget.h"
 #include "Components/TextBlock.h"
+#include "Components/Widget.h"
 #include "Setting/GameSettings.h"
 #include "System/GameManagerSubSystem.h"
 
-static const TArray<ESettingsField>& GetDefaultSettingsFields()
+namespace
 {
-    static const TArray<ESettingsField> Fields = {
-        ESettingsField::BloomIntensity,
-        ESettingsField::BloomThreshold,
-        ESettingsField::AmbientOcclusionIntensity,
-        ESettingsField::RayTracing,
-        ESettingsField::HeightFog,
-        ESettingsField::Cloud,
-        ESettingsField::ShadowQuality,
-        ESettingsField::TextureQuality,
-        ESettingsField::ViewDistanceQuality,
-        ESettingsField::AntiAliasingQuality,
-        ESettingsField::PostProcessingQuality,
-        ESettingsField::EffectsQuality,
-        ESettingsField::FoliageQuality,
-        ESettingsField::ShadingQuality,
-        ESettingsField::GlobalIlluminationQuality,
-        ESettingsField::ReflectionQuality,
-        ESettingsField::DynamicGlobalIlluminationMethod,
-        ESettingsField::ReflectionMethod
-    };
-    return Fields;
+    constexpr float BloomStep = 0.25f;
+    constexpr float BloomIntensityMin = 0.0f;
+    constexpr float BloomIntensityMax = 10.0f;
+    constexpr float BloomThresholdMin = -1.0f;
+    constexpr float BloomThresholdMax = 10.0f;
+    constexpr float AmbientOcclusionStep = 0.25f;
+    constexpr float AmbientOcclusionMin = 0.0f;
+    constexpr float AmbientOcclusionMax = 5.0f;
+    constexpr int32 QualityMin = 0;
+    constexpr int32 QualityMax = 3;
+    constexpr int32 ReflectionMethodMin = 0;
+    constexpr int32 ReflectionMethodMax = 2;
+
+    const TArray<ESettingsField>& GetDefaultSettingsFields()
+    {
+        static const TArray<ESettingsField> Fields = {
+            ESettingsField::BloomIntensity,
+            ESettingsField::BloomThreshold,
+            ESettingsField::AmbientOcclusionIntensity,
+            ESettingsField::RayTracing,
+            ESettingsField::HeightFog,
+            ESettingsField::Cloud,
+            ESettingsField::ShadowQuality,
+            ESettingsField::TextureQuality,
+            ESettingsField::ViewDistanceQuality,
+            ESettingsField::AntiAliasingQuality,
+            ESettingsField::PostProcessingQuality,
+            ESettingsField::EffectsQuality,
+            ESettingsField::FoliageQuality,
+            ESettingsField::ShadingQuality,
+            ESettingsField::GlobalIlluminationQuality,
+            ESettingsField::ReflectionQuality,
+            ESettingsField::DynamicGlobalIlluminationMethod,
+            ESettingsField::ReflectionMethod
+        };
+        return Fields;
+    }
+
+    int32 WrapIndex(int32 Value, int32 MinValue, int32 MaxValue)
+    {
+        const int32 Count = MaxValue - MinValue + 1;
+        if (Count <= 0)
+        {
+            return MinValue;
+        }
+
+        int32 Offset = (Value - MinValue) % Count;
+        if (Offset < 0)
+        {
+            Offset += Count;
+        }
+        return MinValue + Offset;
+    }
+
+    int32 NormalizedDirection(int32 Direction)
+    {
+        return Direction < 0 ? -1 : 1;
+    }
+
+    void CycleInt(int32& Value, int32 MinValue, int32 MaxValue, int32 Direction)
+    {
+        Value = WrapIndex(Value + NormalizedDirection(Direction), MinValue, MaxValue);
+    }
+
+    void CycleFloat(float& Value, float MinValue, float MaxValue, float Step, int32 Direction)
+    {
+        const int32 Count = FMath::Max(1, FMath::RoundToInt((MaxValue - MinValue) / Step) + 1);
+        int32 CurrentIndex = FMath::RoundToInt((FMath::Clamp(Value, MinValue, MaxValue) - MinValue) / Step);
+        CurrentIndex = FMath::Clamp(CurrentIndex, 0, Count - 1);
+
+        int32 NewIndex = (CurrentIndex + NormalizedDirection(Direction)) % Count;
+        if (NewIndex < 0)
+        {
+            NewIndex += Count;
+        }
+
+        Value = MinValue + static_cast<float>(NewIndex) * Step;
+        Value = FMath::Clamp(Value, MinValue, MaxValue);
+    }
+
+    FString NormalizeFieldText(FString Text)
+    {
+        Text.TrimStartAndEndInline();
+        Text.ToLowerInline();
+        Text.ReplaceInline(TEXT(" "), TEXT(""));
+        Text.ReplaceInline(TEXT("_"), TEXT(""));
+        Text.ReplaceInline(TEXT("-"), TEXT(""));
+        return Text;
+    }
+
+    FString StripValuePart(const FString& Text)
+    {
+        FString Left;
+        FString Right;
+        if (Text.Split(TEXT(":"), &Left, &Right))
+        {
+            return Left;
+        }
+        return Text;
+    }
+
+    UTextBlock* FindFirstTextBlock(UWidget* Widget)
+    {
+        if (!Widget)
+        {
+            return nullptr;
+        }
+
+        if (UTextBlock* TextBlock = Cast<UTextBlock>(Widget))
+        {
+            return TextBlock;
+        }
+
+        if (UContentWidget* ContentWidget = Cast<UContentWidget>(Widget))
+        {
+            if (UWidget* Content = ContentWidget->GetContent())
+            {
+                if (UTextBlock* TextBlock = FindFirstTextBlock(Content))
+                {
+                    return TextBlock;
+                }
+            }
+        }
+
+        if (UPanelWidget* PanelWidget = Cast<UPanelWidget>(Widget))
+        {
+            const int32 ChildCount = PanelWidget->GetChildrenCount();
+            for (int32 ChildIndex = 0; ChildIndex < ChildCount; ++ChildIndex)
+            {
+                if (UTextBlock* TextBlock = FindFirstTextBlock(PanelWidget->GetChildAt(ChildIndex)))
+                {
+                    return TextBlock;
+                }
+            }
+        }
+
+        return nullptr;
+    }
+
+    FName FieldName(ESettingsField Field)
+    {
+        switch (Field)
+        {
+        case ESettingsField::BloomIntensity: return TEXT("BloomIntensity");
+        case ESettingsField::BloomThreshold: return TEXT("BloomThreshold");
+        case ESettingsField::AmbientOcclusionIntensity: return TEXT("AmbientOcclusionIntensity");
+        case ESettingsField::RayTracing: return TEXT("RayTracing");
+        case ESettingsField::HeightFog: return TEXT("HeightFog");
+        case ESettingsField::Cloud: return TEXT("Cloud");
+        case ESettingsField::ShadowQuality: return TEXT("ShadowQuality");
+        case ESettingsField::TextureQuality: return TEXT("TextureQuality");
+        case ESettingsField::ViewDistanceQuality: return TEXT("ViewDistanceQuality");
+        case ESettingsField::AntiAliasingQuality: return TEXT("AntiAliasingQuality");
+        case ESettingsField::PostProcessingQuality: return TEXT("PostProcessingQuality");
+        case ESettingsField::EffectsQuality: return TEXT("EffectsQuality");
+        case ESettingsField::FoliageQuality: return TEXT("FoliageQuality");
+        case ESettingsField::ShadingQuality: return TEXT("ShadingQuality");
+        case ESettingsField::GlobalIlluminationQuality: return TEXT("GlobalIlluminationQuality");
+        case ESettingsField::ReflectionQuality: return TEXT("ReflectionQuality");
+        case ESettingsField::DynamicGlobalIlluminationMethod: return TEXT("DynamicGlobalIlluminationMethod");
+        case ESettingsField::ReflectionMethod: return TEXT("ReflectionMethod");
+        default: return NAME_None;
+        }
+    }
 }
 
 void USettingsAdjustmentButton::SetupAdjustment(USettingsMenuWidget* InOwner, ESettingsField InField, float InStep)
@@ -38,7 +184,7 @@ void USettingsAdjustmentButton::SetupAdjustment(USettingsMenuWidget* InOwner, ES
     OwnerWidget = InOwner;
     Field = InField;
     Step = InStep;
-    OnClicked.RemoveAll(this);
+    OnClicked.RemoveDynamic(this, &USettingsAdjustmentButton::HandleClicked);
     OnClicked.AddDynamic(this, &USettingsAdjustmentButton::HandleClicked);
 }
 
@@ -50,11 +196,54 @@ void USettingsAdjustmentButton::HandleClicked()
     }
 }
 
+void USettingsCycleButton::SetupCycleButton(USettingsMenuWidget* InOwner, ESettingsField InField, int32 InDirection)
+{
+    OwnerWidget = InOwner;
+    Field = InField;
+    Direction = InDirection;
+    OnClicked.RemoveDynamic(this, &USettingsCycleButton::HandleClicked);
+    OnClicked.AddDynamic(this, &USettingsCycleButton::HandleClicked);
+    RefreshDisplayedText();
+}
+
+void USettingsCycleButton::RefreshDisplayedText()
+{
+    if (OwnerWidget)
+    {
+        OwnerWidget->SetButtonTextFromUI(this, OwnerWidget->GetSettingButtonText(Field));
+    }
+}
+
+void USettingsCycleButton::HandleClicked()
+{
+    if (OwnerWidget)
+    {
+        OwnerWidget->CycleSettingValueFromUI(Field, Direction);
+        RefreshDisplayedText();
+    }
+}
+
 void USettingsMenuWidget::NativeConstruct()
 {
     Super::NativeConstruct();
+
     CacheUserWidgetReferences();
     BindButtonEvents();
+    InitializeSettingsFromSavedData();
+}
+
+UGameSettings* USettingsMenuWidget::GetEditableSettings() const
+{
+    if (UGameManagerSubSystem* SubSystem = UGameManagerSubSystem::GetSubSystem(GetWorld()))
+    {
+        return SubSystem->GetGameSettings();
+    }
+    return nullptr;
+}
+
+void USettingsMenuWidget::InitializeSettingsFromSavedData()
+{
+    CopySettingsToPending(GetEditableSettings());
     RefreshSettingsValues();
 }
 
@@ -81,12 +270,28 @@ void USettingsMenuWidget::CacheUserWidgetReferences()
             ApplyButton = Cast<UButton>(WidgetTree->FindWidget(TEXT("Settings_ApplyButton")));
         }
     }
+    if (!ConfirmButton)
+    {
+        ConfirmButton = Cast<UButton>(WidgetTree->FindWidget(TEXT("ConfirmButton")));
+        if (!ConfirmButton)
+        {
+            ConfirmButton = Cast<UButton>(WidgetTree->FindWidget(TEXT("Settings_ConfirmButton")));
+        }
+    }
     if (!BackButton)
     {
         BackButton = Cast<UButton>(WidgetTree->FindWidget(TEXT("BackButton")));
         if (!BackButton)
         {
             BackButton = Cast<UButton>(WidgetTree->FindWidget(TEXT("Settings_BackButton")));
+        }
+    }
+    if (!CancelButton)
+    {
+        CancelButton = Cast<UButton>(WidgetTree->FindWidget(TEXT("CancelButton")));
+        if (!CancelButton)
+        {
+            CancelButton = Cast<UButton>(WidgetTree->FindWidget(TEXT("Settings_CancelButton")));
         }
     }
 
@@ -99,6 +304,12 @@ void USettingsMenuWidget::CacheUserWidgetReferences()
             ValueTextBlocks.Add(ValueText);
             ValueFields.Add(Field);
         }
+
+        if (UTextBlock* ValueText = Cast<UTextBlock>(WidgetTree->FindWidget(FName(*FString::Printf(TEXT("Settings_%sValue"), *FieldName(Field).ToString())))))
+        {
+            ValueTextBlocks.Add(ValueText);
+            ValueFields.Add(Field);
+        }
     }
 }
 
@@ -106,65 +317,338 @@ void USettingsMenuWidget::BindButtonEvents()
 {
     if (ApplyButton)
     {
-        ApplyButton->OnClicked.RemoveAll(this);
+        ApplyButton->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::ApplyAndSaveSettingsFromUI);
         ApplyButton->OnClicked.AddDynamic(this, &USettingsMenuWidget::ApplyAndSaveSettingsFromUI);
+    }
+    if (ConfirmButton && ConfirmButton != ApplyButton)
+    {
+        ConfirmButton->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::ConfirmSettingsFromUI);
+        ConfirmButton->OnClicked.AddDynamic(this, &USettingsMenuWidget::ConfirmSettingsFromUI);
     }
     if (BackButton)
     {
-        BackButton->OnClicked.RemoveAll(this);
+        BackButton->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CloseSettingsFromUI);
         BackButton->OnClicked.AddDynamic(this, &USettingsMenuWidget::CloseSettingsFromUI);
+    }
+    if (CancelButton && CancelButton != BackButton)
+    {
+        CancelButton->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CloseSettingsFromUI);
+        CancelButton->OnClicked.AddDynamic(this, &USettingsMenuWidget::CloseSettingsFromUI);
+    }
+
+    BindCycleButtonsInWidgetTree();
+    BindNamedSettingButtons();
+}
+
+void USettingsMenuWidget::BindCycleButtonsInWidgetTree()
+{
+    if (!WidgetTree)
+    {
+        return;
+    }
+
+    WidgetTree->ForEachWidget([this](UWidget* Widget)
+    {
+        if (USettingsCycleButton* CycleButton = Cast<USettingsCycleButton>(Widget))
+        {
+            CycleButton->SetupCycleButton(this, CycleButton->Field, CycleButton->Direction);
+            BoundFieldButtons.Add(TWeakObjectPtr<UButton>(CycleButton), CycleButton->Field);
+        }
+        else if (USettingsAdjustmentButton* AdjustmentButton = Cast<USettingsAdjustmentButton>(Widget))
+        {
+            // Existing adjustment buttons keep their Blueprint-configured field/step and now edit pending values only.
+            AdjustmentButton->SetupAdjustment(this, AdjustmentButton->Field, AdjustmentButton->Step);
+        }
+    });
+}
+
+void USettingsMenuWidget::BindNamedSettingButtons()
+{
+    BindNamedSettingButton(ESettingsField::BloomIntensity, TEXT("Settings_BloomIntensityButton"), TEXT("BloomIntensityButton"));
+    BindNamedSettingButton(ESettingsField::BloomThreshold, TEXT("Settings_BloomThresholdButton"), TEXT("BloomThresholdButton"));
+    BindNamedSettingButton(ESettingsField::AmbientOcclusionIntensity, TEXT("Settings_AmbientOcclusionIntensityButton"), TEXT("AmbientOcclusionIntensityButton"));
+    BindNamedSettingButton(ESettingsField::RayTracing, TEXT("Settings_RayTracingButton"), TEXT("RayTracingButton"));
+    BindNamedSettingButton(ESettingsField::HeightFog, TEXT("Settings_HeightFogButton"), TEXT("HeightFogButton"));
+    BindNamedSettingButton(ESettingsField::Cloud, TEXT("Settings_CloudButton"), TEXT("CloudButton"));
+    BindNamedSettingButton(ESettingsField::ShadowQuality, TEXT("Settings_ShadowQualityButton"), TEXT("ShadowQualityButton"));
+    BindNamedSettingButton(ESettingsField::TextureQuality, TEXT("Settings_TextureQualityButton"), TEXT("TextureQualityButton"));
+    BindNamedSettingButton(ESettingsField::ViewDistanceQuality, TEXT("Settings_ViewDistanceQualityButton"), TEXT("ViewDistanceQualityButton"));
+    BindNamedSettingButton(ESettingsField::AntiAliasingQuality, TEXT("Settings_AntiAliasingQualityButton"), TEXT("AntiAliasingQualityButton"));
+    BindNamedSettingButton(ESettingsField::PostProcessingQuality, TEXT("Settings_PostProcessingQualityButton"), TEXT("PostProcessingQualityButton"));
+    BindNamedSettingButton(ESettingsField::EffectsQuality, TEXT("Settings_EffectsQualityButton"), TEXT("EffectsQualityButton"));
+    BindNamedSettingButton(ESettingsField::FoliageQuality, TEXT("Settings_FoliageQualityButton"), TEXT("FoliageQualityButton"));
+    BindNamedSettingButton(ESettingsField::ShadingQuality, TEXT("Settings_ShadingQualityButton"), TEXT("ShadingQualityButton"));
+    BindNamedSettingButton(ESettingsField::GlobalIlluminationQuality, TEXT("Settings_GlobalIlluminationQualityButton"), TEXT("GlobalIlluminationQualityButton"));
+    BindNamedSettingButton(ESettingsField::ReflectionQuality, TEXT("Settings_ReflectionQualityButton"), TEXT("ReflectionQualityButton"));
+    BindNamedSettingButton(ESettingsField::DynamicGlobalIlluminationMethod, TEXT("Settings_DynamicGlobalIlluminationMethodButton"), TEXT("DynamicGlobalIlluminationMethodButton"));
+    BindNamedSettingButton(ESettingsField::ReflectionMethod, TEXT("Settings_ReflectionMethodButton"), TEXT("ReflectionMethodButton"));
+
+    for (ESettingsField Field : GetDefaultSettingsFields())
+    {
+        const int32 Index = static_cast<int32>(Field);
+        const FName IndexedName(*FString::Printf(TEXT("Settings_Button_%d"), Index));
+        if (UButton* Button = WidgetTree ? Cast<UButton>(WidgetTree->FindWidget(IndexedName)) : nullptr)
+        {
+            BindFieldButton(Field, Button);
+        }
     }
 }
 
-UGameSettings* USettingsMenuWidget::GetEditableSettings() const
+void USettingsMenuWidget::BindNamedSettingButton(ESettingsField Field, const FName& PrimaryName, const FName& AlternateName)
 {
-    if (UGameManagerSubSystem* SubSystem = UGameManagerSubSystem::GetSubSystem(GetWorld()))
+    if (!WidgetTree)
     {
-        return SubSystem->GetGameSettings();
+        return;
     }
-    return nullptr;
+
+    UButton* Button = Cast<UButton>(WidgetTree->FindWidget(PrimaryName));
+    if (!Button && !AlternateName.IsNone())
+    {
+        Button = Cast<UButton>(WidgetTree->FindWidget(AlternateName));
+    }
+
+    BindFieldButton(Field, Button);
+}
+
+void USettingsMenuWidget::BindFieldButton(ESettingsField Field, UButton* Button)
+{
+    if (!Button || Button == ApplyButton || Button == ConfirmButton || Button == BackButton || Button == CancelButton)
+    {
+        return;
+    }
+
+    if (Button->IsA<USettingsCycleButton>() || Button->IsA<USettingsAdjustmentButton>())
+    {
+        // Dedicated settings button subclasses bind themselves in BindCycleButtonsInWidgetTree().
+        return;
+    }
+
+    switch (Field)
+    {
+    case ESettingsField::BloomIntensity:
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleBloomIntensityFromUI);
+        Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleBloomIntensityFromUI);
+        break;
+    case ESettingsField::BloomThreshold:
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleBloomThresholdFromUI);
+        Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleBloomThresholdFromUI);
+        break;
+    case ESettingsField::AmbientOcclusionIntensity:
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleAmbientOcclusionIntensityFromUI);
+        Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleAmbientOcclusionIntensityFromUI);
+        break;
+    case ESettingsField::RayTracing:
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleRayTracingFromUI);
+        Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleRayTracingFromUI);
+        break;
+    case ESettingsField::HeightFog:
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleHeightFogFromUI);
+        Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleHeightFogFromUI);
+        break;
+    case ESettingsField::Cloud:
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleCloudFromUI);
+        Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleCloudFromUI);
+        break;
+    case ESettingsField::ShadowQuality:
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleShadowQualityFromUI);
+        Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleShadowQualityFromUI);
+        break;
+    case ESettingsField::TextureQuality:
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleTextureQualityFromUI);
+        Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleTextureQualityFromUI);
+        break;
+    case ESettingsField::ViewDistanceQuality:
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleViewDistanceQualityFromUI);
+        Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleViewDistanceQualityFromUI);
+        break;
+    case ESettingsField::AntiAliasingQuality:
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleAntiAliasingQualityFromUI);
+        Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleAntiAliasingQualityFromUI);
+        break;
+    case ESettingsField::PostProcessingQuality:
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CyclePostProcessingQualityFromUI);
+        Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CyclePostProcessingQualityFromUI);
+        break;
+    case ESettingsField::EffectsQuality:
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleEffectsQualityFromUI);
+        Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleEffectsQualityFromUI);
+        break;
+    case ESettingsField::FoliageQuality:
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleFoliageQualityFromUI);
+        Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleFoliageQualityFromUI);
+        break;
+    case ESettingsField::ShadingQuality:
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleShadingQualityFromUI);
+        Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleShadingQualityFromUI);
+        break;
+    case ESettingsField::GlobalIlluminationQuality:
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleGlobalIlluminationQualityFromUI);
+        Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleGlobalIlluminationQualityFromUI);
+        break;
+    case ESettingsField::ReflectionQuality:
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleReflectionQualityFromUI);
+        Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleReflectionQualityFromUI);
+        break;
+    case ESettingsField::DynamicGlobalIlluminationMethod:
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleDynamicGlobalIlluminationMethodFromUI);
+        Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleDynamicGlobalIlluminationMethodFromUI);
+        break;
+    case ESettingsField::ReflectionMethod:
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleReflectionMethodFromUI);
+        Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleReflectionMethodFromUI);
+        break;
+    default: break;
+    }
+
+    BoundFieldButtons.Add(TWeakObjectPtr<UButton>(Button), Field);
+}
+
+void USettingsMenuWidget::CopySettingsToPending(const UGameSettings* Settings)
+{
+    if (!Settings)
+    {
+        return;
+    }
+
+    PendingBloomIntensity = FMath::Clamp(Settings->BloomIntensity, BloomIntensityMin, BloomIntensityMax);
+    PendingBloomThreshold = FMath::Clamp(Settings->BloomThreshold, BloomThresholdMin, BloomThresholdMax);
+    PendingAmbientOcclusionIntensity = FMath::Clamp(Settings->AmbientOcclusionIntensity, AmbientOcclusionMin, AmbientOcclusionMax);
+    bPendingRayTracing = Settings->bRayTracing;
+    bPendingHeightFog = Settings->bHeightFog;
+    bPendingCloud = Settings->bCloud;
+    PendingShadowQuality = FMath::Clamp(Settings->ShadowQuality, QualityMin, QualityMax);
+    PendingTextureQuality = FMath::Clamp(Settings->TextureQuality, QualityMin, QualityMax);
+    PendingViewDistanceQuality = FMath::Clamp(Settings->ViewDistanceQuality, QualityMin, QualityMax);
+    PendingAntiAliasingQuality = FMath::Clamp(Settings->AntiAliasingQuality, QualityMin, QualityMax);
+    PendingPostProcessingQuality = FMath::Clamp(Settings->PostProcessingQuality, QualityMin, QualityMax);
+    PendingEffectsQuality = FMath::Clamp(Settings->EffectsQuality, QualityMin, QualityMax);
+    PendingFoliageQuality = FMath::Clamp(Settings->FoliageQuality, QualityMin, QualityMax);
+    PendingShadingQuality = FMath::Clamp(Settings->ShadingQuality, QualityMin, QualityMax);
+    PendingGlobalIlluminationQuality = FMath::Clamp(Settings->GlobalIlluminationQuality, QualityMin, QualityMax);
+    PendingReflectionQuality = FMath::Clamp(Settings->ReflectionQuality, QualityMin, QualityMax);
+    PendingDynamicGlobalIlluminationMethod = FMath::Clamp(Settings->DynamicGlobalIlluminationMethod, QualityMin, QualityMax);
+    PendingReflectionMethod = FMath::Clamp(Settings->ReflectionMethod, ReflectionMethodMin, ReflectionMethodMax);
+}
+
+void USettingsMenuWidget::ApplyPendingToSettings(UGameSettings* Settings) const
+{
+    if (!Settings)
+    {
+        return;
+    }
+
+    Settings->BloomIntensity = PendingBloomIntensity;
+    Settings->BloomThreshold = PendingBloomThreshold;
+    Settings->AmbientOcclusionIntensity = PendingAmbientOcclusionIntensity;
+    Settings->bRayTracing = bPendingRayTracing;
+    Settings->bHeightFog = bPendingHeightFog;
+    Settings->bCloud = bPendingCloud;
+    Settings->ShadowQuality = PendingShadowQuality;
+    Settings->TextureQuality = PendingTextureQuality;
+    Settings->ViewDistanceQuality = PendingViewDistanceQuality;
+    Settings->AntiAliasingQuality = PendingAntiAliasingQuality;
+    Settings->PostProcessingQuality = PendingPostProcessingQuality;
+    Settings->EffectsQuality = PendingEffectsQuality;
+    Settings->FoliageQuality = PendingFoliageQuality;
+    Settings->ShadingQuality = PendingShadingQuality;
+    Settings->GlobalIlluminationQuality = PendingGlobalIlluminationQuality;
+    Settings->ReflectionQuality = PendingReflectionQuality;
+    Settings->DynamicGlobalIlluminationMethod = PendingDynamicGlobalIlluminationMethod;
+    Settings->ReflectionMethod = PendingReflectionMethod;
 }
 
 void USettingsMenuWidget::RefreshSettingsValues()
 {
-    UGameSettings* Settings = GetEditableSettings();
     for (int32 Index = 0; Index < ValueTextBlocks.Num() && Index < ValueFields.Num(); ++Index)
     {
         if (ValueTextBlocks[Index])
         {
-            ValueTextBlocks[Index]->SetText(GetFieldValueText(ValueFields[Index], Settings));
+            ValueTextBlocks[Index]->SetText(GetPendingSettingValueText(ValueFields[Index]));
         }
+    }
+
+    for (const TPair<TWeakObjectPtr<UButton>, ESettingsField>& Pair : BoundFieldButtons)
+    {
+        if (UButton* Button = Pair.Key.Get())
+        {
+            SetButtonTextFromUI(Button, GetSettingButtonText(Pair.Value));
+        }
+    }
+}
+
+void USettingsMenuWidget::CycleSettingValueFromUI(ESettingsField Field, int32 Direction)
+{
+    CyclePendingValue(Field, Direction);
+    RefreshSettingsValues();
+}
+
+void USettingsMenuWidget::CycleSettingByNameFromUI(FName FieldNameValue, int32 Direction)
+{
+    ESettingsField Field = ESettingsField::BloomIntensity;
+    if (TryMatchFieldName(FieldNameValue.ToString(), Field))
+    {
+        CycleSettingValueFromUI(Field, Direction);
+    }
+}
+
+void USettingsMenuWidget::CycleSettingByButtonTextFromUI(UButton* SourceButton, int32 Direction)
+{
+    if (!SourceButton)
+    {
+        return;
+    }
+
+    ESettingsField Field = ESettingsField::BloomIntensity;
+    if (TryGetSettingFieldFromButtonText(GetButtonTextFromUI(SourceButton), Field))
+    {
+        CycleSettingValueFromUI(Field, Direction);
     }
 }
 
 void USettingsMenuWidget::AdjustSettingFromUI(ESettingsField Field, float Step)
 {
-    if (UGameSettings* Settings = GetEditableSettings())
-    {
-        AdjustSettingValue(Field, Step, Settings);
-        RefreshSettingsValues();
-    }
+    CycleSettingValueFromUI(Field, Step < 0.0f ? -1 : 1);
 }
 
 void USettingsMenuWidget::ApplyAndSaveSettingsFromUI()
 {
     if (UGameManagerSubSystem* SubSystem = UGameManagerSubSystem::GetSubSystem(GetWorld()))
     {
+        ApplyPendingToSettings(SubSystem->GetGameSettings());
         SubSystem->UpdateSettings();
         SubSystem->SaveSettings();
     }
+
     RefreshSettingsValues();
+}
+
+void USettingsMenuWidget::ConfirmSettingsFromUI()
+{
+    ApplyAndSaveSettingsFromUI();
+}
+
+void USettingsMenuWidget::DiscardPendingSettingsFromUI()
+{
+    InitializeSettingsFromSavedData();
 }
 
 void USettingsMenuWidget::CloseSettingsFromUI()
 {
+    // Back/Cancel closes without committing pending changes.
+    DiscardPendingSettingsFromUI();
+
     if (APlayerCharacterController* PlayerController = Cast<APlayerCharacterController>(GetOwningPlayer()))
     {
         PlayerController->ReturnToPauseMenuFromSettings();
     }
 }
 
-FText USettingsMenuWidget::GetFieldLabel(ESettingsField Field) const
+TArray<ESettingsField> USettingsMenuWidget::GetSettingFieldList() const
+{
+    return GetDefaultSettingsFields();
+}
+
+FText USettingsMenuWidget::GetSettingLabelText(ESettingsField Field) const
 {
     switch (Field)
     {
@@ -191,105 +675,222 @@ FText USettingsMenuWidget::GetFieldLabel(ESettingsField Field) const
     return FText::FromString(TEXT("Unknown"));
 }
 
-FText USettingsMenuWidget::GetFieldValueText(ESettingsField Field, const UGameSettings* Settings) const
+FText USettingsMenuWidget::GetPendingSettingValueText(ESettingsField Field) const
 {
-    if (!Settings)
-    {
-        return FText::FromString(TEXT("-"));
-    }
+    return GetFieldValueTextFromPending(Field);
+}
 
-    auto BoolText = [](bool bValue) { return FText::FromString(bValue ? TEXT("On") : TEXT("Off")); };
+FText USettingsMenuWidget::GetSettingButtonText(ESettingsField Field) const
+{
+    return FText::FromString(FString::Printf(TEXT("%s: %s"), *GetSettingLabelText(Field).ToString(), *GetPendingSettingValueText(Field).ToString()));
+}
+
+TArray<FText> USettingsMenuWidget::GetSettingOptionTexts(ESettingsField Field) const
+{
+    TArray<FText> Options;
 
     switch (Field)
     {
-    case ESettingsField::BloomIntensity: return FText::FromString(FString::Printf(TEXT("%.2f"), Settings->BloomIntensity));
-    case ESettingsField::BloomThreshold: return FText::FromString(FString::Printf(TEXT("%.2f"), Settings->BloomThreshold));
-    case ESettingsField::AmbientOcclusionIntensity: return FText::FromString(FString::Printf(TEXT("%.2f"), Settings->AmbientOcclusionIntensity));
-    case ESettingsField::RayTracing: return BoolText(Settings->bRayTracing);
-    case ESettingsField::HeightFog: return BoolText(Settings->bHeightFog);
-    case ESettingsField::Cloud: return BoolText(Settings->bCloud);
-    case ESettingsField::ShadowQuality: return FText::AsNumber(Settings->ShadowQuality);
-    case ESettingsField::TextureQuality: return FText::AsNumber(Settings->TextureQuality);
-    case ESettingsField::ViewDistanceQuality: return FText::AsNumber(Settings->ViewDistanceQuality);
-    case ESettingsField::AntiAliasingQuality: return FText::AsNumber(Settings->AntiAliasingQuality);
-    case ESettingsField::PostProcessingQuality: return FText::AsNumber(Settings->PostProcessingQuality);
-    case ESettingsField::EffectsQuality: return FText::AsNumber(Settings->EffectsQuality);
-    case ESettingsField::FoliageQuality: return FText::AsNumber(Settings->FoliageQuality);
-    case ESettingsField::ShadingQuality: return FText::AsNumber(Settings->ShadingQuality);
-    case ESettingsField::GlobalIlluminationQuality: return FText::AsNumber(Settings->GlobalIlluminationQuality);
-    case ESettingsField::ReflectionQuality: return FText::AsNumber(Settings->ReflectionQuality);
-    case ESettingsField::DynamicGlobalIlluminationMethod: return FText::AsNumber(Settings->DynamicGlobalIlluminationMethod);
-    case ESettingsField::ReflectionMethod: return FText::AsNumber(Settings->ReflectionMethod);
+    case ESettingsField::BloomIntensity:
+        for (float Value = BloomIntensityMin; Value <= BloomIntensityMax + KINDA_SMALL_NUMBER; Value += BloomStep)
+        {
+            Options.Add(FText::FromString(FString::Printf(TEXT("%.2f"), Value)));
+        }
+        break;
+    case ESettingsField::BloomThreshold:
+        for (float Value = BloomThresholdMin; Value <= BloomThresholdMax + KINDA_SMALL_NUMBER; Value += BloomStep)
+        {
+            Options.Add(FText::FromString(FString::Printf(TEXT("%.2f"), Value)));
+        }
+        break;
+    case ESettingsField::AmbientOcclusionIntensity:
+        for (float Value = AmbientOcclusionMin; Value <= AmbientOcclusionMax + KINDA_SMALL_NUMBER; Value += AmbientOcclusionStep)
+        {
+            Options.Add(FText::FromString(FString::Printf(TEXT("%.2f"), Value)));
+        }
+        break;
+    case ESettingsField::RayTracing:
+    case ESettingsField::HeightFog:
+    case ESettingsField::Cloud:
+        Options.Add(GetBoolText(false));
+        Options.Add(GetBoolText(true));
+        break;
+    case ESettingsField::DynamicGlobalIlluminationMethod:
+        for (int32 Value = QualityMin; Value <= QualityMax; ++Value)
+        {
+            Options.Add(GetDynamicGlobalIlluminationMethodText(Value));
+        }
+        break;
+    case ESettingsField::ReflectionMethod:
+        for (int32 Value = ReflectionMethodMin; Value <= ReflectionMethodMax; ++Value)
+        {
+            Options.Add(GetReflectionMethodText(Value));
+        }
+        break;
+    default:
+        for (int32 Value = QualityMin; Value <= QualityMax; ++Value)
+        {
+            Options.Add(GetQualityText(Value));
+        }
+        break;
+    }
+
+    return Options;
+}
+
+FText USettingsMenuWidget::GetButtonTextFromUI(UButton* SourceButton) const
+{
+    if (UTextBlock* TextBlock = FindFirstTextBlock(SourceButton))
+    {
+        return TextBlock->GetText();
+    }
+
+    return FText::GetEmpty();
+}
+
+bool USettingsMenuWidget::SetButtonTextFromUI(UButton* SourceButton, const FText& NewText) const
+{
+    if (UTextBlock* TextBlock = FindFirstTextBlock(SourceButton))
+    {
+        TextBlock->SetText(NewText);
+        return true;
+    }
+
+    return false;
+}
+
+bool USettingsMenuWidget::TryGetSettingFieldFromButtonText(const FText& ButtonText, ESettingsField& OutField) const
+{
+    return TryMatchFieldName(StripValuePart(ButtonText.ToString()), OutField);
+}
+
+void USettingsMenuWidget::CyclePendingValue(ESettingsField Field, int32 Direction)
+{
+    switch (Field)
+    {
+    case ESettingsField::BloomIntensity: CycleFloat(PendingBloomIntensity, BloomIntensityMin, BloomIntensityMax, BloomStep, Direction); break;
+    case ESettingsField::BloomThreshold: CycleFloat(PendingBloomThreshold, BloomThresholdMin, BloomThresholdMax, BloomStep, Direction); break;
+    case ESettingsField::AmbientOcclusionIntensity: CycleFloat(PendingAmbientOcclusionIntensity, AmbientOcclusionMin, AmbientOcclusionMax, AmbientOcclusionStep, Direction); break;
+    case ESettingsField::RayTracing: bPendingRayTracing = !bPendingRayTracing; break;
+    case ESettingsField::HeightFog: bPendingHeightFog = !bPendingHeightFog; break;
+    case ESettingsField::Cloud: bPendingCloud = !bPendingCloud; break;
+    case ESettingsField::ShadowQuality: CycleInt(PendingShadowQuality, QualityMin, QualityMax, Direction); break;
+    case ESettingsField::TextureQuality: CycleInt(PendingTextureQuality, QualityMin, QualityMax, Direction); break;
+    case ESettingsField::ViewDistanceQuality: CycleInt(PendingViewDistanceQuality, QualityMin, QualityMax, Direction); break;
+    case ESettingsField::AntiAliasingQuality: CycleInt(PendingAntiAliasingQuality, QualityMin, QualityMax, Direction); break;
+    case ESettingsField::PostProcessingQuality: CycleInt(PendingPostProcessingQuality, QualityMin, QualityMax, Direction); break;
+    case ESettingsField::EffectsQuality: CycleInt(PendingEffectsQuality, QualityMin, QualityMax, Direction); break;
+    case ESettingsField::FoliageQuality: CycleInt(PendingFoliageQuality, QualityMin, QualityMax, Direction); break;
+    case ESettingsField::ShadingQuality: CycleInt(PendingShadingQuality, QualityMin, QualityMax, Direction); break;
+    case ESettingsField::GlobalIlluminationQuality: CycleInt(PendingGlobalIlluminationQuality, QualityMin, QualityMax, Direction); break;
+    case ESettingsField::ReflectionQuality: CycleInt(PendingReflectionQuality, QualityMin, QualityMax, Direction); break;
+    case ESettingsField::DynamicGlobalIlluminationMethod: CycleInt(PendingDynamicGlobalIlluminationMethod, QualityMin, QualityMax, Direction); break;
+    case ESettingsField::ReflectionMethod: CycleInt(PendingReflectionMethod, ReflectionMethodMin, ReflectionMethodMax, Direction); break;
+    default: break;
+    }
+}
+
+bool USettingsMenuWidget::TryMatchFieldName(const FString& Input, ESettingsField& OutField) const
+{
+    const FString NormalizedInput = NormalizeFieldText(StripValuePart(Input));
+    for (ESettingsField Field : GetDefaultSettingsFields())
+    {
+        const FString Label = NormalizeFieldText(GetSettingLabelText(Field).ToString());
+        const FString Name = NormalizeFieldText(FieldName(Field).ToString());
+        if (NormalizedInput == Label || NormalizedInput == Name)
+        {
+            OutField = Field;
+            return true;
+        }
+    }
+    return false;
+}
+
+FText USettingsMenuWidget::GetFieldValueTextFromPending(ESettingsField Field) const
+{
+    switch (Field)
+    {
+    case ESettingsField::BloomIntensity: return FText::FromString(FString::Printf(TEXT("%.2f"), PendingBloomIntensity));
+    case ESettingsField::BloomThreshold: return FText::FromString(FString::Printf(TEXT("%.2f"), PendingBloomThreshold));
+    case ESettingsField::AmbientOcclusionIntensity: return FText::FromString(FString::Printf(TEXT("%.2f"), PendingAmbientOcclusionIntensity));
+    case ESettingsField::RayTracing: return GetBoolText(bPendingRayTracing);
+    case ESettingsField::HeightFog: return GetBoolText(bPendingHeightFog);
+    case ESettingsField::Cloud: return GetBoolText(bPendingCloud);
+    case ESettingsField::ShadowQuality: return GetQualityText(PendingShadowQuality);
+    case ESettingsField::TextureQuality: return GetQualityText(PendingTextureQuality);
+    case ESettingsField::ViewDistanceQuality: return GetQualityText(PendingViewDistanceQuality);
+    case ESettingsField::AntiAliasingQuality: return GetQualityText(PendingAntiAliasingQuality);
+    case ESettingsField::PostProcessingQuality: return GetQualityText(PendingPostProcessingQuality);
+    case ESettingsField::EffectsQuality: return GetQualityText(PendingEffectsQuality);
+    case ESettingsField::FoliageQuality: return GetQualityText(PendingFoliageQuality);
+    case ESettingsField::ShadingQuality: return GetQualityText(PendingShadingQuality);
+    case ESettingsField::GlobalIlluminationQuality: return GetQualityText(PendingGlobalIlluminationQuality);
+    case ESettingsField::ReflectionQuality: return GetQualityText(PendingReflectionQuality);
+    case ESettingsField::DynamicGlobalIlluminationMethod: return GetDynamicGlobalIlluminationMethodText(PendingDynamicGlobalIlluminationMethod);
+    case ESettingsField::ReflectionMethod: return GetReflectionMethodText(PendingReflectionMethod);
     default: break;
     }
     return FText::FromString(TEXT("-"));
 }
 
-void USettingsMenuWidget::AdjustSettingValue(ESettingsField Field, float Step, UGameSettings* Settings) const
+FText USettingsMenuWidget::GetQualityText(int32 Value) const
 {
-    if (!Settings)
+    switch (FMath::Clamp(Value, QualityMin, QualityMax))
     {
-        return;
+    case 0: return FText::FromString(TEXT("Low"));
+    case 1: return FText::FromString(TEXT("Medium"));
+    case 2: return FText::FromString(TEXT("High"));
+    case 3: return FText::FromString(TEXT("Epic"));
+    default: break;
     }
-
-    const int32 IntStep = Step >= 0.0f ? 1 : -1;
-    switch (Field)
-    {
-    case ESettingsField::BloomIntensity:
-        Settings->BloomIntensity = FMath::Clamp(Settings->BloomIntensity + Step * 0.1f, 0.0f, 10.0f);
-        break;
-    case ESettingsField::BloomThreshold:
-        Settings->BloomThreshold = FMath::Clamp(Settings->BloomThreshold + Step * 0.1f, -1.0f, 10.0f);
-        break;
-    case ESettingsField::AmbientOcclusionIntensity:
-        Settings->AmbientOcclusionIntensity = FMath::Clamp(Settings->AmbientOcclusionIntensity + Step * 0.1f, 0.0f, 5.0f);
-        break;
-    case ESettingsField::RayTracing:
-        Settings->bRayTracing = !Settings->bRayTracing;
-        break;
-    case ESettingsField::HeightFog:
-        Settings->bHeightFog = !Settings->bHeightFog;
-        break;
-    case ESettingsField::Cloud:
-        Settings->bCloud = !Settings->bCloud;
-        break;
-    case ESettingsField::ShadowQuality:
-        Settings->ShadowQuality = FMath::Clamp(Settings->ShadowQuality + IntStep, 0, 3);
-        break;
-    case ESettingsField::TextureQuality:
-        Settings->TextureQuality = FMath::Clamp(Settings->TextureQuality + IntStep, 0, 3);
-        break;
-    case ESettingsField::ViewDistanceQuality:
-        Settings->ViewDistanceQuality = FMath::Clamp(Settings->ViewDistanceQuality + IntStep, 0, 3);
-        break;
-    case ESettingsField::AntiAliasingQuality:
-        Settings->AntiAliasingQuality = FMath::Clamp(Settings->AntiAliasingQuality + IntStep, 0, 3);
-        break;
-    case ESettingsField::PostProcessingQuality:
-        Settings->PostProcessingQuality = FMath::Clamp(Settings->PostProcessingQuality + IntStep, 0, 3);
-        break;
-    case ESettingsField::EffectsQuality:
-        Settings->EffectsQuality = FMath::Clamp(Settings->EffectsQuality + IntStep, 0, 3);
-        break;
-    case ESettingsField::FoliageQuality:
-        Settings->FoliageQuality = FMath::Clamp(Settings->FoliageQuality + IntStep, 0, 3);
-        break;
-    case ESettingsField::ShadingQuality:
-        Settings->ShadingQuality = FMath::Clamp(Settings->ShadingQuality + IntStep, 0, 3);
-        break;
-    case ESettingsField::GlobalIlluminationQuality:
-        Settings->GlobalIlluminationQuality = FMath::Clamp(Settings->GlobalIlluminationQuality + IntStep, 0, 3);
-        break;
-    case ESettingsField::ReflectionQuality:
-        Settings->ReflectionQuality = FMath::Clamp(Settings->ReflectionQuality + IntStep, 0, 3);
-        break;
-    case ESettingsField::DynamicGlobalIlluminationMethod:
-        Settings->DynamicGlobalIlluminationMethod = FMath::Clamp(Settings->DynamicGlobalIlluminationMethod + IntStep, 0, 3);
-        break;
-    case ESettingsField::ReflectionMethod:
-        Settings->ReflectionMethod = FMath::Clamp(Settings->ReflectionMethod + IntStep, 0, 2);
-        break;
-    default:
-        break;
-    }
+    return FText::AsNumber(Value);
 }
+
+FText USettingsMenuWidget::GetBoolText(bool bValue) const
+{
+    return FText::FromString(bValue ? TEXT("On") : TEXT("Off"));
+}
+
+FText USettingsMenuWidget::GetDynamicGlobalIlluminationMethodText(int32 Value) const
+{
+    switch (FMath::Clamp(Value, QualityMin, QualityMax))
+    {
+    case 0: return FText::FromString(TEXT("None"));
+    case 1: return FText::FromString(TEXT("Lumen"));
+    case 2: return FText::FromString(TEXT("Screen Space"));
+    case 3: return FText::FromString(TEXT("Plugin"));
+    default: break;
+    }
+    return FText::AsNumber(Value);
+}
+
+FText USettingsMenuWidget::GetReflectionMethodText(int32 Value) const
+{
+    switch (FMath::Clamp(Value, ReflectionMethodMin, ReflectionMethodMax))
+    {
+    case 0: return FText::FromString(TEXT("None"));
+    case 1: return FText::FromString(TEXT("Lumen"));
+    case 2: return FText::FromString(TEXT("Screen Space"));
+    default: break;
+    }
+    return FText::AsNumber(Value);
+}
+
+void USettingsMenuWidget::CycleBloomIntensityFromUI() { CycleSettingValueFromUI(ESettingsField::BloomIntensity); }
+void USettingsMenuWidget::CycleBloomThresholdFromUI() { CycleSettingValueFromUI(ESettingsField::BloomThreshold); }
+void USettingsMenuWidget::CycleAmbientOcclusionIntensityFromUI() { CycleSettingValueFromUI(ESettingsField::AmbientOcclusionIntensity); }
+void USettingsMenuWidget::CycleRayTracingFromUI() { CycleSettingValueFromUI(ESettingsField::RayTracing); }
+void USettingsMenuWidget::CycleHeightFogFromUI() { CycleSettingValueFromUI(ESettingsField::HeightFog); }
+void USettingsMenuWidget::CycleCloudFromUI() { CycleSettingValueFromUI(ESettingsField::Cloud); }
+void USettingsMenuWidget::CycleShadowQualityFromUI() { CycleSettingValueFromUI(ESettingsField::ShadowQuality); }
+void USettingsMenuWidget::CycleTextureQualityFromUI() { CycleSettingValueFromUI(ESettingsField::TextureQuality); }
+void USettingsMenuWidget::CycleViewDistanceQualityFromUI() { CycleSettingValueFromUI(ESettingsField::ViewDistanceQuality); }
+void USettingsMenuWidget::CycleAntiAliasingQualityFromUI() { CycleSettingValueFromUI(ESettingsField::AntiAliasingQuality); }
+void USettingsMenuWidget::CyclePostProcessingQualityFromUI() { CycleSettingValueFromUI(ESettingsField::PostProcessingQuality); }
+void USettingsMenuWidget::CycleEffectsQualityFromUI() { CycleSettingValueFromUI(ESettingsField::EffectsQuality); }
+void USettingsMenuWidget::CycleFoliageQualityFromUI() { CycleSettingValueFromUI(ESettingsField::FoliageQuality); }
+void USettingsMenuWidget::CycleShadingQualityFromUI() { CycleSettingValueFromUI(ESettingsField::ShadingQuality); }
+void USettingsMenuWidget::CycleGlobalIlluminationQualityFromUI() { CycleSettingValueFromUI(ESettingsField::GlobalIlluminationQuality); }
+void USettingsMenuWidget::CycleReflectionQualityFromUI() { CycleSettingValueFromUI(ESettingsField::ReflectionQuality); }
+void USettingsMenuWidget::CycleDynamicGlobalIlluminationMethodFromUI() { CycleSettingValueFromUI(ESettingsField::DynamicGlobalIlluminationMethod); }
+void USettingsMenuWidget::CycleReflectionMethodFromUI() { CycleSettingValueFromUI(ESettingsField::ReflectionMethod); }

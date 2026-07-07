@@ -7,8 +7,15 @@
 #include "GameFramework/Actor.h"
 #include "StartActor.generated.h"
 
-class UUserWidget;
+class UStartWorldWidget;
 
+/**
+ * Owns the StartWorld menu flow.
+ *
+ * BP_StartWorld should inherit from this actor. WBP_StartWorld and WBP_LevelMenu
+ * should inherit from UStartWorldWidget so buttons call typed C++ functions instead
+ * of keeping Blueprint-only world references or invoking functions by reflection.
+ */
 UCLASS(Blueprintable, BlueprintType)
 class GLTFSIMULATOR_API AStartActor : public AActor
 {
@@ -21,11 +28,11 @@ public:
     UFUNCTION(BlueprintCallable, Category="Start World|UI")
     void StartGame();
 
-    /** Shows the start screen widget. Bind this to the world-selection Back button when the widget has a StartWorld reference. */
+    /** Shows the start screen widget. Bind this through UStartWorldWidget when the world-selection Back button is clicked. */
     UFUNCTION(BlueprintCallable, Category="Start World|UI")
     void ReturnToMainMenuFromWorldSelection();
 
-    /** Rebuilds and shows the main start screen widget. */
+    /** Rebuilds and shows the main start-screen widget. */
     UFUNCTION(BlueprintCallable, Category="Start World|UI")
     void ShowStartMenu();
 
@@ -33,25 +40,41 @@ public:
     UFUNCTION(BlueprintCallable, Category="Start World|UI")
     void ShowWorldSelectionMenu();
 
-    /** Re-scans available world folders and display names. */
+    /** Re-scans available world folders and refreshes the opened world-selection widget. */
     UFUNCTION(BlueprintCallable, Category="Start World|Data")
     void RefreshWorldFolderNameMap();
 
-    /** Returns a map of world-folder names to display names for the level menu widget. */
+    /** Returns a map of world-folder names to display names for Blueprint world-list widgets. */
     UFUNCTION(BlueprintPure, Category="Start World|Data")
     TMap<FString, FString> GetFolderNameMap() const { return FolderNameMap; }
+
+    /** Resolves a displayed level name back to its folder key. */
+    UFUNCTION(BlueprintCallable, Category="Start World|Data")
+    bool TryResolveWorldFolderFromDisplayName(const FString& DisplayName, FString& OutFolderName) const;
+
+    /** Opens the gameplay map after selecting a world folder from WBP_LevelMenu. */
+    UFUNCTION(BlueprintCallable, Category="Start World|Navigation")
+    void OpenGameplayWorldByFolderName(const FString& WorldFolderName);
+
+    /** Cleans StartWorld UI and editor-only transaction references before any menu-triggered map travel. */
+    UFUNCTION(BlueprintCallable, Category="Start World|Navigation")
+    void PrepareMenuForWorldTravel();
 
 protected:
     virtual void BeginPlay() override;
     virtual void Destroyed() override;
 
-    /** Start-screen widget class. Set this in BP_StartWorld or another Blueprint child of StartActor. */
+    /** Start-screen widget class. Set this to a WBP_StartWorld child reparented to UStartWorldWidget. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Start World|UI")
-    TSubclassOf<UUserWidget> StartMenuWidgetClass;
+    TSubclassOf<UStartWorldWidget> StartMenuWidgetClass;
 
-    /** World-selection widget class. Set this in BP_StartWorld or another Blueprint child of StartActor. */
+    /** World-selection widget class. Reparent WBP_LevelMenu to UStartWorldWidget and assign it here. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Start World|UI")
-    TSubclassOf<UUserWidget> WorldSelectionWidgetClass;
+    TSubclassOf<UStartWorldWidget> WorldSelectionWidgetClass;
+
+    /** Gameplay level opened after WBP_LevelMenu selects a world folder. */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Start World|Navigation")
+    FName GameplayLevelName = TEXT("MainWorld");
 
     /** Z order used when adding start/world-selection widgets to the viewport. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Start World|UI")
@@ -61,32 +84,26 @@ protected:
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Start World|Input")
     bool bApplyMenuInputMode = true;
 
-    /** Name of the object property on widgets that should receive this StartActor reference. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Start World|Reflection")
-    FName StartActorWidgetPropertyName;
-
-    /** Name of the Blueprint function called on the world-selection widget after creation. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Start World|Reflection")
-    FName WorldSelectionInitFunctionName;
+    /** Clears the editor undo buffer before StartWorld-triggered level travel to prevent REINST widget world leaks in PIE. */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Start World|Editor")
+    bool bResetEditorTransactionsBeforeTravel = true;
 
 private:
     void InitializeStartScreenAfterBlueprintBeginPlay();
-    UClass* ResolveMenuWidgetClass(TSubclassOf<UUserWidget> WidgetClass, const TCHAR* DefaultWidgetClassPath, const TCHAR* DebugWidgetName) const;
-    UUserWidget* CreateAndAddMenuWidget(TSubclassOf<UUserWidget> WidgetClass, const TCHAR* DefaultWidgetClassPath, const TCHAR* DebugWidgetName);
+    UClass* ResolveMenuWidgetClass(TSubclassOf<UStartWorldWidget> WidgetClass, const TCHAR* DefaultWidgetClassPath, const TCHAR* DebugWidgetName) const;
+    UStartWorldWidget* CreateAndAddMenuWidget(TSubclassOf<UStartWorldWidget> WidgetClass, const TCHAR* DefaultWidgetClassPath, const TCHAR* DebugWidgetName, bool bPassWorldSelectionData);
     void RemoveTrackedMenuWidgets();
     void RemoveAllMenuWidgets();
-    void ApplyMenuInputMode(UUserWidget* FocusWidget) const;
-    void AssignStartActorReference(UUserWidget* Widget) const;
-    void InvokeWorldSelectionInit(UUserWidget* Widget) const;
-    bool HasCompatibleInitFunction(const UFunction* Function) const;
+    void ApplyMenuInputMode(UStartWorldWidget* FocusWidget) const;
     void BuildLevelFolderNameMap();
+    void ResetEditorTransactionBufferForMenuTravel(const TCHAR* Reason) const;
 
 private:
     UPROPERTY(Transient)
-    TObjectPtr<UUserWidget> StartMenuWidget;
+    TObjectPtr<UStartWorldWidget> StartMenuWidget;
 
     UPROPERTY(Transient)
-    TObjectPtr<UUserWidget> WorldSelectionWidget;
+    TObjectPtr<UStartWorldWidget> WorldSelectionWidget;
 
     UPROPERTY(Transient)
     TMap<FString, FString> FolderNameMap;

@@ -7,9 +7,9 @@
 #include "Components/Button.h"
 #include "SettingsMenuWidget.generated.h"
 
-class UTextBlock;
 class UGameSettings;
 class USettingsMenuWidget;
+class UTextBlock;
 
 UENUM(BlueprintType)
 enum class ESettingsField : uint8
@@ -34,7 +34,7 @@ enum class ESettingsField : uint8
     ReflectionMethod UMETA(DisplayName="Reflection Method")
 };
 
-/** Button helper that Blueprint widgets can use when they want +/- adjustment buttons. */
+/** Backward-compatible helper button. Its click changes only the pending value; Apply/Confirm commits it. */
 UCLASS(Blueprintable)
 class GLTFSIMULATOR_API USettingsAdjustmentButton : public UButton
 {
@@ -47,23 +47,49 @@ public:
     UFUNCTION()
     void HandleClicked();
 
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Settings")
+    ESettingsField Field = ESettingsField::BloomIntensity;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Settings")
+    float Step = 1.0f;
+
 private:
     UPROPERTY()
     TObjectPtr<USettingsMenuWidget> OwnerWidget;
+};
 
-    UPROPERTY()
+/** Button class that cycles one settings field when clicked. Use it in WBP setting rows when desired. */
+UCLASS(Blueprintable)
+class GLTFSIMULATOR_API USettingsCycleButton : public UButton
+{
+    GENERATED_BODY()
+
+public:
+    UFUNCTION(BlueprintCallable, Category="Settings")
+    void SetupCycleButton(USettingsMenuWidget* InOwner, ESettingsField InField, int32 InDirection = 1);
+
+    UFUNCTION(BlueprintCallable, Category="Settings")
+    void RefreshDisplayedText();
+
+    UFUNCTION()
+    void HandleClicked();
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Settings")
     ESettingsField Field = ESettingsField::BloomIntensity;
 
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Settings")
+    int32 Direction = 1;
+
+private:
     UPROPERTY()
-    float Step = 0.0f;
+    TObjectPtr<USettingsMenuWidget> OwnerWidget;
 };
 
 /**
- * Blueprint-editable settings menu that edits the existing UGameSettings/SettingData object.
+ * Blueprint-editable settings menu backed by UGameSettings.
  *
- * This class no longer creates a native fallback editor. Create the visual tree in a WBP child.
- * ApplyButton and BackButton are bound automatically when present; your own buttons can call
- * AdjustSettingFromUI, ApplyAndSaveSettingsFromUI, and CloseSettingsFromUI directly.
+ * One click only changes this widget's pending value. Nothing is applied to the game, post process,
+ * or JSON file until ApplyAndSaveSettingsFromUI() / ConfirmSettingsFromUI() is called.
  */
 UCLASS(Blueprintable, BlueprintType)
 class GLTFSIMULATOR_API USettingsMenuWidget : public UUserWidget
@@ -73,20 +99,119 @@ class GLTFSIMULATOR_API USettingsMenuWidget : public UUserWidget
 public:
     virtual void NativeConstruct() override;
 
+    /** Returns the active settings object owned by the GameManager subsystem. */
     UFUNCTION(BlueprintCallable, Category="Settings")
     UGameSettings* GetEditableSettings() const;
 
+    /** Loads the current saved/runtime values into the pending UI copy and refreshes button text. */
+    UFUNCTION(BlueprintCallable, Category="Settings")
+    void InitializeSettingsFromSavedData();
+
+    /** Refreshes all known value labels and setting buttons from the pending UI copy. */
     UFUNCTION(BlueprintCallable, Category="Settings")
     void RefreshSettingsValues();
 
+    /** Cycles a setting to its next/previous option in the pending UI copy only. */
+    UFUNCTION(BlueprintCallable, Category="Settings")
+    void CycleSettingValueFromUI(ESettingsField Field, int32 Direction = 1);
+
+    /** Cycles a setting by enum/display name. Useful when a Blueprint stores setting names as text/name data. */
+    UFUNCTION(BlueprintCallable, Category="Settings")
+    void CycleSettingByNameFromUI(FName FieldName, int32 Direction = 1);
+
+    /** Reads the button text, finds the matching setting label, and cycles that pending setting. */
+    UFUNCTION(BlueprintCallable, Category="Settings|Buttons")
+    void CycleSettingByButtonTextFromUI(UButton* SourceButton, int32 Direction = 1);
+
+    /** Backward-compatible adjustment entry point. Positive values cycle forward; negative values cycle backward. */
     UFUNCTION(BlueprintCallable, Category="Settings")
     void AdjustSettingFromUI(ESettingsField Field, float Step);
 
+    /** Applies the pending UI copy to UGameSettings, updates runtime systems, and saves settings.json. */
     UFUNCTION(BlueprintCallable, Category="Settings")
     void ApplyAndSaveSettingsFromUI();
 
+    /** Alias for ApplyAndSaveSettingsFromUI(), intended for a Confirm/OK button. */
+    UFUNCTION(BlueprintCallable, Category="Settings")
+    void ConfirmSettingsFromUI();
+
+    /** Reloads current runtime/saved values and discards pending UI edits. */
+    UFUNCTION(BlueprintCallable, Category="Settings")
+    void DiscardPendingSettingsFromUI();
+
+    /** Closes the settings screen without applying pending edits. */
     UFUNCTION(BlueprintCallable, Category="Settings")
     void CloseSettingsFromUI();
+
+    /** Returns all setting fields represented by UGameSettings. */
+    UFUNCTION(BlueprintPure, Category="Settings")
+    TArray<ESettingsField> GetSettingFieldList() const;
+
+    /** Returns the user-facing label for a setting field. */
+    UFUNCTION(BlueprintPure, Category="Settings|Text")
+    FText GetSettingLabelText(ESettingsField Field) const;
+
+    /** Returns the current pending value text for a setting field. */
+    UFUNCTION(BlueprintPure, Category="Settings|Text")
+    FText GetPendingSettingValueText(ESettingsField Field) const;
+
+    /** Returns "Label: Value" for a setting button. */
+    UFUNCTION(BlueprintPure, Category="Settings|Text")
+    FText GetSettingButtonText(ESettingsField Field) const;
+
+    /** Returns every option label that the field cycles through. */
+    UFUNCTION(BlueprintPure, Category="Settings|Text")
+    TArray<FText> GetSettingOptionTexts(ESettingsField Field) const;
+
+    /** Reads the first child text block inside a button. */
+    UFUNCTION(BlueprintPure, Category="Settings|Buttons")
+    FText GetButtonTextFromUI(UButton* SourceButton) const;
+
+    /** Updates the first child text block inside a button. */
+    UFUNCTION(BlueprintCallable, Category="Settings|Buttons")
+    bool SetButtonTextFromUI(UButton* SourceButton, const FText& NewText) const;
+
+    /** Tries to map a button label such as "Shadow Quality: High" back to a settings field. */
+    UFUNCTION(BlueprintPure, Category="Settings|Buttons")
+    bool TryGetSettingFieldFromButtonText(const FText& ButtonText, ESettingsField& OutField) const;
+
+    // Direct functions for WBP button bindings. Each function cycles one pending setting forward.
+    UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
+    void CycleBloomIntensityFromUI();
+    UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
+    void CycleBloomThresholdFromUI();
+    UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
+    void CycleAmbientOcclusionIntensityFromUI();
+    UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
+    void CycleRayTracingFromUI();
+    UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
+    void CycleHeightFogFromUI();
+    UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
+    void CycleCloudFromUI();
+    UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
+    void CycleShadowQualityFromUI();
+    UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
+    void CycleTextureQualityFromUI();
+    UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
+    void CycleViewDistanceQualityFromUI();
+    UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
+    void CycleAntiAliasingQualityFromUI();
+    UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
+    void CyclePostProcessingQualityFromUI();
+    UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
+    void CycleEffectsQualityFromUI();
+    UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
+    void CycleFoliageQualityFromUI();
+    UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
+    void CycleShadingQualityFromUI();
+    UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
+    void CycleGlobalIlluminationQualityFromUI();
+    UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
+    void CycleReflectionQualityFromUI();
+    UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
+    void CycleDynamicGlobalIlluminationMethodFromUI();
+    UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
+    void CycleReflectionMethodFromUI();
 
 protected:
     UPROPERTY(BlueprintReadOnly, meta=(BindWidgetOptional), Category="Settings|Widgets")
@@ -96,18 +221,56 @@ protected:
     TObjectPtr<UButton> ApplyButton;
 
     UPROPERTY(BlueprintReadOnly, meta=(BindWidgetOptional), Category="Settings|Widgets")
+    TObjectPtr<UButton> ConfirmButton;
+
+    UPROPERTY(BlueprintReadOnly, meta=(BindWidgetOptional), Category="Settings|Widgets")
     TObjectPtr<UButton> BackButton;
+
+    UPROPERTY(BlueprintReadOnly, meta=(BindWidgetOptional), Category="Settings|Widgets")
+    TObjectPtr<UButton> CancelButton;
 
 private:
     void CacheUserWidgetReferences();
     void BindButtonEvents();
-    FText GetFieldLabel(ESettingsField Field) const;
-    FText GetFieldValueText(ESettingsField Field, const UGameSettings* Settings) const;
-    void AdjustSettingValue(ESettingsField Field, float Step, UGameSettings* Settings) const;
+    void BindCycleButtonsInWidgetTree();
+    void BindNamedSettingButtons();
+    void BindNamedSettingButton(ESettingsField Field, const FName& PrimaryName, const FName& AlternateName);
+    void BindFieldButton(ESettingsField Field, UButton* Button);
+    void CopySettingsToPending(const UGameSettings* Settings);
+    void ApplyPendingToSettings(UGameSettings* Settings) const;
+    void CyclePendingValue(ESettingsField Field, int32 Direction);
+    bool TryMatchFieldName(const FString& Input, ESettingsField& OutField) const;
+
+    FText GetFieldValueTextFromPending(ESettingsField Field) const;
+    FText GetQualityText(int32 Value) const;
+    FText GetBoolText(bool bValue) const;
+    FText GetDynamicGlobalIlluminationMethodText(int32 Value) const;
+    FText GetReflectionMethodText(int32 Value) const;
 
     UPROPERTY()
     TArray<TObjectPtr<UTextBlock>> ValueTextBlocks;
 
     UPROPERTY()
     TArray<ESettingsField> ValueFields;
+
+    TMap<TWeakObjectPtr<UButton>, ESettingsField> BoundFieldButtons;
+
+    float PendingBloomIntensity = 0.675f;
+    float PendingBloomThreshold = -1.0f;
+    float PendingAmbientOcclusionIntensity = 0.5f;
+    bool bPendingRayTracing = true;
+    bool bPendingHeightFog = true;
+    bool bPendingCloud = true;
+    int32 PendingShadowQuality = 2;
+    int32 PendingTextureQuality = 2;
+    int32 PendingViewDistanceQuality = 2;
+    int32 PendingAntiAliasingQuality = 2;
+    int32 PendingPostProcessingQuality = 2;
+    int32 PendingEffectsQuality = 2;
+    int32 PendingFoliageQuality = 2;
+    int32 PendingShadingQuality = 2;
+    int32 PendingGlobalIlluminationQuality = 2;
+    int32 PendingReflectionQuality = 2;
+    int32 PendingDynamicGlobalIlluminationMethod = 1;
+    int32 PendingReflectionMethod = 1;
 };

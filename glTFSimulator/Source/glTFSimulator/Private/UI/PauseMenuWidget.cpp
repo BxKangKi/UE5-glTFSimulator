@@ -58,17 +58,17 @@ void UPauseMenuWidget::BindButtonEvents()
 {
     if (ContinueButton)
     {
-        ContinueButton->OnClicked.RemoveAll(this);
+        ContinueButton->OnClicked.RemoveDynamic(this, &UPauseMenuWidget::ContinueFromUI);
         ContinueButton->OnClicked.AddDynamic(this, &UPauseMenuWidget::ContinueFromUI);
     }
     if (SettingsButton)
     {
-        SettingsButton->OnClicked.RemoveAll(this);
+        SettingsButton->OnClicked.RemoveDynamic(this, &UPauseMenuWidget::OpenSettingsFromUI);
         SettingsButton->OnClicked.AddDynamic(this, &UPauseMenuWidget::OpenSettingsFromUI);
     }
     if (ExitButton)
     {
-        ExitButton->OnClicked.RemoveAll(this);
+        ExitButton->OnClicked.RemoveDynamic(this, &UPauseMenuWidget::ExitFromUI);
         ExitButton->OnClicked.AddDynamic(this, &UPauseMenuWidget::ExitFromUI);
     }
 }

@@ -3,35 +3,37 @@
 
 #include "World/StartActor.h"
 
-#include "Blueprint/UserWidget.h"
 #include "Blueprint/WidgetLayoutLibrary.h"
+#include "Engine/GameInstance.h"
 #include "Engine/World.h"
 #include "GameFramework/PlayerController.h"
 #include "Kismet/GameplayStatics.h"
+#include "Misc/Paths.h"
 #include "System/FileFunctionLibrary.h"
 #include "System/GameManagerSubSystem.h"
 #include "System/MacroLibrary.h"
 #include "TimerManager.h"
-#include "UObject/UObjectGlobals.h"
-#include "UObject/UnrealType.h"
+#include "UI/StartWorldWidget.h"
 #include "World/WorldData.h"
 
 namespace
 {
-    static const FName NAME_DefaultStartActorWidgetProperty(TEXT("StartWorld"));
-    static const FName NAME_DefaultWorldSelectionInitFunction(TEXT("Init"));
     static const TCHAR* const DefaultStartMenuWidgetClassPath = TEXT("/Game/Blueprints/StartWorld/WBP_StartWorld.WBP_StartWorld_C");
     static const TCHAR* const DefaultWorldSelectionWidgetClassPath = TEXT("/Game/Blueprints/StartWorld/WBP_LevelMenu.WBP_LevelMenu_C");
+
+    FString NormalizeStartWorldString(FString Value)
+    {
+        Value.TrimStartAndEndInline();
+        return Value;
+    }
 }
 
 AStartActor::AStartActor()
 {
     PrimaryActorTick.bCanEverTick = false;
-    StartActorWidgetPropertyName = NAME_DefaultStartActorWidgetProperty;
-    WorldSelectionInitFunctionName = NAME_DefaultWorldSelectionInitFunction;
 
     // Widget classes are intentionally not loaded in the constructor.
-    // BP_StartWorld or another Blueprint child can assign them, and the native fallback paths are loaded only when UI is opened.
+    // Assign them in BP_StartWorld, or let the fallback paths load only when a menu is opened.
 }
 
 void AStartActor::BeginPlay()
@@ -41,9 +43,8 @@ void AStartActor::BeginPlay()
     // Rebuild the level list before any UI asks for it.
     BuildLevelFolderNameMap();
 
-    // The old Blueprint graph creates widgets after calling the parent BeginPlay.
-    // Running the C++ UI setup on the next tick lets this class remove that legacy output
-    // and guarantees that the native flow owns the final visible menu.
+    // Legacy BP_StartWorld graphs may still create widgets after calling the parent BeginPlay.
+    // Running on the next tick lets this native flow own the final visible menu and clean up legacy widgets.
     GetWorldTimerManager().SetTimerForNextTick(
         FTimerDelegate::CreateWeakLambda(this, [this]()
         {
@@ -53,11 +54,13 @@ void AStartActor::BeginPlay()
 
 void AStartActor::Destroyed()
 {
-    RemoveTrackedMenuWidgets();
+    RemoveAllMenuWidgets();
+    ResetEditorTransactionBufferForMenuTravel(TEXT("StartActor destroyed"));
 
     // Do not force garbage collection from Destroyed(). During level travel this can block asset loading
-    // and make the editor/game appear stuck around the loading-progress phase. Runtime world memory is
-    // released after the destination StartWorld level has finished loading.
+    // and make the editor/game appear stuck around the loading-progress phase.
+    // Super::Destroyed() may still trigger legacy Blueprint ReceiveDestroyed graphs, so the editor
+    // transaction buffer is reset before this call to avoid stale REINST widget world references.
     Super::Destroyed();
 }
 
@@ -67,7 +70,7 @@ void AStartActor::InitializeStartScreenAfterBlueprintBeginPlay()
 
     if (UGameManagerSubSystem* GameManager = UGameManagerSubSystem::GetSubSystem(this))
     {
-        // A gameplay world can only be fully collected after the destination menu level has finished loading.
+        // Runtime world memory is released only after the destination menu level has finished loading.
         if (GameManager->HasPendingMainWorldRuntimePurge())
         {
             GameManager->ReleaseMainWorldRuntimeMemory(true);
@@ -110,9 +113,14 @@ void AStartActor::ShowStartMenu()
     }
 
     RemoveAllMenuWidgets();
+    ResetEditorTransactionBufferForMenuTravel(TEXT("Show StartWorld start menu"));
 
-    StartMenuWidget = CreateAndAddMenuWidget(StartMenuWidgetClass, DefaultStartMenuWidgetClassPath, TEXT("StartMenuWidgetClass"));
-    AssignStartActorReference(StartMenuWidget.Get());
+    StartMenuWidget = CreateAndAddMenuWidget(
+        StartMenuWidgetClass,
+        DefaultStartMenuWidgetClassPath,
+        TEXT("StartMenuWidgetClass"),
+        false);
+
     ApplyMenuInputMode(StartMenuWidget.Get());
 }
 
@@ -120,33 +128,102 @@ void AStartActor::ShowWorldSelectionMenu()
 {
     BuildLevelFolderNameMap();
     RemoveAllMenuWidgets();
+    ResetEditorTransactionBufferForMenuTravel(TEXT("Show StartWorld world-selection menu"));
 
-    WorldSelectionWidget = CreateAndAddMenuWidget(WorldSelectionWidgetClass, DefaultWorldSelectionWidgetClassPath, TEXT("WorldSelectionWidgetClass"));
-    AssignStartActorReference(WorldSelectionWidget.Get());
-    InvokeWorldSelectionInit(WorldSelectionWidget.Get());
+    WorldSelectionWidget = CreateAndAddMenuWidget(
+        WorldSelectionWidgetClass,
+        DefaultWorldSelectionWidgetClassPath,
+        TEXT("WorldSelectionWidgetClass"),
+        true);
+
     ApplyMenuInputMode(WorldSelectionWidget.Get());
 }
 
 void AStartActor::RefreshWorldFolderNameMap()
 {
     BuildLevelFolderNameMap();
+
+    if (IsValid(WorldSelectionWidget))
+    {
+        WorldSelectionWidget->Init(FolderNameMap);
+    }
 }
 
-UClass* AStartActor::ResolveMenuWidgetClass(TSubclassOf<UUserWidget> WidgetClass, const TCHAR* DefaultWidgetClassPath, const TCHAR* DebugWidgetName) const
+bool AStartActor::TryResolveWorldFolderFromDisplayName(const FString& DisplayName, FString& OutFolderName) const
+{
+    const FString NormalizedInput = NormalizeStartWorldString(DisplayName);
+    if (NormalizedInput.IsEmpty())
+    {
+        OutFolderName.Reset();
+        return false;
+    }
+
+    if (FolderNameMap.Contains(NormalizedInput))
+    {
+        OutFolderName = NormalizedInput;
+        return true;
+    }
+
+    for (const TPair<FString, FString>& Pair : FolderNameMap)
+    {
+        if (NormalizeStartWorldString(Pair.Value).Equals(NormalizedInput, ESearchCase::IgnoreCase))
+        {
+            OutFolderName = Pair.Key;
+            return true;
+        }
+    }
+
+    OutFolderName.Reset();
+    return false;
+}
+
+void AStartActor::OpenGameplayWorldByFolderName(const FString& WorldFolderName)
+{
+    FString ResolvedFolderName;
+    if (!TryResolveWorldFolderFromDisplayName(WorldFolderName, ResolvedFolderName))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("StartActor cannot open gameplay world. Unknown world folder/display name: %s"), *WorldFolderName);
+        return;
+    }
+
+    if (GameplayLevelName == NAME_None)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("StartActor cannot open gameplay world because GameplayLevelName is not assigned."));
+        return;
+    }
+
+    if (UGameManagerSubSystem* GameManager = UGameManagerSubSystem::GetSubSystem(this))
+    {
+        GameManager->SetCurrentWorldName(ResolvedFolderName);
+        GameManager->ClearWorldSelectionMenuRequest();
+        GameManager->SetGamePaused(false);
+    }
+
+    PrepareMenuForWorldTravel();
+    UGameplayStatics::OpenLevel(this, GameplayLevelName);
+}
+
+void AStartActor::PrepareMenuForWorldTravel()
+{
+    RemoveAllMenuWidgets();
+    ResetEditorTransactionBufferForMenuTravel(TEXT("StartWorld menu world travel"));
+}
+
+UClass* AStartActor::ResolveMenuWidgetClass(TSubclassOf<UStartWorldWidget> WidgetClass, const TCHAR* DefaultWidgetClassPath, const TCHAR* DebugWidgetName) const
 {
     UClass* ResolvedClass = WidgetClass.Get();
 
     if (!ResolvedClass && DefaultWidgetClassPath && DefaultWidgetClassPath[0] != TEXT('\0'))
     {
-        // Load the native fallback only when a menu is actually opened. This avoids constructor-time
-        // widget Blueprint loads while BP_StartWorld is being compiled or loaded by the editor.
-        ResolvedClass = LoadClass<UUserWidget>(nullptr, DefaultWidgetClassPath);
+        // Load fallback classes only when a menu is opened. This avoids constructor-time widget
+        // Blueprint loads while BP_StartWorld or WBP_StartWorld is being compiled by the editor.
+        ResolvedClass = LoadClass<UStartWorldWidget>(nullptr, DefaultWidgetClassPath);
     }
 
-    if (!ResolvedClass || !ResolvedClass->IsChildOf(UUserWidget::StaticClass()))
+    if (!ResolvedClass || !ResolvedClass->IsChildOf(UStartWorldWidget::StaticClass()))
     {
         UE_LOG(LogTemp, Warning,
-               TEXT("StartActor cannot create %s. Assign a valid widget class in the Blueprint child or fix fallback path: %s"),
+               TEXT("StartActor cannot create %s. Reparent the widget to StartWorldWidget and assign it in BP_StartWorld. Fallback path: %s"),
                DebugWidgetName ? DebugWidgetName : TEXT("MenuWidgetClass"),
                DefaultWidgetClassPath ? DefaultWidgetClassPath : TEXT("<none>"));
         return nullptr;
@@ -155,7 +232,7 @@ UClass* AStartActor::ResolveMenuWidgetClass(TSubclassOf<UUserWidget> WidgetClass
     return ResolvedClass;
 }
 
-UUserWidget* AStartActor::CreateAndAddMenuWidget(TSubclassOf<UUserWidget> WidgetClass, const TCHAR* DefaultWidgetClassPath, const TCHAR* DebugWidgetName)
+UStartWorldWidget* AStartActor::CreateAndAddMenuWidget(TSubclassOf<UStartWorldWidget> WidgetClass, const TCHAR* DefaultWidgetClassPath, const TCHAR* DebugWidgetName, bool bPassWorldSelectionData)
 {
     UClass* ResolvedClass = ResolveMenuWidgetClass(WidgetClass, DefaultWidgetClassPath, DebugWidgetName);
     if (!ResolvedClass)
@@ -163,22 +240,42 @@ UUserWidget* AStartActor::CreateAndAddMenuWidget(TSubclassOf<UUserWidget> Widget
         return nullptr;
     }
 
-    const TSubclassOf<UUserWidget> ResolvedWidgetClass(ResolvedClass);
+    const TSubclassOf<UStartWorldWidget> ResolvedWidgetClass(ResolvedClass);
 
-    UUserWidget* Widget = nullptr;
-    if (APlayerController* PlayerController = UGameplayStatics::GetPlayerController(this, 0))
+    UStartWorldWidget* Widget = nullptr;
+    if (UGameInstance* GameInstance = GetGameInstance())
     {
-        Widget = CreateWidget<UUserWidget>(PlayerController, ResolvedWidgetClass);
+        // Use GameInstance as the widget outer in the native path. If editor transactions accidentally retain
+        // a REINST widget during PIE, this avoids an immediate strong Outer chain back to the old world.
+        Widget = CreateWidget<UStartWorldWidget>(GameInstance, ResolvedWidgetClass);
+    }
+    else if (APlayerController* PlayerController = UGameplayStatics::GetPlayerController(this, 0))
+    {
+        Widget = CreateWidget<UStartWorldWidget>(PlayerController, ResolvedWidgetClass);
     }
     else if (UWorld* World = GetWorld())
     {
-        Widget = CreateWidget<UUserWidget>(World, ResolvedWidgetClass);
+        Widget = CreateWidget<UStartWorldWidget>(World, ResolvedWidgetClass);
     }
 
     if (!IsValid(Widget))
     {
         UE_LOG(LogTemp, Warning, TEXT("StartActor failed to create %s."), DebugWidgetName ? DebugWidgetName : TEXT("MenuWidget"));
         return nullptr;
+    }
+
+    // Runtime menu widgets should not participate in the editor transaction buffer.
+    // A transaction-retained REINST widget was the source of the reported stale-world reference chain.
+    Widget->ClearFlags(RF_Transactional);
+    Widget->SetFlags(RF_Transient);
+
+    // Set the typed owner before AddToViewport so Blueprint Construct/OnAssigned logic can use it safely.
+    Widget->SetStartActor(this);
+
+    if (bPassWorldSelectionData)
+    {
+        // Direct virtual call. No dynamic function lookup, property lookup, or parameter packing is used.
+        Widget->Init(FolderNameMap);
     }
 
     Widget->AddToViewport(MenuZOrder);
@@ -203,9 +300,11 @@ void AStartActor::RemoveTrackedMenuWidgets()
 void AStartActor::RemoveAllMenuWidgets()
 {
     UWidgetLayoutLibrary::RemoveAllWidgets(this);
+    StartMenuWidget = nullptr;
+    WorldSelectionWidget = nullptr;
 }
 
-void AStartActor::ApplyMenuInputMode(UUserWidget* FocusWidget) const
+void AStartActor::ApplyMenuInputMode(UStartWorldWidget* FocusWidget) const
 {
     if (!bApplyMenuInputMode)
     {
@@ -227,90 +326,6 @@ void AStartActor::ApplyMenuInputMode(UUserWidget* FocusWidget) const
         InputMode.SetWidgetToFocus(FocusWidget->TakeWidget());
     }
     PlayerController->SetInputMode(InputMode);
-}
-
-void AStartActor::AssignStartActorReference(UUserWidget* Widget) const
-{
-    if (!IsValid(Widget) || StartActorWidgetPropertyName.IsNone())
-    {
-        return;
-    }
-
-    FProperty* Property = Widget->GetClass()->FindPropertyByName(StartActorWidgetPropertyName);
-    FObjectPropertyBase* ObjectProperty = CastField<FObjectPropertyBase>(Property);
-    if (!ObjectProperty)
-    {
-        return;
-    }
-
-    if (!ObjectProperty->PropertyClass || IsA(ObjectProperty->PropertyClass))
-    {
-        ObjectProperty->SetObjectPropertyValue_InContainer(Widget, const_cast<AStartActor*>(this));
-    }
-}
-
-bool AStartActor::HasCompatibleInitFunction(const UFunction* Function) const
-{
-    if (!Function)
-    {
-        return false;
-    }
-
-    int32 NonReturnParamCount = 0;
-    bool bHasCompatibleMapParam = false;
-
-    for (TFieldIterator<FProperty> It(Function); It; ++It)
-    {
-        const FProperty* Property = *It;
-        if (!Property || !Property->HasAnyPropertyFlags(CPF_Parm) || Property->HasAnyPropertyFlags(CPF_ReturnParm))
-        {
-            continue;
-        }
-
-        ++NonReturnParamCount;
-        const FMapProperty* MapProperty = CastField<FMapProperty>(Property);
-        if (!MapProperty)
-        {
-            continue;
-        }
-
-        const FStrProperty* KeyProperty = CastField<FStrProperty>(MapProperty->KeyProp);
-        const FStrProperty* ValueProperty = CastField<FStrProperty>(MapProperty->ValueProp);
-        bHasCompatibleMapParam = KeyProperty && ValueProperty;
-    }
-
-    return NonReturnParamCount == 1 && bHasCompatibleMapParam;
-}
-
-void AStartActor::InvokeWorldSelectionInit(UUserWidget* Widget) const
-{
-    if (!IsValid(Widget) || WorldSelectionInitFunctionName.IsNone())
-    {
-        return;
-    }
-
-    UFunction* InitFunction = Widget->FindFunction(WorldSelectionInitFunctionName);
-    if (!InitFunction)
-    {
-        UE_LOG(LogTemp, Verbose, TEXT("World-selection widget has no %s function."), *WorldSelectionInitFunctionName.ToString());
-        return;
-    }
-
-    if (!HasCompatibleInitFunction(InitFunction))
-    {
-        UE_LOG(LogTemp, Warning, TEXT("World-selection widget function %s must take exactly one TMap<FString, FString> parameter."),
-               *WorldSelectionInitFunctionName.ToString());
-        return;
-    }
-
-    struct FLevelMenuInitParams
-    {
-        TMap<FString, FString> Values;
-    };
-
-    FLevelMenuInitParams Params;
-    Params.Values = FolderNameMap;
-    Widget->ProcessEvent(InitFunction, &Params);
 }
 
 void AStartActor::BuildLevelFolderNameMap()
@@ -342,4 +357,16 @@ void AStartActor::BuildLevelFolderNameMap()
             UE_LOG(LogTemp, Log, TEXT("Loaded Level: Folder=%s, Name=%s"), *SubFolderName, *NameValue);
         }
     }
+}
+
+void AStartActor::ResetEditorTransactionBufferForMenuTravel(const TCHAR* Reason) const
+{
+    if (!bResetEditorTransactionsBeforeTravel)
+    {
+        return;
+    }
+
+    UGameManagerSubSystem::ResetEditorTransactionBufferForWorldTravel(
+        this,
+        Reason ? FString(Reason) : FString(TEXT("StartWorld menu travel")));
 }

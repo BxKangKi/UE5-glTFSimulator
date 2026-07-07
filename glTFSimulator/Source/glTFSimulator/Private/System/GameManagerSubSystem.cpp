@@ -2,6 +2,11 @@
 // Copyright © 2025 Epic Games, Inc. All rights reserved.
 
 #include "System/GameManagerSubSystem.h"
+
+#if WITH_EDITOR
+#include "Editor.h"
+#include "Editor/TransBuffer.h"
+#endif
 #include "System/GameManagerActor.h"
 #include "Model/EditableMeshActor.h"
 #include "World/PrefabActor.h"
@@ -1575,6 +1580,33 @@ UGameManagerSubSystem* UGameManagerSubSystem::FindGameManager(const UObject* Wor
     return GetSubSystem(WorldContextObject);
 }
 
+void UGameManagerSubSystem::ResetEditorTransactionBufferForWorldTravel(const UObject* WorldContextObject, const FString& Reason)
+{
+#if WITH_EDITOR
+    UWorld* World = WorldContextObject ? WorldContextObject->GetWorld() : nullptr;
+    const bool bRuntimeWorld = !World || World->IsGameWorld();
+    if (!bRuntimeWorld)
+    {
+        return;
+    }
+
+    if (GEditor && GEditor->Trans)
+    {
+        const FString ResetReason = Reason.IsEmpty() ? FString(TEXT("Menu world travel")) : Reason;
+        GEditor->Trans->Reset(FText::FromString(ResetReason));
+        UE_LOG(LogTemp, Display, TEXT("[Gameplay] Editor transaction buffer reset before world travel: %s"), *ResetReason);
+    }
+#else
+    (void)WorldContextObject;
+    (void)Reason;
+#endif
+}
+
+void UGameManagerSubSystem::PrepareForWorldTravelFromUI(const UObject* WorldContextObject)
+{
+    ResetEditorTransactionBufferForWorldTravel(WorldContextObject, TEXT("Widget-triggered world travel"));
+}
+
 void UGameManagerSubSystem::OpenWorldSelectionScreen(const UObject* WorldContextObject, FName WorldSelectionLevelName)
 {
     if (!WorldContextObject)
@@ -1594,6 +1626,7 @@ void UGameManagerSubSystem::OpenWorldSelectionScreen(const UObject* WorldContext
     const FName TargetLevelName = (WorldSelectionLevelName != NAME_None && WorldSelectionLevelName != LegacyWorldSelectionLevelName)
         ? WorldSelectionLevelName
         : FName(TEXT("StartWorld"));
+    ResetEditorTransactionBufferForWorldTravel(WorldContextObject, TEXT("Open world-selection screen"));
     UGameplayStatics::OpenLevel(WorldContextObject, TargetLevelName);
 }
 
@@ -1613,6 +1646,7 @@ void UGameManagerSubSystem::OpenMainMenuFromWorldSelection(const UObject* WorldC
     const FName TargetLevelName = MainMenuLevelName != NAME_None
         ? MainMenuLevelName
         : FName(TEXT("StartWorld"));
+    ResetEditorTransactionBufferForWorldTravel(WorldContextObject, TEXT("Open main menu from world selection"));
     UGameplayStatics::OpenLevel(WorldContextObject, TargetLevelName);
 }
 
