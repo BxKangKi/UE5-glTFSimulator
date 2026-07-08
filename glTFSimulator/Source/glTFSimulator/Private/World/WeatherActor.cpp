@@ -3,6 +3,7 @@
 
 #include "World/WeatherActor.h"
 #include "System/GameManagerSubSystem.h"
+#include "System/GameUpdateSubSystem.h"
 #include "Engine/EngineTypes.h"
 #include "NiagaraComponent.h"
 #include "Components/SceneCaptureComponent2D.h"
@@ -11,7 +12,7 @@
 
 AWeatherActor::AWeatherActor()
 {
-    PrimaryActorTick.bCanEverTick = true;
+    PrimaryActorTick.bCanEverTick = false;
     MaxDistance = 1048576.0f;
     Param = FName("Matrix");
     RootComponent = CreateDefaultSubobject<USceneComponent>(TEXT("Root"));
@@ -40,13 +41,40 @@ void AWeatherActor::BeginPlay()
     {
         SubSystem = UGameManagerSubSystem::GetSubSystem(this);
     }
+    if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
+    {
+        GameUpdateTickHandle = GameUpdate->RegisterUpdate(
+            this,
+            [this](const float DeltaSeconds)
+            {
+                TickFromGameUpdate(DeltaSeconds);
+            },
+            30);
+    }
+
     // 3. Start the async tick loop.
     AsyncTick();
+}
+
+void AWeatherActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+    if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
+    {
+        GameUpdate->UnregisterUpdate(GameUpdateTickHandle);
+    }
+    GameUpdateTickHandle = INDEX_NONE;
+
+    Super::EndPlay(EndPlayReason);
 }
 
 void AWeatherActor::Tick(float DeltaSeconds)
 {
     Super::Tick(DeltaSeconds);
+    TickFromGameUpdate(DeltaSeconds);
+}
+
+void AWeatherActor::TickFromGameUpdate(float DeltaSeconds)
+{
     if (IsValid(SubSystem))
     {
         Location = SubSystem->GetCameraLocation();

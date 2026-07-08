@@ -274,6 +274,12 @@ private:
     float WaterOffset = 0.0f;
     float HalfHeight = 0.0f;
     float Radius = 0.0f;
+    FVector StandingMeshRelativeLocation = FVector(0.0f, 0.0f, -90.0f);
+    FRotator StandingMeshRelativeRotation = FRotator(0.0f, 270.0f, 0.0f);
+    float StandingCapsuleHalfHeight = 0.0f;
+    float StandingCapsuleRadius = 0.0f;
+    bool bCrouchVisualOffsetApplied = false;
+
     float RagdollWeight = 0.0f;
     float RagdollActiveTime = 0.0f;
     float RagdollLowSpeedTime = 0.0f;
@@ -287,6 +293,8 @@ private:
     FVector WaterRecoveryMeshStartRelativeLocation = FVector::ZeroVector;
     FRotator WaterRecoveryMeshStartRelativeRotation = FRotator::ZeroRotator;
     FRotator RagdollPrePhysicsActorRotation = FRotator::ZeroRotator;
+    FVector SmoothedRagdollActorLocation = FVector::ZeroVector;
+    FRotator SmoothedRagdollActorRotation = FRotator::ZeroRotator;
 
     bool bInvincible = false;
     bool bIsRagdoll = false;
@@ -301,6 +309,11 @@ private:
     bool bForceLandRagdollRecoveryOnce = false;
     bool bLandRagdollRecoveryOverridesWater = false;
     bool bHasRagdollPrePhysicsActorRotation = false;
+    bool bHasSmoothedRagdollActorTransform = false;
+    bool bHasSavedRagdollCameraSettings = false;
+    bool bSavedSpringArmCameraLag = false;
+    bool bSavedSpringArmCollisionTest = true;
+    float SavedSpringArmCameraLagSpeed = 0.0f;
     float PendingWaterRagdollDeactivationLevel = 0.0f;
     uint64 RagdollEnvironmentStateFrame = 0;
     uint32 RagdollReleaseGroundTraceRequestId = 0;
@@ -320,6 +333,8 @@ private:
     FVector ActorTargetLocation;
     FRotator ActorTargetRotation;
 
+    void InitializeCrouchSettings();
+    void ApplyCrouchState(bool bShouldCrouch);
     void ProcessRagdollCheck();
     void ClearRagdollWaterIntent(bool bClearSwimLock = true);
     void SetMovementModeAfterRagdollRecovery(UCharacterMovementComponent* CharacterMovement, const FCharacterRagdollEnvironmentState& RecoveryEnvironmentState) const;
@@ -348,6 +363,10 @@ private:
     void BeginPendingWaterRagdollDeactivation(float WaterLevel);
     bool UpdatePendingWaterRagdollDeactivation(float DeltaTime, ACharacterController *InOwner, USkeletalMeshComponent *SkeletalMesh);
     void ClearPendingWaterRagdollDeactivation();
+    void ConfigureCameraForActiveRagdoll();
+    void RestoreCameraAfterRagdoll();
+    void SetOwnerCapsuleCollisionForRagdoll(bool bEnableCollision);
+    void ResetSmoothedRagdollActorTransform();
     void ActiveRagdoll(ACharacterController *InOwner, USkeletalMeshComponent *SkeletalMesh);
     void DeactiveRagdoll(ACharacterController *InOwner, USkeletalMeshComponent *SkeletalMesh, const FCharacterRagdollEnvironmentState &ReleaseEnvironmentState);
     void FinalizeRagdollRecovery(ACharacterController *InOwner, USkeletalMeshComponent *SkeletalMesh);

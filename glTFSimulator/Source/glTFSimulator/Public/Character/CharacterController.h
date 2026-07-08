@@ -20,6 +20,7 @@ class UBuoyancyComponent;
 class UPrimitiveComponent;
 class UAnimInstance;
 class UCharacterLoadAsyncAction;
+class UGameUpdateSubSystem;
 
 UCLASS()
 class GLTFSIMULATOR_API ACharacterController : public ACharacter, public IWaterInteract
@@ -78,6 +79,7 @@ public:
 
 protected:
     virtual void BeginPlay() override;
+    virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
     virtual void Tick(float DeltaSeconds) override;
 
     /** Receives hits from simulating physics objects while the player is not ragdolled. */
@@ -117,6 +119,8 @@ private:
     bool FindDirectWaterLevel(float& OutLevel) const;
     void ClearDryWaterState(float Level, bool bUpdateMovementMode);
     void SyncRagdollWaterStateFromPhysics();
+    void TickFromGameUpdate(float DeltaSeconds);
+    int32 GameUpdateTickHandle = INDEX_NONE;
     int32 CharacterStateBit = 0;
     FVector RawMoveInput;
     float WaterLevel = 0.0f;

@@ -75,6 +75,35 @@ public:
     UFUNCTION(BlueprintCallable, Category="Vehicle|Save")
     FPlacedObjectRecord ToPlacementRecord(int32 VehicleRecordIndex = 0) const;
 
+    struct FVehicleParallelControlInput
+    {
+        float DeltaSeconds = 0.0f;
+        float ThrottleInput = 0.0f;
+        float SteeringInput = 0.0f;
+        float SmoothedThrottleInput = 0.0f;
+        float SmoothedSteeringInput = 0.0f;
+        float ThrottleInputInterpSpeed = 5.0f;
+        float SteeringInputRiseRate = 2.5f;
+        float SteeringInputReturnRate = 5.0f;
+        float SteeringInputSpeedDamping = 0.0f;
+        float SteeringInputCurveExponent = 1.0f;
+        float SteeringSpeedForFullAssist = 4300.0f;
+        FVector BodyForward = FVector::ForwardVector;
+        FVector BodyVelocity = FVector::ZeroVector;
+    };
+
+    struct FVehicleParallelControlOutput
+    {
+        float SmoothedThrottleInput = 0.0f;
+        float SmoothedSteeringInput = 0.0f;
+        bool bValid = false;
+    };
+
+    FVehicleParallelControlInput BuildParallelControlInput(float DeltaSeconds) const;
+    static FVehicleParallelControlOutput CalculateParallelControlOutput(const FVehicleParallelControlInput& Input);
+    void ApplyParallelControlOutput(const FVehicleParallelControlOutput& Output);
+    void TickVehicleFromSubSystem(float DeltaSeconds);
+
 protected:
     virtual void BeginPlay() override;
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
@@ -187,7 +216,7 @@ private:
     // when no authored wheel-rest length is available. Runtime glTF wheels preserve their
     // authored rest pose and use MaxWheelCompressionTravel for the upward limit.
     UPROPERTY(EditAnywhere, Category="Vehicle|Suspension", meta=(ClampMin="0.0", ClampMax="30.0"))
-    float MinimumWheelBodyClearance = 6.0f;
+    float MinimumWheelBodyClearance = 8.0f;
 
     // Legacy deterministic ground solver. Disabled by default because the normal runtime path now uses
     // force-based wheel suspension, tire friction, gravity, anti-roll, and chassis inertia without
@@ -315,19 +344,19 @@ private:
     float MaxRollStabilizationTorque = 135000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle")
-    float EngineForce = 520000.0f;
+    float EngineForce = 360000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle")
-    float ReverseForce = 170000.0f;
+    float ReverseForce = 140000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle")
-    float BrakeForce = 780000.0f;
+    float BrakeForce = 620000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Steering", meta=(ClampMin="0.0"))
     float SteeringTorque = 0.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Steering", meta=(ClampMin="1.0", ClampMax="55.0"))
-    float MaxSteeringAngleDegrees = 37.0f;
+    float MaxSteeringAngleDegrees = 34.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Steering", meta=(ClampMin="0.0"))
     float MinSteeringSpeedFactor = 0.30f;
@@ -339,18 +368,18 @@ private:
     float SteeringSpeedForFullAssist = 4300.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Steering", meta=(ClampMin="0.0"))
-    float SteeringYawRateAssist = 52000.0f;
+    float SteeringYawRateAssist = 32000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Steering", meta=(ClampMin="0.0"))
-    float SteeringYawDamping = 84000.0f;
+    float SteeringYawDamping = 118000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Steering", meta=(ClampMin="0.0"))
-    float MaxSteeringAssistTorque = 125000.0f;
+    float MaxSteeringAssistTorque = 85000.0f;
 
     // Small low-speed yaw helper used only as an anti-understeer assist. Normal turning now comes
     // from Ackermann front-wheel angles and tire lateral forces, not from a forced yaw-rate controller.
     UPROPERTY(EditAnywhere, Category="Vehicle|Steering", meta=(ClampMin="0.0"))
-    float LowSpeedSteeringYawAssistSpeed = 185.0f;
+    float LowSpeedSteeringYawAssistSpeed = 145.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Steering", meta=(ClampMin="0.1"))
     float FrontSteeringGripMultiplier = 1.20f;
@@ -401,19 +430,19 @@ private:
     float DrivenFrontTorqueShare = 0.32f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Tires", meta=(ClampMin="0.0"))
-    float EngineBrakingForce = 90000.0f;
+    float EngineBrakingForce = 72000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Steering", meta=(ClampMin="1.0", ClampMax="45.0"))
-    float HighSpeedSteeringAngleDegrees = 10.5f;
+    float HighSpeedSteeringAngleDegrees = 9.5f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Steering", meta=(ClampMin="0.0", ClampMax="1.0"))
     float AckermannStrength = 1.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Aero", meta=(ClampMin="0.0"))
-    float AerodynamicDragCoefficient = 0.012f;
+    float AerodynamicDragCoefficient = 0.010f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Aero", meta=(ClampMin="0.0"))
-    float MaxAerodynamicDrag = 560000.0f;
+    float MaxAerodynamicDrag = 480000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Roll", meta=(ClampMin="0.0"))
     float AntiRollBarStiffness = 94000.0f;
@@ -461,13 +490,13 @@ private:
     UPROPERTY(EditAnywhere, Category="Vehicle|Stability", meta=(ClampMin="1", ClampMax="64"))
     int32 MaxVehiclePhysicsSubsteps = 60;
 
-    // Prefer the actor async physics tick when the project enables Chaos async physics.
-    // If async ticks are not observed at runtime, Tick() falls back to the normal PrePhysics path.
+    // The subsystem update path is the authority. Mixing Actor async physics tick with normal tick
+    // caused duplicate/flickering integration on projects where Chaos async tick availability changes.
     UPROPERTY(EditAnywhere, Category="Vehicle|Physics")
-    bool bUseAsyncVehiclePhysicsTick = true;
+    bool bUseAsyncVehiclePhysicsTick = false;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Physics")
-    bool bRunVehicleForcesInAsyncPhysicsTick = true;
+    bool bRunVehicleForcesInAsyncPhysicsTick = false;
 
     // Chassis clearance is intentionally lower than the tire diameter. A normal car body should sit
     // roughly half a wheel radius above the road, while wheels occupy the wheel wells.
@@ -667,6 +696,7 @@ private:
     int32 LastObservedAsyncVehiclePhysicsStepCounter = 0;
     bool bHasObservedAsyncVehiclePhysicsStep = false;
     bool bApplyingAsyncVehiclePhysicsStep = false;
+    bool bSkipVehicleInputSmoothingForCurrentRun = false;
     float CurrentVehiclePhysicsStepSeconds = 0.0f;
 
     bool ShouldRunVehiclePhysicsInAsyncTick() const;

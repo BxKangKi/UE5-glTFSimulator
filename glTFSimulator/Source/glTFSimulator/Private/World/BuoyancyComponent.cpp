@@ -8,6 +8,7 @@
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
 #include "PhysicsEngine/BodyInstance.h"
+#include "System/GameUpdateSubSystem.h"
 #include "System/MacroLibrary.h"
 
 struct FBuoyancySampleResult
@@ -525,7 +526,7 @@ static FSkeletalBuoyancyBoneRule MakeDistalSkeletalBodyRule()
 
 UBuoyancyComponent::UBuoyancyComponent()
 {
-    PrimaryComponentTick.bCanEverTick = true;
+    PrimaryComponentTick.bCanEverTick = false;
     PrimaryComponentTick.bStartWithTickEnabled = false;
 
     SkeletalMeshSettings.BoneRules.Add(MakeMinorSkeletalBodyRule());
@@ -538,6 +539,40 @@ void UBuoyancyComponent::BeginPlay()
     TargetPrimitive = ResolveTargetPrimitive();
     RebuildSamplePoints();
     SetComponentTickEnabled(false);
+}
+
+void UBuoyancyComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+    UnregisterGameUpdate();
+    Super::EndPlay(EndPlayReason);
+}
+
+void UBuoyancyComponent::RegisterGameUpdate()
+{
+    if (GameUpdateTickHandle != INDEX_NONE)
+    {
+        return;
+    }
+
+    if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
+    {
+        GameUpdateTickHandle = GameUpdate->RegisterUpdate(
+            this,
+            [this](const float DeltaSeconds)
+            {
+                TickBuoyancy(DeltaSeconds);
+            },
+            10);
+    }
+}
+
+void UBuoyancyComponent::UnregisterGameUpdate()
+{
+    if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
+    {
+        GameUpdate->UnregisterUpdate(GameUpdateTickHandle);
+    }
+    GameUpdateTickHandle = INDEX_NONE;
 }
 
 void UBuoyancyComponent::SetTargetComponentName(FName InTargetComponentName)
@@ -662,14 +697,14 @@ void UBuoyancyComponent::EnterWater(const float Level)
     }
     TargetPrimitive = NewPrimitive;
     RebuildSamplePoints();
-    SetComponentTickEnabled(true);
+    RegisterGameUpdate();
 }
 
 void UBuoyancyComponent::ExitWater(const float Level)
 {
     WaterLevel = Level;
     bInWater = false;
-    SetComponentTickEnabled(false);
+    UnregisterGameUpdate();
 }
 
 bool UBuoyancyComponent::ApplySkeletalMeshBuoyancy(USkeletalMeshComponent* SkeletalMesh, float DeltaTime)
@@ -937,7 +972,11 @@ bool UBuoyancyComponent::ApplySkeletalMeshBuoyancy(USkeletalMeshComponent* Skele
 void UBuoyancyComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
 {
     Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
+    TickBuoyancy(DeltaTime);
+}
 
+void UBuoyancyComponent::TickBuoyancy(float DeltaTime)
+{
     if (!bInWater || DeltaTime <= SMALL_NUMBER)
     {
         return;

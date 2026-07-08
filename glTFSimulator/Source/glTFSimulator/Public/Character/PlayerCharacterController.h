@@ -17,6 +17,7 @@ struct FInputActionValue;
 class UUserWidget;
 class UPauseMenuWidget;
 class USettingsMenuWidget;
+class UGameUpdateSubSystem;
 
 USTRUCT(BlueprintType)
 struct GLTFSIMULATOR_API FPlayerInputMappingContextConfig
@@ -175,6 +176,7 @@ public:
 
 protected:
     virtual void BeginPlay() override;
+    virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
     virtual void Tick(float DeltaSeconds) override;
     virtual void SetupInputComponent() override;
     virtual void BeginPlayingState() override;
@@ -411,6 +413,7 @@ private:
     void FallbackMoveRightReleased();
     void FallbackMoveLeftPressed();
     void FallbackMoveLeftReleased();
+    void TickFromGameUpdate(float DeltaSeconds);
     void UpdateFallbackMoveInput();
     void StopFallbackMovement();
     void FallbackLookYaw(float Value);
@@ -437,6 +440,7 @@ private:
     bool bFallbackMoveLeft = false;
     bool bEnhancedInputComponentWasAvailable = false;
     bool bAnyInputMappingContextApplied = false;
+    int32 GameUpdateTickHandle = INDEX_NONE;
     double LastPrimaryInputTime = -1.0;
     double LastSecondaryInputTime = -1.0;
     double LastInteractInputTime = -1.0;

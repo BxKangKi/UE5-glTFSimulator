@@ -10,6 +10,7 @@
 class UGameManagerSubSystem;
 class USceneCaptureComponent2D;
 class UNiagaraComponent;
+class UGameUpdateSubSystem;
 
 UCLASS()
 class GLTFSIMULATOR_API AWeatherActor : public AActor
@@ -20,6 +21,7 @@ public:
 
 protected:
     virtual void BeginPlay() override;
+    virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
     virtual void Tick(float DeltaSeconds) override;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite)
@@ -32,6 +34,8 @@ private:
 
     FVector Location;
     FVector LocationOffset;
+    int32 GameUpdateTickHandle = INDEX_NONE;
+    void TickFromGameUpdate(float DeltaSeconds);
     void AsyncTick();
 
     // Callback invoked when the asynchronous task completes.

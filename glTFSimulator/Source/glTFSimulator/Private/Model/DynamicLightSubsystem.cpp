@@ -5,17 +5,36 @@
 #include "Model/DynamicPointLightComponent.h"
 #include "Async/ParallelFor.h"
 #include "Engine/World.h"
+#include "Subsystems/SubsystemCollection.h"
 #include "System/ActorHelper.h"
+#include "System/GameUpdateSubSystem.h"
 #include "GameFramework/PlayerController.h"
 #include "Kismet/GameplayStatics.h"
 
 void UDynamicLightSubsystem::Initialize(FSubsystemCollectionBase &Collection)
 {
     Super::Initialize(Collection);
+    Collection.InitializeDependency<UGameUpdateSubSystem>();
+
+    if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
+    {
+        GameUpdateHandle = GameUpdate->RegisterUpdate(
+            this,
+            [this](const float DeltaSeconds)
+            {
+                Tick(DeltaSeconds);
+            },
+            40);
+    }
 }
 
 void UDynamicLightSubsystem::Deinitialize()
 {
+    if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
+    {
+        GameUpdate->UnregisterUpdate(GameUpdateHandle);
+    }
+    GameUpdateHandle = INDEX_NONE;
     ManagedLights.Empty();
     Super::Deinitialize();
 }

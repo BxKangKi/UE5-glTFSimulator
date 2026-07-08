@@ -30,6 +30,7 @@
 #include "System/FileFunctionLibrary.h"
 #include "System/MathHelper.h"
 #include "System/PhysicsHelper.h"
+#include "Vehicle/VehicleSubSystem.h"
 #include "World/BuoyancyComponent.h"
 #include "World/WaterActor.h"
 
@@ -222,9 +223,11 @@ static void ApplyVehicleWaterExitState(APawn* RestoredPawn, float WaterLevel)
 
 AVehiclePawn::AVehiclePawn()
 {
-    PrimaryActorTick.bCanEverTick = true;
+    PrimaryActorTick.bCanEverTick = false;
     PrimaryActorTick.TickGroup = TG_PrePhysics;
-    bAsyncPhysicsTickEnabled = bUseAsyncVehiclePhysicsTick && bRunVehicleForcesInAsyncPhysicsTick;
+    bUseAsyncVehiclePhysicsTick = false;
+    bRunVehicleForcesInAsyncPhysicsTick = false;
+    bAsyncPhysicsTickEnabled = false;
 
     // Always use the force-based wheel simulation by default. The old deterministic ground solver
     // is kept for compatibility but caused unrealistic sticking/snap behavior.
@@ -306,7 +309,9 @@ void AVehiclePawn::BeginPlay()
     // older serialized/placed instances cannot keep an unintended lightweight value.
     VehicleMassKg = 1000.0f;
     bUseStableGroundRideHeight = false;
-    bAsyncPhysicsTickEnabled = ShouldRunVehiclePhysicsInAsyncTick();
+    bUseAsyncVehiclePhysicsTick = false;
+    bRunVehicleForcesInAsyncPhysicsTick = false;
+    bAsyncPhysicsTickEnabled = false;
     LastObservedAsyncVehiclePhysicsStepCounter = AsyncVehiclePhysicsStepCounter.GetValue();
     bHasObservedAsyncVehiclePhysicsStep = false;
     Body->InitBoxExtent(BodyExtent);
@@ -334,6 +339,11 @@ void AVehiclePawn::BeginPlay()
     WheelSuspensionForces.Init(InitialSupportForce, WheelOffsets.Num());
     WheelLateralForces.Init(0.0f, WheelOffsets.Num());
     WheelGrounded.Init(false, WheelOffsets.Num());
+
+    if (UVehicleSubSystem* VehicleSubSystem = UVehicleSubSystem::Get(this))
+    {
+        VehicleSubSystem->RegisterVehicle(this);
+    }
 }
 
 void AVehiclePawn::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
@@ -369,30 +379,52 @@ float AVehiclePawn::GetMinimumWheelSpringLength(int32 WheelIndex) const
     const float SafeWheelRadius = GetEffectiveWheelRadius();
     const float CompressionTravel = FMath::Clamp(MaxWheelCompressionTravel, 2.0f, 30.0f);
     const float FallbackMinimum = FMath::Max(3.0f, SafeWheelRadius * 0.30f);
+    const float SafeBodyHalfHeight = FMath::Max(0.0f, BodyExtent.Z);
+    const float SafeClearance = FMath::Max(0.0f, MinimumWheelBodyClearance);
 
-    // Runtime glTF wheels should preserve their authored/static pose. Use that pose as the
-    // ride-height target and allow only a short upward compression stroke from it, instead
-    // of using the chassis collision box to push the tire visually away from the ground.
+    auto GetBodyClearanceMinimum = [this, SafeWheelRadius, SafeBodyHalfHeight, SafeClearance, FallbackMinimum](int32 InWheelIndex)
+    {
+        if (!WheelOffsets.IsValidIndex(InWheelIndex))
+        {
+            return FallbackMinimum;
+        }
+
+        // WheelOffsets are body-local. The chassis underside is at -BodyExtent.Z; therefore
+        // a wheel mounted higher inside the wheel well still needs enough spring length to
+        // keep the tire crown from crossing through the collision body.
+        const float WheelMountHeightAboveBodyBottom = WheelOffsets[InWheelIndex].Z + SafeBodyHalfHeight;
+        return FMath::Max(FallbackMinimum, WheelMountHeightAboveBodyBottom + SafeWheelRadius + SafeClearance);
+    };
+
     if (WheelTargetSpringLengths.IsValidIndex(WheelIndex))
     {
-        return FMath::Max(FallbackMinimum, WheelTargetSpringLengths[WheelIndex] - CompressionTravel);
+        return FMath::Max(GetBodyClearanceMinimum(WheelIndex), WheelTargetSpringLengths[WheelIndex] - CompressionTravel);
     }
 
     if (WheelIndex == INDEX_NONE && WheelTargetSpringLengths.Num() > 0)
     {
         float MinimumLength = FallbackMinimum;
-        for (float TargetLength : WheelTargetSpringLengths)
+        for (int32 Index = 0; Index < WheelTargetSpringLengths.Num(); ++Index)
         {
-            MinimumLength = FMath::Max(MinimumLength, TargetLength - CompressionTravel);
+            MinimumLength = FMath::Max(MinimumLength, WheelTargetSpringLengths[Index] - CompressionTravel);
+            MinimumLength = FMath::Max(MinimumLength, GetBodyClearanceMinimum(Index));
         }
         return MinimumLength;
     }
 
     if (WheelOffsets.IsValidIndex(WheelIndex))
     {
-        // Fallback/procedural wheels are allowed to sit partially inside the body shell, like
-        // real wheel wells. Do not use chassis clearance to force a full tire-height ride height.
-        return FallbackMinimum;
+        return GetBodyClearanceMinimum(WheelIndex);
+    }
+
+    if (WheelIndex == INDEX_NONE && WheelOffsets.Num() > 0)
+    {
+        float MinimumLength = FallbackMinimum;
+        for (int32 Index = 0; Index < WheelOffsets.Num(); ++Index)
+        {
+            MinimumLength = FMath::Max(MinimumLength, GetBodyClearanceMinimum(Index));
+        }
+        return MinimumLength;
     }
 
     return FallbackMinimum;
@@ -481,9 +513,10 @@ void AVehiclePawn::ApplyVehicleBodyPhysicsSettings()
 
 bool AVehiclePawn::ShouldRunVehiclePhysicsInAsyncTick() const
 {
-    return bUseAsyncVehiclePhysicsTick
-        && bRunVehicleForcesInAsyncPhysicsTick
-        && !bUseStableGroundRideHeight;
+    // The VehicleSubSystem owns the runtime integration phase. Keeping the old actor async
+    // physics path disabled removes the sync/async double-step instability that caused
+    // inconsistent acceleration, yaw, and wheel suspension behavior.
+    return false;
 }
 
 void AVehiclePawn::RunVehiclePhysicsSteps(float DeltaSeconds, bool bFromAsyncPhysicsTick)
@@ -526,7 +559,10 @@ void AVehiclePawn::StepVehiclePhysics(float DeltaSeconds, bool bFromAsyncPhysics
     bApplyingAsyncVehiclePhysicsStep = bFromAsyncPhysicsTick;
     CurrentVehiclePhysicsStepSeconds = SafeStepSeconds;
 
-    UpdateVehicleInputSmoothing(SafeStepSeconds);
+    if (!bSkipVehicleInputSmoothingForCurrentRun)
+    {
+        UpdateVehicleInputSmoothing(SafeStepSeconds);
+    }
 
     if (bUseStableGroundRideHeight)
     {
@@ -584,61 +620,127 @@ void AVehiclePawn::UpdateVehicleInputSmoothing(float DeltaSeconds)
         FMath::Max(0.1f, SteeringRate * SpeedRateScale));
 }
 
-void AVehiclePawn::Tick(float DeltaSeconds)
+AVehiclePawn::FVehicleParallelControlInput AVehiclePawn::BuildParallelControlInput(float DeltaSeconds) const
 {
-    Super::Tick(DeltaSeconds);
+    FVehicleParallelControlInput Input;
+    Input.DeltaSeconds = DeltaSeconds;
+    Input.ThrottleInput = ThrottleInput;
+    Input.SteeringInput = SteeringInput;
+    Input.SmoothedThrottleInput = SmoothedThrottleInput;
+    Input.SmoothedSteeringInput = SmoothedSteeringInput;
+    Input.ThrottleInputInterpSpeed = ThrottleInputInterpSpeed;
+    Input.SteeringInputRiseRate = SteeringInputRiseRate;
+    Input.SteeringInputReturnRate = SteeringInputReturnRate;
+    Input.SteeringInputSpeedDamping = SteeringInputSpeedDamping;
+    Input.SteeringInputCurveExponent = SteeringInputCurveExponent;
+    Input.SteeringSpeedForFullAssist = SteeringSpeedForFullAssist;
+    Input.BodyForward = IsValid(Body) ? Body->GetForwardVector().GetSafeNormal() : GetActorForwardVector().GetSafeNormal();
+    Input.BodyVelocity = IsValid(Body) ? Body->GetPhysicsLinearVelocity() : FVector::ZeroVector;
+    return Input;
+}
 
+AVehiclePawn::FVehicleParallelControlOutput AVehiclePawn::CalculateParallelControlOutput(const FVehicleParallelControlInput& Input)
+{
+    FVehicleParallelControlOutput Output;
+
+    const float SafeDeltaSeconds = FMath::Clamp(Input.DeltaSeconds, 0.0f, 0.05f);
+    if (SafeDeltaSeconds <= 0.0f)
+    {
+        return Output;
+    }
+
+    Output.SmoothedThrottleInput = FMath::FInterpTo(
+        Input.SmoothedThrottleInput,
+        FMath::Clamp(Input.ThrottleInput, -1.0f, 1.0f),
+        SafeDeltaSeconds,
+        FMath::Max(0.1f, Input.ThrottleInputInterpSpeed));
+
+    const float ClampedSteeringTarget = FMath::Clamp(Input.SteeringInput, -1.0f, 1.0f);
+    const float CurvedSteeringTarget = FMath::Sign(ClampedSteeringTarget)
+        * FMath::Pow(FMath::Abs(ClampedSteeringTarget), FMath::Clamp(Input.SteeringInputCurveExponent, 1.0f, 3.0f));
+
+    const FVector BodyForward = Input.BodyForward.GetSafeNormal();
+    const float AbsForwardSpeed = FMath::Abs(FVector::DotProduct(Input.BodyVelocity, BodyForward));
+    const float SpeedAlpha = FMath::Clamp(AbsForwardSpeed / FMath::Max(100.0f, Input.SteeringSpeedForFullAssist), 0.0f, 1.0f);
+    const float SpeedRateScale = FMath::Lerp(1.0f, 1.0f - FMath::Clamp(Input.SteeringInputSpeedDamping, 0.0f, 1.0f), SpeedAlpha);
+
+    const bool bReturningTowardCenter = FMath::Abs(CurvedSteeringTarget) < FMath::Abs(Input.SmoothedSteeringInput)
+        && FMath::Sign(CurvedSteeringTarget) == FMath::Sign(Input.SmoothedSteeringInput);
+    const bool bReversingDirection = CurvedSteeringTarget * Input.SmoothedSteeringInput < -KINDA_SMALL_NUMBER;
+    float SteeringRate = bReturningTowardCenter
+        ? FMath::Max(0.1f, Input.SteeringInputReturnRate)
+        : FMath::Max(0.1f, Input.SteeringInputRiseRate);
+    if (bReversingDirection)
+    {
+        SteeringRate = FMath::Min(SteeringRate, FMath::Max(0.1f, Input.SteeringInputRiseRate) * 0.75f);
+    }
+
+    Output.SmoothedSteeringInput = FMath::FInterpConstantTo(
+        Input.SmoothedSteeringInput,
+        CurvedSteeringTarget,
+        SafeDeltaSeconds,
+        FMath::Max(0.1f, SteeringRate * SpeedRateScale));
+    Output.bValid = true;
+    return Output;
+}
+
+void AVehiclePawn::ApplyParallelControlOutput(const FVehicleParallelControlOutput& Output)
+{
+    if (!Output.bValid)
+    {
+        return;
+    }
+
+    SmoothedThrottleInput = FMath::Clamp(Output.SmoothedThrottleInput, -1.0f, 1.0f);
+    SmoothedSteeringInput = FMath::Clamp(Output.SmoothedSteeringInput, -1.0f, 1.0f);
+}
+
+void AVehiclePawn::TickVehicleFromSubSystem(float DeltaSeconds)
+{
     const float SafeFrameDeltaTime = FMath::Clamp(DeltaSeconds, 0.0f, VehiclePhysicsMaxCatchUpSeconds);
-    if (SafeFrameDeltaTime <= 0.0f)
+    if (SafeFrameDeltaTime <= 0.0f || !IsValid(Body))
     {
         return;
     }
 
-    bAsyncPhysicsTickEnabled = ShouldRunVehiclePhysicsInAsyncTick();
+    bUseAsyncVehiclePhysicsTick = false;
+    bRunVehicleForcesInAsyncPhysicsTick = false;
+    bAsyncPhysicsTickEnabled = false;
 
-    if (bUseStableGroundRideHeight)
     {
-        // Legacy deterministic wheel-contact update. It still uses the unified step path so input
-        // smoothing and movement deltas are integrated in seconds instead of frame counts.
-        RunVehiclePhysicsSteps(SafeFrameDeltaTime, false);
-        UpdateWheelVisuals(SafeFrameDeltaTime);
-        return;
-    }
+        struct FScopedBoolOverride
+        {
+            bool& Flag;
+            const bool PreviousValue;
 
-    const bool bAsyncForcesRequested = ShouldRunVehiclePhysicsInAsyncTick();
-    const int32 ObservedAsyncStepCounter = AsyncVehiclePhysicsStepCounter.GetValue();
-    if (bAsyncForcesRequested && ObservedAsyncStepCounter != LastObservedAsyncVehiclePhysicsStepCounter)
-    {
-        bHasObservedAsyncVehiclePhysicsStep = true;
-        LastObservedAsyncVehiclePhysicsStepCounter = ObservedAsyncStepCounter;
-    }
+            FScopedBoolOverride(bool& InFlag, const bool NewValue)
+                : Flag(InFlag)
+                , PreviousValue(InFlag)
+            {
+                Flag = NewValue;
+            }
 
-    if (!bAsyncForcesRequested || !bHasObservedAsyncVehiclePhysicsStep)
-    {
-        // Fallback path: if the project has not actually produced async physics ticks yet, keep the car moving
-        // on the normal PrePhysics tick. Once async ticks are observed, the game thread only updates visuals.
+            ~FScopedBoolOverride()
+            {
+                Flag = PreviousValue;
+            }
+        } SkipInputSmoothingGuard(bSkipVehicleInputSmoothingForCurrentRun, true);
+
         RunVehiclePhysicsSteps(SafeFrameDeltaTime, false);
     }
 
     UpdateWheelVisuals(SafeFrameDeltaTime);
 }
 
+void AVehiclePawn::Tick(float DeltaSeconds)
+{
+    Super::Tick(DeltaSeconds);
+    TickVehicleFromSubSystem(DeltaSeconds);
+}
+
 void AVehiclePawn::AsyncPhysicsTickActor(float DeltaTime, float SimTime)
 {
     Super::AsyncPhysicsTickActor(DeltaTime, SimTime);
-
-    if (!ShouldRunVehiclePhysicsInAsyncTick())
-    {
-        return;
-    }
-
-    if (DeltaTime <= 0.0f || !IsValid(Body) || !Body->IsSimulatingPhysics())
-    {
-        return;
-    }
-
-    RunVehiclePhysicsSteps(DeltaTime, true);
-    AsyncVehiclePhysicsStepCounter.Increment();
 }
 
 void AVehiclePawn::SetDriveInput(float Throttle, float Steering)
@@ -683,6 +785,11 @@ void AVehiclePawn::ClearDriveInput()
 
 void AVehiclePawn::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+    if (UVehicleSubSystem* VehicleSubSystem = UVehicleSubSystem::Get(this))
+    {
+        VehicleSubSystem->UnregisterVehicle(this);
+    }
+
     ReleaseRuntimeResources();
     Super::EndPlay(EndPlayReason);
 }

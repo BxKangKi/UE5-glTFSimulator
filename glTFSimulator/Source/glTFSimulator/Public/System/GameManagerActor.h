@@ -15,6 +15,7 @@ class AWorldManager;
 class AglTFStreamActor;
 class UMaterialInterface;
 class UUserWidget;
+class UGameUpdateSubSystem;
 
 /**
  * Editor-facing configuration actor for the game manager subsystem.
@@ -123,4 +124,8 @@ public:
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|Mode")
     EPlayMode PlayMode = EPlayMode::Creator;
+
+private:
+    int32 GameUpdateTickHandle = INDEX_NONE;
+    void TickFromGameUpdate(float DeltaSeconds);
 };

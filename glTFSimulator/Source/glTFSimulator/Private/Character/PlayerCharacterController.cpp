@@ -18,6 +18,7 @@
 #include "UI/SettingsMenuWidget.h"
 #include "Vehicle/VehiclePawn.h"
 #include "System/GameManagerSubSystem.h"
+#include "System/GameUpdateSubSystem.h"
 #include "TimerManager.h"
 #include "UObject/ConstructorHelpers.h"
 #include "Blueprint/WidgetBlueprintLibrary.h"
@@ -105,6 +106,16 @@ void APlayerCharacterController::BeginPlay()
         }));
     }
 
+    if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
+    {
+        GameUpdateTickHandle = GameUpdate->RegisterUpdate(
+            this,
+            [this](const float DeltaSeconds)
+            {
+                TickFromGameUpdate(DeltaSeconds);
+            },
+            1);
+    }
 }
 
 
@@ -190,10 +201,29 @@ void APlayerCharacterController::BeginPlayingState()
     }
 }
 
+void APlayerCharacterController::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+    if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
+    {
+        GameUpdate->UnregisterUpdate(GameUpdateTickHandle);
+    }
+    GameUpdateTickHandle = INDEX_NONE;
+
+    Super::EndPlay(EndPlayReason);
+}
+
 void APlayerCharacterController::Tick(float DeltaSeconds)
 {
     Super::Tick(DeltaSeconds);
 
+    if (GameUpdateTickHandle == INDEX_NONE)
+    {
+        TickFromGameUpdate(DeltaSeconds);
+    }
+}
+
+void APlayerCharacterController::TickFromGameUpdate(float DeltaSeconds)
+{
     if (bEnableFallbackKeyBindings && !bUIInputMode &&
         (bFallbackMoveForward || bFallbackMoveBackward || bFallbackMoveRight || bFallbackMoveLeft))
     {

@@ -8,6 +8,7 @@
 #include "Character/PlayerCharacterController.h"
 #include "GameFramework/SpringArmComponent.h"
 #include "System/GameManagerSubSystem.h"
+#include "System/GameUpdateSubSystem.h"
 #include "Components/CapsuleComponent.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Camera/CameraComponent.h"
@@ -36,7 +37,7 @@ namespace CharacterControllerTuning
 
 ACharacterController::ACharacterController()
 {
-    PrimaryActorTick.bCanEverTick = true;
+    PrimaryActorTick.bCanEverTick = false;
     // 1. Create gameplay components.
     Component = CreateDefaultSubobject<UCharacterComponent>(TEXT("CharacterComponent"));
     // Camera setup.
@@ -145,6 +146,17 @@ void ACharacterController::BeginPlay()
     SubSystem->SetCameraComponent(FollowCamera);
     SetActorLocation(SubSystem->GetPlayerLocation(), false, nullptr, ETeleportType::TeleportPhysics);
     Activate(false);
+
+    if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
+    {
+        GameUpdateTickHandle = GameUpdate->RegisterUpdate(
+            this,
+            [this](const float DeltaSeconds)
+            {
+                TickFromGameUpdate(DeltaSeconds);
+            },
+            0);
+    }
 }
 
 void ACharacterController::Load(const FString &Path)
@@ -307,6 +319,17 @@ void ACharacterController::PrepareForPawnReplacement()
 
 
 
+void ACharacterController::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+    if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
+    {
+        GameUpdate->UnregisterUpdate(GameUpdateTickHandle);
+    }
+    GameUpdateTickHandle = INDEX_NONE;
+
+    Super::EndPlay(EndPlayReason);
+}
+
 void ACharacterController::RestoreControlAfterRagdollRecovery()
 {
     // Ragdoll recovery disables movement for several frames while the mesh is being reattached.
@@ -454,6 +477,24 @@ void ACharacterController::HandleCapsulePhysicsHit(UPrimitiveComponent* HitCompo
 void ACharacterController::Tick(float DeltaSeconds)
 {
     Super::Tick(DeltaSeconds);
+    TickFromGameUpdate(DeltaSeconds);
+}
+
+void ACharacterController::TickFromGameUpdate(float DeltaSeconds)
+{
+    if (!IsValid(Component.Get()))
+    {
+        return;
+    }
+    if (!IsValid(SubSystem))
+    {
+        SubSystem = UGameManagerSubSystem::GetSubSystem(this);
+    }
+    if (!IsValid(SubSystem))
+    {
+        return;
+    }
+
     if (GetVelocity().Z <= 0.0f)
     {
         CharacterStateBit &= ~STATE_JUMPING;
@@ -461,9 +502,13 @@ void ACharacterController::Tick(float DeltaSeconds)
     SyncRagdollWaterStateFromPhysics();
     Component->UpdateComponent(DeltaSeconds, RawMoveInput, CharacterStateBit, WaterLevel);
 
-    // Buoyancy is only allowed to touch simulated ragdoll bodies.  When the character is not ragdolled,
-    // keep the visual mesh attached/visible so stale physics state cannot make it vanish or drift away.
-    if (!Component->IsRagdollActive() && !Component->IsGettingUp())
+    const bool bRagdollTransitionActive = Component->IsRagdollTransitionInProgress();
+
+    // Buoyancy is only allowed to touch simulated ragdoll bodies. When no ragdoll
+    // transition is active, keep the visual mesh attached/visible so stale physics
+    // state cannot make it vanish or drift away. Do not run this during get-up:
+    // the component is intentionally blending from the ragdoll world transform.
+    if (!bRagdollTransitionActive)
     {
         if (USkeletalMeshComponent* MeshComp = GetMesh())
         {
@@ -486,18 +531,21 @@ void ACharacterController::Tick(float DeltaSeconds)
                 {
                     MeshComp->AttachToComponent(Capsule, FAttachmentTransformRules::KeepRelativeTransform);
                 }
-                MeshComp->SetRelativeLocation(CharacterControllerTuning::MeshDefaultRelativeLocation);
-                MeshComp->SetRelativeRotation(CharacterControllerTuning::MeshDefaultRelativeRotation);
+                if (!bIsCrouched)
+                {
+                    MeshComp->SetRelativeLocation(CharacterControllerTuning::MeshDefaultRelativeLocation);
+                    MeshComp->SetRelativeRotation(CharacterControllerTuning::MeshDefaultRelativeRotation);
+                }
             }
         }
     }
 
-    if (!Component->IsRagdollActive() && Component->IsRagdollDamage())
+    if (!bRagdollTransitionActive && Component->IsRagdollDamage())
     {
         float DirectWaterLevel = WaterLevel;
         if (!FindDirectWaterLevel(DirectWaterLevel))
         {
-            // Fall-damage ragdoll is starting from dry air/ground.  Drop stale water state
+            // Fall-damage ragdoll is starting from dry air/ground. Drop stale water state
             // before ActiveRagdoll() snapshots bRagdollInWater.
             ClearDryWaterState(DirectWaterLevel, false);
         }
@@ -508,6 +556,7 @@ void ACharacterController::Tick(float DeltaSeconds)
 
         Component->SetRagdollActive(true);
     }
+
     SubSystem->SetPlayerLocation(GetActorLocation());
 }
 
