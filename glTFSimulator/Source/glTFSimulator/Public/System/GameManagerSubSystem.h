@@ -18,6 +18,8 @@ class UMaterialInterface;
 class UProceduralMeshComponent;
 class USceneComponent;
 class UWorldData;
+class UPlayerData;
+class AWeatherActor;
 class UUserWidget;
 class AWorldManager;
 class AglTFStreamActor;
@@ -100,11 +102,11 @@ public:
     UFUNCTION(BlueprintPure, Category="Game", meta=(WorldContext="WorldContextObject"))
     static UGameManagerSubSystem* FindGameManager(const UObject* WorldContextObject);
 
-    // Opens StartWorld and asks its StartActor to show the world-selection widget after travel.
+    // Opens MainWorld and asks its StartActor to show the world-selection widget after travel.
     UFUNCTION(BlueprintCallable, Category="Game|Lifecycle", meta=(WorldContext="WorldContextObject"))
     static void OpenWorldSelectionScreen(const UObject* WorldContextObject, FName WorldSelectionLevelName = NAME_None);
 
-    // Opens the main menu from the world-selection screen. Bind this to the world-selection Back button when you want to reload StartWorld.
+    // Opens the main menu from the world-selection screen. Bind this to the world-selection Back button when you want to reload MainWorld.
     UFUNCTION(BlueprintCallable, Category="Game|Lifecycle", meta=(WorldContext="WorldContextObject"))
     static void OpenMainMenuFromWorldSelection(const UObject* WorldContextObject, FName MainMenuLevelName = NAME_None);
 
@@ -120,7 +122,7 @@ public:
     void StartGameManager(class AGameManagerActor* InConfigActor);
 
     void StopGameManager(const EEndPlayReason::Type EndPlayReason);
-    void TickGameManager(float DeltaSeconds);
+    void UpdateGameManager(float DeltaSeconds);
     void ApplyEditorConfig(const class AGameManagerActor* InConfigActor);
 
     UFUNCTION(BlueprintCallable, Category="Game|Settings")
@@ -152,6 +154,12 @@ public:
     FVector GetCameraLocation() const { return IsValid(CurrentCamera) ? CurrentCamera->GetComponentLocation() : FVector::ZeroVector; }
     bool GetGamePaused() const { return bIsGamePaused; }
     UWorldData* GetWorldData() const { return CurrentWorldData; }
+    UFUNCTION(BlueprintPure, Category="Game|Player")
+    UPlayerData* GetPlayerData() const { return ActivePlayerData; }
+    UFUNCTION(BlueprintPure, Category="Game|Weapon")
+    AWeaponActor* GetEquippedWeaponActor() const { return EquippedWeapon.Get(); }
+    UFUNCTION(BlueprintPure, Category="Game|Level")
+    bool AreCheatsEnabledForCurrentLevel() const { return bCurrentLevelCheatsEnabled; }
     FString GetCurrentWorldName() const { return CurrentWorldName; }
     static void ToggleFullscreen();
     void SetLoadingStatus(float InValue) { LoadingStatus = (int32)(InValue * 100); }
@@ -436,8 +444,12 @@ public:
     UFUNCTION(BlueprintCallable, Category="Game|Lifecycle")
     void PrepareForReturnToMenuLevel();
 
-    /** Legacy wrapper kept for older Blueprint calls. Use PrepareForReturnToMenuLevel(). */
+    /** Legacy wrapper kept for MainWorld menu travel. Use PrepareForReturnToMenuLevel() for the common cleanup path. */
     UFUNCTION(BlueprintCallable, Category="Game|Lifecycle")
+    void PrepareForReturnToMainWorld();
+
+    /** Backward-compatible wrapper for older Blueprint/C++ calls that still refer to StartWorld. */
+    UFUNCTION(BlueprintCallable, Category="Game|Lifecycle", meta=(DeprecatedFunction, DeprecationMessage="StartWorld was renamed to MainWorld. Use PrepareForReturnToMainWorld instead."))
     void PrepareForReturnToStartWorld();
 
     /** Releases runtime main-world actors/assets that can otherwise survive a level transition through GameInstance subsystems. */
@@ -447,20 +459,27 @@ public:
     UFUNCTION(BlueprintPure, Category="Game|Lifecycle")
     bool HasPendingMainWorldRuntimePurge() const { return bPendingMainWorldRuntimePurge; }
 
-    /** Requests that StartWorld opens directly on the world-selection widget after the next level travel. */
+    /** Requests that MainWorld opens directly on the world-selection widget after the next level travel. */
     UFUNCTION(BlueprintCallable, Category="Game|Lifecycle")
+    void RequestWorldSelectionMenuOnNextMainWorld();
+
+    /** Backward-compatible wrapper for older Blueprint/C++ calls that still refer to StartWorld. */
+    UFUNCTION(BlueprintCallable, Category="Game|Lifecycle", meta=(DeprecatedFunction, DeprecationMessage="StartWorld was renamed to MainWorld. Use RequestWorldSelectionMenuOnNextMainWorld instead."))
     void RequestWorldSelectionMenuOnNextStartWorld();
 
-    /** Consumes and clears the pending StartWorld world-selection request. */
+    /** Consumes and clears the pending MainWorld world-selection request. */
     UFUNCTION(BlueprintCallable, Category="Game|Lifecycle")
     bool ConsumeWorldSelectionMenuRequest();
 
-    /** Clears the pending StartWorld world-selection request. */
+    /** Clears the pending MainWorld world-selection request. */
     UFUNCTION(BlueprintCallable, Category="Game|Lifecycle")
     void ClearWorldSelectionMenuRequest();
 
     UFUNCTION(BlueprintPure, Category="Game|Lifecycle")
-    bool ShouldOpenWorldSelectionMenuOnNextStartWorld() const { return bOpenWorldSelectionMenuOnNextStartWorld; }
+    bool ShouldOpenWorldSelectionMenuOnNextMainWorld() const { return bOpenWorldSelectionMenuOnNextMainWorld; }
+
+    UFUNCTION(BlueprintPure, Category="Game|Lifecycle", meta=(DeprecatedFunction, DeprecationMessage="StartWorld was renamed to MainWorld. Use ShouldOpenWorldSelectionMenuOnNextMainWorld instead."))
+    bool ShouldOpenWorldSelectionMenuOnNextStartWorld() const { return ShouldOpenWorldSelectionMenuOnNextMainWorld(); }
 
 
     /** Returns the gameplay-owned world data object that drives time, sky, player position, and save data. */
@@ -555,6 +574,9 @@ private:
     UPROPERTY(Transient)
     TSubclassOf<AWeaponActor> WeaponActorClass;
 
+    UPROPERTY(Transient)
+    TSubclassOf<AWeatherActor> WeatherActorClass;
+
     // GameManager owns the world boot sequence so WorldManager can stay rendering-only.
     UPROPERTY(Transient)
     TSubclassOf<AWorldManager> WorldManagerClass;
@@ -575,6 +597,12 @@ private:
     TObjectPtr<UWorldData> ActiveWorldData;
 
     UPROPERTY()
+    TObjectPtr<UPlayerData> ActivePlayerData;
+
+    UPROPERTY()
+    TObjectPtr<AWeatherActor> ActiveWeatherActor;
+
+    UPROPERTY()
     TObjectPtr<AWorldManager> WorldManagerActor;
 
     UPROPERTY()
@@ -591,7 +619,9 @@ private:
     bool bWorldLoadCompleted = false;
     bool bSpawnedWorldManager = false;
     bool bPendingMainWorldRuntimePurge = false;
-    bool bOpenWorldSelectionMenuOnNextStartWorld = false;
+    bool bOpenWorldSelectionMenuOnNextMainWorld = false;
+    bool bCurrentLevelCheatsEnabled = false;
+    FString ActivePlayerId = TEXT("Player");
     FDelegateHandle PostLoadMapCleanupHandle;
 
     // Legacy placement distance kept so older Blueprint defaults do not lose the property.
@@ -770,13 +800,19 @@ private:
     bool IsObjectCreationItem(const FToolbarItem& Item) const;
     bool ShouldSpawnOcean() const;
     void SpawnOcean();
+    void MainWorldStreaming(const FString& InModelDirectory, const FString& InPlayerDirectory, const FString& InInitialPlayerName);
     void StartWorldStreaming(const FString& InModelDirectory, const FString& InPlayerDirectory, const FString& InInitialPlayerName);
     void InitializeWorldBootstrap();
     void SpawnWorldManager();
     bool CheckWorldSystemsLoaded();
     void LoadWorldData();
+    void LoadPlayerData();
     void SaveWorldData();
-    void SaveWorldDataTick();
+    void SavePlayerData();
+    void SaveWorldDataDelayed();
+    void ApplyLevelSettings();
+    void ApplyWeatherSettings();
+    void ApplyGameplaySettings();
     void LoadWorldAsync();
     void UpdateWorldTime(float DeltaSeconds);
     FString GetWorldFilePath(const FString& FileName) const;

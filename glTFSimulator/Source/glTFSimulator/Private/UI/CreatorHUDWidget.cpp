@@ -8,6 +8,7 @@
 #include "Components/TextBlock.h"
 #include "Components/UniformGridPanel.h"
 #include "Model/EditableMeshActor.h"
+#include "System/GameUpdateSubSystem.h"
 
 static FString MakeKindLabel(EToolbarItemKind Kind)
 {
@@ -34,6 +35,20 @@ void UCreatorHUDWidget::NativeConstruct()
     RefreshManagerReference();
     BindManagerEvents();
 
+    if (GameUpdateTickHandle == INDEX_NONE)
+    {
+        if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
+        {
+            GameUpdateTickHandle = GameUpdate->RegisterUpdate(
+                this,
+                [this](const float DeltaSeconds)
+                {
+                    UpdateFromGameUpdate(DeltaSeconds);
+                },
+                60);
+        }
+    }
+
     RefreshStatus();
     RefreshToolbar();
     RefreshItemList();
@@ -41,14 +56,18 @@ void UCreatorHUDWidget::NativeConstruct()
 
 void UCreatorHUDWidget::NativeDestruct()
 {
+    if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
+    {
+        GameUpdate->UnregisterUpdate(GameUpdateTickHandle);
+    }
+    GameUpdateTickHandle = INDEX_NONE;
+
     UnbindManagerEvents();
     Super::NativeDestruct();
 }
 
-void UCreatorHUDWidget::NativeTick(const FGeometry& MyGeometry, float InDeltaTime)
+void UCreatorHUDWidget::UpdateFromGameUpdate(float DeltaSeconds)
 {
-    Super::NativeTick(MyGeometry, InDeltaTime);
-
     if (!IsValid(UserStatusTextBlock) && !IsValid(UserPlacementInfoTextBlock) &&
         !IsValid(UserMessageTextBlock) && !IsValid(UserItemListPanel))
     {

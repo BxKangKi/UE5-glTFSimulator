@@ -2,6 +2,7 @@
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
 #include "Model/glTFStreamActor.h"
+#include "Setting/GameSettings.h"
 
 #include "Async/Async.h"
 #include "Components/BoxComponent.h"
@@ -28,14 +29,20 @@
 #include "Modules/ModuleManager.h"
 #include "System/FileFunctionLibrary.h"
 #include "System/GameManagerSubSystem.h"
+#include "System/GameUpdateSubSystem.h"
 #include "System/MacroLibrary.h"
 #include "TimerManager.h"
+#include "World/WaterActor.h"
 
-static constexpr int32 GltfStreamTextureDimensionLimit = 1024;
 
 void AglTFStreamActor::Init(const FString& Path)
 {
     FilePath = Path;
+}
+
+void AglTFStreamActor::SetRenderOnlyStreaming(bool bRenderOnly)
+{
+    bRenderOnlyStreaming = bRenderOnly;
 }
 
 void AglTFStreamActor::BeginPlay()
@@ -46,6 +53,7 @@ void AglTFStreamActor::BeginPlay()
     bIsDestroyed = false;
     bAsyncLoading = false;
     LoadingStatus = 0.0f;
+    GameUpdateTickHandle = INDEX_NONE;
     AssetLoadPhase = EGLTFStreamAssetPhase::None;
     ActiveSizeScanAction = nullptr;
     ActiveStreamAction = nullptr;
@@ -54,10 +62,13 @@ void AglTFStreamActor::BeginPlay()
 
     AllNodeMap.Empty();
     AllMeshMap.Empty();
+    WaterNodeMap.Empty();
     LoadedNodes.Empty();
+    LoadedWaterNodes.Empty();
     InstanceMap.Empty();
     UnloadBoxMap.Empty();
     DynamicComponentMap.Empty();
+    WaterActorMap.Empty();
     ModelMetadata = FModelData();
     bHasModelMetadata = false;
 
@@ -83,6 +94,7 @@ void AglTFStreamActor::ReleaseRuntimeResourcesForWorldExit()
         World->GetTimerManager().ClearAllTimersForObject(this);
     }
 
+    UnregisterGameUpdate();
     CancelActiveAssetLoad();
     CancelActiveAsyncActions();
 
@@ -97,15 +109,19 @@ void AglTFStreamActor::ReleaseRuntimeResourcesForWorldExit()
 
     AllNodeMap.Empty();
     AllMeshMap.Empty();
+    WaterNodeMap.Empty();
     LoadedNodes.Empty();
+    LoadedWaterNodes.Empty();
     InstanceMap.Empty();
     UnloadBoxMap.Empty();
     DynamicComponentMap.Empty();
+    WaterActorMap.Empty();
     ModelMetadata = FModelData();
     bHasModelMetadata = false;
     FilePath.Reset();
     ActiveSizeScanAction = nullptr;
     ActiveStreamAction = nullptr;
+    GameUpdateTickHandle = INDEX_NONE;
     AssetLoadPhase = EGLTFStreamAssetPhase::None;
 }
 
@@ -233,8 +249,7 @@ void AglTFStreamActor::OnAssetLoaded(UglTFRuntimeAsset* Asset)
             return;
         case EGLTFStreamAssetPhase::Streaming:
             glTFAsset = Asset;
-            LoadingStatus = AllNodeMap.Num() == 0 ? 1.0f:
-            0.5f;
+            LoadingStatus = (AllNodeMap.Num() + WaterNodeMap.Num()) == 0 ? 1.0f : 0.5f;
             StartStreaming();
             return;
         default:
@@ -301,6 +316,7 @@ void AglTFStreamActor::OnChunksLoaded(const FLoadAsyncWrapper& MapWrapper)
 #endif
 
     AllNodeMap = MapWrapper.NodeMap;
+    WaterNodeMap = MapWrapper.WaterNodeMap;
     AllMeshMap = MapWrapper.MeshMap;
     ModelMetadata = MapWrapper.ModelData;
     bHasModelMetadata = !ModelMetadata.Size.IsNearlyZero(0.001f);
@@ -421,7 +437,18 @@ void AglTFStreamActor::ReleaseStreamingResources()
         }
     }
     DynamicComponentMap.Empty();
+
+    for (TPair<FName, TObjectPtr<AWaterActor>>& Pair : WaterActorMap)
+    {
+        if (IsValid(Pair.Value.Get()))
+        {
+            Pair.Value->Destroy();
+        }
+    }
+    WaterActorMap.Empty();
+    LoadedWaterNodes.Empty();
 }
+
 
 void AglTFStreamActor::OnSizeScanProgress(float Progress)
 {
@@ -458,7 +485,7 @@ void AglTFStreamActor::WriteLogAsync(const FString& Message) const
 
 void AglTFStreamActor::StartStreaming()
 {
-    if (AllNodeMap.Num() == 0)
+    if (AllNodeMap.Num() == 0 && WaterNodeMap.Num() == 0)
     {
         bIsLoaded = true;
         bAsyncLoading = false;
@@ -466,7 +493,41 @@ void AglTFStreamActor::StartStreaming()
         return;
     }
 
-    AsyncTick();
+    RegisterGameUpdate();
+    StartStreamingStep();
+}
+
+void AglTFStreamActor::RegisterGameUpdate()
+{
+    if (GameUpdateTickHandle != INDEX_NONE)
+    {
+        return;
+    }
+
+    if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
+    {
+        GameUpdateTickHandle = GameUpdate->RegisterUpdate(
+            this,
+            [this](const float DeltaSeconds)
+            {
+                UpdateStreamingFromGameUpdate(DeltaSeconds);
+            },
+            15);
+    }
+}
+
+void AglTFStreamActor::UnregisterGameUpdate()
+{
+    if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
+    {
+        GameUpdate->UnregisterUpdate(GameUpdateTickHandle);
+    }
+    GameUpdateTickHandle = INDEX_NONE;
+}
+
+void AglTFStreamActor::UpdateStreamingFromGameUpdate(float DeltaSeconds)
+{
+    StartStreamingStep();
 }
 
 FglTFRuntimeStaticMeshConfig AglTFStreamActor::BuildStreamingStaticMeshConfig()
@@ -521,37 +582,49 @@ FglTFRuntimeStaticMeshConfig AglTFStreamActor::BuildStreamingStaticMeshConfig()
 
     Config.MaterialsConfig.bGeneratesMipMaps = false;
     Config.MaterialsConfig.SpecularFactor = 0.0f;
-    Config.MaterialsConfig.ImagesConfig.MaxWidth = GltfStreamTextureDimensionLimit;
-    Config.MaterialsConfig.ImagesConfig.MaxHeight = GltfStreamTextureDimensionLimit;
+    const int32 TextureDimensionLimit = UGameSettings::ResolveMaxTextureResolution(this);
+    Config.MaterialsConfig.ImagesConfig.MaxWidth = TextureDimensionLimit;
+    Config.MaterialsConfig.ImagesConfig.MaxHeight = TextureDimensionLimit;
     Config.MaterialsConfig.ImagesConfig.bCompressMips = false;
     Config.MaterialsConfig.ImagesConfig.bStreaming = false;
     Config.MaterialsConfig.bLoadMipMaps = false;
     Config.Outer = this;
     Config.bAllowCPUAccess = true;
-    Config.bBuildLumenCards = false;
-    Config.bBuildNavCollision = true;
+    // Single-player and listen-server worlds need runtime lighting cards and nav collision.
+    // Client render-only streaming skips them because authority/collision lives on the server.
+    Config.bBuildLumenCards = !bRenderOnlyStreaming;
+    Config.bBuildNavCollision = !bRenderOnlyStreaming;
+    if (bRenderOnlyStreaming)
+    {
+        Config.CollisionComplexity = ECollisionTraceFlag::CTF_UseDefault;
+        Config.bBuildComplexCollision = false;
+        Config.bBuildSimpleCollision = false;
+    }
     return Config;
 }
 
-void AglTFStreamActor::AsyncTick()
+void AglTFStreamActor::StartStreamingStep()
 {
     if (bIsDestroyed)
     {
         bAsyncLoading = false;
+        UnregisterGameUpdate();
         return;
     }
 
     if (!IsValid(glTFAsset))
     {
         bAsyncLoading = false;
+        UnregisterGameUpdate();
         return;
     }
 
-    if (AllNodeMap.Num() == 0)
+    if (AllNodeMap.Num() == 0 && WaterNodeMap.Num() == 0)
     {
         bIsLoaded = true;
         LoadingStatus = 1.0f;
         bAsyncLoading = false;
+        UnregisterGameUpdate();
         return;
     }
 
@@ -574,7 +647,8 @@ void AglTFStreamActor::AsyncTick()
         PlayerLoc,
         BuildStreamingStaticMeshConfig(),
         StreamDistance,
-        Size);
+        Size,
+        bRenderOnlyStreaming);
 
     ActiveStreamAction = AsyncAction;
     if (AsyncAction)
@@ -593,10 +667,13 @@ void AglTFStreamActor::AsyncTick()
 void AglTFStreamActor::UpdateProperties(const FStreamAsyncWrapper& Collection)
 {
     AllNodeMap = Collection.NodeMap;
+    WaterNodeMap = Collection.WaterNodeMap;
     LoadedNodes = Collection.LoadedNodes;
+    LoadedWaterNodes = Collection.LoadedWaterNodes;
     InstanceMap = Collection.InstanceMap;
     UnloadBoxMap = Collection.UnloadBoxMap;
     DynamicComponentMap = Collection.DynamicComponentMap;
+    WaterActorMap = Collection.WaterActorMap;
 }
 
 void AglTFStreamActor::OnStreamAsyncCompleted(const FStreamAsyncWrapper& MapWrapper)
@@ -613,8 +690,4 @@ void AglTFStreamActor::OnStreamAsyncCompleted(const FStreamAsyncWrapper& MapWrap
     bAsyncLoading = false;
     LoadingStatus = 1.0f;
 
-    if (UWorld* World = GetWorld())
-    {
-        World->GetTimerManager().SetTimerForNextTick(this, &AglTFStreamActor::AsyncTick);
-    }
 }

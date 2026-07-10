@@ -25,6 +25,8 @@ namespace
     constexpr int32 QualityMax = 3;
     constexpr int32 ReflectionMethodMin = 0;
     constexpr int32 ReflectionMethodMax = 2;
+    constexpr int32 TextureResolutionMin = 256;
+    constexpr int32 TextureResolutionMax = 4096;
 
     const TArray<ESettingsField>& GetDefaultSettingsFields()
     {
@@ -37,6 +39,7 @@ namespace
             ESettingsField::Cloud,
             ESettingsField::ShadowQuality,
             ESettingsField::TextureQuality,
+            ESettingsField::MaxTextureResolution,
             ESettingsField::ViewDistanceQuality,
             ESettingsField::AntiAliasingQuality,
             ESettingsField::PostProcessingQuality,
@@ -75,6 +78,26 @@ namespace
     void CycleInt(int32& Value, int32 MinValue, int32 MaxValue, int32 Direction)
     {
         Value = WrapIndex(Value + NormalizedDirection(Direction), MinValue, MaxValue);
+    }
+
+    void CycleTextureResolution(int32& Value, int32 Direction)
+    {
+        static const int32 Options[] = {256, 512, 768, 1024, 1536, 2048, 4096};
+        constexpr int32 OptionCount = sizeof(Options) / sizeof(Options[0]);
+
+        int32 ClosestIndex = 0;
+        int32 ClosestDistance = TNumericLimits<int32>::Max();
+        for (int32 Index = 0; Index < OptionCount; ++Index)
+        {
+            const int32 Distance = FMath::Abs(Value - Options[Index]);
+            if (Distance < ClosestDistance)
+            {
+                ClosestDistance = Distance;
+                ClosestIndex = Index;
+            }
+        }
+
+        Value = Options[WrapIndex(ClosestIndex + NormalizedDirection(Direction), 0, OptionCount - 1)];
     }
 
     void CycleFloat(float& Value, float MinValue, float MaxValue, float Step, int32 Direction)
@@ -164,6 +187,7 @@ namespace
         case ESettingsField::Cloud: return TEXT("Cloud");
         case ESettingsField::ShadowQuality: return TEXT("ShadowQuality");
         case ESettingsField::TextureQuality: return TEXT("TextureQuality");
+        case ESettingsField::MaxTextureResolution: return TEXT("MaxTextureResolution");
         case ESettingsField::ViewDistanceQuality: return TEXT("ViewDistanceQuality");
         case ESettingsField::AntiAliasingQuality: return TEXT("AntiAliasingQuality");
         case ESettingsField::PostProcessingQuality: return TEXT("PostProcessingQuality");
@@ -372,6 +396,7 @@ void USettingsMenuWidget::BindNamedSettingButtons()
     BindNamedSettingButton(ESettingsField::Cloud, TEXT("Settings_CloudButton"), TEXT("CloudButton"));
     BindNamedSettingButton(ESettingsField::ShadowQuality, TEXT("Settings_ShadowQualityButton"), TEXT("ShadowQualityButton"));
     BindNamedSettingButton(ESettingsField::TextureQuality, TEXT("Settings_TextureQualityButton"), TEXT("TextureQualityButton"));
+    BindNamedSettingButton(ESettingsField::MaxTextureResolution, TEXT("Settings_MaxTextureResolutionButton"), TEXT("MaxTextureResolutionButton"));
     BindNamedSettingButton(ESettingsField::ViewDistanceQuality, TEXT("Settings_ViewDistanceQualityButton"), TEXT("ViewDistanceQualityButton"));
     BindNamedSettingButton(ESettingsField::AntiAliasingQuality, TEXT("Settings_AntiAliasingQualityButton"), TEXT("AntiAliasingQualityButton"));
     BindNamedSettingButton(ESettingsField::PostProcessingQuality, TEXT("Settings_PostProcessingQualityButton"), TEXT("PostProcessingQualityButton"));
@@ -457,6 +482,10 @@ void USettingsMenuWidget::BindFieldButton(ESettingsField Field, UButton* Button)
         Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleTextureQualityFromUI);
         Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleTextureQualityFromUI);
         break;
+    case ESettingsField::MaxTextureResolution:
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleMaxTextureResolutionFromUI);
+        Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleMaxTextureResolutionFromUI);
+        break;
     case ESettingsField::ViewDistanceQuality:
         Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleViewDistanceQualityFromUI);
         Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleViewDistanceQualityFromUI);
@@ -518,6 +547,7 @@ void USettingsMenuWidget::CopySettingsToPending(const UGameSettings* Settings)
     bPendingCloud = Settings->bCloud;
     PendingShadowQuality = FMath::Clamp(Settings->ShadowQuality, QualityMin, QualityMax);
     PendingTextureQuality = FMath::Clamp(Settings->TextureQuality, QualityMin, QualityMax);
+    PendingMaxTextureResolution = FMath::Clamp(Settings->MaxTextureResolution, TextureResolutionMin, TextureResolutionMax);
     PendingViewDistanceQuality = FMath::Clamp(Settings->ViewDistanceQuality, QualityMin, QualityMax);
     PendingAntiAliasingQuality = FMath::Clamp(Settings->AntiAliasingQuality, QualityMin, QualityMax);
     PendingPostProcessingQuality = FMath::Clamp(Settings->PostProcessingQuality, QualityMin, QualityMax);
@@ -545,6 +575,7 @@ void USettingsMenuWidget::ApplyPendingToSettings(UGameSettings* Settings) const
     Settings->bCloud = bPendingCloud;
     Settings->ShadowQuality = PendingShadowQuality;
     Settings->TextureQuality = PendingTextureQuality;
+    Settings->MaxTextureResolution = PendingMaxTextureResolution;
     Settings->ViewDistanceQuality = PendingViewDistanceQuality;
     Settings->AntiAliasingQuality = PendingAntiAliasingQuality;
     Settings->PostProcessingQuality = PendingPostProcessingQuality;
@@ -660,6 +691,7 @@ FText USettingsMenuWidget::GetSettingLabelText(ESettingsField Field) const
     case ESettingsField::Cloud: return FText::FromString(TEXT("Cloud"));
     case ESettingsField::ShadowQuality: return FText::FromString(TEXT("Shadow Quality"));
     case ESettingsField::TextureQuality: return FText::FromString(TEXT("Texture Quality"));
+    case ESettingsField::MaxTextureResolution: return FText::FromString(TEXT("Max Texture Resolution"));
     case ESettingsField::ViewDistanceQuality: return FText::FromString(TEXT("View Distance"));
     case ESettingsField::AntiAliasingQuality: return FText::FromString(TEXT("Anti Aliasing"));
     case ESettingsField::PostProcessingQuality: return FText::FromString(TEXT("Post Processing"));
@@ -727,6 +759,15 @@ TArray<FText> USettingsMenuWidget::GetSettingOptionTexts(ESettingsField Field) c
             Options.Add(GetReflectionMethodText(Value));
         }
         break;
+    case ESettingsField::MaxTextureResolution:
+        {
+            static const int32 OptionsPx[] = {256, 512, 768, 1024, 1536, 2048, 4096};
+            for (const int32 Value : OptionsPx)
+            {
+                Options.Add(FText::FromString(FString::Printf(TEXT("%d px"), Value)));
+            }
+        }
+        break;
     default:
         for (int32 Value = QualityMin; Value <= QualityMax; ++Value)
         {
@@ -776,6 +817,7 @@ void USettingsMenuWidget::CyclePendingValue(ESettingsField Field, int32 Directio
     case ESettingsField::Cloud: bPendingCloud = !bPendingCloud; break;
     case ESettingsField::ShadowQuality: CycleInt(PendingShadowQuality, QualityMin, QualityMax, Direction); break;
     case ESettingsField::TextureQuality: CycleInt(PendingTextureQuality, QualityMin, QualityMax, Direction); break;
+    case ESettingsField::MaxTextureResolution: CycleTextureResolution(PendingMaxTextureResolution, Direction); break;
     case ESettingsField::ViewDistanceQuality: CycleInt(PendingViewDistanceQuality, QualityMin, QualityMax, Direction); break;
     case ESettingsField::AntiAliasingQuality: CycleInt(PendingAntiAliasingQuality, QualityMin, QualityMax, Direction); break;
     case ESettingsField::PostProcessingQuality: CycleInt(PendingPostProcessingQuality, QualityMin, QualityMax, Direction); break;
@@ -818,6 +860,7 @@ FText USettingsMenuWidget::GetFieldValueTextFromPending(ESettingsField Field) co
     case ESettingsField::Cloud: return GetBoolText(bPendingCloud);
     case ESettingsField::ShadowQuality: return GetQualityText(PendingShadowQuality);
     case ESettingsField::TextureQuality: return GetQualityText(PendingTextureQuality);
+    case ESettingsField::MaxTextureResolution: return FText::FromString(FString::Printf(TEXT("%d px"), PendingMaxTextureResolution));
     case ESettingsField::ViewDistanceQuality: return GetQualityText(PendingViewDistanceQuality);
     case ESettingsField::AntiAliasingQuality: return GetQualityText(PendingAntiAliasingQuality);
     case ESettingsField::PostProcessingQuality: return GetQualityText(PendingPostProcessingQuality);
@@ -884,6 +927,7 @@ void USettingsMenuWidget::CycleHeightFogFromUI() { CycleSettingValueFromUI(ESett
 void USettingsMenuWidget::CycleCloudFromUI() { CycleSettingValueFromUI(ESettingsField::Cloud); }
 void USettingsMenuWidget::CycleShadowQualityFromUI() { CycleSettingValueFromUI(ESettingsField::ShadowQuality); }
 void USettingsMenuWidget::CycleTextureQualityFromUI() { CycleSettingValueFromUI(ESettingsField::TextureQuality); }
+void USettingsMenuWidget::CycleMaxTextureResolutionFromUI() { CycleSettingValueFromUI(ESettingsField::MaxTextureResolution); }
 void USettingsMenuWidget::CycleViewDistanceQualityFromUI() { CycleSettingValueFromUI(ESettingsField::ViewDistanceQuality); }
 void USettingsMenuWidget::CycleAntiAliasingQualityFromUI() { CycleSettingValueFromUI(ESettingsField::AntiAliasingQuality); }
 void USettingsMenuWidget::CyclePostProcessingQualityFromUI() { CycleSettingValueFromUI(ESettingsField::PostProcessingQuality); }

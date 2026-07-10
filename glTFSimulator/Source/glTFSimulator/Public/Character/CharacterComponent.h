@@ -5,6 +5,7 @@
 
 #include "CoreMinimal.h"
 #include "Components/ActorComponent.h"
+#include "Engine/EngineTypes.h"
 #include "CharacterComponent.generated.h"
 
 // Character state bit flags used by controller input and movement code.
@@ -250,6 +251,9 @@ private:
     FVector ImpactVelocity = FVector::ZeroVector;
     FVector CurrentSpeed = FVector::ZeroVector;
     FVector PrevVelocity = FVector::ZeroVector;
+    FVector LastPreRagdollVelocity = FVector::ZeroVector;
+    float LastPreRagdollVelocityAge = TNumericLimits<float>::Max();
+
 
     /** Stable capsule-local head/fallback offset sampled only after the final runtime mesh has loaded. */
     FVector WaterReferenceOffsetFromCapsule = FVector::ZeroVector;
@@ -293,8 +297,18 @@ private:
     FVector WaterRecoveryMeshStartRelativeLocation = FVector::ZeroVector;
     FRotator WaterRecoveryMeshStartRelativeRotation = FRotator::ZeroRotator;
     FRotator RagdollPrePhysicsActorRotation = FRotator::ZeroRotator;
-    FVector SmoothedRagdollActorLocation = FVector::ZeroVector;
-    FRotator SmoothedRagdollActorRotation = FRotator::ZeroRotator;
+    float RagdollCameraStabilizeRemainingTime = 0.0f;
+    bool bSavedRagdollCameraState = false;
+    bool bSavedSpringArmCameraLag = false;
+    bool bSavedSpringArmCollisionTest = true;
+    bool bSavedSpringArmUseCameraLagSubstepping = false;
+    float SavedSpringArmCameraLagSpeed = 0.0f;
+    float SavedSpringArmCameraLagMaxTimeStep = 0.0f;
+    float SavedSpringArmCameraLagMaxDistance = 0.0f;
+    bool bSavedRagdollCapsuleCollisionState = false;
+    bool bSavedRagdollCapsuleGenerateOverlapEvents = true;
+    ECollisionEnabled::Type SavedRagdollCapsuleCollisionEnabled = ECollisionEnabled::QueryAndPhysics;
+
 
     bool bInvincible = false;
     bool bIsRagdoll = false;
@@ -309,11 +323,6 @@ private:
     bool bForceLandRagdollRecoveryOnce = false;
     bool bLandRagdollRecoveryOverridesWater = false;
     bool bHasRagdollPrePhysicsActorRotation = false;
-    bool bHasSmoothedRagdollActorTransform = false;
-    bool bHasSavedRagdollCameraSettings = false;
-    bool bSavedSpringArmCameraLag = false;
-    bool bSavedSpringArmCollisionTest = true;
-    float SavedSpringArmCameraLagSpeed = 0.0f;
     float PendingWaterRagdollDeactivationLevel = 0.0f;
     uint64 RagdollEnvironmentStateFrame = 0;
     uint32 RagdollReleaseGroundTraceRequestId = 0;
@@ -359,14 +368,20 @@ private:
     void FinishAsyncRagdollReleaseGroundTrace(bool bWalkableGround);
     bool ShouldDelayWaterRagdollDeactivation(float WaterLevel, bool bKnownWalkableGround) const;
     FVector GetRagdollRecoveryActorLocationFromHips(const FVector& HipsLocation, bool bWaterRecovery) const;
+    FVector ResolveRagdollRecoveryGroundPenetration(const FVector& DesiredActorLocation) const;
     bool ShouldUseRagdollWaterRecoveryForState(const FCharacterRagdollEnvironmentState& State) const;
     void BeginPendingWaterRagdollDeactivation(float WaterLevel);
     bool UpdatePendingWaterRagdollDeactivation(float DeltaTime, ACharacterController *InOwner, USkeletalMeshComponent *SkeletalMesh);
     void ClearPendingWaterRagdollDeactivation();
-    void ConfigureCameraForActiveRagdoll();
-    void RestoreCameraAfterRagdoll();
-    void SetOwnerCapsuleCollisionForRagdoll(bool bEnableCollision);
-    void ResetSmoothedRagdollActorTransform();
+    void UpdateRagdollVelocityHistory(float DeltaTime, const FVector& CurrentVelocity);
+    FVector CapturePreRagdollVelocity(ACharacterController *InOwner, UCharacterMovementComponent *CharacterMovement) const;
+    FVector GetInitialRagdollActivationVelocity(ACharacterController *InOwner, UCharacterMovementComponent *CharacterMovement, USkeletalMeshComponent *SkeletalMesh) const;
+    void ApplyInitialRagdollVelocity(USkeletalMeshComponent *SkeletalMesh, const FVector &InitialVelocity) const;
+    void BeginRagdollCameraStabilization();
+    void UpdateRagdollCameraStabilization(float DeltaTime);
+    void RestoreRagdollCameraState();
+    void BeginRagdollCapsuleCollisionIsolation();
+    void RestoreRagdollCapsuleCollision();
     void ActiveRagdoll(ACharacterController *InOwner, USkeletalMeshComponent *SkeletalMesh);
     void DeactiveRagdoll(ACharacterController *InOwner, USkeletalMeshComponent *SkeletalMesh, const FCharacterRagdollEnvironmentState &ReleaseEnvironmentState);
     void FinalizeRagdollRecovery(ACharacterController *InOwner, USkeletalMeshComponent *SkeletalMesh);

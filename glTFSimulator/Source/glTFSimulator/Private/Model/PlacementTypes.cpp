@@ -2,6 +2,7 @@
 
 #include "World/PlacementTypes.h"
 #include "UObject/UnrealType.h"
+#include "System/MacroLibrary.h"
 
 namespace PlacementTypesInternal
 {
@@ -118,6 +119,7 @@ bool FPlacementJson::TryGetTransform(const TSharedPtr<FJsonObject>& Json, FTrans
 TSharedRef<FJsonObject> FPlacedObjectRecord::ToJson() const
 {
     TSharedRef<FJsonObject> Json = MakeShared<FJsonObject>();
+    Json->SetStringField(JSON_VERSION_FIELD, JSON_SCHEMA_VERSION);
     Json->SetStringField(TEXT("ObjectName"), ObjectName);
     Json->SetStringField(TEXT("BaseName"), BaseName);
     Json->SetStringField(TEXT("SourceFile"), SourceFile);
@@ -148,6 +150,7 @@ bool FPlacedObjectRecord::FromJson(const TSharedPtr<FJsonObject>& Json)
 TSharedRef<FJsonObject> FGeneratedMeshRecord::ToJson() const
 {
     TSharedRef<FJsonObject> Json = MakeShared<FJsonObject>();
+    Json->SetStringField(JSON_VERSION_FIELD, JSON_SCHEMA_VERSION);
     Json->SetStringField(TEXT("ObjectName"), ObjectName);
     Json->SetStringField(TEXT("BaseName"), BaseName);
     FPlacementJson::SetTransform(Json, Transform);

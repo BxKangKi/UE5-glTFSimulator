@@ -13,8 +13,10 @@
 #include "Components/VolumetricCloudComponent.h"
 #include "Engine/World.h"
 #include "Materials/MaterialInterface.h"
+#include "Materials/MaterialInstanceDynamic.h"
 #include "Setting/GameSettings.h"
 #include "System/GameManagerSubSystem.h"
+#include "System/GameUpdateSubSystem.h"
 #include "TimerManager.h"
 #include "World/SkyUpdateAsyncAction.h"
 #include "World/WorldData.h"
@@ -89,12 +91,17 @@ void AWorldManager::InitializeRendering(UWorldData* InWorldData)
     }
 
     bRenderingActive = true;
-    GetWorldTimerManager().SetTimerForNextTick(this, &AWorldManager::AsyncTick);
+    ConfigureRenderingSettings();
+    ApplyCloudSettings();
+    RegisterGameUpdate();
+    StartSkyAsyncUpdate();
 }
 
 void AWorldManager::StopRendering()
 {
     bRenderingActive = false;
+    bSkyUpdateInFlight = false;
+    UnregisterGameUpdate();
     Data = nullptr;
 }
 
@@ -119,36 +126,126 @@ void AWorldManager::ConfigureRenderingSettings()
             Fog->SetFogDensity(0.02f);
         }
 
-        if (Setting->bCloud && !IsValid(Cloud))
+        const bool bLevelAllowsCloud = !IsValid(Data) || Data->Cloud.bEnabled;
+        if (Setting->bCloud && bLevelAllowsCloud && !IsValid(Cloud))
         {
             Cloud = NewObject<UVolumetricCloudComponent>(this);
             AddInstanceComponent(Cloud);
             Cloud->SetupAttachment(GetRootComponent());
             Cloud->RegisterComponent();
-            Cloud->SetMaterial(CloudMaterial);
         }
     }
 
+    ApplyCloudSettings();
     SubSystem->UpdateSettings();
 }
 
-void AWorldManager::AsyncTick()
+void AWorldManager::ApplyCloudSettings()
 {
-    if (!bRenderingActive || !IsValid(Data))
+    if (!IsValid(Data))
+    {
+        return;
+    }
+
+    if (!Data->Cloud.bEnabled)
+    {
+        if (IsValid(Cloud))
+        {
+            Cloud->DestroyComponent();
+            Cloud = nullptr;
+            CloudMID = nullptr;
+        }
+        return;
+    }
+
+    if (!IsValid(Cloud))
+    {
+        Cloud = NewObject<UVolumetricCloudComponent>(this);
+        AddInstanceComponent(Cloud);
+        Cloud->SetupAttachment(GetRootComponent());
+        Cloud->RegisterComponent();
+    }
+
+    if (!IsValid(CloudMID))
+    {
+        UMaterialInterface* SourceMaterial = CloudMaterial.Get();
+        if (!SourceMaterial && IsValid(Cloud))
+        {
+            SourceMaterial = Cloud->GetMaterial();
+        }
+        if (SourceMaterial)
+        {
+            CloudMID = UMaterialInstanceDynamic::Create(SourceMaterial, this);
+            Cloud->SetMaterial(CloudMID);
+        }
+    }
+
+    if (IsValid(CloudMID))
+    {
+        // The parameter names are intentionally generic so different cloud materials can opt in.
+        CloudMID->SetScalarParameterValue(TEXT("Coverage"), Data->Cloud.Coverage);
+        CloudMID->SetScalarParameterValue(TEXT("Density"), Data->Cloud.Density);
+        CloudMID->SetScalarParameterValue(TEXT("Opacity"), Data->Cloud.Opacity);
+        CloudMID->SetScalarParameterValue(TEXT("WindSpeed"), Data->Cloud.WindSpeed);
+        CloudMID->SetVectorParameterValue(TEXT("Tint"), Data->Cloud.Tint);
+    }
+}
+
+void AWorldManager::RegisterGameUpdate()
+{
+    if (GameUpdateTickHandle != INDEX_NONE)
+    {
+        return;
+    }
+
+    if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
+    {
+        GameUpdateTickHandle = GameUpdate->RegisterUpdate(
+            this,
+            [this](const float DeltaSeconds)
+            {
+                UpdateFromGameUpdate(DeltaSeconds);
+            },
+            35);
+    }
+}
+
+void AWorldManager::UnregisterGameUpdate()
+{
+    if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
+    {
+        GameUpdate->UnregisterUpdate(GameUpdateTickHandle);
+    }
+    GameUpdateTickHandle = INDEX_NONE;
+}
+
+void AWorldManager::UpdateFromGameUpdate(float DeltaSeconds)
+{
+    ApplyCloudSettings();
+    StartSkyAsyncUpdate();
+}
+
+void AWorldManager::StartSkyAsyncUpdate()
+{
+    if (bSkyUpdateInFlight || !bRenderingActive || !IsValid(Data))
     {
         return;
     }
 
     USkyUpdateAsyncAction* AsyncAction = USkyUpdateAsyncAction::SkyUpdateAsync(this, Data);
-    if (AsyncAction)
+    if (!AsyncAction)
     {
-        AsyncAction->OnCompleted.AddDynamic(this, &AWorldManager::SkyUpdate);
-        AsyncAction->Activate();
+        return;
     }
+
+    bSkyUpdateInFlight = true;
+    AsyncAction->OnCompleted.AddDynamic(this, &AWorldManager::SkyUpdate);
+    AsyncAction->Activate();
 }
 
 void AWorldManager::SkyUpdate(FLightRotation Result)
 {
+    bSkyUpdateInFlight = false;
     if (!bRenderingActive)
     {
         return;
@@ -163,6 +260,4 @@ void AWorldManager::SkyUpdate(FLightRotation Result)
     {
         Moon->SetWorldRotation(Result.Moon);
     }
-
-    GetWorldTimerManager().SetTimerForNextTick(this, &AWorldManager::AsyncTick);
 }

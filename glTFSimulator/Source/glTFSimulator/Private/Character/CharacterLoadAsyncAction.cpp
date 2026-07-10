@@ -3,6 +3,7 @@
 
 #include "Character/CharacterLoadAsyncAction.h"
 #include "Async/Async.h"
+#include "Setting/GameSettings.h"
 #include "System/FileFunctionLibrary.h"
 #include "System/MacroLibrary.h"
 #include "Character/CharacterController.h"
@@ -254,8 +255,9 @@ void UCharacterLoadAsyncAction::LoadBoneMapAsync()
                 Config.MaterialsConfig.UnlitOverrideMap = UberMaterialsOverrideMap;
                 Config.MaterialsConfig.bGeneratesMipMaps = false;
                 Config.MaterialsConfig.SpecularFactor = 0.0f;
-                Config.MaterialsConfig.ImagesConfig.MaxWidth = 1024;
-                Config.MaterialsConfig.ImagesConfig.MaxHeight = 1024;
+                const int32 TextureDimensionLimit = UGameSettings::ResolveMaxTextureResolution(Owner);
+                Config.MaterialsConfig.ImagesConfig.MaxWidth = TextureDimensionLimit;
+                Config.MaterialsConfig.ImagesConfig.MaxHeight = TextureDimensionLimit;
                 Config.MaterialsConfig.ImagesConfig.bCompressMips = false;
                 Config.MaterialsConfig.ImagesConfig.bStreaming = false;
                 Config.MaterialsConfig.bLoadMipMaps = false;

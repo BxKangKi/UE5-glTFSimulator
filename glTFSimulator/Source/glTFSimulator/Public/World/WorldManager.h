@@ -17,7 +17,9 @@ class UStaticMeshComponent;
 class USkyLightComponent;
 class UVolumetricCloudComponent;
 class UMaterialInterface;
+class UMaterialInstanceDynamic;
 class UExponentialHeightFogComponent;
+class UGameUpdateSubSystem;
 
 /**
  * Rendering-only world actor.
@@ -74,10 +76,12 @@ protected:
 private:
     /** Reads current settings and creates optional fog/cloud components. */
     void ConfigureRenderingSettings();
+    void ApplyCloudSettings();
 
-    /** Queues the next asynchronous sky rotation calculation. */
-    UFUNCTION()
-    void AsyncTick();
+    void RegisterGameUpdate();
+    void UnregisterGameUpdate();
+    void UpdateFromGameUpdate(float DeltaSeconds);
+    void StartSkyAsyncUpdate();
 
     /** Applies the asynchronous sun/moon rotation result. */
     UFUNCTION()
@@ -90,10 +94,15 @@ private:
     TObjectPtr<UVolumetricCloudComponent> Cloud;
 
     UPROPERTY()
+    TObjectPtr<UMaterialInstanceDynamic> CloudMID;
+
+    UPROPERTY()
     TObjectPtr<UExponentialHeightFogComponent> Fog;
 
     UPROPERTY()
     TObjectPtr<UGameManagerSubSystem> SubSystem;
 
+    int32 GameUpdateTickHandle = INDEX_NONE;
     bool bRenderingActive = false;
+    bool bSkyUpdateInFlight = false;
 };

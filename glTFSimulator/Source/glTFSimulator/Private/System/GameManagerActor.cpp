@@ -9,6 +9,7 @@
 #include "Weapon/WeaponActor.h"
 #include "Model/glTFStreamActor.h"
 #include "World/WorldManager.h"
+#include "World/WeatherActor.h"
 #include "Components/SceneComponent.h"
 #include "Materials/MaterialInterface.h"
 #include "UObject/ConstructorHelpers.h"
@@ -32,6 +33,7 @@ AGameManagerActor::AGameManagerActor()
     WeaponActorClass = AWeaponActor::StaticClass();
     WorldManagerClass = AWorldManager::StaticClass();
     SpawnActorClass = AglTFStreamActor::StaticClass();
+    WeatherActorClass = AWeatherActor::StaticClass();
 }
 
 void AGameManagerActor::BeginPlay()
@@ -49,7 +51,7 @@ void AGameManagerActor::BeginPlay()
             this,
             [this](const float DeltaSeconds)
             {
-                TickFromGameUpdate(DeltaSeconds);
+                UpdateFromGameUpdate(DeltaSeconds);
             },
             5);
     }
@@ -71,16 +73,11 @@ void AGameManagerActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
     Super::EndPlay(EndPlayReason);
 }
 
-void AGameManagerActor::Tick(float DeltaSeconds)
-{
-    Super::Tick(DeltaSeconds);
-    TickFromGameUpdate(DeltaSeconds);
-}
 
-void AGameManagerActor::TickFromGameUpdate(float DeltaSeconds)
+void AGameManagerActor::UpdateFromGameUpdate(float DeltaSeconds)
 {
     if (UGameManagerSubSystem* GameManager = UGameManagerSubSystem::GetSubSystem(this))
     {
-        GameManager->TickGameManager(DeltaSeconds);
+        GameManager->UpdateGameManager(DeltaSeconds);
     }
 }

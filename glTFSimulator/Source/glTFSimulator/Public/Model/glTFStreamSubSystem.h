@@ -24,7 +24,7 @@ public:
 
     virtual void Deinitialize() override;
 
-    void StartMainWorldStreaming(AActor* InOwnerActor, TSubclassOf<AglTFStreamActor> InSpawnActorClass, const FString& InModelDirectory, const FString& InPlayerDirectory, const FString& InInitialPlayerName);
+    void StartMainWorldStreaming(AActor* InOwnerActor, TSubclassOf<AglTFStreamActor> InSpawnActorClass, const FString& InModelDirectory, const FString& InPlayerDirectory, const FString& InInitialPlayerName, bool bInRenderOnlyStreaming = false);
     void StopMainWorldStreaming();
 
     bool AreInitialModelsReady() const;
@@ -34,6 +34,9 @@ public:
 
     UFUNCTION(BlueprintCallable, Category="glTF Streaming|Player")
     bool CycleNextPlayerCharacter();
+
+    void SetRenderOnlyStreaming(bool bInRenderOnlyStreaming) { bRenderOnlyStreaming = bInRenderOnlyStreaming; }
+    bool IsRenderOnlyStreaming() const { return bRenderOnlyStreaming; }
 
 private:
     UPROPERTY()
@@ -63,6 +66,7 @@ private:
     bool bInitialPlayerLoadStarted = false;
     bool bWaitingForPlayerLoad = false;
     bool bPlayerActivated = false;
+    bool bRenderOnlyStreaming = false;
     FString WaitingPath;
     TWeakObjectPtr<ACharacterController> ActivePlayerCharacter;
     TWeakObjectPtr<ACharacterController> PendingPlayerCharacter;

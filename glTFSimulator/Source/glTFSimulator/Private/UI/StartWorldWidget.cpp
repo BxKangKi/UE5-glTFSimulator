@@ -139,6 +139,22 @@ void UStartWorldWidget::ExecuteShowWorldSelectionMenu()
     UE_LOG(LogTemp, Warning, TEXT("StartWorldWidget cannot show the world-selection menu because StartActor is not assigned."));
 }
 
+void UStartWorldWidget::ExecuteShowMultiplayerMenu()
+{
+    if (AStartActor* Owner = StartActor.Get())
+    {
+        Owner->ShowMultiplayerMenu();
+        return;
+    }
+
+    UE_LOG(LogTemp, Warning, TEXT("StartWorldWidget cannot show the multiplayer menu because StartActor is not assigned."));
+}
+
+void UStartWorldWidget::ShowMultiplayerMenu()
+{
+    ExecuteShowMultiplayerMenu();
+}
+
 void UStartWorldWidget::ExecuteRefreshWorldSelectionData()
 {
     if (AStartActor* Owner = StartActor.Get())
@@ -175,6 +191,30 @@ void UStartWorldWidget::BindDefaultButtons()
         RefreshButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteRefreshWorldSelectionData);
         RefreshButton->OnClicked.AddDynamic(this, &UStartWorldWidget::ExecuteRefreshWorldSelectionData);
     }
+
+    if (MultiplayerButton)
+    {
+        MultiplayerButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteShowMultiplayerMenu);
+        MultiplayerButton->OnClicked.AddDynamic(this, &UStartWorldWidget::ExecuteShowMultiplayerMenu);
+    }
+
+    if (HostButton)
+    {
+        HostButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteHostSelectedWorld);
+        HostButton->OnClicked.AddDynamic(this, &UStartWorldWidget::ExecuteHostSelectedWorld);
+    }
+
+    if (ClientButton)
+    {
+        ClientButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteOpenClientConnectionWorld);
+        ClientButton->OnClicked.AddDynamic(this, &UStartWorldWidget::ExecuteOpenClientConnectionWorld);
+    }
+
+    if (JoinButton)
+    {
+        JoinButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteJoinSelectedWorld);
+        JoinButton->OnClicked.AddDynamic(this, &UStartWorldWidget::ExecuteJoinSelectedWorld);
+    }
 }
 
 void UStartWorldWidget::UnbindDefaultButtons()
@@ -194,6 +234,22 @@ void UStartWorldWidget::UnbindDefaultButtons()
     if (RefreshButton)
     {
         RefreshButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteRefreshWorldSelectionData);
+    }
+    if (MultiplayerButton)
+    {
+        MultiplayerButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteShowMultiplayerMenu);
+    }
+    if (HostButton)
+    {
+        HostButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteHostSelectedWorld);
+    }
+    if (ClientButton)
+    {
+        ClientButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteOpenClientConnectionWorld);
+    }
+    if (JoinButton)
+    {
+        JoinButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteJoinSelectedWorld);
     }
 }
 
@@ -279,6 +335,97 @@ bool UStartWorldWidget::OpenWorldFromButtonText(UButton* Button)
     }
 
     return OpenWorldByDisplayName(ButtonText);
+}
+
+void UStartWorldWidget::ExecuteHostSelectedWorld()
+{
+    HostSelectedWorld();
+}
+
+bool UStartWorldWidget::HostSelectedWorld()
+{
+    return HostWorldByFolderName(SelectedWorldFolderName);
+}
+
+bool UStartWorldWidget::HostWorldByFolderName(const FString& WorldFolderName)
+{
+    FString ResolvedFolderName;
+    if (!ResolveWorldFolderName(WorldFolderName, ResolvedFolderName))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("StartWorldWidget cannot host unknown world: %s"), *WorldFolderName);
+        return false;
+    }
+
+    SelectedWorldFolderName = ResolvedFolderName;
+    if (AStartActor* Owner = StartActor.Get())
+    {
+        Owner->HostMultiplayerWorldByFolderName(ResolvedFolderName);
+        return true;
+    }
+
+    UE_LOG(LogTemp, Warning, TEXT("StartWorldWidget cannot host world because StartActor is not assigned."));
+    return false;
+}
+
+void UStartWorldWidget::ExecuteJoinSelectedWorld()
+{
+    JoinSelectedWorld();
+}
+
+bool UStartWorldWidget::JoinSelectedWorld()
+{
+    if (AStartActor* Owner = StartActor.Get())
+    {
+        Owner->JoinMultiplayerServer(ServerAddress, SelectedWorldFolderName);
+        return true;
+    }
+
+    UE_LOG(LogTemp, Warning, TEXT("StartWorldWidget cannot join multiplayer because StartActor is not assigned."));
+    return false;
+}
+
+bool UStartWorldWidget::JoinServer(const FString& InServerAddress)
+{
+    SetServerAddress(InServerAddress);
+    if (AStartActor* Owner = StartActor.Get())
+    {
+        Owner->JoinMultiplayerServer(ServerAddress, SelectedWorldFolderName);
+        return true;
+    }
+
+    UE_LOG(LogTemp, Warning, TEXT("StartWorldWidget cannot join server because StartActor is not assigned."));
+    return false;
+}
+
+void UStartWorldWidget::ExecuteOpenClientConnectionWorld()
+{
+    OpenClientConnectionWorld();
+}
+
+bool UStartWorldWidget::OpenClientConnectionWorld()
+{
+    if (AStartActor* Owner = StartActor.Get())
+    {
+        Owner->OpenClientConnectionWorld(ServerAddress);
+        return true;
+    }
+
+    UE_LOG(LogTemp, Warning, TEXT("StartWorldWidget cannot open ClientWorld because StartActor is not assigned."));
+    return false;
+}
+
+void UStartWorldWidget::SetServerAddress(const FString& InServerAddress)
+{
+    ServerAddress = NormalizeStartWorldText(InServerAddress);
+    if (ServerAddress.IsEmpty())
+    {
+        ServerAddress = TEXT("127.0.0.1:7777");
+    }
+
+    if (AStartActor* Owner = StartActor.Get())
+    {
+        Owner->SetPendingServerAddress(ServerAddress);
+    }
 }
 
 FString UStartWorldWidget::GetButtonTextFromUI(UButton* Button) const
@@ -376,6 +523,42 @@ void UStartWorldWidget::CacheDefaultButtons()
         if (!RefreshButton)
         {
             RefreshButton = Cast<UButton>(WidgetTree->FindWidget(TEXT("WorldSelection_RefreshButton")));
+        }
+    }
+
+    if (!MultiplayerButton)
+    {
+        MultiplayerButton = Cast<UButton>(WidgetTree->FindWidget(TEXT("MultiplayerButton")));
+        if (!MultiplayerButton)
+        {
+            MultiplayerButton = Cast<UButton>(WidgetTree->FindWidget(TEXT("OpenMultiplayerButton")));
+        }
+    }
+
+    if (!HostButton)
+    {
+        HostButton = Cast<UButton>(WidgetTree->FindWidget(TEXT("HostButton")));
+        if (!HostButton)
+        {
+            HostButton = Cast<UButton>(WidgetTree->FindWidget(TEXT("HostWorldButton")));
+        }
+    }
+
+    if (!ClientButton)
+    {
+        ClientButton = Cast<UButton>(WidgetTree->FindWidget(TEXT("ClientButton")));
+        if (!ClientButton)
+        {
+            ClientButton = Cast<UButton>(WidgetTree->FindWidget(TEXT("ClientWorldButton")));
+        }
+    }
+
+    if (!JoinButton)
+    {
+        JoinButton = Cast<UButton>(WidgetTree->FindWidget(TEXT("JoinButton")));
+        if (!JoinButton)
+        {
+            JoinButton = Cast<UButton>(WidgetTree->FindWidget(TEXT("JoinServerButton")));
         }
     }
 }

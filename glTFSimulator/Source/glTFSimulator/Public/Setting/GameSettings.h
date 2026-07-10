@@ -53,6 +53,9 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Quality", meta=(ClampMin="0", ClampMax="3"))
     int32 TextureQuality = 2;
 
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Rendering", meta=(ClampMin="64", ClampMax="8192"))
+    int32 MaxTextureResolution = 768;
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Quality", meta=(ClampMin="0", ClampMax="3"))
     int32 ViewDistanceQuality = 2;
 
@@ -84,6 +87,9 @@ public:
     int32 ReflectionMethod = 1;
 
     static UGameSettings *CreateSettingsData(UObject *Onwer = nullptr);
+    static int32 GetDefaultMaxTextureResolution() { return 768; }
+    int32 GetClampedMaxTextureResolution() const;
+    static int32 ResolveMaxTextureResolution(const UObject* WorldContextObject);
     UFUNCTION()
     void LoadSettingsData();
     UFUNCTION()

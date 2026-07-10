@@ -10,7 +10,7 @@
 class UStartWorldWidget;
 
 /**
- * Owns the StartWorld menu flow.
+ * Owns the MainWorld menu flow.
  *
  * BP_StartWorld should inherit from this actor. WBP_StartWorld and WBP_LevelMenu
  * should inherit from UStartWorldWidget so buttons call typed C++ functions instead
@@ -36,9 +36,13 @@ public:
     UFUNCTION(BlueprintCallable, Category="Start World|UI")
     void ShowStartMenu();
 
-    /** Rebuilds and shows the world-selection widget. */
+    /** Rebuilds and shows the world-selection widget for single-player world travel. */
     UFUNCTION(BlueprintCallable, Category="Start World|UI")
     void ShowWorldSelectionMenu();
+
+    /** Rebuilds and shows the multiplayer menu. If no dedicated widget is assigned, it falls back to the world-selection widget. */
+    UFUNCTION(BlueprintCallable, Category="Start World|UI")
+    void ShowMultiplayerMenu();
 
     /** Re-scans available world folders and refreshes the opened world-selection widget. */
     UFUNCTION(BlueprintCallable, Category="Start World|Data")
@@ -52,9 +56,27 @@ public:
     UFUNCTION(BlueprintCallable, Category="Start World|Data")
     bool TryResolveWorldFolderFromDisplayName(const FString& DisplayName, FString& OutFolderName) const;
 
-    /** Opens the gameplay map after selecting a world folder from WBP_LevelMenu. */
+    /** Opens the single-player gameplay map after selecting a world folder from WBP_LevelMenu. */
     UFUNCTION(BlueprintCallable, Category="Start World|Navigation")
     void OpenGameplayWorldByFolderName(const FString& WorldFolderName);
+
+    UFUNCTION(BlueprintCallable, Category="Start World|Navigation")
+    void OpenSinglePlayerWorldByFolderName(const FString& WorldFolderName);
+
+    UFUNCTION(BlueprintCallable, Category="Start World|Navigation")
+    void HostMultiplayerWorldByFolderName(const FString& WorldFolderName);
+
+    UFUNCTION(BlueprintCallable, Category="Start World|Navigation")
+    void OpenClientConnectionWorld(const FString& InServerAddress);
+
+    UFUNCTION(BlueprintCallable, Category="Start World|Navigation")
+    void JoinMultiplayerServer(const FString& InServerAddress, const FString& OptionalWorldFolderName);
+
+    UFUNCTION(BlueprintCallable, Category="Start World|Navigation")
+    void SetPendingServerAddress(const FString& InServerAddress);
+
+    UFUNCTION(BlueprintPure, Category="Start World|Navigation")
+    FString GetPendingServerAddress() const { return PendingServerAddress; }
 
     /** Cleans StartWorld UI and editor-only transaction references before any menu-triggered map travel. */
     UFUNCTION(BlueprintCallable, Category="Start World|Navigation")
@@ -72,9 +94,22 @@ protected:
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Start World|UI")
     TSubclassOf<UStartWorldWidget> WorldSelectionWidgetClass;
 
-    /** Gameplay level opened after WBP_LevelMenu selects a world folder. */
+    /** Optional multiplayer menu widget class. Falls back to WorldSelectionWidgetClass when empty. */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Start World|UI")
+    TSubclassOf<UStartWorldWidget> MultiplayerMenuWidgetClass;
+
+    /** Single-player gameplay level opened after WBP_LevelMenu selects a world folder. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Start World|Navigation")
-    FName GameplayLevelName = TEXT("MainWorld");
+    FName GameplayLevelName = TEXT("SingleWorld");
+
+    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Start World|Navigation")
+    FName HostWorldLevelName = TEXT("HostWorld");
+
+    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Start World|Navigation")
+    FName ClientWorldLevelName = TEXT("ClientWorld");
+
+    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Start World|Navigation")
+    FString DefaultServerAddress = TEXT("127.0.0.1:7777");
 
     /** Z order used when adding start/world-selection widgets to the viewport. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Start World|UI")
@@ -106,5 +141,11 @@ private:
     TObjectPtr<UStartWorldWidget> WorldSelectionWidget;
 
     UPROPERTY(Transient)
+    TObjectPtr<UStartWorldWidget> MultiplayerMenuWidget;
+
+    UPROPERTY(Transient)
     TMap<FString, FString> FolderNameMap;
+
+    UPROPERTY(Transient)
+    FString PendingServerAddress = TEXT("127.0.0.1:7777");
 };

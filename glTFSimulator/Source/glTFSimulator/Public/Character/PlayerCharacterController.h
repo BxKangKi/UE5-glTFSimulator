@@ -177,7 +177,6 @@ public:
 protected:
     virtual void BeginPlay() override;
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
-    virtual void Tick(float DeltaSeconds) override;
     virtual void SetupInputComponent() override;
     virtual void BeginPlayingState() override;
 
@@ -259,16 +258,16 @@ public:
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Pause")
     int32 SettingsMenuZOrder = 110;
 
-    // Leaving a gameplay world returns to StartWorld, then StartActor opens the world-selection widget.
+    // Leaving a gameplay world returns to MainWorld, then StartActor opens the world-selection widget.
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Pause|Navigation")
-    FName WorldSelectionLevelName = TEXT("StartWorld");
+    FName WorldSelectionLevelName = TEXT("MainWorld");
 
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Pause|Navigation")
-    FName MainMenuLevelName = TEXT("StartWorld");
+    FName MainMenuLevelName = TEXT("MainWorld");
 
     // Legacy property kept for older Blueprint assets. New code uses WorldSelectionLevelName.
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Pause|Navigation", meta=(DeprecatedProperty, DeprecationMessage="Use WorldSelectionLevelName instead."))
-    FName ExitLevelName = TEXT("StartWorld");
+    FName ExitLevelName = TEXT("MainWorld");
 
     UFUNCTION(BlueprintCallable, Category="Pause")
     UUserWidget* CreatePauseMenu();
@@ -290,7 +289,7 @@ public:
 
     // Legacy wrapper. It now routes gameplay exits to the world-selection screen.
     UFUNCTION(BlueprintCallable, Category="Pause|Navigation")
-    void ExitToStartWorldFromPauseMenu();
+    void ExitToMainWorldFromPauseMenu();
 
     UFUNCTION(BlueprintCallable, Category="Pause|Navigation")
     void ExitToWorldSelectionFromPauseMenu();
@@ -413,9 +412,11 @@ private:
     void FallbackMoveRightReleased();
     void FallbackMoveLeftPressed();
     void FallbackMoveLeftReleased();
-    void TickFromGameUpdate(float DeltaSeconds);
+    void UpdateFromGameUpdate(float DeltaSeconds);
     void UpdateFallbackMoveInput();
     void StopFallbackMovement();
+    void StopGameplayMotionForUI();
+    void ReapplyHeldGameplayInput();
     void FallbackLookYaw(float Value);
     void FallbackLookPitch(float Value);
     bool ConsumeInputDebounce(double& LastInputTime);
@@ -438,6 +439,8 @@ private:
     bool bFallbackMoveBackward = false;
     bool bFallbackMoveRight = false;
     bool bFallbackMoveLeft = false;
+    bool bSprintInputHeld = false;
+    bool bCrouchInputHeld = false;
     bool bEnhancedInputComponentWasAvailable = false;
     bool bAnyInputMappingContextApplied = false;
     int32 GameUpdateTickHandle = INDEX_NONE;

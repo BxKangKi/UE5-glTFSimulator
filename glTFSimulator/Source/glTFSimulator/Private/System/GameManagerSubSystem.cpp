@@ -14,8 +14,12 @@
 #include "Weapon/WeaponActor.h"
 #include "Model/glTFStreamActor.h"
 #include "World/WorldManager.h"
+#include "World/WeatherActor.h"
+#include "World/PlayerData.h"
 #include "ProceduralMeshComponent.h"
 #include "System/MacroLibrary.h"
+#include "System/MultiplayerWorldSubSystem.h"
+#include "System/MultiplayerWorldStateActor.h"
 #include "System/PhysicsHelper.h"
 #include "Setting/GameSettings.h"
 #include "World/WorldData.h"
@@ -35,12 +39,14 @@
 #include "Blueprint/UserWidget.h"
 #include "Components/PrimitiveComponent.h"
 #include "Components/SceneComponent.h"
+#include "Components/SkeletalMeshComponent.h"
 #include "Materials/MaterialInterface.h"
 #include "Engine/World.h"
 #include "Engine/Engine.h"
 #include "EngineUtils.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/Pawn.h"
+#include "GameFramework/Character.h"
 #include "HAL/FileManager.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
@@ -68,6 +74,7 @@ UGameManagerSubSystem::UGameManagerSubSystem()
     EditableMeshActorClass = AEditableMeshActor::StaticClass();
     VehiclePawnClass = AVehiclePawn::StaticClass();
     WeaponActorClass = AWeaponActor::StaticClass();
+    WeatherActorClass = AWeatherActor::StaticClass();
     WorldManagerClass = AWorldManager::StaticClass();
     SpawnActorClass = AglTFStreamActor::StaticClass();
 }
@@ -272,6 +279,7 @@ void UGameManagerSubSystem::ApplyEditorConfig(const AGameManagerActor* InConfigA
     EditableMeshActorClass = InConfigActor->EditableMeshActorClass;
     VehiclePawnClass = InConfigActor->VehiclePawnClass;
     WeaponActorClass = InConfigActor->WeaponActorClass;
+    WeatherActorClass = InConfigActor->WeatherActorClass;
     WorldManagerClass = InConfigActor->WorldManagerClass;
     SpawnActorClass = InConfigActor->SpawnActorClass;
     WaterClass = InConfigActor->WaterClass;
@@ -341,6 +349,25 @@ void UGameManagerSubSystem::StartGameManager(AGameManagerActor* InConfigActor)
 
     ConfigActor = InConfigActor;
     ApplyEditorConfig(InConfigActor);
+
+    if (UWorld* World = GetWorld())
+    {
+        const TCHAR* WorldOption = World->URL.GetOption(TEXT("World="), nullptr);
+        if (WorldOption && FCString::Strlen(WorldOption) > 0)
+        {
+            CurrentWorldName = FString(WorldOption);
+            if (UMultiplayerWorldSubSystem* Multiplayer = UMultiplayerWorldSubSystem::Get(this))
+            {
+                Multiplayer->SetSelectedWorldFolderName(CurrentWorldName);
+            }
+        }
+
+        if (World->GetNetMode() != NM_Standalone && World->GetNetMode() != NM_Client)
+        {
+            AMultiplayerWorldStateActor::SpawnOrUpdateForWorld(this, CurrentWorldName);
+        }
+    }
+
     EnsureRuntimeComponents();
 
     // Input and UI code may request the manager repeatedly; only run the boot sequence once per config actor.
@@ -408,6 +435,8 @@ void UGameManagerSubSystem::StopGameManager(const EEndPlayReason::Type EndPlayRe
     if (bHadActiveMainWorld && bSaveSceneOnEndPlay && EndPlayReason != EEndPlayReason::Destroyed)
     {
         SaveScene();
+        SaveWorldData();
+        SavePlayerData();
     }
 
     ReleaseMainWorldRuntimeMemory(false);
@@ -417,6 +446,7 @@ void UGameManagerSubSystem::PrepareForReturnToMenuLevel()
 {
     SaveScene();
     SaveWorldData();
+    SavePlayerData();
 
     // The old gameplay world will still exist until OpenLevel finishes. Do the destructive release now,
     // then run the expensive full purge once the menu/world-selection level has loaded.
@@ -424,27 +454,39 @@ void UGameManagerSubSystem::PrepareForReturnToMenuLevel()
     ReleaseMainWorldRuntimeMemory(false);
 }
 
+void UGameManagerSubSystem::PrepareForReturnToMainWorld()
+{
+    // MainWorld/menu entry point. The cleanup path is shared by menu and world-selection level travel.
+    PrepareForReturnToMenuLevel();
+}
+
 void UGameManagerSubSystem::PrepareForReturnToStartWorld()
 {
-    // Backward-compatible Blueprint entry point. The cleanup path is no longer tied to StartWorld.
-    PrepareForReturnToMenuLevel();
+    // Backward-compatible Blueprint/C++ entry point for projects that have not refreshed renamed nodes yet.
+    PrepareForReturnToMainWorld();
+}
+
+void UGameManagerSubSystem::RequestWorldSelectionMenuOnNextMainWorld()
+{
+    bOpenWorldSelectionMenuOnNextMainWorld = true;
 }
 
 void UGameManagerSubSystem::RequestWorldSelectionMenuOnNextStartWorld()
 {
-    bOpenWorldSelectionMenuOnNextStartWorld = true;
+    // Backward-compatible Blueprint/C++ entry point for projects that have not refreshed renamed nodes yet.
+    RequestWorldSelectionMenuOnNextMainWorld();
 }
 
 bool UGameManagerSubSystem::ConsumeWorldSelectionMenuRequest()
 {
-    const bool bShouldOpenWorldSelection = bOpenWorldSelectionMenuOnNextStartWorld;
-    bOpenWorldSelectionMenuOnNextStartWorld = false;
+    const bool bShouldOpenWorldSelection = bOpenWorldSelectionMenuOnNextMainWorld;
+    bOpenWorldSelectionMenuOnNextMainWorld = false;
     return bShouldOpenWorldSelection;
 }
 
 void UGameManagerSubSystem::ClearWorldSelectionMenuRequest()
 {
-    bOpenWorldSelectionMenuOnNextStartWorld = false;
+    bOpenWorldSelectionMenuOnNextMainWorld = false;
 }
 
 void UGameManagerSubSystem::ReleaseMainWorldRuntimeMemory(bool bForceGarbageCollection)
@@ -652,10 +694,11 @@ void UGameManagerSubSystem::RunPostLoadRuntimeMemoryCleanup()
 void UGameManagerSubSystem::InitializeWorldSystems(UWorldData* InWorldData, const FString& InModelDirectory, const FString& InPlayerDirectory, const FString& InInitialPlayerName)
 {
     ActiveWorldData = InWorldData;
+    ApplyLevelSettings();
 
     // Keep gameplay-owned world actors centralized here: water and streamed GLB actors are not rendering concerns.
     SpawnOcean();
-    StartWorldStreaming(InModelDirectory, InPlayerDirectory, InInitialPlayerName);
+    MainWorldStreaming(InModelDirectory, InPlayerDirectory, InInitialPlayerName);
 }
 
 void UGameManagerSubSystem::StopWorldSystems()
@@ -673,6 +716,12 @@ void UGameManagerSubSystem::StopWorldSystems()
         // GameInstance subsystems persist after map travel. If our cached pointer was already cleared,
         // still force-stop the global streaming subsystem so glTF assets cannot stay resident.
         GlobalStreamSubSystem->StopMainWorldStreaming();
+    }
+
+    if (IsValid(ActiveWeatherActor))
+    {
+        ActiveWeatherActor->Destroy();
+        ActiveWeatherActor = nullptr;
     }
 
     if (IsValid(OceanActor))
@@ -697,6 +746,8 @@ void UGameManagerSubSystem::StopWorldSystems()
     }
 
     bSpawnedWorldManager = false;
+    ActivePlayerData = nullptr;
+    bCurrentLevelCheatsEnabled = false;
     ActiveWorldData = nullptr;
     SetWorldData(nullptr);
 }
@@ -725,6 +776,8 @@ void UGameManagerSubSystem::InitializeWorldBootstrap()
     // Loading UI, world data, world rendering, water, and GLB streaming now start from one owner.
     ShowLoadingWidget();
     LoadWorldData();
+    LoadPlayerData();
+    ApplyLevelSettings();
     SpawnWorldManager();
 
     if (IsValid(WorldManagerActor))
@@ -736,7 +789,7 @@ void UGameManagerSubSystem::InitializeWorldBootstrap()
         ActiveWorldData,
         GetWorldFilePath(MODEL_DIRECTORY),
         GetWorldFilePath(PLAYER_DIRECTORY),
-        IsValid(ActiveWorldData) ? ActiveWorldData->Player : FString());
+        ActivePlayerId);
 
     LoadWorldAsync();
 }
@@ -798,8 +851,35 @@ void UGameManagerSubSystem::LoadWorldData()
         SaveWorldData();
     }
 
+    // Legacy fallback only. The authoritative per-player transform is loaded from player.json next.
     SetPlayerLocation(ActiveWorldData->PlayerLocation);
     SetWorldData(ActiveWorldData);
+}
+
+void UGameManagerSubSystem::LoadPlayerData()
+{
+    ActivePlayerData = NewObject<UPlayerData>(this);
+    if (!IsValid(ActivePlayerData))
+    {
+        return;
+    }
+
+    ActivePlayerId = IsValid(ActiveWorldData) && !ActiveWorldData->Player.IsEmpty()
+        ? ActiveWorldData->Player
+        : FString(TEXT("Player"));
+
+    const FString Path = GetWorldFilePath(PLAYER_FILE_NAME);
+    const TSharedPtr<FJsonObject> Json = UFileFunctionLibrary::FromJson(Path);
+    if (!UPlayerData::DeserializeData(ActivePlayerData, Json) || ActivePlayerData->Players.Num() == 0)
+    {
+        FWorldPlayerRecord& DefaultPlayer = ActivePlayerData->FindOrAddPlayer(ActivePlayerId);
+        DefaultPlayer.Location = IsValid(ActiveWorldData) ? ActiveWorldData->PlayerLocation : FVector::ZeroVector;
+        DefaultPlayer.DisplayName = ActivePlayerId;
+        SavePlayerData();
+    }
+
+    FWorldPlayerRecord& PlayerRecord = ActivePlayerData->FindOrAddPlayer(ActivePlayerId);
+    SetPlayerLocation(PlayerRecord.Location);
 }
 
 void UGameManagerSubSystem::SaveWorldData()
@@ -813,11 +893,98 @@ void UGameManagerSubSystem::SaveWorldData()
     UFileFunctionLibrary::ToJsonAsync(Json, GetWorldFilePath(LEVEL_FILE_NAME));
 }
 
-void UGameManagerSubSystem::SaveWorldDataTick()
+void UGameManagerSubSystem::SavePlayerData()
 {
-    SaveWorldData();
+    if (!IsValid(ActivePlayerData))
+    {
+        return;
+    }
 
+    FWorldPlayerRecord& PlayerRecord = ActivePlayerData->FindOrAddPlayer(ActivePlayerId);
+    PlayerRecord.Location = GetPlayerLocation();
+    if (const AActor* Player = PlayerActor.Get())
+    {
+        PlayerRecord.Rotation = Player->GetActorRotation();
+    }
+
+    const TSharedRef<FJsonObject> Json = UPlayerData::SerializeData(ActivePlayerData);
+    UFileFunctionLibrary::ToJsonAsync(Json, GetWorldFilePath(PLAYER_FILE_NAME));
+}
+
+void UGameManagerSubSystem::ApplyLevelSettings()
+{
+    ApplyGameplaySettings();
+    ApplyWeatherSettings();
+}
+
+void UGameManagerSubSystem::ApplyWeatherSettings()
+{
     UWorld* World = GetWorld();
+    if (!World || !IsValid(ActiveWorldData))
+    {
+        return;
+    }
+
+    if (!ActiveWorldData->Weather.bEnabled)
+    {
+        if (IsValid(ActiveWeatherActor))
+        {
+            ActiveWeatherActor->Destroy();
+            ActiveWeatherActor = nullptr;
+        }
+        return;
+    }
+
+    if (!IsValid(ActiveWeatherActor))
+    {
+        UClass* SpawnClass = WeatherActorClass ? WeatherActorClass.Get() : AWeatherActor::StaticClass();
+        FActorSpawnParameters Params;
+        Params.Owner = ConfigActor.Get();
+        ActiveWeatherActor = World->SpawnActor<AWeatherActor>(SpawnClass, FTransform::Identity, Params);
+    }
+
+    if (IsValid(ActiveWeatherActor))
+    {
+        ActiveWeatherActor->ConfigureWeather(ActiveWorldData->Weather.Preset, ActiveWorldData->Weather.Intensity);
+    }
+}
+
+void UGameManagerSubSystem::ApplyGameplaySettings()
+{
+    bCurrentLevelCheatsEnabled = IsValid(ActiveWorldData) && ActiveWorldData->Gameplay.bCheatsEnabled;
+
+    if (IsValid(ActiveWorldData))
+    {
+        if (ActiveWorldData->Gameplay.WorldGameMode.Equals(TEXT("Creator"), ESearchCase::IgnoreCase))
+        {
+            PlayMode = EPlayMode::Creator;
+        }
+        else if (ActiveWorldData->Gameplay.WorldGameMode.Equals(TEXT("RealLife"), ESearchCase::IgnoreCase))
+        {
+            PlayMode = EPlayMode::RealLife;
+        }
+    }
+
+    if (bCurrentLevelCheatsEnabled)
+    {
+        if (APlayerController* PC = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr)
+        {
+            PC->EnableCheats();
+        }
+    }
+}
+
+void UGameManagerSubSystem::SaveWorldDataDelayed()
+{
+    UWorld* World = GetWorld();
+    if (World && World->GetNetMode() == NM_Client)
+    {
+        return;
+    }
+
+    SaveWorldData();
+    SavePlayerData();
+
     if (!World || !bManagerStarted)
     {
         return;
@@ -828,7 +995,7 @@ void UGameManagerSubSystem::SaveWorldDataTick()
     World->GetTimerManager().SetTimer(
         WorldDataSaveTimerHandle,
         this,
-        &UGameManagerSubSystem::SaveWorldDataTick,
+        &UGameManagerSubSystem::SaveWorldDataDelayed,
         10.0f,
         false);
 }
@@ -846,7 +1013,10 @@ void UGameManagerSubSystem::LoadWorldAsync()
         SetLoadingStatus(1.0f);
         HideLoadingWidget();
         SetWorldLoading(false);
-        SaveWorldDataTick();
+        if (!GetWorld() || GetWorld()->GetNetMode() != NM_Client)
+        {
+            SaveWorldDataDelayed();
+        }
 
         if (!GetGamePaused())
         {
@@ -872,8 +1042,29 @@ void UGameManagerSubSystem::UpdateWorldTime(float DeltaSeconds)
         return;
     }
 
+    if (const UWorld* World = GetWorld())
+    {
+        if (World->GetNetMode() == NM_Client)
+        {
+            return;
+        }
+    }
+
     ActiveWorldData->WorldTime += DeltaSeconds * ActiveWorldData->TimeSpeed;
-    ActiveWorldData->PlayerLocation = GetPlayerLocation();
+
+    // Player transforms live in player.json. Keep the legacy level.json location mirrored only
+    // for backward compatibility with older worlds that have not generated player.json yet.
+    const FVector CurrentLocation = GetPlayerLocation();
+    ActiveWorldData->PlayerLocation = CurrentLocation;
+    if (IsValid(ActivePlayerData))
+    {
+        FWorldPlayerRecord& PlayerRecord = ActivePlayerData->FindOrAddPlayer(ActivePlayerId);
+        PlayerRecord.Location = CurrentLocation;
+        if (const AActor* Player = PlayerActor.Get())
+        {
+            PlayerRecord.Rotation = Player->GetActorRotation();
+        }
+    }
 }
 
 FString UGameManagerSubSystem::GetWorldFilePath(const FString& FileName) const
@@ -935,6 +1126,12 @@ void UGameManagerSubSystem::SpawnOcean()
 
 void UGameManagerSubSystem::StartWorldStreaming(const FString& InModelDirectory, const FString& InPlayerDirectory, const FString& InInitialPlayerName)
 {
+    // Backward-compatible private wrapper for pre-rename C++ call sites.
+    MainWorldStreaming(InModelDirectory, InPlayerDirectory, InInitialPlayerName);
+}
+
+void UGameManagerSubSystem::MainWorldStreaming(const FString& InModelDirectory, const FString& InPlayerDirectory, const FString& InInitialPlayerName)
+{
     UWorld* World = GetWorld();
     if (!World)
     {
@@ -954,15 +1151,17 @@ void UGameManagerSubSystem::StartWorldStreaming(const FString& InModelDirectory,
         EffectiveSpawnClass = AglTFStreamActor::StaticClass();
     }
 
+    const bool bRenderOnlyStreaming = UMultiplayerWorldSubSystem::ShouldUseClientRenderOnlyStreaming(this);
     StreamSubSystem->StartMainWorldStreaming(
         ConfigActor.Get(),
         EffectiveSpawnClass,
         InModelDirectory,
         InPlayerDirectory,
-        InInitialPlayerName);
+        InInitialPlayerName,
+        bRenderOnlyStreaming);
 }
 
-void UGameManagerSubSystem::TickGameManager(float DeltaSeconds)
+void UGameManagerSubSystem::UpdateGameManager(float DeltaSeconds)
 {
     UpdateWorldTime(DeltaSeconds);
 
@@ -1617,15 +1816,15 @@ void UGameManagerSubSystem::OpenWorldSelectionScreen(const UObject* WorldContext
     if (UGameManagerSubSystem* Manager = FindGameManager(WorldContextObject))
     {
         Manager->PrepareForReturnToMenuLevel();
-        Manager->RequestWorldSelectionMenuOnNextStartWorld();
+        Manager->RequestWorldSelectionMenuOnNextMainWorld();
     }
 
-    // The project uses the StartWorld map for both the main menu and the world-selection widget.
-    // StartActor consumes the pending request above and opens the level menu after StartWorld loads.
+    // The project uses the MainWorld map for both the main menu and the world-selection widget.
+    // StartActor consumes the pending request above and opens the level menu after MainWorld loads.
     static const FName LegacyWorldSelectionLevelName(TEXT("WorldSelectWorld"));
     const FName TargetLevelName = (WorldSelectionLevelName != NAME_None && WorldSelectionLevelName != LegacyWorldSelectionLevelName)
         ? WorldSelectionLevelName
-        : FName(TEXT("StartWorld"));
+        : FName(TEXT("MainWorld"));
     ResetEditorTransactionBufferForWorldTravel(WorldContextObject, TEXT("Open world-selection screen"));
     UGameplayStatics::OpenLevel(WorldContextObject, TargetLevelName);
 }
@@ -1645,7 +1844,7 @@ void UGameManagerSubSystem::OpenMainMenuFromWorldSelection(const UObject* WorldC
 
     const FName TargetLevelName = MainMenuLevelName != NAME_None
         ? MainMenuLevelName
-        : FName(TEXT("StartWorld"));
+        : FName(TEXT("MainWorld"));
     ResetEditorTransactionBufferForWorldTravel(WorldContextObject, TEXT("Open main menu from world selection"));
     UGameplayStatics::OpenLevel(WorldContextObject, TargetLevelName);
 }
@@ -1822,12 +2021,6 @@ void UGameManagerSubSystem::SelectNextWeapon()
 void UGameManagerSubSystem::EquipCurrentWeapon()
 {
     ScanAssetFolders();
-    if (!WeaponFiles.IsValidIndex(CurrentWeaponIndex))
-    {
-        LastSaveMessage = TEXT("items/ 폴더에 gltf 또는 glb 무기가 없습니다.");
-        NotifyStateChanged();
-        return;
-    }
 
     APlayerController* PC = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr;
     if (!IsValid(PC))
@@ -1843,21 +2036,43 @@ void UGameManagerSubSystem::EquipCurrentWeapon()
         EquippedWeapon = nullptr;
     }
 
-    UCameraComponent* Camera = nullptr;
-    if (UGameManagerSubSystem* GameSys = UGameManagerSubSystem::GetSubSystem(GetWorld()))
+    USceneComponent* AttachTarget = nullptr;
+    if (ACharacter* CharacterPawn = Cast<ACharacter>(PC->GetPawn()))
     {
-        Camera = GameSys->GetCameraComponent<UCameraComponent>();
+        AttachTarget = CharacterPawn->GetMesh();
+    }
+    if (!IsValid(AttachTarget))
+    {
+        AttachTarget = GetCameraComponent<UCameraComponent>();
     }
 
+    if (!IsValid(AttachTarget))
+    {
+        LastSaveMessage = TEXT("무기를 부착할 캐릭터 메시 또는 카메라를 찾을 수 없습니다.");
+        NotifyStateChanged();
+        return;
+    }
+
+    const bool bHasConfiguredWeaponFile = WeaponFiles.IsValidIndex(CurrentWeaponIndex);
+    const FString SelectedWeaponFile = bHasConfiguredWeaponFile ? WeaponFiles[CurrentWeaponIndex] : FString();
+
     FActorSpawnParameters Params;
-    Params.Owner = ConfigActor.Get();
+    Params.Owner = PC->GetPawn() ? Cast<AActor>(PC->GetPawn()) : ConfigActor.Get();
+    Params.Instigator = PC->GetPawn();
     UClass* WeaponSpawnClass = WeaponActorClass ? WeaponActorClass.Get() : AWeaponActor::StaticClass();
     AWeaponActor* Weapon = GetWorld()->SpawnActor<AWeaponActor>(WeaponSpawnClass, FTransform::Identity, Params);
-    if (IsValid(Weapon) && Weapon->EquipFromFile(WeaponFiles[CurrentWeaponIndex], Camera))
+
+    const bool bEquipped = IsValid(Weapon) && (bHasConfiguredWeaponFile
+        ? Weapon->EquipFromFile(SelectedWeaponFile, AttachTarget)
+        : Weapon->EquipDefault(AttachTarget));
+
+    if (bEquipped)
     {
         EquippedWeapon = Weapon;
         CurrentMode = EToolMode::Weapon;
-        LastSaveMessage = FString::Printf(TEXT("무기 장착: %s"), *GetCurrentWeaponName());
+        LastSaveMessage = bHasConfiguredWeaponFile
+            ? FString::Printf(TEXT("무기 장착: %s"), *GetCurrentWeaponName())
+            : TEXT("기본 테스트 무기 장착");
     }
     else if (IsValid(Weapon))
     {
@@ -2669,6 +2884,10 @@ void UGameManagerSubSystem::PlaceCurrentPrefab(const FVector& Location)
     const FRotator SpawnRot = FRotator(0.0f, GetWorld()->GetFirstPlayerController() ? GetWorld()->GetFirstPlayerController()->GetControlRotation().Yaw : 0.0f, 0.0f);
     UClass* PrefabSpawnClass = PrefabActorClass ? PrefabActorClass.Get() : APrefabActor::StaticClass();
     APrefabActor* Actor = GetWorld()->SpawnActor<APrefabActor>(PrefabSpawnClass, FTransform(SpawnRot, Location), Params);
+    if (IsValid(Actor))
+    {
+        Actor->SetRenderOnlyMode(UMultiplayerWorldSubSystem::ShouldUseClientRenderOnlyStreaming(this));
+    }
     if (IsValid(Actor) && Actor->LoadPrefab(SourceFile, ObjectName))
     {
         SpawnedPrefabs.Add(Actor);
@@ -3318,6 +3537,17 @@ bool UGameManagerSubSystem::LoadSavedScene()
     }
     bSavedSceneLoaded = true;
 
+    if (const UWorld* World = GetWorld())
+    {
+        if (World->GetNetMode() == NM_Client)
+        {
+            // Clients receive gameplay actors from the authoritative server.
+            // They still stream the selected GLB world render-only through StartMainWorldStreaming(),
+            // but must not spawn a second local gameplay/collision scene from the manifest.
+            return false;
+        }
+    }
+
     TArray<FPlacedObjectRecord> Placed;
     TArray<FGeneratedMeshRecord> Meshes;
     FString LoadedManifestPath = GetManifestPath();
@@ -3349,6 +3579,10 @@ bool UGameManagerSubSystem::LoadSavedScene()
         {
             UClass* PrefabSpawnClass = PrefabActorClass ? PrefabActorClass.Get() : APrefabActor::StaticClass();
             APrefabActor* Prefab = GetWorld()->SpawnActor<APrefabActor>(PrefabSpawnClass, Record.Transform, Params);
+            if (IsValid(Prefab))
+            {
+                Prefab->SetRenderOnlyMode(UMultiplayerWorldSubSystem::ShouldUseClientRenderOnlyStreaming(this));
+            }
             if (IsValid(Prefab) && Prefab->LoadPrefab(Record.SourceFile, Record.ObjectName))
             {
                 SpawnedPrefabs.Add(Prefab);

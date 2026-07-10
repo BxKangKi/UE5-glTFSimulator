@@ -6,6 +6,7 @@
 #include "Components/BoxComponent.h"
 #include "System/StringHelper.h"
 #include "System/JsonHelper.h"
+#include "System/MacroLibrary.h"
 
 // ==========================================
 // FModelCollider
@@ -14,6 +15,7 @@
 TSharedRef<FJsonObject> FModelCollider::Serialization() const
 {
     TSharedRef<FJsonObject> Json = MakeShared<FJsonObject>();
+    Json->SetStringField(JSON_VERSION_FIELD, JSON_SCHEMA_VERSION);
     FJsonHelper::SetEnumField<EColliderType>(Json, TEXT("Type"), Collider);
     FJsonHelper::SetVector(Json, Center);
     FJsonHelper::SetVector(Json, Size, TEXT("D"));
@@ -39,6 +41,7 @@ bool FModelCollider::Deserialization(const TSharedPtr<FJsonObject> &Json)
 TSharedRef<FJsonObject> FLightData::Serialization() const
 {
     TSharedRef<FJsonObject> Json = MakeShared<FJsonObject>();
+    Json->SetStringField(JSON_VERSION_FIELD, JSON_SCHEMA_VERSION);
     FJsonHelper::SetVector(Json, Location);
     FJsonHelper::SetEnumField<ELightUnits>(Json, TEXT("Unit"), Unit);
     Json->SetNumberField(TEXT("Intensity"), Intensity);
@@ -72,6 +75,7 @@ bool FLightData::Deserialization(const TSharedPtr<FJsonObject> &Json)
 TSharedRef<FJsonObject> FMeshData::Serialization() const
 {
     TSharedRef<FJsonObject> Json = MakeShared<FJsonObject>();
+    Json->SetStringField(JSON_VERSION_FIELD, JSON_SCHEMA_VERSION);
     Json->SetBoolField(TEXT("ComplexCollision"), bComplexCollision);
     Json->SetBoolField(TEXT("SimpleCollision"), bSimpleCollision);
     Json->SetBoolField(TEXT("IsEntity"), bIsEntity);
@@ -112,6 +116,7 @@ bool FMeshData::Deserialization(const TSharedPtr<FJsonObject> &Json)
 TSharedRef<FJsonObject> FModelData::Serialization() const
 {
     TSharedRef<FJsonObject> Json = MakeShared<FJsonObject>();
+    Json->SetStringField(JSON_VERSION_FIELD, JSON_SCHEMA_VERSION);
     FJsonHelper::SetVector(Json, Center);
     FJsonHelper::SetVector(Json, Size, TEXT("Size"));
 

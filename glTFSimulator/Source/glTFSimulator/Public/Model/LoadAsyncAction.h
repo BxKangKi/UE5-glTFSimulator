@@ -64,6 +64,9 @@ private:
     UPROPERTY()
     TMap<FName, FModelNodeData> NodeMap;
 
+    UPROPERTY()
+    TMap<FName, FWaterStreamNodeData> WaterNodeMap;
+
     FglTFRuntimeNode CurrentNode;
     FTimerHandle ProcessTimerHandle;
     FglTFRuntimeStaticMeshConfig StaticMeshConfig;
@@ -71,6 +74,7 @@ private:
     int32 MaxCount = 0;
     FName CurrentMeshName;
     int32 ChunkSize;
+    int32 MaxTextureDimension = 768;
     bool bCancelled = false;
     FModelData GeneratedModelData;
 
@@ -84,6 +88,7 @@ private:
     void GetStaticMesh(UStaticMesh *StaticMesh);
 
     void UpdateModelNodeData();
+    void UpdateWaterNodeData();
     void CalculateSize();
     void ProcessChunk();
     void UpdateNext();

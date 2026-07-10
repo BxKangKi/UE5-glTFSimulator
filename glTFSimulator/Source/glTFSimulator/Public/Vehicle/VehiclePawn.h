@@ -52,6 +52,9 @@ public:
     UFUNCTION(BlueprintCallable, Category="Vehicle|Input")
     void ClearDriveInput();
 
+    UFUNCTION(Server, Unreliable)
+    void ServerSetDriveInput(float Throttle, float Steering);
+
     UFUNCTION(BlueprintPure, Category="Vehicle")
     APawn* GetStoredPawn() const { return StoredPawn.Get(); }
 
@@ -84,7 +87,7 @@ public:
         float SmoothedSteeringInput = 0.0f;
         float ThrottleInputInterpSpeed = 5.0f;
         float SteeringInputRiseRate = 2.5f;
-        float SteeringInputReturnRate = 5.0f;
+        float SteeringInputReturnRate = 10.5f;
         float SteeringInputSpeedDamping = 0.0f;
         float SteeringInputCurveExponent = 1.0f;
         float SteeringSpeedForFullAssist = 4300.0f;
@@ -102,14 +105,13 @@ public:
     FVehicleParallelControlInput BuildParallelControlInput(float DeltaSeconds) const;
     static FVehicleParallelControlOutput CalculateParallelControlOutput(const FVehicleParallelControlInput& Input);
     void ApplyParallelControlOutput(const FVehicleParallelControlOutput& Output);
-    void TickVehicleFromSubSystem(float DeltaSeconds);
+    void UpdateVehicleFromSubSystem(float DeltaSeconds);
 
 protected:
     virtual void BeginPlay() override;
+    virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
     virtual void Destroyed() override;
-    virtual void Tick(float DeltaSeconds) override;
-    virtual void AsyncPhysicsTickActor(float DeltaTime, float SimTime) override;
     virtual void SetupPlayerInputComponent(UInputComponent* PlayerInputComponent) override;
 
 private:
@@ -296,28 +298,28 @@ private:
     float StableSuspensionForceLimitMultiplier = 1.45f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Aero", meta=(ClampMin="0.0"))
-    float GroundedDownforceCoefficient = 0.00028f;
+    float GroundedDownforceCoefficient = 0.00055f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Aero", meta=(ClampMin="0.0"))
-    float MaxGroundedDownforce = 8800.0f;
+    float MaxGroundedDownforce = 22000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Aero", meta=(ClampMin="0.0"))
-    float AirborneDownforceCoefficient = 0.0010f;
+    float AirborneDownforceCoefficient = 0.00115f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Aero", meta=(ClampMin="0.0"))
-    float MaxAirborneDownforce = 45000.0f;
+    float MaxAirborneDownforce = 56000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Aero", meta=(ClampMin="0.0"))
-    float MinimumDownforceSpeed = 650.0f;
+    float MinimumDownforceSpeed = 280.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Aero", meta=(ClampMin="0.0"))
-    float FrontDownforceCoefficient = 0.00020f;
+    float FrontDownforceCoefficient = 0.00035f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Aero", meta=(ClampMin="0.0"))
-    float MaxFrontDownforce = 5000.0f;
+    float MaxFrontDownforce = 11000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Aero", meta=(ClampMin="0.0"))
-    float ThrottleFrontDownforce = 700.0f;
+    float ThrottleFrontDownforce = 3200.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Pitch", meta=(ClampMin="0.0"))
     float PitchStabilizationTorqueStrength = 0.0f;
@@ -344,7 +346,7 @@ private:
     float MaxRollStabilizationTorque = 135000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle")
-    float EngineForce = 360000.0f;
+    float EngineForce = 430000.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle")
     float ReverseForce = 140000.0f;
@@ -406,7 +408,7 @@ private:
     float WheelWidth = 24.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle")
-    float MaxSpeedForward = 3600.0f;
+    float MaxSpeedForward = 4200.0f;
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Tires", meta=(ClampMin="0.1"))
     float TireLongitudinalFriction = 1.48f;
@@ -471,11 +473,11 @@ private:
 
     // Steering returns to center slightly faster than it moves toward full lock.
     UPROPERTY(EditAnywhere, Category="Vehicle|Input", meta=(ClampMin="0.1"))
-    float SteeringInputReturnRate = 5.25f;
+    float SteeringInputReturnRate = 10.5f;
 
     // High speed reduces steering input rate, matching the slower hand-wheel motion of a real car.
     UPROPERTY(EditAnywhere, Category="Vehicle|Input", meta=(ClampMin="0.0", ClampMax="1.0"))
-    float SteeringInputSpeedDamping = 0.48f;
+    float SteeringInputSpeedDamping = 0.36f;
 
     // Curves low analog values for softer initial turn-in while still allowing full lock.
     UPROPERTY(EditAnywhere, Category="Vehicle|Input", meta=(ClampMin="1.0", ClampMax="3.0"))
@@ -653,6 +655,16 @@ private:
     UPROPERTY()
     TMap<int32, TObjectPtr<UStaticMesh>> MeshCache;
 
+
+    UPROPERTY(ReplicatedUsing=OnRep_VehicleModelReplicationData)
+    FString ReplicatedSourceFilePath;
+
+    UPROPERTY(ReplicatedUsing=OnRep_VehicleModelReplicationData)
+    FString ReplicatedObjectName;
+
+    UFUNCTION()
+    void OnRep_VehicleModelReplicationData();
+
     UPROPERTY()
     FString SourceFilePath;
 
@@ -699,7 +711,6 @@ private:
     bool bSkipVehicleInputSmoothingForCurrentRun = false;
     float CurrentVehiclePhysicsStepSeconds = 0.0f;
 
-    bool ShouldRunVehiclePhysicsInAsyncTick() const;
     void RunVehiclePhysicsSteps(float DeltaSeconds, bool bFromAsyncPhysicsTick);
     void StepVehiclePhysics(float DeltaSeconds, bool bFromAsyncPhysicsTick);
     void UpdateVehicleInputSmoothing(float DeltaSeconds);

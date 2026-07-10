@@ -12,6 +12,7 @@ class AEditableMeshActor;
 class AVehiclePawn;
 class AWeaponActor;
 class AWorldManager;
+class AWeatherActor;
 class AglTFStreamActor;
 class UMaterialInterface;
 class UUserWidget;
@@ -32,7 +33,6 @@ public:
 protected:
     virtual void BeginPlay() override;
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
-    virtual void Tick(float DeltaSeconds) override;
 
 public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|Grid")
@@ -70,6 +70,9 @@ public:
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|World")
     TSubclassOf<AglTFStreamActor> SpawnActorClass;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|World")
+    TSubclassOf<AWeatherActor> WeatherActorClass;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|World")
     TSubclassOf<AActor> WaterClass;
@@ -127,5 +130,5 @@ public:
 
 private:
     int32 GameUpdateTickHandle = INDEX_NONE;
-    void TickFromGameUpdate(float DeltaSeconds);
+    void UpdateFromGameUpdate(float DeltaSeconds);
 };

@@ -7,6 +7,9 @@
 #include "System/MacroLibrary.h"
 #include "Character/CharacterController.h"
 #include "Character/CharacterComponent.h"
+#include "System/GameManagerSubSystem.h"
+#include "Weapon/WeaponActor.h"
+#include "Components/SkeletalMeshComponent.h"
 
 namespace CharacterAnimTuning
 {
@@ -17,11 +20,106 @@ namespace CharacterAnimTuning
     constexpr float SwimVerticalSpeedDeadZone = 0.01f;
 }
 
-void UCharacterAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
+void UCharacterAnimInstance::ResetRuntimeAnimationState()
 {
-    // 1. Validate and cache pointers/variables used by the animation graph.
-    if (!IsValid(Movement) || !IsValid(Component.Get()))
+    Velocity = FVector::ZeroVector;
+    Speed = 0.0f;
+    MoveSpeed = 0.0f;
+    UpSpeed = 0.0f;
+    bShouldMove = false;
+    bIsFlying = false;
+    bIsSwimming = false;
+    bIsFalling = false;
+    bIsGrounded = false;
+    bIsCrouch = false;
+    bIsDiving = false;
+    bIsRagdoll = false;
+    bIsGettingUp = false;
+    bIsWaterRagdollRecovery = false;
+    bRagdollEnvironmentOnGround = false;
+    bRagdollEnvironmentInWater = false;
+    bTreatRagdollWaterAsGround = false;
+    bShouldRecoverRagdollInWater = false;
+    RagdollEnvironmentWaterLevel = 0.0f;
+    bRagdollMeaningfullySubmerged = false;
+    RagdollMaxSubmersionDepth = 0.0f;
+    RagdollAverageSubmersionDepth = 0.0f;
+    bGetUpTrigger = false;
+    IsLieOnBack = 0.0f;
+    CapturedMeshLocation = FVector::ZeroVector;
+    CapturedMeshRotation = FRotator::ZeroRotator;
+    bHasWeaponIK = false;
+    WeaponRightHandIKLocationCS = FVector::ZeroVector;
+    WeaponRightHandIKRotationCS = FRotator::ZeroRotator;
+    WeaponLeftHandIKLocationCS = FVector::ZeroVector;
+    WeaponLeftHandIKRotationCS = FRotator::ZeroRotator;
+    WeaponMuzzleLocationWS = FVector::ZeroVector;
+}
+
+
+void UCharacterAnimInstance::RefreshWeaponIKState()
+{
+    bHasWeaponIK = false;
+    WeaponRightHandIKLocationCS = FVector::ZeroVector;
+    WeaponRightHandIKRotationCS = FRotator::ZeroRotator;
+    WeaponLeftHandIKLocationCS = FVector::ZeroVector;
+    WeaponLeftHandIKRotationCS = FRotator::ZeroRotator;
+    WeaponMuzzleLocationWS = FVector::ZeroVector;
+
+    USkeletalMeshComponent* MeshComponent = GetSkelMeshComponent();
+    UWorld* World = GetWorld();
+    if (!IsValid(MeshComponent) || !IsValid(World))
+    {
         return;
+    }
+
+    UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(World);
+    AWeaponActor* Weapon = Manager ? Manager->GetEquippedWeaponActor() : nullptr;
+    if (!IsValid(Weapon))
+    {
+        return;
+    }
+
+    const FTransform MeshToWorld = MeshComponent->GetComponentTransform();
+    const FTransform RightHandCS = Weapon->GetRightHandIKWorldTransform().GetRelativeTransform(MeshToWorld);
+    const FTransform LeftHandCS = Weapon->GetLeftHandIKWorldTransform().GetRelativeTransform(MeshToWorld);
+
+    bHasWeaponIK = true;
+    WeaponRightHandIKLocationCS = RightHandCS.GetLocation();
+    WeaponRightHandIKRotationCS = RightHandCS.Rotator();
+    WeaponLeftHandIKLocationCS = LeftHandCS.GetLocation();
+    WeaponLeftHandIKRotationCS = LeftHandCS.Rotator();
+    WeaponMuzzleLocationWS = Weapon->GetMuzzleWorldLocation();
+}
+
+void UCharacterAnimInstance::RefreshCachedReferences()
+{
+    AActor* Owner = GetOwningActor();
+    ACharacterController* Character = IsValid(Owner) ? Cast<ACharacterController>(Owner) : nullptr;
+    if (!IsValid(Character))
+    {
+        Component = nullptr;
+        Movement = nullptr;
+        return;
+    }
+
+    Component = Character->GetCharacterComponent();
+    Movement = Character->GetCharacterMovement();
+}
+
+void UCharacterAnimInstance::RefreshCharacterAnimationState(float DeltaSeconds)
+{
+    // 1. Always re-cache the owner/component pair. Runtime mesh replacement can recreate
+    // the AnimInstance or swap ownership while the old weak-looking UObject pointers are
+    // still technically valid for a frame; relying on the cached pair can leave the AnimBP
+    // with stale ragdoll/get-up variables.
+    RefreshCachedReferences();
+
+    if (!IsValid(Movement.Get()) || !IsValid(Component.Get()))
+    {
+        ResetRuntimeAnimationState();
+        return;
+    }
 
     // 2. Refresh the filtered ragdoll water snapshot before animation variables are read.
     Component->RefreshRagdollWaterStateForAnimation();
@@ -80,6 +178,7 @@ void UCharacterAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
     IsLieOnBack = Component->IsLieOnBack() ? 1.0f: 0.0f;
     CapturedMeshLocation = Component->GetCapturedMeshLocation();
     CapturedMeshRotation = Component->GetCapturedMeshRotation();
+    RefreshWeaponIKState();
 
     // 6. Movement intent: acceleration must be non-zero and speed must be visible.
     // Built-in IsNearlyZero keeps this branch cheap and readable.
@@ -137,14 +236,14 @@ void UCharacterAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
     }
 }
 
+void UCharacterAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
+{
+    RefreshCharacterAnimationState(DeltaSeconds);
+}
+
 void UCharacterAnimInstance::NativeInitializeAnimation()
 {
-    AActor *Owner = GetOwningActor();
-    if (!IsValid(Owner))
-        return;
-    ACharacterController *Character = Cast<ACharacterController>(Owner);
-    if (!IsValid(Character))
-        return;
-    Component = Character->GetCharacterComponent();
-    Movement = Character->GetCharacterMovement();
+    ResetRuntimeAnimationState();
+    RefreshCachedReferences();
+    RefreshCharacterAnimationState(0.0f);
 }

@@ -8,6 +8,7 @@
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
+#include "System/MacroLibrary.h"
 
 namespace GLTFSaveInternal
 {
@@ -73,7 +74,8 @@ TSharedRef<FJsonObject> UGLTFSaveLibrary::BuildManifestJson(
     const TArray<FGeneratedMeshRecord>& GeneratedMeshes)
 {
     TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
-    Root->SetNumberField(TEXT("Version"), 2);
+    Root->SetStringField(JSON_VERSION_FIELD, JSON_SCHEMA_VERSION);
+    Root->SetNumberField(TEXT("ManifestFormat"), 2);
     Root->SetStringField(TEXT("StorageMode"), TEXT("JsonSourceReferenceOnly"));
     Root->SetBoolField(TEXT("WritesEntitiesGlb"), false);
     Root->SetStringField(TEXT("PlacedObjectMeshStorage"), TEXT("OriginalGlbAndNodeReference"));

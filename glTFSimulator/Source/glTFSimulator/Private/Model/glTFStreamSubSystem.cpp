@@ -47,7 +47,7 @@ void UglTFStreamSubSystem::Deinitialize()
     Super::Deinitialize();
 }
 
-void UglTFStreamSubSystem::StartMainWorldStreaming(AActor* InOwnerActor, TSubclassOf<AglTFStreamActor> InSpawnActorClass, const FString& InModelDirectory, const FString& InPlayerDirectory, const FString& InInitialPlayerName)
+void UglTFStreamSubSystem::StartMainWorldStreaming(AActor* InOwnerActor, TSubclassOf<AglTFStreamActor> InSpawnActorClass, const FString& InModelDirectory, const FString& InPlayerDirectory, const FString& InInitialPlayerName, bool bInRenderOnlyStreaming)
 {
     if (!IsValid(InOwnerActor) || !InSpawnActorClass)
     {
@@ -62,6 +62,7 @@ void UglTFStreamSubSystem::StartMainWorldStreaming(AActor* InOwnerActor, TSubcla
     ModelDirectory = InModelDirectory;
     PlayerDirectory = InPlayerDirectory;
     InitialPlayerName = InInitialPlayerName;
+    bRenderOnlyStreaming = bInRenderOnlyStreaming;
     bActive = true;
     bInitialPathScanComplete = false;
     bInitialPlayerLoadComplete = false;
@@ -89,12 +90,13 @@ void UglTFStreamSubSystem::StartMainWorldStreaming(AActor* InOwnerActor, TSubcla
         AssetManager->ActivateForMainWorld(InOwnerActor);
     }
 
-    WriteLogAsync(FString::Printf(TEXT("glTFStreamSubSystem started. ModelDirectory=%s GLBCount=%d PlayerDirectory=%s PlayerCount=%d InitialPlayer=%s"),
+    WriteLogAsync(FString::Printf(TEXT("glTFStreamSubSystem started. ModelDirectory=%s GLBCount=%d PlayerDirectory=%s PlayerCount=%d InitialPlayer=%s RenderOnly=%s"),
         *ModelDirectory,
         GlbFilePaths.Num(),
         *PlayerDirectory,
         PlayerGlbFilePaths.Num(),
-        *InitialPlayerName));
+        *InitialPlayerName,
+        bRenderOnlyStreaming ? TEXT("true") : TEXT("false")));
 
     BeginInitialPlayerStreamingIfNeeded();
     ScheduleProcessNextPath();
@@ -104,6 +106,7 @@ void UglTFStreamSubSystem::StopMainWorldStreaming()
 {
     ClearTimers();
     bActive = false;
+    bRenderOnlyStreaming = false;
 
     for (TPair<FString, TObjectPtr<AglTFStreamActor>>& Pair : SpawnActorMap)
     {
@@ -987,6 +990,7 @@ AglTFStreamActor* UglTFStreamSubSystem::EnsureSpawnActor(const FString& GlbPath)
 
     if (IsValid(NewActor))
     {
+        NewActor->SetRenderOnlyStreaming(bRenderOnlyStreaming);
         NewActor->Init(GlbPath);
         NewActor->FinishSpawning(OwnerActor->GetActorTransform());
         SpawnActorMap.Add(GlbPath, NewActor);

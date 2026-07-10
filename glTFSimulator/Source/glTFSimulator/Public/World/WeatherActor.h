@@ -19,10 +19,18 @@ class GLTFSIMULATOR_API AWeatherActor : public AActor
 public:
     AWeatherActor();
 
+    UFUNCTION(BlueprintCallable, Category="Weather")
+    void ConfigureWeather(const FString& InPreset, float InIntensity);
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Weather")
+    FString WeatherPreset = TEXT("Rain");
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Weather", meta=(ClampMin="0.0"))
+    float WeatherIntensity = 1.0f;
+
 protected:
     virtual void BeginPlay() override;
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
-    virtual void Tick(float DeltaSeconds) override;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite)
     TObjectPtr<USceneCaptureComponent2D> SceneCapture;
@@ -35,8 +43,9 @@ private:
     FVector Location;
     FVector LocationOffset;
     int32 GameUpdateTickHandle = INDEX_NONE;
-    void TickFromGameUpdate(float DeltaSeconds);
-    void AsyncTick();
+    bool bRainUpdateInFlight = false;
+    void UpdateFromGameUpdate(float DeltaSeconds);
+    void StartRainAsyncUpdate();
 
     // Callback invoked when the asynchronous task completes.
     UFUNCTION()

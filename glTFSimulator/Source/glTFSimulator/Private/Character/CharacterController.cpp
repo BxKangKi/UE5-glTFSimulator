@@ -140,11 +140,12 @@ void ACharacterController::BeginPlay()
         Capsule->OnComponentHit.AddDynamic(this, &ACharacterController::HandleCapsulePhysicsHit);
     }
     SubSystem = UGameManagerSubSystem::GetSubSystem(this);
-    if (!IsValid(SubSystem))
-        return;
-    SubSystem->SetPlayerActor(this);
-    SubSystem->SetCameraComponent(FollowCamera);
-    SetActorLocation(SubSystem->GetPlayerLocation(), false, nullptr, ETeleportType::TeleportPhysics);
+    if (IsValid(SubSystem))
+    {
+        SubSystem->SetPlayerActor(this);
+        SubSystem->SetCameraComponent(FollowCamera);
+        SetActorLocation(SubSystem->GetPlayerLocation(), false, nullptr, ETeleportType::TeleportPhysics);
+    }
     Activate(false);
 
     if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
@@ -153,10 +154,11 @@ void ACharacterController::BeginPlay()
             this,
             [this](const float DeltaSeconds)
             {
-                TickFromGameUpdate(DeltaSeconds);
+                UpdateFromGameUpdate(DeltaSeconds);
             },
             0);
     }
+
 }
 
 void ACharacterController::Load(const FString &Path)
@@ -474,13 +476,8 @@ void ACharacterController::HandleCapsulePhysicsHit(UPrimitiveComponent* HitCompo
     }
 }
 
-void ACharacterController::Tick(float DeltaSeconds)
-{
-    Super::Tick(DeltaSeconds);
-    TickFromGameUpdate(DeltaSeconds);
-}
 
-void ACharacterController::TickFromGameUpdate(float DeltaSeconds)
+void ACharacterController::UpdateFromGameUpdate(float DeltaSeconds)
 {
     if (!IsValid(Component.Get()))
     {
@@ -490,10 +487,6 @@ void ACharacterController::TickFromGameUpdate(float DeltaSeconds)
     {
         SubSystem = UGameManagerSubSystem::GetSubSystem(this);
     }
-    if (!IsValid(SubSystem))
-    {
-        return;
-    }
 
     if (GetVelocity().Z <= 0.0f)
     {
@@ -502,13 +495,12 @@ void ACharacterController::TickFromGameUpdate(float DeltaSeconds)
     SyncRagdollWaterStateFromPhysics();
     Component->UpdateComponent(DeltaSeconds, RawMoveInput, CharacterStateBit, WaterLevel);
 
-    const bool bRagdollTransitionActive = Component->IsRagdollTransitionInProgress();
+    const bool bRagdollTransitionInProgress = Component->IsRagdollTransitionInProgress();
 
-    // Buoyancy is only allowed to touch simulated ragdoll bodies. When no ragdoll
-    // transition is active, keep the visual mesh attached/visible so stale physics
-    // state cannot make it vanish or drift away. Do not run this during get-up:
-    // the component is intentionally blending from the ragdoll world transform.
-    if (!bRagdollTransitionActive)
+    // Buoyancy is only allowed to touch simulated ragdoll bodies. While ragdoll/get-up is
+    // transitioning, do not reattach or reset the mesh here; the animation snapshot blend
+    // owns the mesh transform until the component clears the ragdoll weight.
+    if (!bRagdollTransitionInProgress)
     {
         if (USkeletalMeshComponent* MeshComp = GetMesh())
         {
@@ -540,7 +532,7 @@ void ACharacterController::TickFromGameUpdate(float DeltaSeconds)
         }
     }
 
-    if (!bRagdollTransitionActive && Component->IsRagdollDamage())
+    if (!bRagdollTransitionInProgress && Component->IsRagdollDamage())
     {
         float DirectWaterLevel = WaterLevel;
         if (!FindDirectWaterLevel(DirectWaterLevel))
@@ -557,7 +549,10 @@ void ACharacterController::TickFromGameUpdate(float DeltaSeconds)
         Component->SetRagdollActive(true);
     }
 
-    SubSystem->SetPlayerLocation(GetActorLocation());
+    if (IsValid(SubSystem))
+    {
+        SubSystem->SetPlayerLocation(GetActorLocation());
+    }
 }
 
 void ACharacterController::EnterWater(const float Level)

@@ -4,6 +4,7 @@
 #include "Character/CharacterComponent.h"
 #include "Character/CharacterController.h"
 #include "Character/CharacterFunctionLibrary.h"
+#include "Character/CharacterAnimInstance.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "System/ActorHelper.h"
 #include "System/MacroLibrary.h"
@@ -27,6 +28,7 @@ namespace CharacterRagdollTuning
     static const FRotator MeshRecoveryRelativeRotation(0.0f, 270.0f, 0.0f);
 
     constexpr float MaxBlendWeight = 1.0f;
+    constexpr float CameraLagSpeed = 6.0f;
     constexpr float GetUpSpeedThreshold = 350.0f;
     constexpr float WaterGetUpSpeedThreshold = 320.0f;
     constexpr float MinimumActiveTime = 2.0f;
@@ -43,10 +45,24 @@ namespace CharacterRagdollTuning
     constexpr float WaterRecoveryAverageDepth = 10.0f;
     constexpr float TreatWaterAsGroundMaxDepth = 14.0f;
     constexpr float WaterReleaseHysteresisDepth = 6.0f;
+    constexpr float InitialRagdollVelocityDeadZone = 1.0f;
+    constexpr float MeaningfulVelocityDeadZone = 2.0f;
+    constexpr float PreRagdollVelocityGraceSeconds = 0.20f;
+    constexpr float PreRagdollVelocityDropPreserveRatio = 0.75f;
+    constexpr float MaxInitialRagdollSpeed = 10000.0f;
+    constexpr float InitialRagdollVelocityScale = 1.0f;
+    constexpr float MaxInitialRagdollPlanarSpeed = 10000.0f;
+    constexpr float MaxInitialRagdollUpSpeed = 5000.0f;
+    constexpr float MaxInitialRagdollDownSpeed = 10000.0f;
+    constexpr float RagdollCameraStabilizeDuration = 0.0f;
+    constexpr float RagdollCameraAnchorDeadZone = 0.25f;
+    constexpr float RagdollSpringArmLagSpeed = 3.75f;
+    constexpr float RagdollSpringArmMaxLagDistance = 0.0f;
+    constexpr float RagdollSpringArmLagMaxTimeStep = 1.0f / 90.0f;
+    constexpr float LandRecoveryGroundClearance = 6.0f;
+    constexpr float LandRecoveryGroundProbeUp = 96.0f;
+    constexpr float LandRecoveryGroundProbeDown = 320.0f;
     constexpr int32 WaterReleaseMinCoreProbes = 2;
-    constexpr float RagdollActorLocationInterpSpeed = 12.0f;
-    constexpr float RagdollActorRotationInterpSpeed = 10.0f;
-    constexpr float RagdollActorSnapDistance = 420.0f;
 }
 
 namespace CharacterMovementTuning
@@ -595,6 +611,122 @@ static bool IsRagdollCoreReleaseBone(const FName BoneName)
         || BoneString.Contains(TEXT("head"));
 }
 
+
+static FVector ClampInitialRagdollVelocityForActivation(const FVector& Velocity)
+{
+    if (Velocity.ContainsNaN())
+    {
+        return FVector::ZeroVector;
+    }
+
+    // The ragdoll inherits only the previous character movement velocity.
+    // Do not multiply it or reconstruct impact velocity here; extra energy makes
+    // the body launch and causes visible stepping on the spring-arm target.
+    FVector Result = Velocity;
+
+    FVector PlanarVelocity(Result.X, Result.Y, 0.0f);
+    PlanarVelocity = PlanarVelocity.GetClampedToMaxSize(CharacterRagdollTuning::MaxInitialRagdollPlanarSpeed);
+
+    Result.X = PlanarVelocity.X;
+    Result.Y = PlanarVelocity.Y;
+    Result.Z = FMath::Clamp(
+        Result.Z,
+        -CharacterRagdollTuning::MaxInitialRagdollDownSpeed,
+        CharacterRagdollTuning::MaxInitialRagdollUpSpeed);
+
+    return Result.GetClampedToMaxSize(CharacterRagdollTuning::MaxInitialRagdollSpeed);
+}
+
+static FORCEINLINE bool IsUsefulInitialRagdollVelocity(const FVector& Candidate)
+{
+    return !Candidate.ContainsNaN()
+        && Candidate.SizeSquared() > FMath::Square(CharacterRagdollTuning::InitialRagdollVelocityDeadZone);
+}
+
+static FORCEINLINE void ConsiderInitialRagdollVelocity(FVector& BestVelocity, const FVector& Candidate)
+{
+    if (!IsUsefulInitialRagdollVelocity(Candidate))
+    {
+        return;
+    }
+
+    const FVector SafeCandidate = ClampInitialRagdollVelocityForActivation(Candidate);
+    if (SafeCandidate.SizeSquared() > BestVelocity.SizeSquared())
+    {
+        BestVelocity = SafeCandidate;
+    }
+}
+
+static FORCEINLINE bool ShouldPreserveCachedPreRagdollVelocity(const FVector& CachedVelocity, const float CachedAge, const FVector& NewVelocity)
+{
+    if (CachedAge > CharacterRagdollTuning::PreRagdollVelocityGraceSeconds || !IsUsefulInitialRagdollVelocity(CachedVelocity))
+    {
+        return false;
+    }
+
+    // A collision or movement-mode transition can reduce CharacterMovement velocity
+    // before SetRagdollActive() runs in the same frame.  Keep the last full-speed
+    // gameplay velocity briefly instead of replacing it with that already-damped value.
+    const float PreserveRatio = CharacterRagdollTuning::PreRagdollVelocityDropPreserveRatio;
+    return NewVelocity.SizeSquared() < CachedVelocity.SizeSquared() * PreserveRatio * PreserveRatio;
+}
+
+static bool ShouldApplyInitialRagdollVelocityToBone(const FName BoneName)
+{
+    const FString BoneString = GetCharacterNormalizedBoneName(BoneName);
+    if (IsRagdollCosmeticOrHelperBoneName(BoneString))
+    {
+        return false;
+    }
+
+    // Give the initial gameplay velocity only to the bodies that make up the
+    // character's physical mass. Fingers, toes, and accessory/helper chains are
+    // left to constraints so they do not amplify the activation energy.
+    return IsRagdollPrimaryReleaseBone(BoneName)
+        || BoneString.Contains(TEXT("spine"))
+        || BoneString.Contains(TEXT("chest"))
+        || BoneString.Contains(TEXT("torso"))
+        || BoneString.Contains(TEXT("abdomen"))
+        || BoneString.Contains(TEXT("neck"))
+        || BoneString.Contains(TEXT("head"))
+        || BoneString.Contains(TEXT("clavicle"))
+        || BoneString.Contains(TEXT("shoulder"))
+        || BoneString.Contains(TEXT("upperarm"))
+        || BoneString.Contains(TEXT("upper_arm"))
+        || BoneString.Contains(TEXT("lowerarm"))
+        || BoneString.Contains(TEXT("lower_arm"))
+        || BoneString.Contains(TEXT("forearm"))
+        || BoneString.Contains(TEXT("thigh"))
+        || BoneString.Contains(TEXT("upperleg"))
+        || BoneString.Contains(TEXT("upper_leg"))
+        || BoneString.Contains(TEXT("lowerleg"))
+        || BoneString.Contains(TEXT("lower_leg"))
+        || BoneString.Contains(TEXT("calf"))
+        || BoneString.Contains(TEXT("shin"));
+}
+
+static FORCEINLINE float GetSafeRagdollBodyMass(const FBodyInstance* BodyInstance)
+{
+    if (!BodyInstance)
+    {
+        return 1.0f;
+    }
+
+    const float BodyMass = BodyInstance->GetBodyMass();
+    return FMath::IsFinite(BodyMass) && BodyMass > UE_SMALL_NUMBER ? BodyMass : 1.0f;
+}
+
+static FORCEINLINE FVector GetSafeRagdollBodyVelocity(const FBodyInstance* BodyInstance)
+{
+    if (!BodyInstance)
+    {
+        return FVector::ZeroVector;
+    }
+
+    const FVector Velocity = BodyInstance->GetUnrealWorldVelocity();
+    return Velocity.ContainsNaN() ? FVector::ZeroVector : Velocity;
+}
+
 static FORCEINLINE bool IsRagdollPreferredProbeBone(const FName BoneName)
 {
     return BoneName == FName(BONE_HIPS)
@@ -998,10 +1130,11 @@ void UCharacterComponent::InitializeCrouchSettings()
         Movement->GetNavAgentPropertiesRef().bCanCrouch = true;
         const float SafeStandingHalfHeight = FMath::Max(StandingCapsuleRadius + 2.0f, StandingCapsuleHalfHeight);
         const float DefaultCrouchedHalfHeight = FMath::Max(StandingCapsuleRadius + 2.0f, SafeStandingHalfHeight * 0.58f);
-        if (Movement->CrouchedHalfHeight <= StandingCapsuleRadius
-            || Movement->CrouchedHalfHeight >= SafeStandingHalfHeight - 1.0f)
+        const float CurrentCrouchedHalfHeight = Movement->GetCrouchedHalfHeight();
+        if (CurrentCrouchedHalfHeight <= StandingCapsuleRadius
+            || CurrentCrouchedHalfHeight >= SafeStandingHalfHeight - 1.0f)
         {
-            Movement->CrouchedHalfHeight = DefaultCrouchedHalfHeight;
+            Movement->SetCrouchedHalfHeight(DefaultCrouchedHalfHeight);
         }
     }
 }
@@ -1183,10 +1316,21 @@ void UCharacterComponent::UpdateComponent(float DeltaTime, const FVector &MoveIn
         bRagdollRecoveryWantsSwimming = false;
     }
 
-    ImpactVelocity = CalculateImpactVelocity(CurrentVelocity);
+    const bool bRagdollLikeState = IsRagdollLikeState();
+    if (!bRagdollLikeState)
+    {
+        UpdateRagdollVelocityHistory(DeltaTime, CurrentVelocity);
+        ImpactVelocity = CalculateImpactVelocity(CurrentVelocity);
+    }
+    else
+    {
+        // Active ragdoll uses the actor as a location-only camera/control anchor.
+        // Do not feed that anchor displacement back into later ragdoll velocity inheritance.
+        PrevVelocity = CurrentVelocity;
+        ImpactVelocity = FVector::ZeroVector;
+    }
 
     float EffectiveWaterLevel = WaterLevel;
-    const bool bRagdollLikeState = IsRagdollLikeState();
     const bool bRagdollBodyDetectedInWater = bRagdollLikeState && RefreshRagdollWaterDetection(&EffectiveWaterLevel);
     const bool bOwnerInsideStrictWaterColumn = AWaterActor::FindWaterLevelAtLocationStrict(this, OwnerCharacter->GetActorLocation(), EffectiveWaterLevel)
         || AWaterActor::FindWaterLevelAtLocationStrict(this, OwnerCharacter->GetBottomLocation(), EffectiveWaterLevel);
@@ -1208,43 +1352,41 @@ void UCharacterComponent::UpdateComponent(float DeltaTime, const FVector &MoveIn
     // that made movement feel sluggish and could immediately cancel an explicit Fly input.
     const bool bActiveRagdollOrRecoverySwimLock = bSwimRecoveryLocked && bRagdollLikeState;
 
-    if (bRagdollLikeState && (bEffectiveInWaterState || bActiveRagdollOrRecoverySwimLock))
+    if (bRagdollLikeState)
     {
-        bRagdollInWater = true;
-        if (!bIsRagdoll && (bGettingUp || RagdollWeight > 0.0f))
+        if (bEffectiveInWaterState || bActiveRagdollOrRecoverySwimLock)
         {
-            bRagdollRecoveryWantsSwimming = true;
+            bRagdollInWater = true;
+            if (!bIsRagdoll && (bGettingUp || RagdollWeight > 0.0f))
+            {
+                bRagdollRecoveryWantsSwimming = true;
+            }
+
+            StopMovementAndSetMode(Movement, MOVE_Swimming);
         }
-
-        StopMovementAndSetMode(Movement, MOVE_Swimming);
-
-        UpdateRagdoll(DeltaTime, OwnerCharacter, MeshComp);
-        return;
-    }
-    else if (bRagdollLikeState)
-    {
-        // Current frame probes say the ragdoll/recovery is dry. Clear the sticky water flags
-        // before the animation instance reads them so a character that came out of water does
-        // not stay in the swimming state during land get-up.
-        ClearRagdollWaterIntent();
-        if (Movement->MovementMode == MOVE_Swimming)
+        else
         {
-            StopMovementAndDisable(Movement);
-        }
-
-        // Ragdoll and get-up recovery own the actor, capsule, and mesh transforms.
-        // Running the normal movement/crouch branch in the same frame can reset the
-        // mesh relative transform or queue input while physics is still being blended out.
-        UpdateRagdoll(DeltaTime, OwnerCharacter, MeshComp);
-        return;
-    }
-    else
-    {
-        bRagdollInWater = bEffectiveInWaterState;
-        if (!bRagdollInWater)
-        {
+            // Current frame probes say the ragdoll/recovery is dry. Clear the sticky water flags
+            // before the animation instance reads them so a character that came out of water does
+            // not stay in the swimming state during land get-up.
             ClearRagdollWaterIntent();
+            if (Movement->MovementMode == MOVE_Swimming)
+            {
+                StopMovementAndDisable(Movement);
+            }
         }
+
+        // Ragdoll/get-up owns actor, capsule and mesh transforms until recovery finishes.
+        // Do not fall through to normal movement/crouch code, which can overwrite the mesh
+        // relative transform and make the AnimBP appear to snap out of the saved pose.
+        UpdateRagdoll(DeltaTime, OwnerCharacter, MeshComp);
+        return;
+    }
+
+    bRagdollInWater = bEffectiveInWaterState;
+    if (!bRagdollInWater)
+    {
+        ClearRagdollWaterIntent();
     }
 
     // 1. Cache ground and base movement states once for this frame.
@@ -1451,6 +1593,8 @@ void UCharacterComponent::ResetMovementState()
     ImpactVelocity = FVector::ZeroVector;
     CurrentSpeed = FVector::ZeroVector;
     PrevVelocity = FVector::ZeroVector;
+    LastPreRagdollVelocity = FVector::ZeroVector;
+    LastPreRagdollVelocityAge = TNumericLimits<float>::Max();
     bSwimmingSurfaceCeilingLocked = false;
 
     ApplyCrouchState(false);
@@ -1534,9 +1678,8 @@ void UCharacterComponent::ResetRagdollRecoveryState(bool bKeepWaterIntent)
     WaterRecoveryMeshStartRelativeRotation = FRotator::ZeroRotator;
     RagdollPrePhysicsActorRotation = FRotator::ZeroRotator;
     bHasRagdollPrePhysicsActorRotation = false;
-    ResetSmoothedRagdollActorTransform();
-    RestoreCameraAfterRagdoll();
-    SetOwnerCapsuleCollisionForRagdoll(true);
+    RagdollCameraStabilizeRemainingTime = 0.0f;
+    bSavedRagdollCameraState = false;
 
     if (!bKeepWaterIntent)
     {
@@ -2191,6 +2334,48 @@ FVector UCharacterComponent::GetRagdollRecoveryActorLocationFromHips(const FVect
     return HipsLocation + FVector(0.0f, 0.0f, ActorZOffsetFromHips);
 }
 
+FVector UCharacterComponent::ResolveRagdollRecoveryGroundPenetration(const FVector& DesiredActorLocation) const
+{
+    if (!IsValid(OwnerCharacter))
+    {
+        return DesiredActorLocation;
+    }
+
+    UWorld* World = OwnerCharacter->GetWorld();
+    const UCapsuleComponent* Capsule = OwnerCharacter->GetCapsuleComponent();
+    if (!World || !Capsule || DesiredActorLocation.ContainsNaN())
+    {
+        return DesiredActorLocation;
+    }
+
+    const float CapsuleHalfHeight = FMath::Max(1.0f, Capsule->GetScaledCapsuleHalfHeight());
+    const FVector Start = DesiredActorLocation + FVector::UpVector * (CapsuleHalfHeight + CharacterRagdollTuning::LandRecoveryGroundProbeUp);
+    const FVector End = DesiredActorLocation - FVector::UpVector * (CapsuleHalfHeight + CharacterRagdollTuning::LandRecoveryGroundProbeDown);
+
+    FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(CharacterRagdollRecoveryGroundLift), true, OwnerCharacter);
+    AddCharacterSelfIgnore(QueryParams, OwnerCharacter.Get(), MeshComp.Get());
+    QueryParams.bTraceComplex = true;
+
+    FHitResult GroundHit;
+    if (!TraceWalkableGroundByChannel(World, Start, End, Movement.Get(), QueryParams, &GroundHit))
+    {
+        return DesiredActorLocation;
+    }
+
+    const float CurrentCapsuleBottomZ = DesiredActorLocation.Z - CapsuleHalfHeight;
+    const float MinimumCapsuleBottomZ = GroundHit.ImpactPoint.Z + CharacterRagdollTuning::LandRecoveryGroundClearance;
+    if (CurrentCapsuleBottomZ >= MinimumCapsuleBottomZ)
+    {
+        return DesiredActorLocation;
+    }
+
+    // Lift the owning capsule just enough to clear the floor. Foot IK can polish
+    // the visible pose later, but root/capsule penetration must be solved here.
+    FVector AdjustedLocation = DesiredActorLocation;
+    AdjustedLocation.Z += MinimumCapsuleBottomZ - CurrentCapsuleBottomZ;
+    return AdjustedLocation;
+}
+
 bool UCharacterComponent::ShouldUseRagdollWaterRecoveryForState(const FCharacterRagdollEnvironmentState& State) const
 {
     if (!State.bIsValid || !State.bIsInWater || State.bTreatWaterAsGround || State.bForcedLandRecovery)
@@ -2376,76 +2561,6 @@ void UCharacterComponent::ClearPendingWaterRagdollDeactivation()
     PendingWaterRagdollDeactivationLevel = 0.0f;
 }
 
-void UCharacterComponent::ConfigureCameraForActiveRagdoll()
-{
-    if (!IsValid(SpringArm))
-    {
-        return;
-    }
-
-    if (!bHasSavedRagdollCameraSettings)
-    {
-        bSavedSpringArmCameraLag = SpringArm->bEnableCameraLag;
-        bSavedSpringArmCollisionTest = SpringArm->bDoCollisionTest;
-        SavedSpringArmCameraLagSpeed = SpringArm->CameraLagSpeed;
-        bHasSavedRagdollCameraSettings = true;
-    }
-
-    // While the capsule follows a physics-driven ragdoll anchor, camera lag/collision
-    // can fight the one-frame-late physics sync and look like the camera is being
-    // blocked by an invisible wall. Keep the view deterministic until recovery ends.
-    SpringArm->bEnableCameraLag = false;
-    SpringArm->bDoCollisionTest = false;
-}
-
-void UCharacterComponent::RestoreCameraAfterRagdoll()
-{
-    if (!IsValid(SpringArm) || !bHasSavedRagdollCameraSettings)
-    {
-        return;
-    }
-
-    SpringArm->bEnableCameraLag = bSavedSpringArmCameraLag;
-    SpringArm->bDoCollisionTest = bSavedSpringArmCollisionTest;
-    SpringArm->CameraLagSpeed = SavedSpringArmCameraLagSpeed;
-    bHasSavedRagdollCameraSettings = false;
-}
-
-void UCharacterComponent::SetOwnerCapsuleCollisionForRagdoll(bool bEnableCollision)
-{
-    if (!IsValid(OwnerCharacter))
-    {
-        return;
-    }
-
-    UCapsuleComponent* Capsule = OwnerCharacter->GetCapsuleComponent();
-    if (!Capsule)
-    {
-        return;
-    }
-
-    if (bEnableCollision)
-    {
-        Capsule->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
-        Capsule->SetGenerateOverlapEvents(true);
-    }
-    else
-    {
-        // The simulated mesh is detached during ragdoll. Leaving the character capsule
-        // enabled while it is teleported to the hips can push against the ragdoll bodies
-        // and produce visible jitter in both the mesh and the camera target.
-        Capsule->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-        Capsule->SetGenerateOverlapEvents(false);
-    }
-}
-
-void UCharacterComponent::ResetSmoothedRagdollActorTransform()
-{
-    bHasSmoothedRagdollActorTransform = false;
-    SmoothedRagdollActorLocation = FVector::ZeroVector;
-    SmoothedRagdollActorRotation = FRotator::ZeroRotator;
-}
-
 bool UCharacterComponent::IsRagdollTouchingWalkableGround(float TraceDistance, bool bCoreOnly) const
 {
     if (!IsValid(OwnerCharacter) || !IsValid(MeshComp))
@@ -2571,12 +2686,11 @@ void UCharacterComponent::FinishAsyncRagdollReleaseGroundTrace(bool bWalkableGro
         return;
     }
 
-    // Store the async result, but do not deactivate from the trace delegate itself.
-    // The next CharacterComponent update consumes this after the current physics pose
-    // has been observed on the game thread, so the pose snapshot is not taken from a
-    // half-synced async step.
+    // Store the async result for the immediately following SetRagdollActive(false) call.
+    // The result is consumed once so later animation/water refreshes cannot reuse stale ground data.
     bUseAsyncRagdollReleaseGroundResult = true;
     bAsyncRagdollReleaseGroundResult = bWalkableGround;
+    SetRagdollActive(false);
 }
 
 bool UCharacterComponent::ShouldDelayWaterRagdollDeactivation(float WaterLevel, bool bKnownWalkableGround) const
@@ -2735,9 +2849,312 @@ inline FVector UCharacterComponent::CalculateImpactVelocity(const FVector &Curre
     return Result;
 }
 
+void UCharacterComponent::UpdateRagdollVelocityHistory(float DeltaTime, const FVector& CurrentVelocity)
+{
+    const float SafeDeltaTime = FMath::Max(0.0f, DeltaTime);
+
+    if (IsRagdollLikeState())
+    {
+        return;
+    }
+
+    FVector BestVelocity = FVector::ZeroVector;
+    ConsiderInitialRagdollVelocity(BestVelocity, CurrentVelocity);
+    if (IsValid(Movement))
+    {
+        ConsiderInitialRagdollVelocity(BestVelocity, Movement->Velocity);
+        ConsiderInitialRagdollVelocity(BestVelocity, Movement->GetLastUpdateVelocity());
+    }
+
+    if (ShouldPreserveCachedPreRagdollVelocity(LastPreRagdollVelocity, LastPreRagdollVelocityAge, BestVelocity))
+    {
+        LastPreRagdollVelocityAge += SafeDeltaTime;
+        if (LastPreRagdollVelocityAge > CharacterRagdollTuning::PreRagdollVelocityGraceSeconds)
+        {
+            LastPreRagdollVelocity = FVector::ZeroVector;
+        }
+        return;
+    }
+
+    if (IsUsefulInitialRagdollVelocity(BestVelocity))
+    {
+        LastPreRagdollVelocity = ClampInitialRagdollVelocityForActivation(BestVelocity);
+        LastPreRagdollVelocityAge = 0.0f;
+        return;
+    }
+
+    LastPreRagdollVelocityAge += SafeDeltaTime;
+    if (LastPreRagdollVelocityAge > CharacterRagdollTuning::PreRagdollVelocityGraceSeconds)
+    {
+        LastPreRagdollVelocity = FVector::ZeroVector;
+    }
+}
+
 bool UCharacterComponent::IsRagdollDamage()
 {
     return (ImpactVelocity.Size() > RagdollResistance) && !bInvincible;
+}
+
+FVector UCharacterComponent::CapturePreRagdollVelocity(ACharacterController *InOwner, UCharacterMovementComponent *CharacterMovement) const
+{
+    FVector BestVelocity = FVector::ZeroVector;
+
+    // Pick the strongest valid gameplay velocity instead of the first non-zero one.
+    // During the impact frame CharacterMovement can already be partially damped, while
+    // LastPreRagdollVelocity still contains the real velocity from the previous game tick.
+    if (CharacterMovement)
+    {
+        ConsiderInitialRagdollVelocity(BestVelocity, CharacterMovement->Velocity);
+        ConsiderInitialRagdollVelocity(BestVelocity, CharacterMovement->GetLastUpdateVelocity());
+    }
+
+    if (InOwner)
+    {
+        ConsiderInitialRagdollVelocity(BestVelocity, InOwner->GetVelocity());
+    }
+
+    if (LastPreRagdollVelocityAge <= CharacterRagdollTuning::PreRagdollVelocityGraceSeconds)
+    {
+        ConsiderInitialRagdollVelocity(BestVelocity, LastPreRagdollVelocity);
+    }
+
+    // PrevVelocity is the last value used by impact detection. It is a fallback only,
+    // but considering the largest valid candidate prevents a low same-frame value from
+    // making the ragdoll appear to stop at activation.
+    ConsiderInitialRagdollVelocity(BestVelocity, PrevVelocity);
+
+    return ClampInitialRagdollVelocityForActivation(BestVelocity);
+}
+
+FVector UCharacterComponent::GetInitialRagdollActivationVelocity(ACharacterController *InOwner, UCharacterMovementComponent *CharacterMovement, USkeletalMeshComponent *SkeletalMesh) const
+{
+    (void)SkeletalMesh;
+    return CapturePreRagdollVelocity(InOwner, CharacterMovement);
+}
+
+void UCharacterComponent::ApplyInitialRagdollVelocity(USkeletalMeshComponent *SkeletalMesh, const FVector &InitialVelocity) const
+{
+    if (!IsValid(SkeletalMesh))
+    {
+        return;
+    }
+
+    const FVector SafeInitialVelocity = ClampInitialRagdollVelocityForActivation(InitialVelocity);
+    if (!IsUsefulInitialRagdollVelocity(SafeInitialVelocity))
+    {
+        return;
+    }
+
+    struct FRagdollVelocityBody
+    {
+        FName BoneName = NAME_None;
+        FBodyInstance* BodyInstance = nullptr;
+        float Mass = 1.0f;
+    };
+
+    TArray<FRagdollVelocityBody, TInlineAllocator<24>> VelocityBodies;
+    float TotalMass = 0.0f;
+    FVector MassWeightedVelocity = FVector::ZeroVector;
+
+    const int32 BoneCount = SkeletalMesh->GetNumBones();
+    for (int32 BoneIndex = 0; BoneIndex < BoneCount; ++BoneIndex)
+    {
+        const FName BoneName = SkeletalMesh->GetBoneName(BoneIndex);
+        FBodyInstance* BodyInstance = SkeletalMesh->GetBodyInstance(BoneName);
+        if (!BodyInstance || !BodyInstance->IsInstanceSimulatingPhysics())
+        {
+            continue;
+        }
+
+        if (!ShouldApplyInitialRagdollVelocityToBone(BoneName))
+        {
+            continue;
+        }
+
+        // Some skeletons can resolve several bones to the same physical body.
+        // Each BodyInstance participates once in the mass-weighted velocity solve.
+        const bool bAlreadyAdded = VelocityBodies.ContainsByPredicate(
+            [BodyInstance](const FRagdollVelocityBody& ExistingBody)
+            {
+                return ExistingBody.BodyInstance == BodyInstance;
+            });
+
+        if (bAlreadyAdded)
+        {
+            continue;
+        }
+
+        const float BodyMass = GetSafeRagdollBodyMass(BodyInstance);
+        FRagdollVelocityBody VelocityBody;
+        VelocityBody.BoneName = BoneName;
+        VelocityBody.BodyInstance = BodyInstance;
+        VelocityBody.Mass = BodyMass;
+        VelocityBodies.Add(VelocityBody);
+        TotalMass += BodyMass;
+        MassWeightedVelocity += GetSafeRagdollBodyVelocity(BodyInstance) * BodyMass;
+    }
+
+    if (VelocityBodies.Num() == 0 || TotalMass <= UE_SMALL_NUMBER)
+    {
+        // Fallback for unusual physics assets that expose only the component body.
+        SkeletalMesh->WakeAllRigidBodies();
+        SkeletalMesh->SetPhysicsLinearVelocity(SafeInitialVelocity, false, NAME_None);
+        if (FBodyInstance* RootBodyInstance = SkeletalMesh->GetBodyInstance(NAME_None))
+        {
+            RootBodyInstance->SetLinearVelocity(SafeInitialVelocity, false, true);
+        }
+        SkeletalMesh->WakeAllRigidBodies();
+        return;
+    }
+
+    // Apply one common delta velocity so the mass-weighted center-of-mass velocity
+    // of the driven ragdoll bodies becomes exactly the character velocity captured
+    // immediately before activation. This preserves momentum without dividing the
+    // velocity by body count and without injecting an impulse or angular velocity.
+    const FVector CurrentCenterOfMassVelocity = MassWeightedVelocity / TotalMass;
+    const FVector CommonVelocityDelta = SafeInitialVelocity - CurrentCenterOfMassVelocity;
+    if (!IsUsefulInitialRagdollVelocity(CommonVelocityDelta))
+    {
+        return;
+    }
+
+    SkeletalMesh->WakeAllRigidBodies();
+
+    for (const FRagdollVelocityBody& VelocityBody : VelocityBodies)
+    {
+        FBodyInstance* BodyInstance = VelocityBody.BodyInstance;
+        if (!BodyInstance)
+        {
+            continue;
+        }
+
+        const FVector BodyVelocity = GetSafeRagdollBodyVelocity(BodyInstance);
+        BodyInstance->SetLinearVelocity(BodyVelocity + CommonVelocityDelta, false, true);
+    }
+
+    SkeletalMesh->WakeAllRigidBodies();
+}
+
+void UCharacterComponent::BeginRagdollCameraStabilization()
+{
+    RagdollCameraStabilizeRemainingTime = CharacterRagdollTuning::RagdollCameraStabilizeDuration;
+    // Keep the actor as a raw location-only ragdoll anchor. Camera smoothing is
+    // handled by SpringArm lag, not by interpolating the actor/capsule transform.
+
+    if (IsValid(SpringArm))
+    {
+        if (!bSavedRagdollCameraState)
+        {
+            bSavedSpringArmCameraLag = SpringArm->bEnableCameraLag;
+            bSavedSpringArmCollisionTest = SpringArm->bDoCollisionTest;
+            SavedSpringArmCameraLagSpeed = SpringArm->CameraLagSpeed;
+            bSavedSpringArmUseCameraLagSubstepping = SpringArm->bUseCameraLagSubstepping;
+            SavedSpringArmCameraLagMaxTimeStep = SpringArm->CameraLagMaxTimeStep;
+            SavedSpringArmCameraLagMaxDistance = SpringArm->CameraLagMaxDistance;
+            bSavedRagdollCameraState = true;
+        }
+
+        // Ragdoll does not move the camera component directly. The capsule is snapped to
+        // the ragdoll location as a location-only anchor; the spring arm handles visual
+        // smoothing through camera lag while keeping collision tests enabled.
+        SpringArm->bEnableCameraLag = true;
+        SpringArm->bDoCollisionTest = true;
+        SpringArm->CameraLagSpeed = CharacterRagdollTuning::RagdollSpringArmLagSpeed;
+        SpringArm->bUseCameraLagSubstepping = true;
+        SpringArm->CameraLagMaxTimeStep = CharacterRagdollTuning::RagdollSpringArmLagMaxTimeStep;
+        SpringArm->CameraLagMaxDistance = CharacterRagdollTuning::RagdollSpringArmMaxLagDistance;
+    }
+}
+
+void UCharacterComponent::UpdateRagdollCameraStabilization(float DeltaTime)
+{
+    if (bIsRagdoll)
+    {
+        if (IsValid(SpringArm))
+        {
+            SpringArm->bEnableCameraLag = true;
+            SpringArm->bDoCollisionTest = true;
+            SpringArm->CameraLagSpeed = CharacterRagdollTuning::RagdollSpringArmLagSpeed;
+            SpringArm->bUseCameraLagSubstepping = true;
+            SpringArm->CameraLagMaxTimeStep = CharacterRagdollTuning::RagdollSpringArmLagMaxTimeStep;
+            SpringArm->CameraLagMaxDistance = CharacterRagdollTuning::RagdollSpringArmMaxLagDistance;
+        }
+        return;
+    }
+
+    if (RagdollCameraStabilizeRemainingTime <= 0.0f)
+    {
+        return;
+    }
+
+    RagdollCameraStabilizeRemainingTime = FMath::Max(0.0f, RagdollCameraStabilizeRemainingTime - FMath::Max(0.0f, DeltaTime));
+    if (RagdollCameraStabilizeRemainingTime <= 0.0f)
+    {
+        RestoreRagdollCameraState();
+    }
+}
+
+void UCharacterComponent::RestoreRagdollCameraState()
+{
+    RagdollCameraStabilizeRemainingTime = 0.0f;
+
+    if (IsValid(SpringArm) && bSavedRagdollCameraState)
+    {
+        SpringArm->bEnableCameraLag = bSavedSpringArmCameraLag;
+        SpringArm->bDoCollisionTest = bSavedSpringArmCollisionTest;
+        SpringArm->CameraLagSpeed = SavedSpringArmCameraLagSpeed;
+        SpringArm->bUseCameraLagSubstepping = bSavedSpringArmUseCameraLagSubstepping;
+        SpringArm->CameraLagMaxTimeStep = SavedSpringArmCameraLagMaxTimeStep;
+        SpringArm->CameraLagMaxDistance = SavedSpringArmCameraLagMaxDistance;
+    }
+
+    bSavedRagdollCameraState = false;
+}
+
+void UCharacterComponent::BeginRagdollCapsuleCollisionIsolation()
+{
+    if (!IsValid(OwnerCharacter))
+    {
+        return;
+    }
+
+    UCapsuleComponent* Capsule = OwnerCharacter->GetCapsuleComponent();
+    if (!IsValid(Capsule))
+    {
+        return;
+    }
+
+    if (!bSavedRagdollCapsuleCollisionState)
+    {
+        SavedRagdollCapsuleCollisionEnabled = Capsule->GetCollisionEnabled();
+        bSavedRagdollCapsuleGenerateOverlapEvents = Capsule->GetGenerateOverlapEvents();
+        bSavedRagdollCapsuleCollisionState = true;
+    }
+
+    // During active ragdoll the skeletal mesh is the authoritative physics body.
+    // Leaving the character capsule colliding while it is moved as a camera anchor can
+    // push the ragdoll bodies, causing over-speed, hitching, and spring-arm collision pops.
+    Capsule->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+    Capsule->SetGenerateOverlapEvents(false);
+}
+
+void UCharacterComponent::RestoreRagdollCapsuleCollision()
+{
+    if (!bSavedRagdollCapsuleCollisionState)
+    {
+        return;
+    }
+
+    if (IsValid(OwnerCharacter))
+    {
+        if (UCapsuleComponent* Capsule = OwnerCharacter->GetCapsuleComponent())
+        {
+            Capsule->SetCollisionEnabled(SavedRagdollCapsuleCollisionEnabled);
+            Capsule->SetGenerateOverlapEvents(bSavedRagdollCapsuleGenerateOverlapEvents);
+        }
+    }
+
+    bSavedRagdollCapsuleCollisionState = false;
 }
 
 void UCharacterComponent::ActiveRagdoll(ACharacterController *InOwner, USkeletalMeshComponent *SkeletalMesh)
@@ -2746,6 +3163,9 @@ void UCharacterComponent::ActiveRagdoll(ACharacterController *InOwner, USkeletal
         return;
 
     UCharacterMovementComponent* CharacterMovement = InOwner->GetCharacterMovement();
+    const FVector InitialRagdollVelocity = GetInitialRagdollActivationVelocity(InOwner, CharacterMovement, SkeletalMesh);
+    LastPreRagdollVelocity = InitialRagdollVelocity;
+    LastPreRagdollVelocityAge = 0.0f;
     const bool bKeepWaterIntent = bRagdollInWater || bRagdollRecoveryWantsSwimming;
     const FRotator ActorRotationBeforeRagdoll = MakeFlatYawRotation(InOwner->GetActorRotation().Yaw);
 
@@ -2772,12 +3192,18 @@ void UCharacterComponent::ActiveRagdoll(ACharacterController *InOwner, USkeletal
         }
     }
 
-    SetOwnerCapsuleCollisionForRagdoll(false);
-    ConfigureCameraForActiveRagdoll();
+    BeginRagdollCapsuleCollisionIsolation();
+
+    if (UCharacterAnimInstance* CharacterAnimInst = Cast<UCharacterAnimInstance>(SkeletalMesh->GetAnimInstance()))
+    {
+        CharacterAnimInst->RefreshCharacterAnimationState(0.0f);
+    }
 
     FActorHelper::DetachParent(SkeletalMesh, FDetachmentTransformRules::KeepWorldTransform);
     SkeletalMesh->SetAllBodiesSimulatePhysics(true);
     UCharacterFunctionLibrary::BlendRagdoll(*SkeletalMesh, CharacterRagdollTuning::MaxBlendWeight);
+    ApplyInitialRagdollVelocity(SkeletalMesh, InitialRagdollVelocity);
+    BeginRagdollCameraStabilization();
 }
 
 void UCharacterComponent::DeactiveRagdoll(ACharacterController *InOwner, USkeletalMeshComponent *SkeletalMesh, const FCharacterRagdollEnvironmentState &InReleaseEnvironmentState)
@@ -2790,6 +3216,7 @@ void UCharacterComponent::DeactiveRagdoll(ACharacterController *InOwner, USkelet
         return;
 
     ClearPendingWaterRagdollDeactivation();
+    RestoreRagdollCameraState();
 
     CapturedMeshLocation = UCharacterFunctionLibrary::GetBoneLocation(*SkeletalMesh, BONE_HIPS);
     CapturedMeshRotation = UCharacterFunctionLibrary::GetBoneRotation(*SkeletalMesh, BONE_HIPS);
@@ -2843,6 +3270,7 @@ void UCharacterComponent::DeactiveRagdoll(ACharacterController *InOwner, USkelet
         // underwater deactivation feel like it popped before interpolation even began.
 
         UCharacterFunctionLibrary::DisableRagdollPhysicsButKeepSecondary(*SkeletalMesh);
+        RestoreRagdollCapsuleCollision();
         if (SkeletalMesh->GetAttachParent() != InOwner->GetCapsuleComponent())
         {
             FActorHelper::AttachParent(SkeletalMesh, InOwner->GetCapsuleComponent(), FAttachmentTransformRules::KeepWorldTransform);
@@ -2863,30 +3291,33 @@ void UCharacterComponent::DeactiveRagdoll(ACharacterController *InOwner, USkelet
         WaterRagdollRecoveryElapsed = 0.0f;
         bWaterRecoveryTransformInitialized = false;
 
-        bIsLieOnBack = CheckIfLieOnBack(SkeletalMesh);
-        ActorTargetLocation = GetRagdollRecoveryActorLocationFromHips(CapturedMeshLocation, false);
-        ActorTargetRotation = FRotator(0.0f, GetMeshForwardYaw(bIsLieOnBack, SkeletalMesh), 0.0f);
+        const FVector DesiredRecoveryLocation = GetRagdollRecoveryActorLocationFromHips(CapturedMeshLocation, false);
+        const FVector SafeRecoveryLocation = ResolveRagdollRecoveryGroundPenetration(DesiredRecoveryLocation);
+        if (!SafeRecoveryLocation.Equals(InOwner->GetActorLocation(), KINDA_SMALL_NUMBER))
+        {
+            InOwner->SetActorLocation(SafeRecoveryLocation, false, nullptr, ETeleportType::TeleportPhysics);
+        }
 
-        // Move the capsule to the final get-up anchor while the simulated mesh is still
-        // world-space detached. Attaching with KeepWorldTransform preserves the saved
-        // ragdoll pose visually; the mesh component then blends back to its normal
-        // capsule-relative transform during UpdateRagdoll instead of snapping now.
-        InOwner->SetActorLocationAndRotation(ActorTargetLocation, ActorTargetRotation, false, nullptr, ETeleportType::TeleportPhysics);
         UCharacterFunctionLibrary::DisableRagdollPhysicsButKeepSecondary(*SkeletalMesh);
+        RestoreRagdollCapsuleCollision();
         FActorHelper::AttachParent(SkeletalMesh, InOwner->GetCapsuleComponent(), FAttachmentTransformRules::KeepWorldTransform);
-        WaterRecoveryMeshStartRelativeLocation = SkeletalMesh->GetRelativeLocation();
-        WaterRecoveryMeshStartRelativeRotation = SkeletalMesh->GetRelativeRotation();
-        bWaterRecoveryTransformInitialized = true;
+        SetSkeletalMeshLocationAndRotation(SkeletalMesh, CharacterRagdollTuning::MeshRecoveryRelativeLocation, CharacterRagdollTuning::MeshRecoveryRelativeRotation);
         SkeletalMesh->SetVisibility(true, true);
 
         bGettingUp = true;
-        RagdollWeight = CharacterConstants::MaxRagdollWeight;
-        GetUpActiveTime = 0.0f;
 
         if (UCharacterMovementComponent* CharacterMovement = InOwner->GetCharacterMovement())
         {
             StopMovementAndDisable(CharacterMovement);
         }
+    }
+
+    // Push the just-mutated component state into the AnimInstance before the graph evaluates.
+    // This avoids a one-frame stale bIsRagdoll/bIsGettingUp/bIsSwimming state when ragdoll
+    // deactivation happens from the game-update callback instead of the skeletal mesh tick.
+    if (UCharacterAnimInstance* CharacterAnimInst = Cast<UCharacterAnimInstance>(AnimInst))
+    {
+        CharacterAnimInst->RefreshCharacterAnimationState(0.0f);
     }
 
     // UpdateAnimation will run NativeUpdateAnimation before the Blueprint graph reads the
@@ -2936,9 +3367,17 @@ void UCharacterComponent::FinalizeRagdollRecovery(ACharacterController *InOwner,
     bRagdollRecoveryWantsSwimming = false;
     bRagdollInWater = bShouldResumeSwimming;
 
-    ResetSmoothedRagdollActorTransform();
-    SetOwnerCapsuleCollisionForRagdoll(true);
-    RestoreCameraAfterRagdoll();
+    RestoreRagdollCameraState();
+    RestoreRagdollCapsuleCollision();
+
+    if (!bShouldResumeSwimming)
+    {
+        const FVector SafeFinalLocation = ResolveRagdollRecoveryGroundPenetration(InOwner->GetActorLocation());
+        if (!SafeFinalLocation.Equals(InOwner->GetActorLocation(), KINDA_SMALL_NUMBER))
+        {
+            InOwner->SetActorLocation(SafeFinalLocation, false, nullptr, ETeleportType::TeleportPhysics);
+        }
+    }
 
     if (UCharacterMovementComponent* CharacterMovement = InOwner->GetCharacterMovement())
     {
@@ -2958,6 +3397,13 @@ void UCharacterComponent::FinalizeRagdollRecovery(ACharacterController *InOwner,
     bHasRagdollPrePhysicsActorRotation = false;
 
     ResetMovementState();
+
+    if (UCharacterAnimInstance* CharacterAnimInst = Cast<UCharacterAnimInstance>(SkeletalMesh->GetAnimInstance()))
+    {
+        CharacterAnimInst->RefreshCharacterAnimationState(0.0f);
+    }
+    SkeletalMesh->UpdateComponentToWorld();
+
     InOwner->RestoreControlAfterRagdollRecovery();
 }
 
@@ -2968,6 +3414,9 @@ void UCharacterComponent::SetRagdollActive(bool bActive)
 
     if (bActive)
     {
+        // Cache the last gameplay velocity before bIsRagdoll changes branch state.
+        LastPreRagdollVelocity = CapturePreRagdollVelocity(OwnerCharacter, OwnerCharacter->GetCharacterMovement());
+        LastPreRagdollVelocityAge = LastPreRagdollVelocity.IsNearlyZero() ? TNumericLimits<float>::Max() : 0.0f;
         bIsRagdoll = true;
         float DetectedActivationWaterLevel = 0.0f;
         const bool bActivationPoseInWater = RefreshRagdollWaterDetection(&DetectedActivationWaterLevel);
@@ -2987,8 +3436,8 @@ void UCharacterComponent::SetRagdollActive(bool bActive)
         }
 
         // Capture the final ground state through an async raycast batch before disabling physics.
-        // The callback only stores the result. The next component update consumes it after the
-        // current physics pose has been synchronized on the game thread.
+        // The callback re-enters this branch with a one-shot cached result, so the expensive
+        // ground decision is never made from the already-attached capsule or stale movement mode.
         if (!bUseAsyncRagdollReleaseGroundResult)
         {
             RequestAsyncRagdollReleaseGroundTrace();
@@ -3076,40 +3525,17 @@ void UCharacterComponent::UpdateRagdoll(const float DeltaTime, ACharacterControl
             ActorTargetRotation = FRotator(0.0f, GetMeshForwardYaw(bIsLieOnBack, SkeletalMesh), 0.0f);
         }
         const bool bUseWaterActorOrigin = bRagdollInWater || bRagdollRecoveryWantsSwimming || RagdollEnvironmentState.bShouldRecoverInWater;
-        ActorTargetLocation = GetRagdollRecoveryActorLocationFromHips(UCharacterFunctionLibrary::GetBoneLocation(*SkeletalMesh, BONE_HIPS), bUseWaterActorOrigin);
-
-        if (!bHasSmoothedRagdollActorTransform
-            || FVector::DistSquared(SmoothedRagdollActorLocation, ActorTargetLocation) > FMath::Square(CharacterRagdollTuning::RagdollActorSnapDistance))
+        const FVector Location = GetRagdollRecoveryActorLocationFromHips(UCharacterFunctionLibrary::GetBoneLocation(*SkeletalMesh, BONE_HIPS), bUseWaterActorOrigin);
+        // The actor is only a camera/control anchor during active ragdoll. Keep it location-only
+        // and let SpringArm camera lag smooth the view; do not interpolate the actor itself and
+        // do not rotate it from the simulated mesh yaw.
+        if (!Location.ContainsNaN())
         {
-            SmoothedRagdollActorLocation = ActorTargetLocation;
-            SmoothedRagdollActorRotation = ActorTargetRotation;
-            bHasSmoothedRagdollActorTransform = true;
+            InOwner->SetActorLocation(Location, false, nullptr, ETeleportType::TeleportPhysics);
         }
-        else
-        {
-            SmoothedRagdollActorLocation = FMath::VInterpTo(
-                SmoothedRagdollActorLocation,
-                ActorTargetLocation,
-                DeltaTime,
-                CharacterRagdollTuning::RagdollActorLocationInterpSpeed);
-            SmoothedRagdollActorRotation = FMath::RInterpTo(
-                SmoothedRagdollActorRotation,
-                ActorTargetRotation,
-                DeltaTime,
-                CharacterRagdollTuning::RagdollActorRotationInterpSpeed);
-            SmoothedRagdollActorRotation.Pitch = 0.0f;
-            SmoothedRagdollActorRotation.Roll = 0.0f;
-        }
-
-        InOwner->SetActorLocationAndRotation(SmoothedRagdollActorLocation, SmoothedRagdollActorRotation, false, nullptr, ETeleportType::TeleportPhysics);
+        UpdateRagdollCameraStabilization(DeltaTime);
 
         if (bPendingWaterRagdollDeactivation && UpdatePendingWaterRagdollDeactivation(DeltaTime, InOwner, SkeletalMesh))
-        {
-            SetRagdollActive(false);
-            return;
-        }
-
-        if (bUseAsyncRagdollReleaseGroundResult && !bRagdollReleaseGroundTraceInFlight)
         {
             SetRagdollActive(false);
             return;
@@ -3171,36 +3597,28 @@ void UCharacterComponent::UpdateRagdoll(const float DeltaTime, ACharacterControl
         {
             RagdollWeight = FMath::Max(0.0f, RagdollWeight - DeltaTime);
             InOwner->GetCharacterMovement()->DisableMovement();
-
-            if (!bWaterRecoveryTransformInitialized)
-            {
-                WaterRecoveryMeshStartRelativeLocation = SkeletalMesh->GetRelativeLocation();
-                WaterRecoveryMeshStartRelativeRotation = SkeletalMesh->GetRelativeRotation();
-                bWaterRecoveryTransformInitialized = true;
-            }
-
-            const float RecoveryAlpha = 1.0f - FMath::Clamp(RagdollWeight / CharacterConstants::MaxRagdollWeight, 0.0f, 1.0f);
-            const float SmoothAlpha = RecoveryAlpha * RecoveryAlpha * (3.0f - 2.0f * RecoveryAlpha);
-            const FVector BlendedMeshLocation = FMath::Lerp(WaterRecoveryMeshStartRelativeLocation, CharacterRagdollTuning::MeshRecoveryRelativeLocation, SmoothAlpha);
-            const FQuat BlendedMeshQuat = FQuat::Slerp(WaterRecoveryMeshStartRelativeRotation.Quaternion(), CharacterRagdollTuning::MeshRecoveryRelativeRotation.Quaternion(), SmoothAlpha).GetNormalized();
-            SkeletalMesh->SetRelativeLocationAndRotation(BlendedMeshLocation, BlendedMeshQuat.Rotator(), false, nullptr, ETeleportType::TeleportPhysics);
-
             if (RagdollWeight == 0.0f)
             {
                 bGettingUp = false;
                 bLandRagdollRecoveryOverridesWater = false;
                 RagdollPrePhysicsActorRotation = FRotator::ZeroRotator;
                 bHasRagdollPrePhysicsActorRotation = false;
-                bWaterRecoveryTransformInitialized = false;
-                ResetSmoothedRagdollActorTransform();
-                SetSkeletalMeshLocationAndRotation(SkeletalMesh, CharacterRagdollTuning::MeshRecoveryRelativeLocation, CharacterRagdollTuning::MeshRecoveryRelativeRotation);
-                SetOwnerCapsuleCollisionForRagdoll(true);
-                RestoreCameraAfterRagdoll();
+                RestoreRagdollCameraState();
+                RestoreRagdollCapsuleCollision();
+                const FVector SafeFinalLocation = ResolveRagdollRecoveryGroundPenetration(InOwner->GetActorLocation());
+                if (!SafeFinalLocation.Equals(InOwner->GetActorLocation(), KINDA_SMALL_NUMBER))
+                {
+                    InOwner->SetActorLocation(SafeFinalLocation, false, nullptr, ETeleportType::TeleportPhysics);
+                }
                 if (UCharacterMovementComponent* CharacterMovement = InOwner->GetCharacterMovement())
                 {
                     SetMovementModeAfterRagdollRecovery(CharacterMovement, RagdollEnvironmentState);
                 }
                 ResetMovementState();
+                if (UCharacterAnimInstance* CharacterAnimInst = Cast<UCharacterAnimInstance>(SkeletalMesh->GetAnimInstance()))
+                {
+                    CharacterAnimInst->RefreshCharacterAnimationState(0.0f);
+                }
                 InOwner->RestoreControlAfterRagdollRecovery();
             }
         }

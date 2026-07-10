@@ -3,10 +3,14 @@
 
 #include "Setting/GameSettings.h"
 #include "System/FileFunctionLibrary.h"
+#include "System/GameManagerSubSystem.h"
 #include "System/MacroLibrary.h"
 #include "Components/PostProcessComponent.h"
 #include "GameFramework/GameUserSettings.h"
 #include "Components/ActorComponent.h"
+#include "Engine/Engine.h"
+#include "Engine/GameInstance.h"
+#include "Engine/World.h"
 
 #define SETTING_FILE_NAME TEXT("/settings.json")
 #define SETTING_PATH FPaths::Combine(DIRECTORY_USER, DIRECTORY_GAME, SETTING_FILE_NAME)
@@ -14,11 +18,13 @@
 TSharedRef<FJsonObject> UGameSettings::Serialization()
 {
     TSharedRef<FJsonObject> Json = MakeShared<FJsonObject>();
+    Json->SetStringField(JSON_VERSION_FIELD, JSON_SCHEMA_VERSION);
     Json->SetNumberField(TEXT("BloomIntensity"), BloomIntensity);
     Json->SetNumberField(TEXT("BloomThreshold"), BloomThreshold);
     Json->SetNumberField(TEXT("AmbientOcclusionIntensity"), AmbientOcclusionIntensity);
     Json->SetNumberField(TEXT("ShadowQuality"), ShadowQuality);
     Json->SetNumberField(TEXT("TextureQuality"), TextureQuality);
+    Json->SetNumberField(TEXT("MaxTextureResolution"), GetClampedMaxTextureResolution());
     Json->SetNumberField(TEXT("ViewDistanceQuality"), ViewDistanceQuality);
     Json->SetNumberField(TEXT("AntiAliasingQuality"), AntiAliasingQuality);
     Json->SetNumberField(TEXT("PostProcessingQuality"), PostProcessingQuality);
@@ -44,6 +50,8 @@ bool UGameSettings::Deserialization(TSharedPtr<FJsonObject> Json)
         Json->TryGetNumberField(TEXT("AmbientOcclusionIntensity"), AmbientOcclusionIntensity);
         Json->TryGetNumberField(TEXT("ShadowQuality"), ShadowQuality);
         Json->TryGetNumberField(TEXT("TextureQuality"), TextureQuality);
+        Json->TryGetNumberField(TEXT("MaxTextureResolution"), MaxTextureResolution);
+        MaxTextureResolution = GetClampedMaxTextureResolution();
         Json->TryGetNumberField(TEXT("ViewDistanceQuality"), ViewDistanceQuality);
         Json->TryGetNumberField(TEXT("AntiAliasingQuality"), AntiAliasingQuality);
         Json->TryGetNumberField(TEXT("PostProcessingQuality"), PostProcessingQuality);
@@ -60,6 +68,46 @@ bool UGameSettings::Deserialization(TSharedPtr<FJsonObject> Json)
         return true;
     }
     return false;
+}
+
+
+int32 UGameSettings::GetClampedMaxTextureResolution() const
+{
+    // Runtime texture decode cost grows quadratically with resolution. Keep a
+    // native clamp even when settings.json is edited by hand.
+    return FMath::Clamp(MaxTextureResolution, 64, 8192);
+}
+
+int32 UGameSettings::ResolveMaxTextureResolution(const UObject* WorldContextObject)
+{
+    if (GEngine && WorldContextObject)
+    {
+        if (UWorld* World = GEngine->GetWorldFromContextObject(WorldContextObject, EGetWorldErrorMode::ReturnNull))
+        {
+            if (UGameInstance* GameInstance = World->GetGameInstance())
+            {
+                if (const UGameManagerSubSystem* Manager = GameInstance->GetSubsystem<UGameManagerSubSystem>())
+                {
+                    if (const UGameSettings* Settings = Manager->GetGameSettings())
+                    {
+                        return Settings->GetClampedMaxTextureResolution();
+                    }
+                }
+            }
+        }
+    }
+
+    const FString Path = SETTING_PATH;
+    if (const TSharedPtr<FJsonObject> Json = UFileFunctionLibrary::FromJson(Path); Json.IsValid())
+    {
+        int32 SavedResolution = GetDefaultMaxTextureResolution();
+        if (Json->TryGetNumberField(TEXT("MaxTextureResolution"), SavedResolution))
+        {
+            return FMath::Clamp(SavedResolution, 64, 8192);
+        }
+    }
+
+    return GetDefaultMaxTextureResolution();
 }
 
 UGameSettings *UGameSettings::CreateSettingsData(UObject *Onwer)

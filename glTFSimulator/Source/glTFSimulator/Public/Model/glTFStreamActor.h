@@ -17,6 +17,8 @@ class UglTFRuntimeAsset;
 class ULoadAsyncAction;
 class UStreamAsyncAction;
 class UTexture;
+class UGameUpdateSubSystem;
+class AWaterActor;
 struct FLoadAsyncWrapper;
 struct FStreamAsyncWrapper;
 
@@ -50,6 +52,9 @@ public:
 
     void ReleaseRuntimeResourcesForWorldExit();
 
+    void SetRenderOnlyStreaming(bool bRenderOnly);
+    bool IsRenderOnlyStreaming() const { return bRenderOnlyStreaming; }
+
     bool HasModelMetadata() const { return bHasModelMetadata; }
     const FModelData& GetModelMetadata() const { return ModelMetadata; }
 
@@ -61,10 +66,13 @@ public:
 
     const TMap<FName, FModelNodeData>& GetAllNodeMapRef() const { return AllNodeMap; }
     const TMap<FName, FModelMeshData>& GetAllMeshMapRef() const { return AllMeshMap; }
+    const TMap<FName, FWaterStreamNodeData>& GetWaterNodeMapRef() const { return WaterNodeMap; }
     const TSet<FName>& GetLoadedNodesRef() const { return LoadedNodes; }
+    const TSet<FName>& GetLoadedWaterNodesRef() const { return LoadedWaterNodes; }
     const TMap<FName, TObjectPtr<UInstancedStaticMeshComponent>>& GetInstanceMapRef() const { return InstanceMap; }
     const TMap<FName, TObjectPtr<UBoxComponent>>& GetUnloadBoxMapRef() const { return UnloadBoxMap; }
     const TMap<FName, FComponentGroup>& GetDynamicComponentMapRef() const { return DynamicComponentMap; }
+    const TMap<FName, TObjectPtr<AWaterActor>>& GetWaterActorMapRef() const { return WaterActorMap; }
     UMaterialInterface* GetDecalLight() const { return DecalLight; }
 
     UFUNCTION(BlueprintCallable)
@@ -125,7 +133,13 @@ private:
     TMap<FName, FModelMeshData> AllMeshMap;
 
     UPROPERTY()
+    TMap<FName, FWaterStreamNodeData> WaterNodeMap;
+
+    UPROPERTY()
     TSet<FName> LoadedNodes;
+
+    UPROPERTY()
+    TSet<FName> LoadedWaterNodes;
 
     UPROPERTY()
     TMap<FName, TObjectPtr<UInstancedStaticMeshComponent>> InstanceMap;
@@ -137,12 +151,17 @@ private:
     TMap<FName, FComponentGroup> DynamicComponentMap;
 
     UPROPERTY()
+    TMap<FName, TObjectPtr<AWaterActor>> WaterActorMap;
+
+    UPROPERTY()
     FModelData ModelMetadata;
 
     FString FilePath;
     bool bHasModelMetadata = false;
+    bool bRenderOnlyStreaming = false;
     bool bIsDestroyed = false;
     float LoadingStatus = 0.0f;
+    int32 GameUpdateTickHandle = INDEX_NONE;
     EGLTFStreamAssetPhase AssetLoadPhase = EGLTFStreamAssetPhase::None;
     TSharedPtr<FThreadSafeCounter, ESPMode::ThreadSafe> ActiveAssetLoadCancelToken;
     int32 AssetLoadRequestSerial = 0;
@@ -153,8 +172,11 @@ private:
     void CancelActiveAsyncActions();
     void ReleaseAsset(UglTFRuntimeAsset* Asset);
     void ReleaseStreamingResources();
+    void RegisterGameUpdate();
+    void UnregisterGameUpdate();
+    void UpdateStreamingFromGameUpdate(float DeltaSeconds);
     void StartStreaming();
-    void AsyncTick();
+    void StartStreamingStep();
     void UpdateProperties(const FStreamAsyncWrapper& Collection);
     bool IsPlayerInsideModelRange() const;
     void WriteLogAsync(const FString& Message) const;

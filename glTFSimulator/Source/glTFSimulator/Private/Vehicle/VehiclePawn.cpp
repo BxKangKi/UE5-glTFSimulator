@@ -26,10 +26,14 @@
 #include "HAL/FileManager.h"
 #include "HAL/PlatformTime.h"
 #include "Misc/Paths.h"
+#include "Setting/GameSettings.h"
 #include "System/ActorHelper.h"
 #include "System/FileFunctionLibrary.h"
 #include "System/MathHelper.h"
+#include "System/MacroLibrary.h"
 #include "System/PhysicsHelper.h"
+#include "System/MultiplayerWorldSubSystem.h"
+#include "Net/UnrealNetwork.h"
 #include "Vehicle/VehicleSubSystem.h"
 #include "World/BuoyancyComponent.h"
 #include "World/WaterActor.h"
@@ -123,6 +127,21 @@ namespace
     constexpr float VehicleLowSpeedSlopeDampingRate = 1.65f;
     constexpr float VehicleLowSpeedSlopeDampingMaxAlpha = 0.22f;
 
+    static FORCEINLINE float ComputeVehicleAeroSpeedAlpha(const float Speed, const float MinimumSpeed)
+    {
+        // Aerodynamic downforce is speed dependent. Keeping the force at zero near
+        // rest prevents idle cars from buzzing on the suspension or ground contacts.
+        const float StartSpeed = FMath::Max(1.0f, MinimumSpeed);
+        if (Speed <= StartSpeed)
+        {
+            return 0.0f;
+        }
+
+        const float FullSpeed = FMath::Max(StartSpeed + 1.0f, StartSpeed * 2.25f);
+        const float Alpha = FMath::Clamp((Speed - StartSpeed) / (FullSpeed - StartSpeed), 0.0f, 1.0f);
+        return Alpha * Alpha * (3.0f - 2.0f * Alpha);
+    }
+
     static FBox TransformVehicleBounds(const FBox& LocalBounds, const FTransform& Transform)
     {
         FBox Result(ForceInit);
@@ -197,6 +216,40 @@ static bool IsVehicleExitLocationInWater(const UObject* WorldContextObject, cons
     return bInWater;
 }
 
+
+static FString ResolveReplicatedVehicleGltfPathForCurrentWorld(const UObject* WorldContextObject, const FString& InPath)
+{
+    FString NormalizedPath = InPath;
+    FPaths::NormalizeFilename(NormalizedPath);
+    if (FPaths::FileExists(NormalizedPath))
+    {
+        return NormalizedPath;
+    }
+
+    FString RelativeModelPath = FPaths::GetCleanFilename(NormalizedPath);
+    const int32 ModelSegmentIndex = NormalizedPath.Find(TEXT("/model/"), ESearchCase::IgnoreCase, ESearchDir::FromStart);
+    if (ModelSegmentIndex != INDEX_NONE)
+    {
+        RelativeModelPath = NormalizedPath.Mid(ModelSegmentIndex + 7);
+    }
+
+    if (const UMultiplayerWorldSubSystem* Multiplayer = UMultiplayerWorldSubSystem::Get(WorldContextObject))
+    {
+        const FString WorldFolderName = Multiplayer->GetSelectedWorldFolderName();
+        if (!WorldFolderName.IsEmpty())
+        {
+            const FString Candidate = FPaths::Combine(PATH_ROOT, WorldFolderName, TEXT("model"), RelativeModelPath);
+            if (FPaths::FileExists(Candidate))
+            {
+                return Candidate;
+            }
+            return Candidate;
+        }
+    }
+
+    return NormalizedPath;
+}
+
 static void ApplyVehicleWaterExitState(APawn* RestoredPawn, float WaterLevel)
 {
     if (!IsValid(RestoredPawn))
@@ -225,6 +278,10 @@ AVehiclePawn::AVehiclePawn()
 {
     PrimaryActorTick.bCanEverTick = false;
     PrimaryActorTick.TickGroup = TG_PrePhysics;
+    bReplicates = true;
+    SetReplicateMovement(true);
+    SetNetUpdateFrequency(30.0f);
+    SetMinNetUpdateFrequency(10.0f);
     bUseAsyncVehiclePhysicsTick = false;
     bRunVehicleForcesInAsyncPhysicsTick = false;
     bAsyncPhysicsTickEnabled = false;
@@ -302,6 +359,23 @@ AVehiclePawn::AVehiclePawn()
     WheelOffsets.Add(FVector(-112.0f, -66.0f, 10.0f));
 }
 
+void AVehiclePawn::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+    Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+    DOREPLIFETIME(AVehiclePawn, ReplicatedSourceFilePath);
+    DOREPLIFETIME(AVehiclePawn, ReplicatedObjectName);
+}
+
+void AVehiclePawn::OnRep_VehicleModelReplicationData()
+{
+    if (ReplicatedSourceFilePath.IsEmpty())
+    {
+        return;
+    }
+
+    LoadVehicleModel(ResolveReplicatedVehicleGltfPathForCurrentWorld(this, ReplicatedSourceFilePath), ReplicatedObjectName);
+}
+
 void AVehiclePawn::BeginPlay()
 {
     Super::BeginPlay();
@@ -322,7 +396,28 @@ void AVehiclePawn::BeginPlay()
     ApplyVehicleBodyPhysicsSettings();
     BuildBodyMesh();
     BuildWheelMeshes();
-    ResetVehiclePoseAboveGround();
+
+    const bool bClientRenderOnlyVehicle = UMultiplayerWorldSubSystem::ShouldUseClientRenderOnlyStreaming(this) && !HasAuthority();
+    if (bClientRenderOnlyVehicle)
+    {
+        Body->SetSimulatePhysics(false);
+        Body->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+        Body->SetGenerateOverlapEvents(false);
+        BodyMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+        BodyMesh->SetGenerateOverlapEvents(false);
+        for (TObjectPtr<UProceduralMeshComponent>& WheelMesh : WheelMeshes)
+        {
+            if (IsValid(WheelMesh.Get()))
+            {
+                WheelMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+                WheelMesh->SetGenerateOverlapEvents(false);
+            }
+        }
+    }
+    else
+    {
+        ResetVehiclePoseAboveGround();
+    }
 
     WheelSpinDegrees.Init(0.0f, WheelOffsets.Num());
     WheelSpringLengths.SetNum(WheelOffsets.Num());
@@ -340,9 +435,12 @@ void AVehiclePawn::BeginPlay()
     WheelLateralForces.Init(0.0f, WheelOffsets.Num());
     WheelGrounded.Init(false, WheelOffsets.Num());
 
-    if (UVehicleSubSystem* VehicleSubSystem = UVehicleSubSystem::Get(this))
+    if (!bClientRenderOnlyVehicle)
     {
-        VehicleSubSystem->RegisterVehicle(this);
+        if (UVehicleSubSystem* VehicleSubSystem = UVehicleSubSystem::Get(this))
+        {
+            VehicleSubSystem->RegisterVehicle(this);
+        }
     }
 }
 
@@ -511,13 +609,6 @@ void AVehiclePawn::ApplyVehicleBodyPhysicsSettings()
     Body->SetPhysicsMaxAngularVelocityInRadians(FMath::Max(0.5f, MaxAngularVelocityRadians), false);
 }
 
-bool AVehiclePawn::ShouldRunVehiclePhysicsInAsyncTick() const
-{
-    // The VehicleSubSystem owns the runtime integration phase. Keeping the old actor async
-    // physics path disabled removes the sync/async double-step instability that caused
-    // inconsistent acceleration, yaw, and wheel suspension behavior.
-    return false;
-}
 
 void AVehiclePawn::RunVehiclePhysicsSteps(float DeltaSeconds, bool bFromAsyncPhysicsTick)
 {
@@ -602,7 +693,8 @@ void AVehiclePawn::UpdateVehicleInputSmoothing(float DeltaSeconds)
     const float SpeedRateScale = FMath::Lerp(1.0f, 1.0f - FMath::Clamp(SteeringInputSpeedDamping, 0.0f, 1.0f), SpeedAlpha);
 
     const bool bReturningTowardCenter = FMath::Abs(CurvedSteeringTarget) < FMath::Abs(SmoothedSteeringInput)
-        && FMath::Sign(CurvedSteeringTarget) == FMath::Sign(SmoothedSteeringInput);
+        && (FMath::IsNearlyZero(CurvedSteeringTarget, 0.001f)
+            || FMath::Sign(CurvedSteeringTarget) == FMath::Sign(SmoothedSteeringInput));
     const bool bReversingDirection = CurvedSteeringTarget * SmoothedSteeringInput < -KINDA_SMALL_NUMBER;
     float SteeringRate = bReturningTowardCenter
         ? FMath::Max(0.1f, SteeringInputReturnRate)
@@ -665,7 +757,8 @@ AVehiclePawn::FVehicleParallelControlOutput AVehiclePawn::CalculateParallelContr
     const float SpeedRateScale = FMath::Lerp(1.0f, 1.0f - FMath::Clamp(Input.SteeringInputSpeedDamping, 0.0f, 1.0f), SpeedAlpha);
 
     const bool bReturningTowardCenter = FMath::Abs(CurvedSteeringTarget) < FMath::Abs(Input.SmoothedSteeringInput)
-        && FMath::Sign(CurvedSteeringTarget) == FMath::Sign(Input.SmoothedSteeringInput);
+        && (FMath::IsNearlyZero(CurvedSteeringTarget, 0.001f)
+            || FMath::Sign(CurvedSteeringTarget) == FMath::Sign(Input.SmoothedSteeringInput));
     const bool bReversingDirection = CurvedSteeringTarget * Input.SmoothedSteeringInput < -KINDA_SMALL_NUMBER;
     float SteeringRate = bReturningTowardCenter
         ? FMath::Max(0.1f, Input.SteeringInputReturnRate)
@@ -695,8 +788,13 @@ void AVehiclePawn::ApplyParallelControlOutput(const FVehicleParallelControlOutpu
     SmoothedSteeringInput = FMath::Clamp(Output.SmoothedSteeringInput, -1.0f, 1.0f);
 }
 
-void AVehiclePawn::TickVehicleFromSubSystem(float DeltaSeconds)
+void AVehiclePawn::UpdateVehicleFromSubSystem(float DeltaSeconds)
 {
+    if (UMultiplayerWorldSubSystem::ShouldUseClientRenderOnlyStreaming(this) && !HasAuthority())
+    {
+        return;
+    }
+
     const float SafeFrameDeltaTime = FMath::Clamp(DeltaSeconds, 0.0f, VehiclePhysicsMaxCatchUpSeconds);
     if (SafeFrameDeltaTime <= 0.0f || !IsValid(Body))
     {
@@ -732,21 +830,18 @@ void AVehiclePawn::TickVehicleFromSubSystem(float DeltaSeconds)
     UpdateWheelVisuals(SafeFrameDeltaTime);
 }
 
-void AVehiclePawn::Tick(float DeltaSeconds)
-{
-    Super::Tick(DeltaSeconds);
-    TickVehicleFromSubSystem(DeltaSeconds);
-}
 
-void AVehiclePawn::AsyncPhysicsTickActor(float DeltaTime, float SimTime)
-{
-    Super::AsyncPhysicsTickActor(DeltaTime, SimTime);
-}
 
 void AVehiclePawn::SetDriveInput(float Throttle, float Steering)
 {
     ThrottleInput = FMath::Clamp(Throttle, -1.0f, 1.0f);
     SteeringInput = FMath::Clamp(Steering, -1.0f, 1.0f);
+
+    if (!HasAuthority())
+    {
+        ServerSetDriveInput(ThrottleInput, SteeringInput);
+    }
+
     if (IsValid(Body) && Body->IsSimulatingPhysics() && (!FMath::IsNearlyZero(ThrottleInput, 0.01f) || !FMath::IsNearlyZero(SteeringInput, 0.01f)))
     {
         Body->WakeRigidBody();
@@ -756,18 +851,20 @@ void AVehiclePawn::SetDriveInput(float Throttle, float Steering)
 
 void AVehiclePawn::SetThrottleInput(float Throttle)
 {
-    ThrottleInput = FMath::Clamp(Throttle, -1.0f, 1.0f);
-    if (IsValid(Body) && Body->IsSimulatingPhysics() && !FMath::IsNearlyZero(ThrottleInput, 0.01f))
-    {
-        Body->WakeRigidBody();
-        Body->WakeAllRigidBodies();
-    }
+    SetDriveInput(Throttle, SteeringInput);
 }
 
 void AVehiclePawn::SetSteeringInput(float Steering)
 {
+    SetDriveInput(ThrottleInput, Steering);
+}
+
+void AVehiclePawn::ServerSetDriveInput_Implementation(float Throttle, float Steering)
+{
+    ThrottleInput = FMath::Clamp(Throttle, -1.0f, 1.0f);
     SteeringInput = FMath::Clamp(Steering, -1.0f, 1.0f);
-    if (IsValid(Body) && Body->IsSimulatingPhysics() && !FMath::IsNearlyZero(SteeringInput, 0.01f))
+
+    if (IsValid(Body) && Body->IsSimulatingPhysics() && (!FMath::IsNearlyZero(ThrottleInput, 0.01f) || !FMath::IsNearlyZero(SteeringInput, 0.01f)))
     {
         Body->WakeRigidBody();
         Body->WakeAllRigidBodies();
@@ -781,6 +878,11 @@ void AVehiclePawn::ClearDriveInput()
     SmoothedThrottleInput = 0.0f;
     SmoothedSteeringInput = 0.0f;
     SmoothedStableYawRate = 0.0f;
+
+    if (!HasAuthority())
+    {
+        ServerSetDriveInput(0.0f, 0.0f);
+    }
 }
 
 void AVehiclePawn::EndPlay(const EEndPlayReason::Type EndPlayReason)
@@ -1116,6 +1218,7 @@ bool AVehiclePawn::SaveVehicleTuningJsonTemplate(const FString& JsonPath) const
 
     const FString FullJsonPath = FPaths::ConvertRelativePathToFull(JsonPath);
     TSharedRef<FJsonObject> RootObject = MakeShared<FJsonObject>();
+    RootObject->SetStringField(JSON_VERSION_FIELD, JSON_SCHEMA_VERSION);
     RootObject->SetStringField(TEXT("Schema"), TEXT("glTFSimulator.VehicleTuning.v1"));
     RootObject->SetStringField(TEXT("DisplayName"), ObjectName.IsEmpty() ? BaseName : ObjectName);
     RootObject->SetStringField(TEXT("Notes"), TEXT("Gameplay driving tune values only. Do not put physical constants such as mass, suspension, gravity, or collision body sizes here."));
@@ -1184,8 +1287,9 @@ UStaticMesh* AVehiclePawn::LoadMeshByIndex(int32 MeshIndex)
     MeshConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
     MeshConfig.MaterialsConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
     MeshConfig.MaterialsConfig.bGeneratesMipMaps = false;
-    MeshConfig.MaterialsConfig.ImagesConfig.MaxWidth = 1024;
-    MeshConfig.MaterialsConfig.ImagesConfig.MaxHeight = 1024;
+    const int32 TextureDimensionLimit = UGameSettings::ResolveMaxTextureResolution(this);
+    MeshConfig.MaterialsConfig.ImagesConfig.MaxWidth = TextureDimensionLimit;
+    MeshConfig.MaterialsConfig.ImagesConfig.MaxHeight = TextureDimensionLimit;
     MeshConfig.MaterialsConfig.ImagesConfig.bCompressMips = false;
     MeshConfig.MaterialsConfig.ImagesConfig.bStreaming = false;
     MeshConfig.MaterialsConfig.bLoadMipMaps = false;
@@ -1195,6 +1299,7 @@ UStaticMesh* AVehiclePawn::LoadMeshByIndex(int32 MeshIndex)
         MeshConfig.MaterialsConfig.UnlitOverrideMap = LitOverrides;
     }
     MeshConfig.bAllowCPUAccess = true;
+    MeshConfig.bBuildLumenCards = true;
     MeshConfig.bBuildSimpleCollision = false;
     MeshConfig.bBuildComplexCollision = false;
 
@@ -1422,7 +1527,18 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InFilePath, const FString& In
 
     const bool bLoadedAnyVisual = LoadedBodyMeshComponents.Num() > 0 || LoadedWheelMeshComponents.Num() > 0;
     HideProceduralDefaultVisuals(bLoadedAnyVisual);
-    ResetVehiclePoseAboveGround();
+
+    if (bLoadedAnyVisual && HasAuthority())
+    {
+        ReplicatedSourceFilePath = SourceFilePath;
+        ReplicatedObjectName = ObjectName;
+        ForceNetUpdate();
+    }
+
+    if (!UMultiplayerWorldSubSystem::ShouldUseClientRenderOnlyStreaming(this) || HasAuthority())
+    {
+        ResetVehiclePoseAboveGround();
+    }
     return bLoadedAnyVisual;
 }
 
@@ -2113,9 +2229,18 @@ void AVehiclePawn::UpdateStableWheelVehicle(float DeltaSeconds)
         const float DragMagnitude = FMath::Clamp(Speed * Speed * FMath::Max(0.0f, AerodynamicDragCoefficient) * MassScale, 0.0f, MaxAerodynamicDrag * MassScale);
         TotalForce += -StablePhysicsLinearVelocity.GetSafeNormal() * DragMagnitude;
     }
-    if (GroundedWheels > 0 && Speed >= MinimumDownforceSpeed && GroundedDownforceCoefficient > 0.0f)
+    if (GroundedWheels > 0)
     {
-        const float Downforce = FMath::Clamp(Speed * Speed * GroundedDownforceCoefficient * MassScale, 0.0f, MaxGroundedDownforce * MassScale) * GroundedRatio;
+        const float DownforceSpeedAlpha = ComputeVehicleAeroSpeedAlpha(Speed, MinimumDownforceSpeed);
+        float Downforce = 0.0f;
+        if (DownforceSpeedAlpha > 0.0f && GroundedDownforceCoefficient > 0.0f)
+        {
+            Downforce += FMath::Clamp(Speed * Speed * GroundedDownforceCoefficient * MassScale, 0.0f, MaxGroundedDownforce * MassScale) * GroundedRatio * DownforceSpeedAlpha;
+        }
+        if (DownforceSpeedAlpha > 0.0f && SmoothedThrottleInput > 0.02f && ThrottleFrontDownforce > 0.0f)
+        {
+            Downforce += FMath::Clamp(SmoothedThrottleInput * ThrottleFrontDownforce * 0.65f * MassScale, 0.0f, MaxGroundedDownforce * 0.45f * MassScale) * GroundedRatio * DownforceSpeedAlpha;
+        }
         TotalForce += -Up * Downforce;
     }
 
@@ -3944,7 +4069,8 @@ void AVehiclePawn::ApplyAeroDownforce(int32 GroundedWheels)
         AddVehicleForce(-LinearVelocity.GetSafeNormal() * DragMagnitude);
     }
 
-    if (Speed >= MinimumDownforceSpeed)
+    const float DownforceSpeedAlpha = ComputeVehicleAeroSpeedAlpha(Speed, MinimumDownforceSpeed);
+    if (DownforceSpeedAlpha > 0.0f)
     {
         const float Coefficient = bGrounded ? GroundedDownforceCoefficient : AirborneDownforceCoefficient;
         const float MaxForce = (bGrounded ? MaxGroundedDownforce : MaxAirborneDownforce) * MassScale;
@@ -3954,7 +4080,7 @@ void AVehiclePawn::ApplyAeroDownforce(int32 GroundedWheels)
             const float UprightAlpha = FMath::Clamp(FVector::DotProduct(BodyUp, FVector::UpVector), 0.0f, 1.0f);
             const FVector ChassisDown = (-BodyUp).GetSafeNormal();
             const FVector DownDirection = FMath::Lerp(-FVector::UpVector, ChassisDown, UprightAlpha).GetSafeNormal();
-            const float Downforce = FMath::Clamp(Speed * Speed * Coefficient * MassScale, 0.0f, MaxForce) * ClearanceScale;
+            const float Downforce = FMath::Clamp(Speed * Speed * Coefficient * MassScale, 0.0f, MaxForce) * ClearanceScale * DownforceSpeedAlpha;
 
             if (Downforce > KINDA_SMALL_NUMBER)
             {
@@ -3963,11 +4089,19 @@ void AVehiclePawn::ApplyAeroDownforce(int32 GroundedWheels)
         }
     }
 
-    if (bGrounded && MaxFrontDownforce > 0.0f)
+    if (bGrounded && DownforceSpeedAlpha > 0.0f && SmoothedThrottleInput > 0.02f && ThrottleFrontDownforce > 0.0f)
+    {
+        // A small center downforce under acceleration counteracts suspension rebound/pitch lift.
+        const float ThrottleCenterDownforce = FMath::Clamp(SmoothedThrottleInput * ThrottleFrontDownforce * 0.65f * MassScale, 0.0f, MaxGroundedDownforce * 0.45f * MassScale) * DownforceSpeedAlpha;
+        AddVehicleForce(-FVector::UpVector * ThrottleCenterDownforce);
+    }
+
+    if (bGrounded && DownforceSpeedAlpha > 0.0f && MaxFrontDownforce > 0.0f)
     {
         const float ForwardSpeed = FMath::Abs(FVector::DotProduct(LinearVelocity, Body->GetForwardVector()));
-        const float SpeedFrontForce = ForwardSpeed * ForwardSpeed * FMath::Max(0.0f, FrontDownforceCoefficient) * MassScale;
-        const float ThrottleFrontForce = FMath::Max(0.0f, SmoothedThrottleInput) * FMath::Max(0.0f, ThrottleFrontDownforce) * MassScale;
+        const float ForwardSpeedAlpha = ComputeVehicleAeroSpeedAlpha(ForwardSpeed, MinimumDownforceSpeed);
+        const float SpeedFrontForce = ForwardSpeed * ForwardSpeed * FMath::Max(0.0f, FrontDownforceCoefficient) * MassScale * ForwardSpeedAlpha;
+        const float ThrottleFrontForce = FMath::Max(0.0f, SmoothedThrottleInput) * FMath::Max(0.0f, ThrottleFrontDownforce) * MassScale * DownforceSpeedAlpha;
         const float GroundedRatio = static_cast<float>(GroundedWheels) / static_cast<float>(FMath::Max(1, WheelOffsets.Num()));
         const float FrontForce = FMath::Clamp((SpeedFrontForce + ThrottleFrontForce) * FMath::Clamp(GroundedRatio, 0.25f, 1.0f), 0.0f, MaxFrontDownforce * MassScale) * ClearanceScale;
 

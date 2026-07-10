@@ -49,6 +49,12 @@ public:
     bool LoadPrefab(const FString& InFilePath, const FString& InObjectName);
 
     UFUNCTION(BlueprintCallable, Category="Prefab")
+    void SetRenderOnlyMode(bool bInRenderOnlyMode);
+
+    UFUNCTION(BlueprintPure, Category="Prefab")
+    bool IsRenderOnlyMode() const { return bRenderOnlyMode; }
+
+    UFUNCTION(BlueprintCallable, Category="Prefab")
     FPlacedObjectRecord ToPlacementRecord() const;
 
     UFUNCTION(BlueprintCallable, Category="Prefab")
@@ -70,6 +76,7 @@ public:
     bool IsPrefabLoaded() const { return bLoaded; }
 
 protected:
+    virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
     virtual void Destroyed() override;
 
@@ -86,6 +93,16 @@ private:
     UPROPERTY()
     TMap<int32, TObjectPtr<UStaticMesh>> MeshCache;
 
+
+    UPROPERTY(ReplicatedUsing=OnRep_PrefabReplicationData)
+    FString ReplicatedSourceFilePath;
+
+    UPROPERTY(ReplicatedUsing=OnRep_PrefabReplicationData)
+    FString ReplicatedObjectName;
+
+    UFUNCTION()
+    void OnRep_PrefabReplicationData();
+
     UPROPERTY()
     FString SourceFilePath;
 
@@ -99,6 +116,7 @@ private:
     FPrefabActorConfig Config;
 
     bool bLoaded = false;
+    bool bRenderOnlyMode = false;
 
     bool LoadConfigJson(const FString& JsonPath);
     void ApplyConfigToMeshComponent(UStaticMeshComponent* MeshComponent) const;

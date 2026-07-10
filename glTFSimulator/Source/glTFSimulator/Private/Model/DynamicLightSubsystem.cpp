@@ -14,15 +14,13 @@
 void UDynamicLightSubsystem::Initialize(FSubsystemCollectionBase &Collection)
 {
     Super::Initialize(Collection);
-    Collection.InitializeDependency<UGameUpdateSubSystem>();
-
     if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
     {
         GameUpdateHandle = GameUpdate->RegisterUpdate(
             this,
             [this](const float DeltaSeconds)
             {
-                Tick(DeltaSeconds);
+                UpdateLightsFromGameUpdate(DeltaSeconds);
             },
             40);
     }
@@ -43,6 +41,20 @@ void UDynamicLightSubsystem::RegisterLight(UDynamicPointLightComponent *InLight)
 {
     if (!IsValid(InLight))
         return;
+
+    if (GameUpdateHandle == INDEX_NONE)
+    {
+        if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
+        {
+            GameUpdateHandle = GameUpdate->RegisterUpdate(
+                this,
+                [this](const float DeltaSeconds)
+                {
+                    UpdateLightsFromGameUpdate(DeltaSeconds);
+                },
+                40);
+        }
+    }
 
     FLightOptimizationData NewData;
     NewData.Position = InLight->GetComponentLocation();
@@ -78,7 +90,7 @@ void UDynamicLightSubsystem::UnregisterLight(UDynamicPointLightComponent *InLigh
     }
 }
 
-void UDynamicLightSubsystem::Tick(float DeltaTime)
+void UDynamicLightSubsystem::UpdateLightsFromGameUpdate(float DeltaTime)
 {
     if (ManagedLights.Num() == 0)
         return;

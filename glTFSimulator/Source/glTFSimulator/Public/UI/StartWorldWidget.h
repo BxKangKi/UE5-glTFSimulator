@@ -59,6 +59,13 @@ public:
     UFUNCTION(BlueprintCallable, Category="Start World|Actions")
     void ExecuteShowWorldSelectionMenu();
 
+    /** Opens the multiplayer menu through the owning StartActor. */
+    UFUNCTION(BlueprintCallable, Category="Start World|Actions")
+    void ExecuteShowMultiplayerMenu();
+
+    UFUNCTION(BlueprintCallable, Category="Start World|Actions")
+    void ShowMultiplayerMenu();
+
     /** Re-scans world folders and refreshes the world-selection widget. */
     UFUNCTION(BlueprintCallable, Category="Start World|Actions")
     void ExecuteRefreshWorldSelectionData();
@@ -98,6 +105,36 @@ public:
     /** Opens a world by reading the first TextBlock found under a Button. */
     UFUNCTION(BlueprintCallable, Category="Start World|World Selection")
     bool OpenWorldFromButtonText(UButton* Button);
+
+    UFUNCTION(BlueprintCallable, Category="Start World|Multiplayer")
+    void ExecuteHostSelectedWorld();
+
+    UFUNCTION(BlueprintCallable, Category="Start World|Multiplayer")
+    bool HostSelectedWorld();
+
+    UFUNCTION(BlueprintCallable, Category="Start World|Multiplayer")
+    bool HostWorldByFolderName(const FString& WorldFolderName);
+
+    UFUNCTION(BlueprintCallable, Category="Start World|Multiplayer")
+    void ExecuteJoinSelectedWorld();
+
+    UFUNCTION(BlueprintCallable, Category="Start World|Multiplayer")
+    bool JoinSelectedWorld();
+
+    UFUNCTION(BlueprintCallable, Category="Start World|Multiplayer")
+    bool JoinServer(const FString& InServerAddress);
+
+    UFUNCTION(BlueprintCallable, Category="Start World|Multiplayer")
+    void ExecuteOpenClientConnectionWorld();
+
+    UFUNCTION(BlueprintCallable, Category="Start World|Multiplayer")
+    bool OpenClientConnectionWorld();
+
+    UFUNCTION(BlueprintCallable, Category="Start World|Multiplayer")
+    void SetServerAddress(const FString& InServerAddress);
+
+    UFUNCTION(BlueprintPure, Category="Start World|Multiplayer")
+    FString GetServerAddress() const { return ServerAddress; }
 
     /** Reads the first TextBlock text under a Button. Useful for WBP_LevelMenu dynamic buttons. */
     UFUNCTION(BlueprintPure, Category="Start World|World Selection")
@@ -149,6 +186,18 @@ protected:
     UPROPERTY(BlueprintReadOnly, meta=(BindWidgetOptional), Category="Start World|Widgets")
     TObjectPtr<UButton> RefreshButton;
 
+    UPROPERTY(BlueprintReadOnly, meta=(BindWidgetOptional), Category="Start World|Widgets")
+    TObjectPtr<UButton> MultiplayerButton;
+
+    UPROPERTY(BlueprintReadOnly, meta=(BindWidgetOptional), Category="Start World|Widgets")
+    TObjectPtr<UButton> HostButton;
+
+    UPROPERTY(BlueprintReadOnly, meta=(BindWidgetOptional), Category="Start World|Widgets")
+    TObjectPtr<UButton> ClientButton;
+
+    UPROPERTY(BlueprintReadOnly, meta=(BindWidgetOptional), Category="Start World|Widgets")
+    TObjectPtr<UButton> JoinButton;
+
     /** Last world-folder map passed from StartActor. */
     UPROPERTY(BlueprintReadOnly, Category="Start World|Data")
     TMap<FString, FString> CachedWorldSelectionData;
@@ -156,6 +205,9 @@ protected:
     /** Last selected world folder key. */
     UPROPERTY(BlueprintReadOnly, Category="Start World|World Selection")
     FString SelectedWorldFolderName;
+
+    UPROPERTY(BlueprintReadOnly, Category="Start World|Multiplayer")
+    FString ServerAddress = TEXT("127.0.0.1:7777");
 
 private:
     void CacheDefaultButtons();

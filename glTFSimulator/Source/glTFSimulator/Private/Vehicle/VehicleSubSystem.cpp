@@ -31,15 +31,13 @@ UVehicleSubSystem* UVehicleSubSystem::Get(const UObject* WorldContextObject)
 void UVehicleSubSystem::Initialize(FSubsystemCollectionBase& Collection)
 {
     Super::Initialize(Collection);
-    Collection.InitializeDependency<UGameUpdateSubSystem>();
-
     if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
     {
         GameUpdateHandle = GameUpdate->RegisterUpdate(
             this,
             [this](const float DeltaSeconds)
             {
-                TickVehicles(DeltaSeconds);
+                UpdateVehiclesFromGameUpdate(DeltaSeconds);
             },
             20);
     }
@@ -62,6 +60,20 @@ void UVehicleSubSystem::RegisterVehicle(AVehiclePawn* VehiclePawn)
     if (!IsValid(VehiclePawn))
     {
         return;
+    }
+
+    if (GameUpdateHandle == INDEX_NONE)
+    {
+        if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
+        {
+            GameUpdateHandle = GameUpdate->RegisterUpdate(
+                this,
+                [this](const float DeltaSeconds)
+                {
+                    UpdateVehiclesFromGameUpdate(DeltaSeconds);
+                },
+                20);
+        }
     }
 
     CompactVehicles();
@@ -89,12 +101,7 @@ void UVehicleSubSystem::UnregisterVehicle(AVehiclePawn* VehiclePawn)
     }, EAllowShrinking::No);
 }
 
-void UVehicleSubSystem::Tick(float DeltaTime)
-{
-    TickVehicles(DeltaTime);
-}
-
-void UVehicleSubSystem::TickVehicles(float DeltaSeconds)
+void UVehicleSubSystem::UpdateVehiclesFromGameUpdate(float DeltaSeconds)
 {
     const float SafeDeltaSeconds = FMath::Clamp(DeltaSeconds, 0.0f, 1.0f);
     if (SafeDeltaSeconds <= 0.0f)
@@ -157,7 +164,7 @@ void UVehicleSubSystem::TickVehicles(float DeltaSeconds)
         }
 
         VehiclePawn->ApplyParallelControlOutput(Outputs[Index]);
-        VehiclePawn->TickVehicleFromSubSystem(SafeDeltaSeconds);
+        VehiclePawn->UpdateVehicleFromSubSystem(SafeDeltaSeconds);
     }
 }
 

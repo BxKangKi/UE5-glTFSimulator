@@ -18,6 +18,7 @@
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
+#include "Setting/GameSettings.h"
 #include "System/FileFunctionLibrary.h"
 #include "System/JsonHelper.h"
 #include "System/MacroLibrary.h"
@@ -26,8 +27,6 @@
 
 namespace
 {
-    constexpr int32 LoadAsyncTextureDimensionLimit = 1024;
-
     static bool IsValidModelBounds(const FModelData& ModelData)
     {
         return !ModelData.Size.IsNearlyZero(0.001f);
@@ -74,6 +73,7 @@ ULoadAsyncAction *ULoadAsyncAction::LoadAsync(
     Action->Asset = Asset;
     Action->StaticMeshConfig = StaticMeshConfig;
     Action->ChunkSize = FMath::Max(1, ChunkSize);
+    Action->MaxTextureDimension = UGameSettings::ResolveMaxTextureResolution(WorldContextObject);
     Action->JsonFilePath = InJsonFilePath;
     Action->RegisterWithGameInstance(WorldContextObject);
     return Action;
@@ -96,6 +96,7 @@ void ULoadAsyncAction::Activate()
     MaxCount = Nodes.Num();
     CurrentIndex = 0;
     NodeMap.Reserve(MaxCount);
+    WaterNodeMap.Reserve(FMath::Max(1, MaxCount / 16));
     Progress.Broadcast(0.0f);
 
     LoadJsonAsync();
@@ -251,6 +252,7 @@ void ULoadAsyncAction::ProcessChunk()
 
         FLoadAsyncWrapper Wrapper;
         Wrapper.NodeMap = MoveTemp(NodeMap);
+        Wrapper.WaterNodeMap = MoveTemp(WaterNodeMap);
         Wrapper.MeshMap = MoveTemp(MeshMap);
         Wrapper.ModelData = GeneratedModelData;
         Progress.Broadcast(1.0f);
@@ -294,6 +296,7 @@ void ULoadAsyncAction::ReleaseActionReferences()
     Nodes.Empty();
     MeshMap.Empty();
     NodeMap.Empty();
+    WaterNodeMap.Empty();
     LoadedJsonModelData = FModelData();
     GeneratedModelData = FModelData();
     CurrentMeshName = NAME_None;
@@ -345,6 +348,12 @@ void ULoadAsyncAction::RefreshGeneratedModelData()
         Bounds += FBox::BuildAABB(NodeData.Transform.GetLocation(), Extent);
     }
 
+    for (const TPair<FName, FWaterStreamNodeData>& Pair : WaterNodeMap)
+    {
+        const FVector WaterExtent = Pair.Value.Transform.GetScale3D().GetAbs() * 50.0f;
+        Bounds += FBox::BuildAABB(Pair.Value.Transform.GetLocation(), FVector(FMath::Max(WaterExtent.X, 100.0f), FMath::Max(WaterExtent.Y, 100.0f), FMath::Max(WaterExtent.Z, 100.0f)));
+    }
+
     if (Bounds.IsValid)
     {
         GeneratedModelData.Center = Bounds.GetCenter();
@@ -382,32 +391,42 @@ void ULoadAsyncAction::CalculateSize()
         return;
     }
 
-    FString Prefix = FStringHelper::GetTextBeforeChar(CurrentNode.Name, ';');
-    FString Suffix = FStringHelper::GetTextAfterChar(CurrentNode.Name, ';');
+    const FString Prefix = FStringHelper::GetTextBeforeChar(CurrentNode.Name, ';');
+    const FString Suffix = FStringHelper::GetTextAfterChar(CurrentNode.Name, ';');
+    const FString SuffixUpper = Suffix.ToUpper();
+
+    // A glTF node named "Something;WATER" is a streaming water-volume marker.
+    // It owns an AWaterActor at runtime and intentionally does not create mesh data.
+    if (SuffixUpper.Contains(TEXT("WATER")))
+    {
+        UpdateWaterNodeData();
+        return;
+    }
+
     CurrentMeshName = FName(Prefix);
     FModelMeshData &Info = MeshMap.FindOrAdd(CurrentMeshName);
 
-    if (Suffix.Contains(TEXT("NCOL")))
+    if (SuffixUpper.Contains(TEXT("NCOL")))
     {
         Info.Data.bComplexCollision = false;
         Info.Data.bSimpleCollision = false;
     }
 
-    if (Suffix.Contains(TEXT("INST")))
+    if (SuffixUpper.Contains(TEXT("INST")))
     {
         UpdateModelNodeData();
     }
-    else if (Suffix.Contains(TEXT("LOD1")))
+    else if (SuffixUpper.Contains(TEXT("LOD1")))
     {
         Info.LOD1 = CurrentNode.MeshIndex;
         UpdateNext();
     }
-    else if (Suffix.Contains(TEXT("LOD2")))
+    else if (SuffixUpper.Contains(TEXT("LOD2")))
     {
         Info.LOD2 = CurrentNode.MeshIndex;
         UpdateNext();
     }
-    else if (Suffix.Contains(TEXT("LOD3")))
+    else if (SuffixUpper.Contains(TEXT("LOD3")))
     {
         Info.LOD3 = CurrentNode.MeshIndex;
         UpdateNext();
@@ -418,6 +437,21 @@ void ULoadAsyncAction::CalculateSize()
         Callback.BindDynamic(this, &ULoadAsyncAction::GetStaticMesh);
         Asset->LoadStaticMeshAsync(CurrentNode.MeshIndex, Callback, StaticMeshConfig);
     }
+}
+
+
+void ULoadAsyncAction::UpdateWaterNodeData()
+{
+    const FName NodeName(CurrentNode.Name);
+    if (!WaterNodeMap.Contains(NodeName))
+    {
+        FWaterStreamNodeData WaterInfo;
+        WaterInfo.Transform = CurrentNode.Transform;
+        const FVector AbsScale = CurrentNode.Transform.GetScale3D().GetAbs();
+        WaterInfo.StreamRadius = FMath::Max(2048.0f, FMath::Max3(AbsScale.X, AbsScale.Y, AbsScale.Z) * 65536.0f);
+        WaterNodeMap.Add(NodeName, WaterInfo);
+    }
+    UpdateNext();
 }
 
 void ULoadAsyncAction::UpdateModelNodeData()
@@ -505,7 +539,8 @@ void ULoadAsyncAction::UpdateNext()
 void ULoadAsyncAction::LoadTextureAsync(FString ImagePath)
 {
     TWeakObjectPtr<ULoadAsyncAction> WeakThis(this);
-    AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [ImagePath, WeakThis]()
+    const int32 TextureDimensionLimit = FMath::Clamp(MaxTextureDimension, 64, 8192);
+    AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [ImagePath, WeakThis, TextureDimensionLimit]()
     {
         TArray<uint8> RawFileData;
         if (!FFileHelper::LoadFileToArray(RawFileData, *ImagePath))
@@ -526,9 +561,9 @@ void ULoadAsyncAction::LoadTextureAsync(FString ImagePath)
                 int32 Height = ImageWrapper->GetHeight();
 
                 const int32 LargestDimension = FMath::Max(Width, Height);
-                if (LargestDimension > LoadAsyncTextureDimensionLimit)
+                if (LargestDimension > TextureDimensionLimit)
                 {
-                    const float ResizeScale = static_cast<float>(LoadAsyncTextureDimensionLimit) / static_cast<float>(LargestDimension);
+                    const float ResizeScale = static_cast<float>(TextureDimensionLimit) / static_cast<float>(LargestDimension);
                     const int32 TargetWidth = FMath::Max(1, FMath::RoundToInt(static_cast<float>(Width) * ResizeScale));
                     const int32 TargetHeight = FMath::Max(1, FMath::RoundToInt(static_cast<float>(Height) * ResizeScale));
 

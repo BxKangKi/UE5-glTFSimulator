@@ -4,10 +4,12 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Animation/AnimInstance.h"
 #include "CharacterAnimInstance.generated.h"
 
 class UCharacterMovementComponent;
 class UCharacterComponent;
+class AWeaponActor;
 
 UCLASS()
 class GLTFSIMULATOR_API UCharacterAnimInstance : public UAnimInstance
@@ -16,86 +18,111 @@ class GLTFSIMULATOR_API UCharacterAnimInstance : public UAnimInstance
 
 public:
     UPROPERTY(BlueprintReadOnly, Category = "Character|Animation")
-    FVector Velocity;
+    FVector Velocity = FVector::ZeroVector;
 
     UPROPERTY(BlueprintReadOnly, Category = "Character|Animation")
-    float Speed;
+    float Speed = 0.0f;
 
     UPROPERTY(BlueprintReadOnly, Category = "Character|Animation")
-    float MoveSpeed;
+    float MoveSpeed = 0.0f;
 
     UPROPERTY(BlueprintReadOnly, Category = "Character|Animation")
-    float UpSpeed;
+    float UpSpeed = 0.0f;
 
     UPROPERTY(BlueprintReadOnly, Category = "Character|Animation")
-    bool bShouldMove;
+    bool bShouldMove = false;
 
     UPROPERTY(BlueprintReadOnly, Category = "Character|Animation")
-    bool bIsFlying;
+    bool bIsFlying = false;
 
     UPROPERTY(BlueprintReadOnly, Category = "Character|Animation")
-    bool bIsSwimming;
+    bool bIsSwimming = false;
 
     UPROPERTY(BlueprintReadOnly, Category = "Character|Animation")
-    bool bIsFalling;
+    bool bIsFalling = false;
 
     UPROPERTY(BlueprintReadOnly, Category = "Character|Animation")
-    bool bIsGrounded;
+    bool bIsGrounded = false;
 
     UPROPERTY(BlueprintReadOnly, Category = "Character|Animation")
-    bool bIsCrouch;
+    bool bIsCrouch = false;
 
     UPROPERTY(BlueprintReadOnly, Category = "Character|Animation")
-    bool bIsDiving;
+    bool bIsDiving = false;
     
     UPROPERTY(BlueprintReadOnly, Category = "Character|Animation")
-    bool bIsRagdoll;
+    bool bIsRagdoll = false;
 
     UPROPERTY(BlueprintReadOnly, Category = "Character|Animation")
-    bool bIsGettingUp;
+    bool bIsGettingUp = false;
 
     UPROPERTY(BlueprintReadOnly, Category = "Character|Animation")
-    bool bIsWaterRagdollRecovery;
+    bool bIsWaterRagdollRecovery = false;
 
     UPROPERTY(BlueprintReadOnly, Category = "Character|Animation|Ragdoll")
-    bool bRagdollEnvironmentOnGround;
+    bool bRagdollEnvironmentOnGround = false;
 
     UPROPERTY(BlueprintReadOnly, Category = "Character|Animation|Ragdoll")
-    bool bRagdollEnvironmentInWater;
+    bool bRagdollEnvironmentInWater = false;
 
     UPROPERTY(BlueprintReadOnly, Category = "Character|Animation|Ragdoll")
-    bool bTreatRagdollWaterAsGround;
+    bool bTreatRagdollWaterAsGround = false;
 
     UPROPERTY(BlueprintReadOnly, Category = "Character|Animation|Ragdoll")
-    bool bShouldRecoverRagdollInWater;
+    bool bShouldRecoverRagdollInWater = false;
 
     UPROPERTY(BlueprintReadOnly, Category = "Character|Animation|Ragdoll")
-    float RagdollEnvironmentWaterLevel;
+    float RagdollEnvironmentWaterLevel = 0.0f;
 
     UPROPERTY(BlueprintReadOnly, Category = "Character|Animation|Ragdoll")
-    bool bRagdollMeaningfullySubmerged;
+    bool bRagdollMeaningfullySubmerged = false;
 
     UPROPERTY(BlueprintReadOnly, Category = "Character|Animation|Ragdoll")
-    float RagdollMaxSubmersionDepth;
+    float RagdollMaxSubmersionDepth = 0.0f;
 
     UPROPERTY(BlueprintReadOnly, Category = "Character|Animation|Ragdoll")
-    float RagdollAverageSubmersionDepth;
+    float RagdollAverageSubmersionDepth = 0.0f;
 
     UPROPERTY(BlueprintReadOnly, Category = "Character|Animation")
-    bool bGetUpTrigger;
+    bool bGetUpTrigger = false;
 
     UPROPERTY(BlueprintReadOnly, Category = "Character|Animation")
-    float IsLieOnBack;
+    float IsLieOnBack = 0.0f;
 
     UPROPERTY(BlueprintReadOnly, Category = "Character|Animation")
-    FVector CapturedMeshLocation;
+    FVector CapturedMeshLocation = FVector::ZeroVector;
 
     UPROPERTY(BlueprintReadOnly, Category = "Character|Animation")
-    FRotator CapturedMeshRotation;
+    FRotator CapturedMeshRotation = FRotator::ZeroRotator;
+
+    UPROPERTY(BlueprintReadOnly, Category = "Character|Animation|Weapon")
+    bool bHasWeaponIK = false;
+
+    UPROPERTY(BlueprintReadOnly, Category = "Character|Animation|Weapon")
+    FVector WeaponRightHandIKLocationCS = FVector::ZeroVector;
+
+    UPROPERTY(BlueprintReadOnly, Category = "Character|Animation|Weapon")
+    FRotator WeaponRightHandIKRotationCS = FRotator::ZeroRotator;
+
+    UPROPERTY(BlueprintReadOnly, Category = "Character|Animation|Weapon")
+    FVector WeaponLeftHandIKLocationCS = FVector::ZeroVector;
+
+    UPROPERTY(BlueprintReadOnly, Category = "Character|Animation|Weapon")
+    FRotator WeaponLeftHandIKRotationCS = FRotator::ZeroRotator;
+
+    UPROPERTY(BlueprintReadOnly, Category = "Character|Animation|Weapon")
+    FVector WeaponMuzzleLocationWS = FVector::ZeroVector;
+
+    /** Immediately mirrors native character/ragdoll state into AnimBP-readable variables. */
+    void RefreshCharacterAnimationState(float DeltaSeconds = 0.0f);
 
 private:
     virtual void NativeUpdateAnimation(float DeltaSeconds) override;
     virtual void NativeInitializeAnimation() override;
+
+    void RefreshCachedReferences();
+    void ResetRuntimeAnimationState();
+    void RefreshWeaponIKState();
 
     UPROPERTY()
     TObjectPtr<UCharacterMovementComponent> Movement;

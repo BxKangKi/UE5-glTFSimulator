@@ -560,7 +560,7 @@ void UBuoyancyComponent::RegisterGameUpdate()
             this,
             [this](const float DeltaSeconds)
             {
-                TickBuoyancy(DeltaSeconds);
+                UpdateBuoyancyFromGameUpdate(DeltaSeconds);
             },
             10);
     }
@@ -969,13 +969,8 @@ bool UBuoyancyComponent::ApplySkeletalMeshBuoyancy(USkeletalMeshComponent* Skele
     return bAppliedAnyImpulse;
 }
 
-void UBuoyancyComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
-{
-    Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
-    TickBuoyancy(DeltaTime);
-}
 
-void UBuoyancyComponent::TickBuoyancy(float DeltaTime)
+void UBuoyancyComponent::UpdateBuoyancyFromGameUpdate(float DeltaTime)
 {
     if (!bInWater || DeltaTime <= SMALL_NUMBER)
     {

@@ -112,7 +112,7 @@ void APlayerCharacterController::BeginPlay()
             this,
             [this](const float DeltaSeconds)
             {
-                TickFromGameUpdate(DeltaSeconds);
+                UpdateFromGameUpdate(DeltaSeconds);
             },
             1);
     }
@@ -212,17 +212,8 @@ void APlayerCharacterController::EndPlay(const EEndPlayReason::Type EndPlayReaso
     Super::EndPlay(EndPlayReason);
 }
 
-void APlayerCharacterController::Tick(float DeltaSeconds)
-{
-    Super::Tick(DeltaSeconds);
 
-    if (GameUpdateTickHandle == INDEX_NONE)
-    {
-        TickFromGameUpdate(DeltaSeconds);
-    }
-}
-
-void APlayerCharacterController::TickFromGameUpdate(float DeltaSeconds)
+void APlayerCharacterController::UpdateFromGameUpdate(float DeltaSeconds)
 {
     if (bEnableFallbackKeyBindings && !bUIInputMode &&
         (bFallbackMoveForward || bFallbackMoveBackward || bFallbackMoveRight || bFallbackMoveLeft))
@@ -246,6 +237,7 @@ void APlayerCharacterController::ApplyGameInputMode()
     bEnableMouseOverEvents = false;
     SetIgnoreLookInput(false);
     SetIgnoreMoveInput(false);
+    ReapplyHeldGameplayInput();
 }
 
 void APlayerCharacterController::ApplyUIInputMode(UUserWidget* WidgetToFocus)
@@ -260,6 +252,9 @@ void APlayerCharacterController::ApplyUIInputMode(UUserWidget* WidgetToFocus)
     bShowMouseCursor = true;
     bEnableClickEvents = true;
     bEnableMouseOverEvents = true;
+    StopGameplayMotionForUI();
+    SetIgnoreMoveInput(true);
+    SetIgnoreLookInput(true);
 }
 
 void APlayerCharacterController::ApplyLoadingInputMode(UUserWidget* WidgetToFocus)
@@ -275,6 +270,49 @@ void APlayerCharacterController::ApplyLoadingInputMode(UUserWidget* WidgetToFocu
     bShowMouseCursor = true;
     bEnableClickEvents = true;
     bEnableMouseOverEvents = true;
+    StopGameplayMotionForUI();
+    SetIgnoreMoveInput(true);
+    SetIgnoreLookInput(true);
+}
+
+void APlayerCharacterController::StopGameplayMotionForUI()
+{
+    // UI/mouse-cursor mode must stop active gameplay input immediately.
+    // Enhanced Input may not emit Completed events while focus is on a widget, so clear
+    // the controlled pawn explicitly instead of waiting for key release callbacks.
+    StopFallbackMovement();
+
+    if (AVehiclePawn* Vehicle = Cast<AVehiclePawn>(GetPawn()))
+    {
+        Vehicle->ClearDriveInput();
+        return;
+    }
+
+    if (ACharacterController* CharacterCtrl = Cast<ACharacterController>(GetPawn()))
+    {
+        CharacterCtrl->ClearTransientInputState();
+    }
+}
+
+void APlayerCharacterController::ReapplyHeldGameplayInput()
+{
+    if (bUIInputMode)
+    {
+        return;
+    }
+
+    if (ACharacterController* CharacterCtrl = Cast<ACharacterController>(GetPawn()))
+    {
+        // A held sprint key does not always fire another Started event after ragdoll
+        // recovery or an input-mode switch. Reapply the physical held state here.
+        CharacterCtrl->Sprinting(bSprintInputHeld);
+        CharacterCtrl->Crouching(bCrouchInputHeld);
+    }
+
+    if (bEnableFallbackKeyBindings && (bFallbackMoveForward || bFallbackMoveBackward || bFallbackMoveRight || bFallbackMoveLeft))
+    {
+        UpdateFallbackMoveInput();
+    }
 }
 
 void APlayerCharacterController::ApplyConfiguredInputMappingContexts()
@@ -797,6 +835,11 @@ void APlayerCharacterController::Input_Look(const FVector2D& LookValue)
 
 void APlayerCharacterController::Input_JumpStarted()
 {
+    if (bUIInputMode)
+    {
+        return;
+    }
+
     if (ACharacterController* CharacterCtrl = Cast<ACharacterController>(GetPawn()))
     {
         CharacterCtrl->Jumping(true);
@@ -813,6 +856,12 @@ void APlayerCharacterController::Input_JumpCompleted()
 
 void APlayerCharacterController::Input_SprintStarted()
 {
+    bSprintInputHeld = true;
+    if (bUIInputMode)
+    {
+        return;
+    }
+
     if (ACharacterController* CharacterCtrl = Cast<ACharacterController>(GetPawn()))
     {
         CharacterCtrl->Sprinting(true);
@@ -821,6 +870,7 @@ void APlayerCharacterController::Input_SprintStarted()
 
 void APlayerCharacterController::Input_SprintCompleted()
 {
+    bSprintInputHeld = false;
     if (ACharacterController* CharacterCtrl = Cast<ACharacterController>(GetPawn()))
     {
         CharacterCtrl->Sprinting(false);
@@ -829,6 +879,12 @@ void APlayerCharacterController::Input_SprintCompleted()
 
 void APlayerCharacterController::Input_CrouchStarted()
 {
+    bCrouchInputHeld = true;
+    if (bUIInputMode)
+    {
+        return;
+    }
+
     if (ACharacterController* CharacterCtrl = Cast<ACharacterController>(GetPawn()))
     {
         CharacterCtrl->Crouching(true);
@@ -837,6 +893,7 @@ void APlayerCharacterController::Input_CrouchStarted()
 
 void APlayerCharacterController::Input_CrouchCompleted()
 {
+    bCrouchInputHeld = false;
     if (ACharacterController* CharacterCtrl = Cast<ACharacterController>(GetPawn()))
     {
         CharacterCtrl->Crouching(false);
@@ -845,6 +902,11 @@ void APlayerCharacterController::Input_CrouchCompleted()
 
 void APlayerCharacterController::Input_FlyPressed()
 {
+    if (bUIInputMode)
+    {
+        return;
+    }
+
     if (ACharacterController* CharacterCtrl = Cast<ACharacterController>(GetPawn()))
     {
         CharacterCtrl->Flying();
@@ -853,6 +915,11 @@ void APlayerCharacterController::Input_FlyPressed()
 
 void APlayerCharacterController::Input_RagdollPressed()
 {
+    if (bUIInputMode)
+    {
+        return;
+    }
+
     if (ACharacterController* CharacterCtrl = Cast<ACharacterController>(GetPawn()))
     {
         CharacterCtrl->ToggleRagdoll();
@@ -996,6 +1063,11 @@ void APlayerCharacterController::Input_SnapPressed()
 
 void APlayerCharacterController::Input_VehicleMove(const FVector2D& MoveValue)
 {
+    if (bUIInputMode && !MoveValue.IsNearlyZero())
+    {
+        return;
+    }
+
     if (AVehiclePawn* Vehicle = Cast<AVehiclePawn>(GetPawn()))
     {
         Vehicle->SetDriveInput(MoveValue.Y, MoveValue.X);
@@ -1010,6 +1082,11 @@ void APlayerCharacterController::Input_VehicleMove(const FVector2D& MoveValue)
 
 void APlayerCharacterController::Input_VehicleThrottle(float Throttle)
 {
+    if (bUIInputMode && !FMath::IsNearlyZero(Throttle))
+    {
+        return;
+    }
+
     if (AVehiclePawn* Vehicle = Cast<AVehiclePawn>(GetPawn()))
     {
         Vehicle->SetThrottleInput(Throttle);
@@ -1024,6 +1101,11 @@ void APlayerCharacterController::Input_VehicleThrottle(float Throttle)
 
 void APlayerCharacterController::Input_VehicleSteering(float Steering)
 {
+    if (bUIInputMode && !FMath::IsNearlyZero(Steering))
+    {
+        return;
+    }
+
     if (AVehiclePawn* Vehicle = Cast<AVehiclePawn>(GetPawn()))
     {
         Vehicle->SetSteeringInput(Steering);
@@ -1063,6 +1145,8 @@ void APlayerCharacterController::ClearLatchedMovementInput()
     {
         CharacterCtrl->ClearTransientInputState();
     }
+
+    ReapplyHeldGameplayInput();
 }
 
 // Debug toggle translated from the Blueprint flow into C++.
@@ -1317,7 +1401,7 @@ void APlayerCharacterController::ReturnToPauseMenuFromSettings()
     bPrevGamePaused = true;
 }
 
-void APlayerCharacterController::ExitToStartWorldFromPauseMenu()
+void APlayerCharacterController::ExitToMainWorldFromPauseMenu()
 {
     // Backward-compatible Blueprint entry point. Gameplay exits now land on world selection.
     ExitToWorldSelectionFromPauseMenu();
@@ -1329,7 +1413,7 @@ void APlayerCharacterController::ExitToWorldSelectionFromPauseMenu()
     if (IsValid(Manager))
     {
         Manager->PrepareForReturnToMenuLevel();
-        Manager->RequestWorldSelectionMenuOnNextStartWorld();
+        Manager->RequestWorldSelectionMenuOnNextMainWorld();
     }
 
     if (IsValid(SettingsMenuWidget))
@@ -1352,7 +1436,7 @@ void APlayerCharacterController::ExitToWorldSelectionFromPauseMenu()
 
     ApplyGameInputMode();
 
-    // The world list is hosted by StartWorld. StartActor consumes the request set above and opens the list widget.
+    // The world list is hosted by MainWorld. StartActor consumes the request set above and opens the list widget.
     static const FName LegacyWorldSelectionLevelName(TEXT("WorldSelectWorld"));
     FName TargetLevelName = WorldSelectionLevelName;
     if (TargetLevelName == NAME_None || TargetLevelName == LegacyWorldSelectionLevelName)
@@ -1361,7 +1445,7 @@ void APlayerCharacterController::ExitToWorldSelectionFromPauseMenu()
     }
     if (TargetLevelName == NAME_None || TargetLevelName == LegacyWorldSelectionLevelName)
     {
-        TargetLevelName = FName(TEXT("StartWorld"));
+        TargetLevelName = FName(TEXT("MainWorld"));
     }
 
     if (TargetLevelName != NAME_None)
@@ -1394,7 +1478,7 @@ void APlayerCharacterController::ReturnToMainMenuFromWorldSelection()
 
     ApplyGameInputMode();
 
-    const FName TargetLevelName = MainMenuLevelName != NAME_None ? MainMenuLevelName : FName(TEXT("StartWorld"));
+    const FName TargetLevelName = MainMenuLevelName != NAME_None ? MainMenuLevelName : FName(TEXT("MainWorld"));
     if (TargetLevelName != NAME_None)
     {
         UGameManagerSubSystem::ResetEditorTransactionBufferForWorldTravel(this, TEXT("Return to main menu from world selection"));

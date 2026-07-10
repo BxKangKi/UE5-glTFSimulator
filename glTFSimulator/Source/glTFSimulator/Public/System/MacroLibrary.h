@@ -21,6 +21,8 @@
 #define EMPTY_STR TEXT("")
 #define RAGDOLL TEXT("Ragdoll")
 #define JSON TEXT(".json")
+#define JSON_VERSION_FIELD TEXT("Version")
+#define JSON_SCHEMA_VERSION TEXT("1.0.0")
 
 #define BONE_HAIR_ROOT TEXT("hairRoot")
 #define BONE_DYN_ROOT TEXT("dynRoot")

@@ -22,6 +22,7 @@ enum class ESettingsField : uint8
     Cloud UMETA(DisplayName="Cloud"),
     ShadowQuality UMETA(DisplayName="Shadow Quality"),
     TextureQuality UMETA(DisplayName="Texture Quality"),
+    MaxTextureResolution UMETA(DisplayName="Max Texture Resolution"),
     ViewDistanceQuality UMETA(DisplayName="View Distance Quality"),
     AntiAliasingQuality UMETA(DisplayName="Anti Aliasing Quality"),
     PostProcessingQuality UMETA(DisplayName="Post Processing Quality"),
@@ -193,6 +194,8 @@ public:
     UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
     void CycleTextureQualityFromUI();
     UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
+    void CycleMaxTextureResolutionFromUI();
+    UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
     void CycleViewDistanceQualityFromUI();
     UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
     void CycleAntiAliasingQualityFromUI();
@@ -263,6 +266,7 @@ private:
     bool bPendingCloud = true;
     int32 PendingShadowQuality = 2;
     int32 PendingTextureQuality = 2;
+    int32 PendingMaxTextureResolution = 768;
     int32 PendingViewDistanceQuality = 2;
     int32 PendingAntiAliasingQuality = 2;
     int32 PendingPostProcessingQuality = 2;

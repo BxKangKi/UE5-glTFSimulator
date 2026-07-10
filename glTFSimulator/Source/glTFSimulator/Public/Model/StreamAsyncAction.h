@@ -17,6 +17,7 @@ class UInstancedStaticMeshComponent;
 class UBoxComponent;
 class UShapeComponent;
 class ULightComponent;
+class AWaterActor;
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
     FOnUpdateCompleted,
@@ -45,7 +46,8 @@ public:
         const FVector &InPlayerLocation,
         const FglTFRuntimeStaticMeshConfig &StaticMeshConfig,
         float InDistance = 65536.0f,
-        int32 InChunkSize = 256);
+        int32 InChunkSize = 256,
+        bool bInRenderOnly = false);
 
     virtual void Activate() override;
 
@@ -57,15 +59,22 @@ private:
     UPROPERTY()
     TMap<FName, FModelNodeData> NodeMap;
     UPROPERTY()
+    TMap<FName, FWaterStreamNodeData> WaterNodeMap;
+    UPROPERTY()
     TMap<FName, FModelMeshData> MeshMap;
     UPROPERTY()
     TSet<FName> LoadedNodes;
+    UPROPERTY()
+    TSet<FName> LoadedWaterNodes;
     UPROPERTY()
     TMap<FName, TObjectPtr<UInstancedStaticMeshComponent>> InstanceMap;
 
     // Excluded from UPROPERTY to avoid UHT nested-container build errors.
     UPROPERTY()
     TMap<FName, FComponentGroup> DynamicComponentMap;
+
+    UPROPERTY()
+    TMap<FName, TObjectPtr<AWaterActor>> WaterActorMap;
 
     // Uses a separate FName-keyed map to manage unload boxes.
     UPROPERTY()
@@ -78,6 +87,10 @@ private:
     UPROPERTY()
     TArray<FName> PendingUnloadNodes;
     UPROPERTY()
+    TArray<FName> PendingLoadWaterNodes;
+    UPROPERTY()
+    TArray<FName> PendingUnloadWaterNodes;
+    UPROPERTY()
     TObjectPtr<UglTFRuntimeAsset> Asset;
     UPROPERTY()
     TObjectPtr<AActor> OwnerActor;
@@ -87,11 +100,14 @@ private:
     FVector CurrentSize;
     bool bIsLoading = false;
     bool bAbortRequested = false;
+    bool bRenderOnly = false;
     FName CurrentLoadingNode;
     FName CurrentLoadingMesh;
 
     int32 CurrentLoadIndex;
     int32 CurrentUnloadIndex;
+    int32 CurrentLoadWaterIndex = 0;
+    int32 CurrentUnloadWaterIndex = 0;
     int32 ChunkSize;
     int32 TotalOperationCount = 0;
 
@@ -110,6 +126,9 @@ private:
     void AddTrasnform(const FName &Name, UInstancedStaticMeshComponent *ISMC);
     void ProcessUnloadNode(const FName &Name);
     bool ProcessLoadNode(const FName &Name);
+    void ProcessUnloadWaterNode(const FName &Name);
+    void ProcessLoadWaterNode(const FName &Name);
+    float GetWaterStreamRadiusSq(const FWaterStreamNodeData& Data) const;
 
     void SpawnStreamComponents(const FName &NodeName, const FModelNodeData &NodeInfo, const FMeshData &Data);
     void DestroyStreamComponents(const FName &NodeName);

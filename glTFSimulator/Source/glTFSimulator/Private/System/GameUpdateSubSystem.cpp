@@ -1,9 +1,9 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
 #include "System/GameUpdateSubSystem.h"
-#include "Engine/Engine.h"
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
+#include "Subsystems/SubsystemCollection.h"
 
 UGameUpdateSubSystem::UGameUpdateSubSystem()
 {
@@ -16,20 +16,51 @@ UGameUpdateSubSystem* UGameUpdateSubSystem::Get(const UObject* WorldContextObjec
         return nullptr;
     }
 
+    if (const UGameInstance* GameInstance = Cast<UGameInstance>(WorldContextObject))
+    {
+        return const_cast<UGameInstance*>(GameInstance)->GetSubsystem<UGameUpdateSubSystem>();
+    }
+
+    if (const UGameInstanceSubsystem* GameInstanceSubsystem = Cast<UGameInstanceSubsystem>(WorldContextObject))
+    {
+        if (UGameInstance* GameInstance = GameInstanceSubsystem->GetGameInstance())
+        {
+            return GameInstance->GetSubsystem<UGameUpdateSubSystem>();
+        }
+    }
+
     UWorld* World = WorldContextObject->GetWorld();
     if (!World)
     {
         return nullptr;
     }
 
-    return World->GetSubsystem<UGameUpdateSubSystem>();
+    UGameInstance* GameInstance = World->GetGameInstance();
+    return GameInstance ? GameInstance->GetSubsystem<UGameUpdateSubSystem>() : nullptr;
+}
+
+void UGameUpdateSubSystem::Initialize(FSubsystemCollectionBase& Collection)
+{
+    Super::Initialize(Collection);
+    bInitialized = true;
+    MarkDispatchOrderDirty();
 }
 
 void UGameUpdateSubSystem::Deinitialize()
 {
-    PendingRemoveHandles.Empty();
+    bInitialized = false;
+    bIsDispatching = false;
+    bSortedHandlesDirty = true;
+    PendingRemoveHandleSet.Empty();
+    SortedHandles.Empty();
     UpdateEntries.Empty();
     Super::Deinitialize();
+}
+
+UWorld* UGameUpdateSubSystem::GetTickableGameObjectWorld() const
+{
+    const UGameInstance* GameInstance = GetGameInstance();
+    return GameInstance ? GameInstance->GetWorld() : nullptr;
 }
 
 int32 UGameUpdateSubSystem::RegisterUpdate(UObject* Owner, TFunction<void(float)>&& UpdateFunction, int32 Priority)
@@ -45,6 +76,8 @@ int32 UGameUpdateSubSystem::RegisterUpdate(UObject* Owner, TFunction<void(float)
     Entry.UpdateFunction = MoveTemp(UpdateFunction);
     Entry.Priority = Priority;
     Entry.Serial = NextSerial++;
+
+    MarkDispatchOrderDirty();
     return Handle;
 }
 
@@ -57,11 +90,14 @@ void UGameUpdateSubSystem::UnregisterUpdate(int32 Handle)
 
     if (bIsDispatching)
     {
-        PendingRemoveHandles.AddUnique(Handle);
+        PendingRemoveHandleSet.Add(Handle);
         return;
     }
 
-    UpdateEntries.Remove(Handle);
+    if (UpdateEntries.Remove(Handle) > 0)
+    {
+        MarkDispatchOrderDirty();
+    }
 }
 
 void UGameUpdateSubSystem::UnregisterOwner(const UObject* Owner)
@@ -71,57 +107,41 @@ void UGameUpdateSubSystem::UnregisterOwner(const UObject* Owner)
         return;
     }
 
-    TArray<int32> HandlesToRemove;
     for (const TPair<int32, FGameUpdateEntry>& Pair : UpdateEntries)
     {
         if (!Pair.Value.Owner.IsValid() || Pair.Value.Owner.Get() == Owner)
         {
-            HandlesToRemove.Add(Pair.Key);
+            PendingRemoveHandleSet.Add(Pair.Key);
         }
     }
 
-    for (int32 Handle : HandlesToRemove)
+    // If called from inside a callback, defer physical removal until the dispatcher
+    // finishes iterating the stable handle array.
+    if (!bIsDispatching)
     {
-        UnregisterUpdate(Handle);
+        FlushPendingRemovals();
     }
 }
 
 void UGameUpdateSubSystem::Tick(float DeltaTime)
 {
+    if (!bInitialized)
+    {
+        return;
+    }
+
+    if (UpdateEntries.Num() == 0)
+    {
+        return;
+    }
+
     if (DeltaTime <= 0.0f)
     {
         RemoveInvalidEntries();
         return;
     }
 
-    TArray<int32> Handles;
-    Handles.Reserve(UpdateEntries.Num());
-    for (const TPair<int32, FGameUpdateEntry>& Pair : UpdateEntries)
-    {
-        if (Pair.Value.Owner.IsValid() && Pair.Value.UpdateFunction)
-        {
-            Handles.Add(Pair.Key);
-        }
-        else
-        {
-            PendingRemoveHandles.AddUnique(Pair.Key);
-        }
-    }
-
-    Handles.Sort([this](const int32 A, const int32 B)
-    {
-        const FGameUpdateEntry* EntryA = UpdateEntries.Find(A);
-        const FGameUpdateEntry* EntryB = UpdateEntries.Find(B);
-        if (!EntryA || !EntryB)
-        {
-            return A < B;
-        }
-        if (EntryA->Priority != EntryB->Priority)
-        {
-            return EntryA->Priority < EntryB->Priority;
-        }
-        return EntryA->Serial < EntryB->Serial;
-    });
+    RebuildDispatchOrderIfNeeded();
 
     struct FScopedDispatchFlag
     {
@@ -140,9 +160,12 @@ void UGameUpdateSubSystem::Tick(float DeltaTime)
             Flag = PreviousValue;
         }
     } DispatchGuard(bIsDispatching);
-    for (int32 Handle : Handles)
+
+    for (const int32 Handle : SortedHandles)
     {
-        if (PendingRemoveHandles.Contains(Handle))
+        // Most frames have no deferred removals. Avoid a hash lookup for every
+        // registered callback unless a callback actually unregistered something.
+        if (PendingRemoveHandleSet.Num() > 0 && PendingRemoveHandleSet.Contains(Handle))
         {
             continue;
         }
@@ -150,7 +173,7 @@ void UGameUpdateSubSystem::Tick(float DeltaTime)
         FGameUpdateEntry* Entry = UpdateEntries.Find(Handle);
         if (!Entry || !Entry->Owner.IsValid() || !Entry->UpdateFunction)
         {
-            PendingRemoveHandles.AddUnique(Handle);
+            PendingRemoveHandleSet.Add(Handle);
             continue;
         }
 
@@ -160,28 +183,78 @@ void UGameUpdateSubSystem::Tick(float DeltaTime)
     FlushPendingRemovals();
 }
 
+void UGameUpdateSubSystem::MarkDispatchOrderDirty()
+{
+    bSortedHandlesDirty = true;
+}
+
+void UGameUpdateSubSystem::RebuildDispatchOrderIfNeeded()
+{
+    if (!bSortedHandlesDirty)
+    {
+        return;
+    }
+
+    SortedHandles.Reset(UpdateEntries.Num());
+    for (const TPair<int32, FGameUpdateEntry>& Pair : UpdateEntries)
+    {
+        if (Pair.Value.Owner.IsValid() && Pair.Value.UpdateFunction)
+        {
+            SortedHandles.Add(Pair.Key);
+        }
+        else
+        {
+            PendingRemoveHandleSet.Add(Pair.Key);
+        }
+    }
+
+    SortedHandles.Sort([this](const int32 A, const int32 B)
+    {
+        const FGameUpdateEntry* EntryA = UpdateEntries.Find(A);
+        const FGameUpdateEntry* EntryB = UpdateEntries.Find(B);
+        if (!EntryA || !EntryB)
+        {
+            return A < B;
+        }
+        if (EntryA->Priority != EntryB->Priority)
+        {
+            return EntryA->Priority < EntryB->Priority;
+        }
+        return EntryA->Serial < EntryB->Serial;
+    });
+
+    bSortedHandlesDirty = false;
+}
+
 void UGameUpdateSubSystem::RemoveInvalidEntries()
 {
-    TArray<int32> HandlesToRemove;
     for (const TPair<int32, FGameUpdateEntry>& Pair : UpdateEntries)
     {
         if (!Pair.Value.Owner.IsValid() || !Pair.Value.UpdateFunction)
         {
-            HandlesToRemove.Add(Pair.Key);
+            PendingRemoveHandleSet.Add(Pair.Key);
         }
     }
 
-    for (int32 Handle : HandlesToRemove)
-    {
-        UpdateEntries.Remove(Handle);
-    }
+    FlushPendingRemovals();
 }
 
 void UGameUpdateSubSystem::FlushPendingRemovals()
 {
-    for (int32 Handle : PendingRemoveHandles)
+    if (PendingRemoveHandleSet.Num() == 0)
     {
-        UpdateEntries.Remove(Handle);
+        return;
     }
-    PendingRemoveHandles.Reset();
+
+    int32 RemovedCount = 0;
+    for (const int32 Handle : PendingRemoveHandleSet)
+    {
+        RemovedCount += UpdateEntries.Remove(Handle);
+    }
+    PendingRemoveHandleSet.Empty();
+
+    if (RemovedCount > 0)
+    {
+        MarkDispatchOrderDirty();
+    }
 }

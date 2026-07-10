@@ -29,6 +29,20 @@ AWeatherActor::AWeatherActor()
     Niagara->SetupAttachment(RootComponent);
 }
 
+void AWeatherActor::ConfigureWeather(const FString& InPreset, float InIntensity)
+{
+    WeatherPreset = InPreset.IsEmpty() ? FString(TEXT("Rain")) : InPreset;
+    WeatherIntensity = FMath::Max(0.0f, InIntensity);
+
+    if (IsValid(Niagara))
+    {
+        // These parameter names are intentionally generic so Blueprint/Niagara variants can opt in.
+        Niagara->SetFloatParameter(TEXT("Intensity"), WeatherIntensity);
+        Niagara->SetFloatParameter(TEXT("WeatherIntensity"), WeatherIntensity);
+        Niagara->SetFloatParameter(TEXT("RainIntensity"), WeatherIntensity);
+    }
+}
+
 void AWeatherActor::BeginPlay()
 {
     // 1. Call the parent BeginPlay implementation.
@@ -41,19 +55,17 @@ void AWeatherActor::BeginPlay()
     {
         SubSystem = UGameManagerSubSystem::GetSubSystem(this);
     }
+    ConfigureWeather(WeatherPreset, WeatherIntensity);
     if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
     {
         GameUpdateTickHandle = GameUpdate->RegisterUpdate(
             this,
             [this](const float DeltaSeconds)
             {
-                TickFromGameUpdate(DeltaSeconds);
+                UpdateFromGameUpdate(DeltaSeconds);
             },
             30);
     }
-
-    // 3. Start the async tick loop.
-    AsyncTick();
 }
 
 void AWeatherActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
@@ -63,49 +75,48 @@ void AWeatherActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
         GameUpdate->UnregisterUpdate(GameUpdateTickHandle);
     }
     GameUpdateTickHandle = INDEX_NONE;
+    bRainUpdateInFlight = false;
 
     Super::EndPlay(EndPlayReason);
 }
 
-void AWeatherActor::Tick(float DeltaSeconds)
-{
-    Super::Tick(DeltaSeconds);
-    TickFromGameUpdate(DeltaSeconds);
-}
 
-void AWeatherActor::TickFromGameUpdate(float DeltaSeconds)
+void AWeatherActor::UpdateFromGameUpdate(float DeltaSeconds)
 {
     if (IsValid(SubSystem))
     {
         Location = SubSystem->GetCameraLocation();
         SetActorLocation(Location + LocationOffset, false, nullptr, ETeleportType::TeleportPhysics);
     }
+
+    StartRainAsyncUpdate();
 }
 
-void AWeatherActor::AsyncTick()
+void AWeatherActor::StartRainAsyncUpdate()
 {
-    // Logic equivalent to calling the Blueprint UpdateRainAsync node.
-    // UBlueprintAsyncActionBase objects are usually created through the static UpdateRainAsync function.
-    UUpdateRainAsync* RainAction = UUpdateRainAsync::UpdateRainAsync(
-        this, 
-        SceneCapture, 
-        Niagara, 
-        MaxDistance, 
-        Param
-    );
-
-    if (RainAction)
+    if (bRainUpdateInFlight || !IsValid(SceneCapture) || !IsValid(Niagara))
     {
-        // Bind the Blueprint Completed pin to the delegate.
-        RainAction->Completed.AddDynamic(this, &AWeatherActor::OnRainUpdateCompleted);
-        // Activate the async action.
-        RainAction->Activate();
+        return;
     }
+
+    UUpdateRainAsync* RainAction = UUpdateRainAsync::UpdateRainAsync(
+        this,
+        SceneCapture,
+        Niagara,
+        MaxDistance,
+        Param);
+
+    if (!RainAction)
+    {
+        return;
+    }
+
+    bRainUpdateInFlight = true;
+    RainAction->Completed.AddDynamic(this, &AWeatherActor::OnRainUpdateCompleted);
+    RainAction->Activate();
 }
 
 void AWeatherActor::OnRainUpdateCompleted()
 {
-    // Implements the loop that calls Async Tick again after Blueprint DelayUntilNextTick.
-    // In C++, schedule the next call for the following frame or use a timer.
-    GetWorld()->GetTimerManager().SetTimerForNextTick(this, &AWeatherActor::AsyncTick);
+    bRainUpdateInFlight = false;
 }

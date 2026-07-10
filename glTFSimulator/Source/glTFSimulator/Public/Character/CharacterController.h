@@ -80,7 +80,6 @@ public:
 protected:
     virtual void BeginPlay() override;
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
-    virtual void Tick(float DeltaSeconds) override;
 
     /** Receives hits from simulating physics objects while the player is not ragdolled. */
     UFUNCTION()
@@ -119,7 +118,7 @@ private:
     bool FindDirectWaterLevel(float& OutLevel) const;
     void ClearDryWaterState(float Level, bool bUpdateMovementMode);
     void SyncRagdollWaterStateFromPhysics();
-    void TickFromGameUpdate(float DeltaSeconds);
+    void UpdateFromGameUpdate(float DeltaSeconds);
     int32 GameUpdateTickHandle = INDEX_NONE;
     int32 CharacterStateBit = 0;
     FVector RawMoveInput;

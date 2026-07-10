@@ -12,6 +12,7 @@
 #include "System/FileFunctionLibrary.h"
 #include "System/GameManagerSubSystem.h"
 #include "System/MacroLibrary.h"
+#include "System/MultiplayerWorldSubSystem.h"
 #include "TimerManager.h"
 #include "UI/StartWorldWidget.h"
 #include "World/WorldData.h"
@@ -20,6 +21,7 @@ namespace
 {
     static const TCHAR* const DefaultStartMenuWidgetClassPath = TEXT("/Game/Blueprints/StartWorld/WBP_StartWorld.WBP_StartWorld_C");
     static const TCHAR* const DefaultWorldSelectionWidgetClassPath = TEXT("/Game/Blueprints/StartWorld/WBP_LevelMenu.WBP_LevelMenu_C");
+    static const TCHAR* const DefaultMultiplayerWidgetClassPath = TEXT("/Game/Blueprints/StartWorld/WBP_LevelMenu.WBP_LevelMenu_C");
 
     FString NormalizeStartWorldString(FString Value)
     {
@@ -31,6 +33,8 @@ namespace
 AStartActor::AStartActor()
 {
     PrimaryActorTick.bCanEverTick = false;
+
+    PendingServerAddress = DefaultServerAddress;
 
     // Widget classes are intentionally not loaded in the constructor.
     // Assign them in BP_StartWorld, or let the fallback paths load only when a menu is opened.
@@ -113,7 +117,7 @@ void AStartActor::ShowStartMenu()
     }
 
     RemoveAllMenuWidgets();
-    ResetEditorTransactionBufferForMenuTravel(TEXT("Show StartWorld start menu"));
+    ResetEditorTransactionBufferForMenuTravel(TEXT("Show MainWorld start menu"));
 
     StartMenuWidget = CreateAndAddMenuWidget(
         StartMenuWidgetClass,
@@ -128,7 +132,7 @@ void AStartActor::ShowWorldSelectionMenu()
 {
     BuildLevelFolderNameMap();
     RemoveAllMenuWidgets();
-    ResetEditorTransactionBufferForMenuTravel(TEXT("Show StartWorld world-selection menu"));
+    ResetEditorTransactionBufferForMenuTravel(TEXT("Show MainWorld single-player world-selection menu"));
 
     WorldSelectionWidget = CreateAndAddMenuWidget(
         WorldSelectionWidgetClass,
@@ -137,6 +141,22 @@ void AStartActor::ShowWorldSelectionMenu()
         true);
 
     ApplyMenuInputMode(WorldSelectionWidget.Get());
+}
+
+void AStartActor::ShowMultiplayerMenu()
+{
+    BuildLevelFolderNameMap();
+    RemoveAllMenuWidgets();
+    ResetEditorTransactionBufferForMenuTravel(TEXT("Show MainWorld multiplayer menu"));
+
+    const TSubclassOf<UStartWorldWidget> WidgetClass = MultiplayerMenuWidgetClass ? MultiplayerMenuWidgetClass : WorldSelectionWidgetClass;
+    MultiplayerMenuWidget = CreateAndAddMenuWidget(
+        WidgetClass,
+        DefaultMultiplayerWidgetClassPath,
+        TEXT("MultiplayerMenuWidgetClass"),
+        true);
+
+    ApplyMenuInputMode(MultiplayerMenuWidget.Get());
 }
 
 void AStartActor::RefreshWorldFolderNameMap()
@@ -179,16 +199,21 @@ bool AStartActor::TryResolveWorldFolderFromDisplayName(const FString& DisplayNam
 
 void AStartActor::OpenGameplayWorldByFolderName(const FString& WorldFolderName)
 {
+    OpenSinglePlayerWorldByFolderName(WorldFolderName);
+}
+
+void AStartActor::OpenSinglePlayerWorldByFolderName(const FString& WorldFolderName)
+{
     FString ResolvedFolderName;
     if (!TryResolveWorldFolderFromDisplayName(WorldFolderName, ResolvedFolderName))
     {
-        UE_LOG(LogTemp, Warning, TEXT("StartActor cannot open gameplay world. Unknown world folder/display name: %s"), *WorldFolderName);
+        UE_LOG(LogTemp, Warning, TEXT("StartActor cannot open single-player world. Unknown world folder/display name: %s"), *WorldFolderName);
         return;
     }
 
     if (GameplayLevelName == NAME_None)
     {
-        UE_LOG(LogTemp, Warning, TEXT("StartActor cannot open gameplay world because GameplayLevelName is not assigned."));
+        UE_LOG(LogTemp, Warning, TEXT("StartActor cannot open single-player world because GameplayLevelName is not assigned."));
         return;
     }
 
@@ -200,13 +225,91 @@ void AStartActor::OpenGameplayWorldByFolderName(const FString& WorldFolderName)
     }
 
     PrepareMenuForWorldTravel();
-    UGameplayStatics::OpenLevel(this, GameplayLevelName);
+    if (UMultiplayerWorldSubSystem* Multiplayer = UMultiplayerWorldSubSystem::Get(this))
+    {
+        Multiplayer->StartSinglePlayerWorld(this, ResolvedFolderName, GameplayLevelName);
+    }
+    else
+    {
+        UGameplayStatics::OpenLevel(this, GameplayLevelName);
+    }
+}
+
+void AStartActor::HostMultiplayerWorldByFolderName(const FString& WorldFolderName)
+{
+    FString ResolvedFolderName;
+    if (!TryResolveWorldFolderFromDisplayName(WorldFolderName, ResolvedFolderName))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("StartActor cannot host multiplayer world. Unknown world folder/display name: %s"), *WorldFolderName);
+        return;
+    }
+
+    if (HostWorldLevelName == NAME_None)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("StartActor cannot host multiplayer world because HostWorldLevelName is not assigned."));
+        return;
+    }
+
+    if (UGameManagerSubSystem* GameManager = UGameManagerSubSystem::GetSubSystem(this))
+    {
+        GameManager->SetCurrentWorldName(ResolvedFolderName);
+        GameManager->ClearWorldSelectionMenuRequest();
+        GameManager->SetGamePaused(false);
+    }
+
+    PrepareMenuForWorldTravel();
+    if (UMultiplayerWorldSubSystem* Multiplayer = UMultiplayerWorldSubSystem::Get(this))
+    {
+        Multiplayer->HostMultiplayerWorld(this, ResolvedFolderName, HostWorldLevelName);
+    }
+}
+
+void AStartActor::OpenClientConnectionWorld(const FString& InServerAddress)
+{
+    SetPendingServerAddress(InServerAddress);
+    PrepareMenuForWorldTravel();
+    if (UMultiplayerWorldSubSystem* Multiplayer = UMultiplayerWorldSubSystem::Get(this))
+    {
+        Multiplayer->SetServerAddress(PendingServerAddress);
+        Multiplayer->OpenClientConnectionWorld(this, ClientWorldLevelName);
+    }
+}
+
+void AStartActor::JoinMultiplayerServer(const FString& InServerAddress, const FString& OptionalWorldFolderName)
+{
+    SetPendingServerAddress(InServerAddress);
+    if (UGameManagerSubSystem* GameManager = UGameManagerSubSystem::GetSubSystem(this))
+    {
+        GameManager->ClearWorldSelectionMenuRequest();
+        GameManager->SetGamePaused(false);
+    }
+
+    PrepareMenuForWorldTravel();
+    if (UMultiplayerWorldSubSystem* Multiplayer = UMultiplayerWorldSubSystem::Get(this))
+    {
+        Multiplayer->JoinMultiplayerWorld(this, PendingServerAddress, OptionalWorldFolderName);
+    }
+}
+
+void AStartActor::SetPendingServerAddress(const FString& InServerAddress)
+{
+    PendingServerAddress = InServerAddress;
+    PendingServerAddress.TrimStartAndEndInline();
+    if (PendingServerAddress.IsEmpty())
+    {
+        PendingServerAddress = DefaultServerAddress.IsEmpty() ? FString(TEXT("127.0.0.1:7777")) : DefaultServerAddress;
+    }
+
+    if (UMultiplayerWorldSubSystem* Multiplayer = UMultiplayerWorldSubSystem::Get(this))
+    {
+        Multiplayer->SetServerAddress(PendingServerAddress);
+    }
 }
 
 void AStartActor::PrepareMenuForWorldTravel()
 {
     RemoveAllMenuWidgets();
-    ResetEditorTransactionBufferForMenuTravel(TEXT("StartWorld menu world travel"));
+    ResetEditorTransactionBufferForMenuTravel(TEXT("MainWorld menu world travel"));
 }
 
 UClass* AStartActor::ResolveMenuWidgetClass(TSubclassOf<UStartWorldWidget> WidgetClass, const TCHAR* DefaultWidgetClassPath, const TCHAR* DebugWidgetName) const
@@ -292,9 +395,14 @@ void AStartActor::RemoveTrackedMenuWidgets()
     {
         WorldSelectionWidget->RemoveFromParent();
     }
+    if (IsValid(MultiplayerMenuWidget))
+    {
+        MultiplayerMenuWidget->RemoveFromParent();
+    }
 
     StartMenuWidget = nullptr;
     WorldSelectionWidget = nullptr;
+    MultiplayerMenuWidget = nullptr;
 }
 
 void AStartActor::RemoveAllMenuWidgets()
@@ -302,6 +410,7 @@ void AStartActor::RemoveAllMenuWidgets()
     UWidgetLayoutLibrary::RemoveAllWidgets(this);
     StartMenuWidget = nullptr;
     WorldSelectionWidget = nullptr;
+    MultiplayerMenuWidget = nullptr;
 }
 
 void AStartActor::ApplyMenuInputMode(UStartWorldWidget* FocusWidget) const
@@ -368,5 +477,5 @@ void AStartActor::ResetEditorTransactionBufferForMenuTravel(const TCHAR* Reason)
 
     UGameManagerSubSystem::ResetEditorTransactionBufferForWorldTravel(
         this,
-        Reason ? FString(Reason) : FString(TEXT("StartWorld menu travel")));
+        Reason ? FString(Reason) : FString(TEXT("MainWorld menu travel")));
 }

@@ -1,4 +1,3 @@
-
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
@@ -7,7 +6,6 @@
 #include "CoreMinimal.h"
 #include "Subsystems/WorldSubsystem.h"
 #include "Components/DecalComponent.h"
-#include "Tickable.h"
 #include "DynamicLightSubsystem.generated.h"
 
 class UDynamicPointLightComponent;
@@ -34,7 +32,7 @@ struct FLightOptimizationData
 };
 
 UCLASS()
-class GLTFSIMULATOR_API UDynamicLightSubsystem : public UWorldSubsystem, public FTickableGameObject
+class GLTFSIMULATOR_API UDynamicLightSubsystem : public UWorldSubsystem
 {
     GENERATED_BODY()
 
@@ -42,18 +40,14 @@ public:
     virtual void Initialize(FSubsystemCollectionBase &Collection) override;
     virtual void Deinitialize() override;
 
-    // FTickableGameObject interface implementation.
-    virtual void Tick(float DeltaTime) override;
-    virtual ETickableTickType GetTickableTickType() const override { return ETickableTickType::Conditional; }
-    virtual bool IsTickable() const override { return !IsTemplate() && GameUpdateHandle == INDEX_NONE && ManagedLights.Num() > 0; }
-    virtual TStatId GetStatId() const override { RETURN_QUICK_DECLARE_CYCLE_STAT(UDynamicLightSubsystem, STATGROUP_Default); }
-    virtual UWorld* GetTickableGameObjectWorld() const override { return GetWorld(); }
     void RegisterLight(UDynamicPointLightComponent *InLight);
     void UnregisterLight(UDynamicPointLightComponent *InLight);
 
 private:
     TArray<FLightOptimizationData> ManagedLights;
     int32 GameUpdateHandle = INDEX_NONE;
+
+    void UpdateLightsFromGameUpdate(float DeltaTime);
 
     // Internal helper for lazy decal component creation.
     UDecalComponent *CreateDecalComponent(UDynamicPointLightComponent *LightComp, UMaterialInterface *Material);

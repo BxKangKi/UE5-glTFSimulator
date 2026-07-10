@@ -11,6 +11,7 @@ class UBorder;
 class UScrollBox;
 class UTextBlock;
 class UUniformGridPanel;
+class UGameUpdateSubSystem;
 
 /**
  * Creator HUD bridge class.
@@ -75,10 +76,10 @@ protected:
     /** Unbinds manager events when the widget is removed. */
     virtual void NativeDestruct() override;
 
-    /** Lightly refreshes per-frame values such as center-cursor and status text. */
-    virtual void NativeTick(const FGeometry& MyGeometry, float InDeltaTime) override;
-
 private:
+    int32 GameUpdateTickHandle = INDEX_NONE;
+    void UpdateFromGameUpdate(float DeltaSeconds);
+
     /** Bridges GameManager state changes to HUD refreshes. */
     UFUNCTION()
     void HandleStateChanged();

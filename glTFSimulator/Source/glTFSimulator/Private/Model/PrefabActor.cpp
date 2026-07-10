@@ -9,6 +9,10 @@
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Materials/MaterialInterface.h"
+#include "Setting/GameSettings.h"
+#include "System/MultiplayerWorldSubSystem.h"
+#include "System/MacroLibrary.h"
+#include "Net/UnrealNetwork.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 
@@ -54,6 +58,40 @@ namespace
 
 namespace
 {
+
+    static FString ResolveReplicatedGltfPathForCurrentWorld(const UObject* WorldContextObject, const FString& InPath)
+    {
+        FString NormalizedPath = InPath;
+        FPaths::NormalizeFilename(NormalizedPath);
+        if (FPaths::FileExists(NormalizedPath))
+        {
+            return NormalizedPath;
+        }
+
+        FString RelativeModelPath = FPaths::GetCleanFilename(NormalizedPath);
+        const int32 ModelSegmentIndex = NormalizedPath.Find(TEXT("/model/"), ESearchCase::IgnoreCase, ESearchDir::FromStart);
+        if (ModelSegmentIndex != INDEX_NONE)
+        {
+            RelativeModelPath = NormalizedPath.Mid(ModelSegmentIndex + 7);
+        }
+
+        if (const UMultiplayerWorldSubSystem* Multiplayer = UMultiplayerWorldSubSystem::Get(WorldContextObject))
+        {
+            const FString WorldFolderName = Multiplayer->GetSelectedWorldFolderName();
+            if (!WorldFolderName.IsEmpty())
+            {
+                const FString Candidate = FPaths::Combine(PATH_ROOT, WorldFolderName, TEXT("model"), RelativeModelPath);
+                if (FPaths::FileExists(Candidate))
+                {
+                    return Candidate;
+                }
+                return Candidate;
+            }
+        }
+
+        return NormalizedPath;
+    }
+
     static bool ReadTransformObject(const TSharedPtr<FJsonObject>& Object, FTransform& OutTransform)
     {
         if (!Object.IsValid())
@@ -96,8 +134,20 @@ namespace
 APrefabActor::APrefabActor()
 {
     PrimaryActorTick.bCanEverTick = false;
+    bReplicates = true;
+    SetReplicateMovement(true);
+    SetNetUpdateFrequency(10.0f);
+    SetMinNetUpdateFrequency(2.0f);
+
     Root = CreateDefaultSubobject<USceneComponent>(TEXT("Root"));
     SetRootComponent(Root);
+}
+
+void APrefabActor::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+    Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+    DOREPLIFETIME(APrefabActor, ReplicatedSourceFilePath);
+    DOREPLIFETIME(APrefabActor, ReplicatedObjectName);
 }
 
 void APrefabActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
@@ -110,6 +160,26 @@ void APrefabActor::Destroyed()
 {
     ReleaseRuntimeResources();
     Super::Destroyed();
+}
+
+void APrefabActor::SetRenderOnlyMode(bool bInRenderOnlyMode)
+{
+    bRenderOnlyMode = bInRenderOnlyMode;
+    for (TObjectPtr<UStaticMeshComponent>& MeshComponent : MeshComponents)
+    {
+        ApplyConfigToMeshComponent(MeshComponent.Get());
+    }
+}
+
+void APrefabActor::OnRep_PrefabReplicationData()
+{
+    if (ReplicatedSourceFilePath.IsEmpty())
+    {
+        return;
+    }
+
+    SetRenderOnlyMode(UMultiplayerWorldSubSystem::ShouldUseClientRenderOnlyStreaming(this));
+    LoadPrefab(ResolveReplicatedGltfPathForCurrentWorld(this, ReplicatedSourceFilePath), ReplicatedObjectName);
 }
 
 void APrefabActor::ReleaseRuntimeResources()
@@ -212,9 +282,11 @@ void APrefabActor::ApplyConfigToMeshComponent(UStaticMeshComponent* MeshComponen
         return;
     }
 
-    MeshComponent->SetCollisionEnabled(Config.bEnableCollision ? ECollisionEnabled::QueryAndPhysics : ECollisionEnabled::NoCollision);
+    const bool bEnablePhysicsCollision = !bRenderOnlyMode && Config.bEnableCollision;
+    MeshComponent->SetCollisionEnabled(bEnablePhysicsCollision ? ECollisionEnabled::QueryAndPhysics : ECollisionEnabled::NoCollision);
     MeshComponent->SetCollisionProfileName(Config.CollisionProfileName.IsEmpty() ? TEXT("BlockAll") : FName(*Config.CollisionProfileName));
-    MeshComponent->SetSimulatePhysics(Config.bSimulatePhysics);
+    MeshComponent->SetGenerateOverlapEvents(bEnablePhysicsCollision);
+    MeshComponent->SetSimulatePhysics(!bRenderOnlyMode && Config.bSimulatePhysics);
 }
 
 UStaticMesh* APrefabActor::LoadMeshByIndex(int32 MeshIndex)
@@ -234,8 +306,9 @@ UStaticMesh* APrefabActor::LoadMeshByIndex(int32 MeshIndex)
     MeshConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
     MeshConfig.MaterialsConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
     MeshConfig.MaterialsConfig.bGeneratesMipMaps = false;
-    MeshConfig.MaterialsConfig.ImagesConfig.MaxWidth = 1024;
-    MeshConfig.MaterialsConfig.ImagesConfig.MaxHeight = 1024;
+    const int32 TextureDimensionLimit = UGameSettings::ResolveMaxTextureResolution(this);
+    MeshConfig.MaterialsConfig.ImagesConfig.MaxWidth = TextureDimensionLimit;
+    MeshConfig.MaterialsConfig.ImagesConfig.MaxHeight = TextureDimensionLimit;
     MeshConfig.MaterialsConfig.ImagesConfig.bCompressMips = false;
     MeshConfig.MaterialsConfig.ImagesConfig.bStreaming = false;
     MeshConfig.MaterialsConfig.bLoadMipMaps = false;
@@ -247,9 +320,11 @@ UStaticMesh* APrefabActor::LoadMeshByIndex(int32 MeshIndex)
         }
     }
     MeshConfig.bAllowCPUAccess = true;
-    MeshConfig.bBuildSimpleCollision = true;
-    MeshConfig.bBuildComplexCollision = true;
-    MeshConfig.CollisionComplexity = ECollisionTraceFlag::CTF_UseComplexAsSimple;
+    MeshConfig.bBuildLumenCards = !bRenderOnlyMode;
+    MeshConfig.bBuildSimpleCollision = !bRenderOnlyMode;
+    MeshConfig.bBuildComplexCollision = !bRenderOnlyMode;
+    MeshConfig.bBuildNavCollision = !bRenderOnlyMode;
+    MeshConfig.CollisionComplexity = bRenderOnlyMode ? ECollisionTraceFlag::CTF_UseDefault : ECollisionTraceFlag::CTF_UseComplexAsSimple;
 
     UStaticMesh* Mesh = GltfAsset->LoadStaticMesh(MeshIndex, MeshConfig);
     if (IsValid(Mesh))
@@ -314,6 +389,12 @@ bool APrefabActor::LoadPrefab(const FString& InFilePath, const FString& InObject
     }
 
     bLoaded = MeshComponents.Num() > 0;
+    if (bLoaded && HasAuthority())
+    {
+        ReplicatedSourceFilePath = SourceFilePath;
+        ReplicatedObjectName = ObjectName;
+        ForceNetUpdate();
+    }
     return bLoaded;
 }
 

@@ -11,6 +11,7 @@ class UInstancedStaticMeshComponent;
 class UBoxComponent;
 class UShapeComponent;
 class ULightComponent;
+class AWaterActor;
 
 UENUM(BlueprintType)
 enum class EColliderType : uint8
@@ -143,6 +144,19 @@ struct FModelNodeData
     FTransform Transform;
 };
 
+
+USTRUCT(BlueprintType)
+struct FWaterStreamNodeData
+{
+    GENERATED_BODY()
+
+    UPROPERTY()
+    FTransform Transform = FTransform::Identity;
+
+    UPROPERTY()
+    float StreamRadius = 65536.0f;
+};
+
 USTRUCT(BlueprintType)
 struct FLoadAsyncWrapper
 {
@@ -150,6 +164,9 @@ struct FLoadAsyncWrapper
 
     UPROPERTY()
     TMap<FName, FModelNodeData> NodeMap;
+
+    UPROPERTY()
+    TMap<FName, FWaterStreamNodeData> WaterNodeMap;
 
     UPROPERTY()
     TMap<FName, FModelMeshData> MeshMap;
@@ -178,11 +195,17 @@ struct FStreamAsyncWrapper
     UPROPERTY()
     TSet<FName> LoadedNodes;
     UPROPERTY()
+    TSet<FName> LoadedWaterNodes;
+    UPROPERTY()
     TMap<FName, FModelNodeData> NodeMap;
+    UPROPERTY()
+    TMap<FName, FWaterStreamNodeData> WaterNodeMap;
     UPROPERTY()
     TMap<FName, TObjectPtr<UInstancedStaticMeshComponent>> InstanceMap;
     UPROPERTY()
     TMap<FName, TObjectPtr<UBoxComponent>> UnloadBoxMap;
     UPROPERTY()
     TMap<FName, FComponentGroup> DynamicComponentMap;
+    UPROPERTY()
+    TMap<FName, TObjectPtr<AWaterActor>> WaterActorMap;
 };
