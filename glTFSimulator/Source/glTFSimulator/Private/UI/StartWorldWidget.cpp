@@ -96,10 +96,6 @@ void UStartWorldWidget::ExecuteStartGame()
     UE_LOG(LogTemp, Warning, TEXT("StartWorldWidget cannot start the game because StartActor is not assigned."));
 }
 
-void UStartWorldWidget::StartGame()
-{
-    ExecuteStartGame();
-}
 
 void UStartWorldWidget::ExecuteReturnToMainMenuFromWorldSelection()
 {
@@ -148,11 +144,6 @@ void UStartWorldWidget::ExecuteShowMultiplayerMenu()
     }
 
     UE_LOG(LogTemp, Warning, TEXT("StartWorldWidget cannot show the multiplayer menu because StartActor is not assigned."));
-}
-
-void UStartWorldWidget::ShowMultiplayerMenu()
-{
-    ExecuteShowMultiplayerMenu();
 }
 
 void UStartWorldWidget::ExecuteRefreshWorldSelectionData()

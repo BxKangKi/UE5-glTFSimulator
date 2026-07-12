@@ -39,10 +39,6 @@ public:
     UFUNCTION(BlueprintCallable, Category="Start World|Actions")
     void ExecuteStartGame();
 
-    /** Short alias for Blueprint button bindings. */
-    UFUNCTION(BlueprintCallable, Category="Start World|Actions")
-    void StartGame();
-
     /** Returns from the world-selection screen to the main start screen. Bind this to the Back button. */
     UFUNCTION(BlueprintCallable, Category="Start World|Actions")
     void ExecuteReturnToMainMenuFromWorldSelection();
@@ -62,9 +58,6 @@ public:
     /** Opens the multiplayer menu through the owning StartActor. */
     UFUNCTION(BlueprintCallable, Category="Start World|Actions")
     void ExecuteShowMultiplayerMenu();
-
-    UFUNCTION(BlueprintCallable, Category="Start World|Actions")
-    void ShowMultiplayerMenu();
 
     /** Re-scans world folders and refreshes the world-selection widget. */
     UFUNCTION(BlueprintCallable, Category="Start World|Actions")
