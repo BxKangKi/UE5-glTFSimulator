@@ -2,7 +2,6 @@
 
 #include "UI/CreatorHUDWidget.h"
 
-#include "Blueprint/WidgetTree.h"
 #include "Components/Border.h"
 #include "Components/ScrollBox.h"
 #include "Components/TextBlock.h"
@@ -31,7 +30,6 @@ void UCreatorHUDWidget::NativeConstruct()
 {
     Super::NativeConstruct();
 
-    CacheUserWidgetReferences();
     RefreshManagerReference();
     BindManagerEvents();
 
@@ -68,28 +66,13 @@ void UCreatorHUDWidget::NativeDestruct()
 
 void UCreatorHUDWidget::UpdateFromGameUpdate(float DeltaSeconds)
 {
-    if (!IsValid(UserStatusTextBlock) && !IsValid(UserPlacementInfoTextBlock) &&
-        !IsValid(UserMessageTextBlock) && !IsValid(UserItemListPanel))
+    if (!IsValid(CreatorHUD_StatusText) && !IsValid(CreatorHUD_PlacementText) &&
+        !IsValid(CreatorHUD_MessageText) && !IsValid(CreatorHUD_ItemListPanel))
     {
         return;
     }
 
     RefreshStatus();
-}
-
-void UCreatorHUDWidget::CacheUserWidgetReferences()
-{
-    if (!WidgetTree)
-    {
-        return;
-    }
-
-    UserToolbarGrid = Cast<UUniformGridPanel>(WidgetTree->FindWidget(TEXT("CreatorHUD_ToolbarGrid")));
-    UserItemListScrollBox = Cast<UScrollBox>(WidgetTree->FindWidget(TEXT("CreatorHUD_ItemListScrollBox")));
-    UserItemListPanel = Cast<UBorder>(WidgetTree->FindWidget(TEXT("CreatorHUD_ItemListPanel")));
-    UserStatusTextBlock = Cast<UTextBlock>(WidgetTree->FindWidget(TEXT("CreatorHUD_StatusText")));
-    UserPlacementInfoTextBlock = Cast<UTextBlock>(WidgetTree->FindWidget(TEXT("CreatorHUD_PlacementText")));
-    UserMessageTextBlock = Cast<UTextBlock>(WidgetTree->FindWidget(TEXT("CreatorHUD_MessageText")));
 }
 
 void UCreatorHUDWidget::RefreshManagerReference()
@@ -103,46 +86,38 @@ void UCreatorHUDWidget::RefreshToolbar()
 {
     // No native fallback buttons are generated here anymore.
     // Keep this as a Blueprint-friendly refresh hook for user-authored WBP graphs.
-    CacheUserWidgetReferences();
 }
 
 void UCreatorHUDWidget::RefreshItemList()
 {
     // No native fallback item buttons are generated here anymore.
     // User-authored WBP graphs should build their own list and call SelectAvailableItemFromUI().
-    CacheUserWidgetReferences();
 
-    if (IsValid(UserItemListPanel))
+    if (IsValid(CreatorHUD_ItemListPanel))
     {
         const UGameManagerSubSystem* Manager = GetGameManager();
-        UserItemListPanel->SetVisibility(IsValid(Manager) && Manager->IsItemListWindowOpen() ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
+        CreatorHUD_ItemListPanel->SetVisibility(IsValid(Manager) && Manager->IsItemListWindowOpen() ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
     }
 }
 
 void UCreatorHUDWidget::RefreshStatus()
 {
-    if (!IsValid(UserStatusTextBlock) && !IsValid(UserPlacementInfoTextBlock) &&
-        !IsValid(UserMessageTextBlock) && !IsValid(UserItemListPanel))
+    if (IsValid(CreatorHUD_StatusText))
     {
-        CacheUserWidgetReferences();
+        CreatorHUD_StatusText->SetText(GetStatusText());
     }
-
-    if (IsValid(UserStatusTextBlock))
+    if (IsValid(CreatorHUD_PlacementText))
     {
-        UserStatusTextBlock->SetText(GetStatusText());
+        CreatorHUD_PlacementText->SetText(GetPlacementInfoText());
     }
-    if (IsValid(UserPlacementInfoTextBlock))
+    if (IsValid(CreatorHUD_MessageText))
     {
-        UserPlacementInfoTextBlock->SetText(GetPlacementInfoText());
+        CreatorHUD_MessageText->SetText(GetMessageText());
     }
-    if (IsValid(UserMessageTextBlock))
-    {
-        UserMessageTextBlock->SetText(GetMessageText());
-    }
-    if (IsValid(UserItemListPanel))
+    if (IsValid(CreatorHUD_ItemListPanel))
     {
         const UGameManagerSubSystem* Manager = GetGameManager();
-        UserItemListPanel->SetVisibility(IsValid(Manager) && Manager->IsItemListWindowOpen() ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
+        CreatorHUD_ItemListPanel->SetVisibility(IsValid(Manager) && Manager->IsItemListWindowOpen() ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
     }
 }
 

@@ -5,16 +5,15 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
+#include "UI/WorldSelectionWidget.h"
 #include "StartActor.generated.h"
-
-class UStartWorldWidget;
 
 /**
  * Owns the MainWorld menu flow.
  *
- * BP_StartWorld should inherit from this actor. WBP_StartWorld and WBP_LevelMenu
- * should inherit from UStartWorldWidget so buttons call typed C++ functions instead
- * of keeping Blueprint-only world references or invoking functions by reflection.
+ * BP_StartWorld should inherit from this actor and explicitly assign each menu widget class.
+ * WBP_StartWorld should inherit UStartWorldWidget, and WBP_LevelMenu should inherit
+ * UWorldSelectionWidget so the native widget builds and handles the world buttons directly.
  */
 UCLASS(Blueprintable, BlueprintType)
 class GLTFSIMULATOR_API AStartActor : public AActor
@@ -40,11 +39,11 @@ public:
     UFUNCTION(BlueprintCallable, Category="Start World|UI")
     void ShowWorldSelectionMenu();
 
-    /** Rebuilds and shows the multiplayer menu. If no dedicated widget is assigned, it falls back to the world-selection widget. */
+    /** Rebuilds and shows the multiplayer menu. Assign MultiplayerMenuWidgetClass in BP_StartWorld before using this. */
     UFUNCTION(BlueprintCallable, Category="Start World|UI")
     void ShowMultiplayerMenu();
 
-    /** Re-scans available world folders and refreshes the opened world-selection widget. */
+    /** Re-scans available world folders and refreshes opened world-list widgets. */
     UFUNCTION(BlueprintCallable, Category="Start World|Data")
     void RefreshWorldFolderNameMap();
 
@@ -57,9 +56,6 @@ public:
     bool TryResolveWorldFolderFromDisplayName(const FString& DisplayName, FString& OutFolderName) const;
 
     /** Opens the single-player gameplay map after selecting a world folder from WBP_LevelMenu. */
-    UFUNCTION(BlueprintCallable, Category="Start World|Navigation")
-    void OpenGameplayWorldByFolderName(const FString& WorldFolderName);
-
     UFUNCTION(BlueprintCallable, Category="Start World|Navigation")
     void OpenSinglePlayerWorldByFolderName(const FString& WorldFolderName);
 
@@ -90,11 +86,11 @@ protected:
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Start World|UI")
     TSubclassOf<UStartWorldWidget> StartMenuWidgetClass;
 
-    /** World-selection widget class. Reparent WBP_LevelMenu to UStartWorldWidget and assign it here. */
+    /** World-selection widget class. Set this to WBP_LevelMenu reparented to UWorldSelectionWidget. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Start World|UI")
-    TSubclassOf<UStartWorldWidget> WorldSelectionWidgetClass;
+    TSubclassOf<UWorldSelectionWidget> WorldSelectionWidgetClass;
 
-    /** Optional multiplayer menu widget class. Falls back to WorldSelectionWidgetClass when empty. */
+    /** Optional multiplayer menu widget class. Assign explicitly when the project uses a multiplayer menu. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Start World|UI")
     TSubclassOf<UStartWorldWidget> MultiplayerMenuWidgetClass;
 
@@ -125,8 +121,8 @@ protected:
 
 private:
     void InitializeStartScreenAfterBlueprintBeginPlay();
-    UClass* ResolveMenuWidgetClass(TSubclassOf<UStartWorldWidget> WidgetClass, const TCHAR* DefaultWidgetClassPath, const TCHAR* DebugWidgetName) const;
-    UStartWorldWidget* CreateAndAddMenuWidget(TSubclassOf<UStartWorldWidget> WidgetClass, const TCHAR* DefaultWidgetClassPath, const TCHAR* DebugWidgetName, bool bPassWorldSelectionData);
+    UClass* ResolveMenuWidgetClass(UClass* WidgetClass, const TCHAR* DebugWidgetName) const;
+    UStartWorldWidget* CreateAndAddMenuWidget(UClass* WidgetClass, const TCHAR* DebugWidgetName);
     void RemoveTrackedMenuWidgets();
     void RemoveAllMenuWidgets();
     void ApplyMenuInputMode(UStartWorldWidget* FocusWidget) const;
@@ -138,7 +134,7 @@ private:
     TObjectPtr<UStartWorldWidget> StartMenuWidget;
 
     UPROPERTY(Transient)
-    TObjectPtr<UStartWorldWidget> WorldSelectionWidget;
+    TObjectPtr<UWorldSelectionWidget> WorldSelectionWidget;
 
     UPROPERTY(Transient)
     TObjectPtr<UStartWorldWidget> MultiplayerMenuWidget;

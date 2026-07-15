@@ -1801,11 +1801,6 @@ void UGameManagerSubSystem::ResetEditorTransactionBufferForWorldTravel(const UOb
 #endif
 }
 
-void UGameManagerSubSystem::PrepareForWorldTravelFromUI(const UObject* WorldContextObject)
-{
-    ResetEditorTransactionBufferForWorldTravel(WorldContextObject, TEXT("Widget-triggered world travel"));
-}
-
 void UGameManagerSubSystem::OpenWorldSelectionScreen(const UObject* WorldContextObject, FName WorldSelectionLevelName)
 {
     if (!WorldContextObject)

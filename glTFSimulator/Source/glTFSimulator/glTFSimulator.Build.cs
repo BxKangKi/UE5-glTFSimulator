@@ -16,7 +16,8 @@ public class glTFSimulator : ModuleRules
                 "CoreUObject",
                 "Engine",
                 "EnhancedInput",
-                "UMG"
+                "UMG",
+                "SlateCore"
             });
 
         PrivateDependencyModuleNames.AddRange(
@@ -28,7 +29,6 @@ public class glTFSimulator : ModuleRules
                 "Niagara",
                 "RHI",
                 "Slate",
-                "SlateCore",
                 "ProceduralMeshComponent",
                 "PhysicsCore",
                 "ImageWrapper",

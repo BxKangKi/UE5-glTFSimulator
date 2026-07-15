@@ -17,7 +17,7 @@ class UGameUpdateSubSystem;
  * Creator HUD bridge class.
  *
  * This class no longer creates a native/UMG fallback layout. Create your own WBP
- * and bind its buttons to the BlueprintCallable functions below.
+ * and assign widget variables or bind its buttons to the BlueprintCallable functions below.
  */
 UCLASS(Blueprintable, BlueprintType)
 class GLTFSIMULATOR_API UCreatorHUDWidget : public UUserWidget
@@ -114,29 +114,32 @@ private:
     /** Safely removes manager event bindings. */
     void UnbindManagerEvents();
 
-    /** Caches same-named text and panel widgets from the WBP only; it does not create widgets. */
-    void CacheUserWidgetReferences();
+protected:
+    /** Optional toolbar grid assigned directly by the WBP. */
+    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Creator HUD|Widgets")
+    TObjectPtr<UUniformGridPanel> CreatorHUD_ToolbarGrid;
+
+    /** Optional item-list scroll box assigned directly by the WBP. */
+    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Creator HUD|Widgets")
+    TObjectPtr<UScrollBox> CreatorHUD_ItemListScrollBox;
+
+    /** Optional item-list panel assigned directly by the WBP. */
+    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Creator HUD|Widgets")
+    TObjectPtr<UBorder> CreatorHUD_ItemListPanel;
+
+    /** Optional status text assigned directly by the WBP. */
+    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Creator HUD|Widgets")
+    TObjectPtr<UTextBlock> CreatorHUD_StatusText;
+
+    /** Optional placement-info text assigned directly by the WBP. */
+    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Creator HUD|Widgets")
+    TObjectPtr<UTextBlock> CreatorHUD_PlacementText;
+
+    /** Optional message text assigned directly by the WBP. */
+    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Creator HUD|Widgets")
+    TObjectPtr<UTextBlock> CreatorHUD_MessageText;
 
 private:
-    /** Used for automatic text updates only when same-named widgets exist in the custom WBP. */
-    UPROPERTY(Transient)
-    TObjectPtr<UUniformGridPanel> UserToolbarGrid;
-
-    UPROPERTY(Transient)
-    TObjectPtr<UScrollBox> UserItemListScrollBox;
-
-    UPROPERTY(Transient)
-    TObjectPtr<UBorder> UserItemListPanel;
-
-    UPROPERTY(Transient)
-    TObjectPtr<UTextBlock> UserStatusTextBlock;
-
-    UPROPERTY(Transient)
-    TObjectPtr<UTextBlock> UserPlacementInfoTextBlock;
-
-    UPROPERTY(Transient)
-    TObjectPtr<UTextBlock> UserMessageTextBlock;
-
     /** GameManager currently connected to this HUD. */
     UPROPERTY(Transient)
     mutable TObjectPtr<UGameManagerSubSystem> CachedGameManager;

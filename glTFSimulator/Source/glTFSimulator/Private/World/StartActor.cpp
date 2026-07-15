@@ -15,14 +15,11 @@
 #include "System/MultiplayerWorldSubSystem.h"
 #include "TimerManager.h"
 #include "UI/StartWorldWidget.h"
+#include "UI/WorldSelectionWidget.h"
 #include "World/WorldData.h"
 
 namespace
 {
-    static const TCHAR* const DefaultStartMenuWidgetClassPath = TEXT("/Game/Blueprints/StartWorld/WBP_StartWorld.WBP_StartWorld_C");
-    static const TCHAR* const DefaultWorldSelectionWidgetClassPath = TEXT("/Game/Blueprints/StartWorld/WBP_LevelMenu.WBP_LevelMenu_C");
-    static const TCHAR* const DefaultMultiplayerWidgetClassPath = TEXT("/Game/Blueprints/StartWorld/WBP_LevelMenu.WBP_LevelMenu_C");
-
     FString NormalizeStartWorldString(FString Value)
     {
         Value.TrimStartAndEndInline();
@@ -36,8 +33,7 @@ AStartActor::AStartActor()
 
     PendingServerAddress = DefaultServerAddress;
 
-    // Widget classes are intentionally not loaded in the constructor.
-    // Assign them in BP_StartWorld, or let the fallback paths load only when a menu is opened.
+    // Widget classes are intentionally assigned in BP_StartWorld. No fallback Blueprint paths are loaded here.
 }
 
 void AStartActor::BeginPlay()
@@ -120,10 +116,8 @@ void AStartActor::ShowStartMenu()
     ResetEditorTransactionBufferForMenuTravel(TEXT("Show MainWorld start menu"));
 
     StartMenuWidget = CreateAndAddMenuWidget(
-        StartMenuWidgetClass,
-        DefaultStartMenuWidgetClassPath,
-        TEXT("StartMenuWidgetClass"),
-        false);
+        StartMenuWidgetClass.Get(),
+        TEXT("StartMenuWidgetClass"));
 
     ApplyMenuInputMode(StartMenuWidget.Get());
 }
@@ -134,11 +128,14 @@ void AStartActor::ShowWorldSelectionMenu()
     RemoveAllMenuWidgets();
     ResetEditorTransactionBufferForMenuTravel(TEXT("Show MainWorld single-player world-selection menu"));
 
-    WorldSelectionWidget = CreateAndAddMenuWidget(
-        WorldSelectionWidgetClass,
-        DefaultWorldSelectionWidgetClassPath,
-        TEXT("WorldSelectionWidgetClass"),
-        true);
+    WorldSelectionWidget = Cast<UWorldSelectionWidget>(CreateAndAddMenuWidget(
+        WorldSelectionWidgetClass.Get(),
+        TEXT("WorldSelectionWidgetClass")));
+
+    if (IsValid(WorldSelectionWidget))
+    {
+        WorldSelectionWidget->SetWorldSelectionData(FolderNameMap);
+    }
 
     ApplyMenuInputMode(WorldSelectionWidget.Get());
 }
@@ -149,12 +146,14 @@ void AStartActor::ShowMultiplayerMenu()
     RemoveAllMenuWidgets();
     ResetEditorTransactionBufferForMenuTravel(TEXT("Show MainWorld multiplayer menu"));
 
-    const TSubclassOf<UStartWorldWidget> WidgetClass = MultiplayerMenuWidgetClass ? MultiplayerMenuWidgetClass : WorldSelectionWidgetClass;
     MultiplayerMenuWidget = CreateAndAddMenuWidget(
-        WidgetClass,
-        DefaultMultiplayerWidgetClassPath,
-        TEXT("MultiplayerMenuWidgetClass"),
-        true);
+        MultiplayerMenuWidgetClass.Get(),
+        TEXT("MultiplayerMenuWidgetClass"));
+
+    if (IsValid(MultiplayerMenuWidget))
+    {
+        MultiplayerMenuWidget->SetWorldSelectionData(FolderNameMap);
+    }
 
     ApplyMenuInputMode(MultiplayerMenuWidget.Get());
 }
@@ -165,7 +164,12 @@ void AStartActor::RefreshWorldFolderNameMap()
 
     if (IsValid(WorldSelectionWidget))
     {
-        WorldSelectionWidget->Init(FolderNameMap);
+        WorldSelectionWidget->SetWorldSelectionData(FolderNameMap);
+    }
+
+    if (IsValid(MultiplayerMenuWidget))
+    {
+        MultiplayerMenuWidget->SetWorldSelectionData(FolderNameMap);
     }
 }
 
@@ -195,11 +199,6 @@ bool AStartActor::TryResolveWorldFolderFromDisplayName(const FString& DisplayNam
 
     OutFolderName.Reset();
     return false;
-}
-
-void AStartActor::OpenGameplayWorldByFolderName(const FString& WorldFolderName)
-{
-    OpenSinglePlayerWorldByFolderName(WorldFolderName);
 }
 
 void AStartActor::OpenSinglePlayerWorldByFolderName(const FString& WorldFolderName)
@@ -312,32 +311,23 @@ void AStartActor::PrepareMenuForWorldTravel()
     ResetEditorTransactionBufferForMenuTravel(TEXT("MainWorld menu world travel"));
 }
 
-UClass* AStartActor::ResolveMenuWidgetClass(TSubclassOf<UStartWorldWidget> WidgetClass, const TCHAR* DefaultWidgetClassPath, const TCHAR* DebugWidgetName) const
+UClass* AStartActor::ResolveMenuWidgetClass(UClass* WidgetClass, const TCHAR* DebugWidgetName) const
 {
-    UClass* ResolvedClass = WidgetClass.Get();
-
-    if (!ResolvedClass && DefaultWidgetClassPath && DefaultWidgetClassPath[0] != TEXT('\0'))
-    {
-        // Load fallback classes only when a menu is opened. This avoids constructor-time widget
-        // Blueprint loads while BP_StartWorld or WBP_StartWorld is being compiled by the editor.
-        ResolvedClass = LoadClass<UStartWorldWidget>(nullptr, DefaultWidgetClassPath);
-    }
-
+    UClass* ResolvedClass = WidgetClass;
     if (!ResolvedClass || !ResolvedClass->IsChildOf(UStartWorldWidget::StaticClass()))
     {
         UE_LOG(LogTemp, Warning,
-               TEXT("StartActor cannot create %s. Reparent the widget to StartWorldWidget and assign it in BP_StartWorld. Fallback path: %s"),
-               DebugWidgetName ? DebugWidgetName : TEXT("MenuWidgetClass"),
-               DefaultWidgetClassPath ? DefaultWidgetClassPath : TEXT("<none>"));
+               TEXT("StartActor cannot create %s because no valid widget class is assigned in BP_StartWorld."),
+               DebugWidgetName ? DebugWidgetName : TEXT("MenuWidgetClass"));
         return nullptr;
     }
 
     return ResolvedClass;
 }
 
-UStartWorldWidget* AStartActor::CreateAndAddMenuWidget(TSubclassOf<UStartWorldWidget> WidgetClass, const TCHAR* DefaultWidgetClassPath, const TCHAR* DebugWidgetName, bool bPassWorldSelectionData)
+UStartWorldWidget* AStartActor::CreateAndAddMenuWidget(UClass* WidgetClass, const TCHAR* DebugWidgetName)
 {
-    UClass* ResolvedClass = ResolveMenuWidgetClass(WidgetClass, DefaultWidgetClassPath, DebugWidgetName);
+    UClass* ResolvedClass = ResolveMenuWidgetClass(WidgetClass, DebugWidgetName);
     if (!ResolvedClass)
     {
         return nullptr;
@@ -374,12 +364,6 @@ UStartWorldWidget* AStartActor::CreateAndAddMenuWidget(TSubclassOf<UStartWorldWi
 
     // Set the typed owner before AddToViewport so Blueprint Construct/OnAssigned logic can use it safely.
     Widget->SetStartActor(this);
-
-    if (bPassWorldSelectionData)
-    {
-        // Direct virtual call. No dynamic function lookup, property lookup, or parameter packing is used.
-        Widget->Init(FolderNameMap);
-    }
 
     Widget->AddToViewport(MenuZOrder);
     return Widget;

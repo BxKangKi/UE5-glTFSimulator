@@ -13,7 +13,7 @@ class UTextBlock;
  * Blueprint-editable pause menu base widget.
  *
  * This class no longer creates a native fallback layout. Create the visual tree
- * in a WBP child and bind widgets named ContinueButton, SettingsButton, and ExitButton,
+ * in a WBP child and assign the ContinueButton, SettingsButton, and ExitButton variables,
  * or call the BlueprintCallable functions from your own UI events.
  */
 UCLASS(Blueprintable, BlueprintType)
@@ -34,19 +34,18 @@ public:
     void ExitFromUI();
 
 protected:
-    UPROPERTY(BlueprintReadOnly, meta=(BindWidgetOptional), Category="Pause|Widgets")
+    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Pause|Widgets")
     TObjectPtr<UTextBlock> TitleText;
 
-    UPROPERTY(BlueprintReadOnly, meta=(BindWidgetOptional), Category="Pause|Widgets")
+    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Pause|Widgets")
     TObjectPtr<UButton> ContinueButton;
 
-    UPROPERTY(BlueprintReadOnly, meta=(BindWidgetOptional), Category="Pause|Widgets")
+    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Pause|Widgets")
     TObjectPtr<UButton> SettingsButton;
 
-    UPROPERTY(BlueprintReadOnly, meta=(BindWidgetOptional), Category="Pause|Widgets")
+    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Pause|Widgets")
     TObjectPtr<UButton> ExitButton;
 
 private:
-    void CacheUserWidgetReferences();
     void BindButtonEvents();
 };

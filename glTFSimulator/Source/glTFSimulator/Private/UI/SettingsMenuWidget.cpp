@@ -2,12 +2,9 @@
 
 #include "UI/SettingsMenuWidget.h"
 
-#include "Blueprint/WidgetTree.h"
 #include "Character/PlayerCharacterController.h"
 #include "Components/ContentWidget.h"
-#include "Components/PanelWidget.h"
 #include "Components/TextBlock.h"
-#include "Components/Widget.h"
 #include "Setting/GameSettings.h"
 #include "System/GameManagerSubSystem.h"
 
@@ -137,44 +134,6 @@ namespace
         return Text;
     }
 
-    UTextBlock* FindFirstTextBlock(UWidget* Widget)
-    {
-        if (!Widget)
-        {
-            return nullptr;
-        }
-
-        if (UTextBlock* TextBlock = Cast<UTextBlock>(Widget))
-        {
-            return TextBlock;
-        }
-
-        if (UContentWidget* ContentWidget = Cast<UContentWidget>(Widget))
-        {
-            if (UWidget* Content = ContentWidget->GetContent())
-            {
-                if (UTextBlock* TextBlock = FindFirstTextBlock(Content))
-                {
-                    return TextBlock;
-                }
-            }
-        }
-
-        if (UPanelWidget* PanelWidget = Cast<UPanelWidget>(Widget))
-        {
-            const int32 ChildCount = PanelWidget->GetChildrenCount();
-            for (int32 ChildIndex = 0; ChildIndex < ChildCount; ++ChildIndex)
-            {
-                if (UTextBlock* TextBlock = FindFirstTextBlock(PanelWidget->GetChildAt(ChildIndex)))
-                {
-                    return TextBlock;
-                }
-            }
-        }
-
-        return nullptr;
-    }
-
     FName FieldName(ESettingsField Field)
     {
         switch (Field)
@@ -251,7 +210,7 @@ void USettingsMenuWidget::NativeConstruct()
 {
     Super::NativeConstruct();
 
-    CacheUserWidgetReferences();
+    CollectAssignedWidgetReferences();
     BindButtonEvents();
     InitializeSettingsFromSavedData();
 }
@@ -271,70 +230,61 @@ void USettingsMenuWidget::InitializeSettingsFromSavedData()
     RefreshSettingsValues();
 }
 
-void USettingsMenuWidget::CacheUserWidgetReferences()
+void USettingsMenuWidget::CollectAssignedWidgetReferences()
 {
-    if (!WidgetTree)
-    {
-        return;
-    }
-
     if (!TitleText)
     {
-        TitleText = Cast<UTextBlock>(WidgetTree->FindWidget(TEXT("TitleText")));
-        if (!TitleText)
-        {
-            TitleText = Cast<UTextBlock>(WidgetTree->FindWidget(TEXT("Settings_TitleText")));
-        }
+        TitleText = Settings_TitleText;
     }
     if (!ApplyButton)
     {
-        ApplyButton = Cast<UButton>(WidgetTree->FindWidget(TEXT("ApplyButton")));
-        if (!ApplyButton)
-        {
-            ApplyButton = Cast<UButton>(WidgetTree->FindWidget(TEXT("Settings_ApplyButton")));
-        }
+        ApplyButton = Settings_ApplyButton;
     }
     if (!ConfirmButton)
     {
-        ConfirmButton = Cast<UButton>(WidgetTree->FindWidget(TEXT("ConfirmButton")));
-        if (!ConfirmButton)
-        {
-            ConfirmButton = Cast<UButton>(WidgetTree->FindWidget(TEXT("Settings_ConfirmButton")));
-        }
+        ConfirmButton = Settings_ConfirmButton;
     }
     if (!BackButton)
     {
-        BackButton = Cast<UButton>(WidgetTree->FindWidget(TEXT("BackButton")));
-        if (!BackButton)
-        {
-            BackButton = Cast<UButton>(WidgetTree->FindWidget(TEXT("Settings_BackButton")));
-        }
+        BackButton = Settings_BackButton;
     }
     if (!CancelButton)
     {
-        CancelButton = Cast<UButton>(WidgetTree->FindWidget(TEXT("CancelButton")));
-        if (!CancelButton)
-        {
-            CancelButton = Cast<UButton>(WidgetTree->FindWidget(TEXT("Settings_CancelButton")));
-        }
+        CancelButton = Settings_CancelButton;
     }
 
     ValueTextBlocks.Reset();
     ValueFields.Reset();
-    for (ESettingsField Field : GetDefaultSettingsFields())
-    {
-        if (UTextBlock* ValueText = Cast<UTextBlock>(WidgetTree->FindWidget(FName(*FString::Printf(TEXT("Settings_Value_%d"), static_cast<int32>(Field))))))
-        {
-            ValueTextBlocks.Add(ValueText);
-            ValueFields.Add(Field);
-        }
+    RegisterValueTextBlock(ESettingsField::BloomIntensity, Settings_BloomIntensityValue);
+    RegisterValueTextBlock(ESettingsField::BloomThreshold, Settings_BloomThresholdValue);
+    RegisterValueTextBlock(ESettingsField::AmbientOcclusionIntensity, Settings_AmbientOcclusionIntensityValue);
+    RegisterValueTextBlock(ESettingsField::RayTracing, Settings_RayTracingValue);
+    RegisterValueTextBlock(ESettingsField::HeightFog, Settings_HeightFogValue);
+    RegisterValueTextBlock(ESettingsField::Cloud, Settings_CloudValue);
+    RegisterValueTextBlock(ESettingsField::ShadowQuality, Settings_ShadowQualityValue);
+    RegisterValueTextBlock(ESettingsField::TextureQuality, Settings_TextureQualityValue);
+    RegisterValueTextBlock(ESettingsField::MaxTextureResolution, Settings_MaxTextureResolutionValue);
+    RegisterValueTextBlock(ESettingsField::ViewDistanceQuality, Settings_ViewDistanceQualityValue);
+    RegisterValueTextBlock(ESettingsField::AntiAliasingQuality, Settings_AntiAliasingQualityValue);
+    RegisterValueTextBlock(ESettingsField::PostProcessingQuality, Settings_PostProcessingQualityValue);
+    RegisterValueTextBlock(ESettingsField::EffectsQuality, Settings_EffectsQualityValue);
+    RegisterValueTextBlock(ESettingsField::FoliageQuality, Settings_FoliageQualityValue);
+    RegisterValueTextBlock(ESettingsField::ShadingQuality, Settings_ShadingQualityValue);
+    RegisterValueTextBlock(ESettingsField::GlobalIlluminationQuality, Settings_GlobalIlluminationQualityValue);
+    RegisterValueTextBlock(ESettingsField::ReflectionQuality, Settings_ReflectionQualityValue);
+    RegisterValueTextBlock(ESettingsField::DynamicGlobalIlluminationMethod, Settings_DynamicGlobalIlluminationMethodValue);
+    RegisterValueTextBlock(ESettingsField::ReflectionMethod, Settings_ReflectionMethodValue);
+}
 
-        if (UTextBlock* ValueText = Cast<UTextBlock>(WidgetTree->FindWidget(FName(*FString::Printf(TEXT("Settings_%sValue"), *FieldName(Field).ToString())))))
-        {
-            ValueTextBlocks.Add(ValueText);
-            ValueFields.Add(Field);
-        }
+void USettingsMenuWidget::RegisterValueTextBlock(ESettingsField Field, UTextBlock* TextBlock)
+{
+    if (!TextBlock)
+    {
+        return;
     }
+
+    ValueTextBlocks.Add(TextBlock);
+    ValueFields.Add(Field);
 }
 
 void USettingsMenuWidget::BindButtonEvents()
@@ -360,78 +310,35 @@ void USettingsMenuWidget::BindButtonEvents()
         CancelButton->OnClicked.AddDynamic(this, &USettingsMenuWidget::CloseSettingsFromUI);
     }
 
-    BindCycleButtonsInWidgetTree();
-    BindNamedSettingButtons();
+    BindAssignedSettingButtons();
 }
 
-void USettingsMenuWidget::BindCycleButtonsInWidgetTree()
+void USettingsMenuWidget::BindAssignedSettingButtons()
 {
-    if (!WidgetTree)
-    {
-        return;
-    }
-
-    WidgetTree->ForEachWidget([this](UWidget* Widget)
-    {
-        if (USettingsCycleButton* CycleButton = Cast<USettingsCycleButton>(Widget))
-        {
-            CycleButton->SetupCycleButton(this, CycleButton->Field, CycleButton->Direction);
-            BoundFieldButtons.Add(TWeakObjectPtr<UButton>(CycleButton), CycleButton->Field);
-        }
-        else if (USettingsAdjustmentButton* AdjustmentButton = Cast<USettingsAdjustmentButton>(Widget))
-        {
-            // Existing adjustment buttons keep their Blueprint-configured field/step and now edit pending values only.
-            AdjustmentButton->SetupAdjustment(this, AdjustmentButton->Field, AdjustmentButton->Step);
-        }
-    });
+    BoundFieldButtons.Empty();
+    BindAssignedSettingButton(ESettingsField::BloomIntensity, Settings_BloomIntensityButton);
+    BindAssignedSettingButton(ESettingsField::BloomThreshold, Settings_BloomThresholdButton);
+    BindAssignedSettingButton(ESettingsField::AmbientOcclusionIntensity, Settings_AmbientOcclusionIntensityButton);
+    BindAssignedSettingButton(ESettingsField::RayTracing, Settings_RayTracingButton);
+    BindAssignedSettingButton(ESettingsField::HeightFog, Settings_HeightFogButton);
+    BindAssignedSettingButton(ESettingsField::Cloud, Settings_CloudButton);
+    BindAssignedSettingButton(ESettingsField::ShadowQuality, Settings_ShadowQualityButton);
+    BindAssignedSettingButton(ESettingsField::TextureQuality, Settings_TextureQualityButton);
+    BindAssignedSettingButton(ESettingsField::MaxTextureResolution, Settings_MaxTextureResolutionButton);
+    BindAssignedSettingButton(ESettingsField::ViewDistanceQuality, Settings_ViewDistanceQualityButton);
+    BindAssignedSettingButton(ESettingsField::AntiAliasingQuality, Settings_AntiAliasingQualityButton);
+    BindAssignedSettingButton(ESettingsField::PostProcessingQuality, Settings_PostProcessingQualityButton);
+    BindAssignedSettingButton(ESettingsField::EffectsQuality, Settings_EffectsQualityButton);
+    BindAssignedSettingButton(ESettingsField::FoliageQuality, Settings_FoliageQualityButton);
+    BindAssignedSettingButton(ESettingsField::ShadingQuality, Settings_ShadingQualityButton);
+    BindAssignedSettingButton(ESettingsField::GlobalIlluminationQuality, Settings_GlobalIlluminationQualityButton);
+    BindAssignedSettingButton(ESettingsField::ReflectionQuality, Settings_ReflectionQualityButton);
+    BindAssignedSettingButton(ESettingsField::DynamicGlobalIlluminationMethod, Settings_DynamicGlobalIlluminationMethodButton);
+    BindAssignedSettingButton(ESettingsField::ReflectionMethod, Settings_ReflectionMethodButton);
 }
 
-void USettingsMenuWidget::BindNamedSettingButtons()
+void USettingsMenuWidget::BindAssignedSettingButton(ESettingsField Field, UButton* Button)
 {
-    BindNamedSettingButton(ESettingsField::BloomIntensity, TEXT("Settings_BloomIntensityButton"), TEXT("BloomIntensityButton"));
-    BindNamedSettingButton(ESettingsField::BloomThreshold, TEXT("Settings_BloomThresholdButton"), TEXT("BloomThresholdButton"));
-    BindNamedSettingButton(ESettingsField::AmbientOcclusionIntensity, TEXT("Settings_AmbientOcclusionIntensityButton"), TEXT("AmbientOcclusionIntensityButton"));
-    BindNamedSettingButton(ESettingsField::RayTracing, TEXT("Settings_RayTracingButton"), TEXT("RayTracingButton"));
-    BindNamedSettingButton(ESettingsField::HeightFog, TEXT("Settings_HeightFogButton"), TEXT("HeightFogButton"));
-    BindNamedSettingButton(ESettingsField::Cloud, TEXT("Settings_CloudButton"), TEXT("CloudButton"));
-    BindNamedSettingButton(ESettingsField::ShadowQuality, TEXT("Settings_ShadowQualityButton"), TEXT("ShadowQualityButton"));
-    BindNamedSettingButton(ESettingsField::TextureQuality, TEXT("Settings_TextureQualityButton"), TEXT("TextureQualityButton"));
-    BindNamedSettingButton(ESettingsField::MaxTextureResolution, TEXT("Settings_MaxTextureResolutionButton"), TEXT("MaxTextureResolutionButton"));
-    BindNamedSettingButton(ESettingsField::ViewDistanceQuality, TEXT("Settings_ViewDistanceQualityButton"), TEXT("ViewDistanceQualityButton"));
-    BindNamedSettingButton(ESettingsField::AntiAliasingQuality, TEXT("Settings_AntiAliasingQualityButton"), TEXT("AntiAliasingQualityButton"));
-    BindNamedSettingButton(ESettingsField::PostProcessingQuality, TEXT("Settings_PostProcessingQualityButton"), TEXT("PostProcessingQualityButton"));
-    BindNamedSettingButton(ESettingsField::EffectsQuality, TEXT("Settings_EffectsQualityButton"), TEXT("EffectsQualityButton"));
-    BindNamedSettingButton(ESettingsField::FoliageQuality, TEXT("Settings_FoliageQualityButton"), TEXT("FoliageQualityButton"));
-    BindNamedSettingButton(ESettingsField::ShadingQuality, TEXT("Settings_ShadingQualityButton"), TEXT("ShadingQualityButton"));
-    BindNamedSettingButton(ESettingsField::GlobalIlluminationQuality, TEXT("Settings_GlobalIlluminationQualityButton"), TEXT("GlobalIlluminationQualityButton"));
-    BindNamedSettingButton(ESettingsField::ReflectionQuality, TEXT("Settings_ReflectionQualityButton"), TEXT("ReflectionQualityButton"));
-    BindNamedSettingButton(ESettingsField::DynamicGlobalIlluminationMethod, TEXT("Settings_DynamicGlobalIlluminationMethodButton"), TEXT("DynamicGlobalIlluminationMethodButton"));
-    BindNamedSettingButton(ESettingsField::ReflectionMethod, TEXT("Settings_ReflectionMethodButton"), TEXT("ReflectionMethodButton"));
-
-    for (ESettingsField Field : GetDefaultSettingsFields())
-    {
-        const int32 Index = static_cast<int32>(Field);
-        const FName IndexedName(*FString::Printf(TEXT("Settings_Button_%d"), Index));
-        if (UButton* Button = WidgetTree ? Cast<UButton>(WidgetTree->FindWidget(IndexedName)) : nullptr)
-        {
-            BindFieldButton(Field, Button);
-        }
-    }
-}
-
-void USettingsMenuWidget::BindNamedSettingButton(ESettingsField Field, const FName& PrimaryName, const FName& AlternateName)
-{
-    if (!WidgetTree)
-    {
-        return;
-    }
-
-    UButton* Button = Cast<UButton>(WidgetTree->FindWidget(PrimaryName));
-    if (!Button && !AlternateName.IsNone())
-    {
-        Button = Cast<UButton>(WidgetTree->FindWidget(AlternateName));
-    }
-
     BindFieldButton(Field, Button);
 }
 
@@ -442,9 +349,16 @@ void USettingsMenuWidget::BindFieldButton(ESettingsField Field, UButton* Button)
         return;
     }
 
-    if (Button->IsA<USettingsCycleButton>() || Button->IsA<USettingsAdjustmentButton>())
+    if (USettingsCycleButton* CycleButton = Cast<USettingsCycleButton>(Button))
     {
-        // Dedicated settings button subclasses bind themselves in BindCycleButtonsInWidgetTree().
+        CycleButton->SetupCycleButton(this, Field, CycleButton->Direction);
+        BoundFieldButtons.Add(TWeakObjectPtr<UButton>(Button), Field);
+        return;
+    }
+
+    if (USettingsAdjustmentButton* AdjustmentButton = Cast<USettingsAdjustmentButton>(Button))
+    {
+        AdjustmentButton->SetupAdjustment(this, Field, AdjustmentButton->Step);
         return;
     }
 
@@ -781,7 +695,12 @@ TArray<FText> USettingsMenuWidget::GetSettingOptionTexts(ESettingsField Field) c
 
 FText USettingsMenuWidget::GetButtonTextFromUI(UButton* SourceButton) const
 {
-    if (UTextBlock* TextBlock = FindFirstTextBlock(SourceButton))
+    if (!SourceButton)
+    {
+        return FText::GetEmpty();
+    }
+
+    if (UTextBlock* TextBlock = Cast<UTextBlock>(SourceButton->GetContent()))
     {
         return TextBlock->GetText();
     }
@@ -791,7 +710,12 @@ FText USettingsMenuWidget::GetButtonTextFromUI(UButton* SourceButton) const
 
 bool USettingsMenuWidget::SetButtonTextFromUI(UButton* SourceButton, const FText& NewText) const
 {
-    if (UTextBlock* TextBlock = FindFirstTextBlock(SourceButton))
+    if (!SourceButton)
+    {
+        return false;
+    }
+
+    if (UTextBlock* TextBlock = Cast<UTextBlock>(SourceButton->GetContent()))
     {
         TextBlock->SetText(NewText);
         return true;
