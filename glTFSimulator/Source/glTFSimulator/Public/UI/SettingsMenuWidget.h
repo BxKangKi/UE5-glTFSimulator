@@ -89,8 +89,9 @@ private:
 /**
  * Blueprint-editable settings menu backed by UGameSettings.
  *
- * One click only changes this widget's pending value. Nothing is applied to the game, post process,
- * or JSON file until ApplyAndSaveSettingsFromUI() / ConfirmSettingsFromUI() is called.
+ * WBP children should pass buttons and value text blocks explicitly from Construct by calling
+ * the Set*Button(), SetTitleText(), RegisterSettingValueText(), and RegisterSettingButton()
+ * functions. This class does not use automatic widget-name binding or widget-tree lookup.
  */
 UCLASS(Blueprintable, BlueprintType)
 class GLTFSIMULATOR_API USettingsMenuWidget : public UUserWidget
@@ -99,6 +100,28 @@ class GLTFSIMULATOR_API USettingsMenuWidget : public UUserWidget
 
 public:
     virtual void NativeConstruct() override;
+    virtual void NativeDestruct() override;
+
+    UFUNCTION(BlueprintCallable, Category="Settings|Widgets")
+    void SetTitleText(UTextBlock* InTitleText);
+
+    UFUNCTION(BlueprintCallable, Category="Settings|Widgets")
+    void SetApplyButton(UButton* InButton);
+
+    UFUNCTION(BlueprintCallable, Category="Settings|Widgets")
+    void SetConfirmButton(UButton* InButton);
+
+    UFUNCTION(BlueprintCallable, Category="Settings|Widgets")
+    void SetBackButton(UButton* InButton);
+
+    UFUNCTION(BlueprintCallable, Category="Settings|Widgets")
+    void SetCancelButton(UButton* InButton);
+
+    UFUNCTION(BlueprintCallable, Category="Settings|Widgets")
+    void RegisterSettingValueText(ESettingsField Field, UTextBlock* InTextBlock);
+
+    UFUNCTION(BlueprintCallable, Category="Settings|Widgets")
+    void RegisterSettingButton(ESettingsField Field, UButton* InButton);
 
     /** Returns the active settings object owned by the GameManager subsystem. */
     UFUNCTION(BlueprintCallable, Category="Settings")
@@ -216,205 +239,24 @@ public:
     UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
     void CycleReflectionMethodFromUI();
 
-protected:
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Widgets")
-    TObjectPtr<UTextBlock> TitleText;
-
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Widgets")
-    TObjectPtr<UButton> ApplyButton;
-
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Widgets")
-    TObjectPtr<UButton> ConfirmButton;
-
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Widgets")
-    TObjectPtr<UButton> BackButton;
-
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Widgets")
-    TObjectPtr<UButton> CancelButton;
-
-    /** Optional title text using the Settings_ prefix. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Widgets")
-    TObjectPtr<UTextBlock> Settings_TitleText;
-
-    /** Optional apply button using the Settings_ prefix. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Widgets")
-    TObjectPtr<UButton> Settings_ApplyButton;
-
-    /** Optional confirm button using the Settings_ prefix. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Widgets")
-    TObjectPtr<UButton> Settings_ConfirmButton;
-
-    /** Optional back button using the Settings_ prefix. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Widgets")
-    TObjectPtr<UButton> Settings_BackButton;
-
-    /** Optional cancel button using the Settings_ prefix. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Widgets")
-    TObjectPtr<UButton> Settings_CancelButton;
-
-    /** Optional value text for Bloom Intensity. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Value Widgets")
-    TObjectPtr<UTextBlock> Settings_BloomIntensityValue;
-
-    /** Optional cycle button for Bloom Intensity. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Button Widgets")
-    TObjectPtr<UButton> Settings_BloomIntensityButton;
-
-    /** Optional value text for Bloom Threshold. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Value Widgets")
-    TObjectPtr<UTextBlock> Settings_BloomThresholdValue;
-
-    /** Optional cycle button for Bloom Threshold. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Button Widgets")
-    TObjectPtr<UButton> Settings_BloomThresholdButton;
-
-    /** Optional value text for Ambient Occlusion. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Value Widgets")
-    TObjectPtr<UTextBlock> Settings_AmbientOcclusionIntensityValue;
-
-    /** Optional cycle button for Ambient Occlusion. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Button Widgets")
-    TObjectPtr<UButton> Settings_AmbientOcclusionIntensityButton;
-
-    /** Optional value text for Ray Tracing. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Value Widgets")
-    TObjectPtr<UTextBlock> Settings_RayTracingValue;
-
-    /** Optional cycle button for Ray Tracing. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Button Widgets")
-    TObjectPtr<UButton> Settings_RayTracingButton;
-
-    /** Optional value text for Height Fog. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Value Widgets")
-    TObjectPtr<UTextBlock> Settings_HeightFogValue;
-
-    /** Optional cycle button for Height Fog. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Button Widgets")
-    TObjectPtr<UButton> Settings_HeightFogButton;
-
-    /** Optional value text for Cloud. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Value Widgets")
-    TObjectPtr<UTextBlock> Settings_CloudValue;
-
-    /** Optional cycle button for Cloud. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Button Widgets")
-    TObjectPtr<UButton> Settings_CloudButton;
-
-    /** Optional value text for Shadow Quality. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Value Widgets")
-    TObjectPtr<UTextBlock> Settings_ShadowQualityValue;
-
-    /** Optional cycle button for Shadow Quality. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Button Widgets")
-    TObjectPtr<UButton> Settings_ShadowQualityButton;
-
-    /** Optional value text for Texture Quality. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Value Widgets")
-    TObjectPtr<UTextBlock> Settings_TextureQualityValue;
-
-    /** Optional cycle button for Texture Quality. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Button Widgets")
-    TObjectPtr<UButton> Settings_TextureQualityButton;
-
-    /** Optional value text for Max Texture Resolution. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Value Widgets")
-    TObjectPtr<UTextBlock> Settings_MaxTextureResolutionValue;
-
-    /** Optional cycle button for Max Texture Resolution. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Button Widgets")
-    TObjectPtr<UButton> Settings_MaxTextureResolutionButton;
-
-    /** Optional value text for View Distance Quality. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Value Widgets")
-    TObjectPtr<UTextBlock> Settings_ViewDistanceQualityValue;
-
-    /** Optional cycle button for View Distance Quality. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Button Widgets")
-    TObjectPtr<UButton> Settings_ViewDistanceQualityButton;
-
-    /** Optional value text for Anti Aliasing Quality. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Value Widgets")
-    TObjectPtr<UTextBlock> Settings_AntiAliasingQualityValue;
-
-    /** Optional cycle button for Anti Aliasing Quality. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Button Widgets")
-    TObjectPtr<UButton> Settings_AntiAliasingQualityButton;
-
-    /** Optional value text for Post Processing Quality. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Value Widgets")
-    TObjectPtr<UTextBlock> Settings_PostProcessingQualityValue;
-
-    /** Optional cycle button for Post Processing Quality. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Button Widgets")
-    TObjectPtr<UButton> Settings_PostProcessingQualityButton;
-
-    /** Optional value text for Effects Quality. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Value Widgets")
-    TObjectPtr<UTextBlock> Settings_EffectsQualityValue;
-
-    /** Optional cycle button for Effects Quality. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Button Widgets")
-    TObjectPtr<UButton> Settings_EffectsQualityButton;
-
-    /** Optional value text for Foliage Quality. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Value Widgets")
-    TObjectPtr<UTextBlock> Settings_FoliageQualityValue;
-
-    /** Optional cycle button for Foliage Quality. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Button Widgets")
-    TObjectPtr<UButton> Settings_FoliageQualityButton;
-
-    /** Optional value text for Shading Quality. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Value Widgets")
-    TObjectPtr<UTextBlock> Settings_ShadingQualityValue;
-
-    /** Optional cycle button for Shading Quality. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Button Widgets")
-    TObjectPtr<UButton> Settings_ShadingQualityButton;
-
-    /** Optional value text for Global Illumination Quality. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Value Widgets")
-    TObjectPtr<UTextBlock> Settings_GlobalIlluminationQualityValue;
-
-    /** Optional cycle button for Global Illumination Quality. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Button Widgets")
-    TObjectPtr<UButton> Settings_GlobalIlluminationQualityButton;
-
-    /** Optional value text for Reflection Quality. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Value Widgets")
-    TObjectPtr<UTextBlock> Settings_ReflectionQualityValue;
-
-    /** Optional cycle button for Reflection Quality. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Button Widgets")
-    TObjectPtr<UButton> Settings_ReflectionQualityButton;
-
-    /** Optional value text for Dynamic Global Illumination Method. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Value Widgets")
-    TObjectPtr<UTextBlock> Settings_DynamicGlobalIlluminationMethodValue;
-
-    /** Optional cycle button for Dynamic Global Illumination Method. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Button Widgets")
-    TObjectPtr<UButton> Settings_DynamicGlobalIlluminationMethodButton;
-
-    /** Optional value text for Reflection Method. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Value Widgets")
-    TObjectPtr<UTextBlock> Settings_ReflectionMethodValue;
-
-    /** Optional cycle button for Reflection Method. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Settings|Button Widgets")
-    TObjectPtr<UButton> Settings_ReflectionMethodButton;
-
 private:
     void CollectAssignedWidgetReferences();
     void BindButtonEvents();
+    void UnbindButtonEvents();
     void BindAssignedSettingButtons();
     void RegisterValueTextBlock(ESettingsField Field, UTextBlock* TextBlock);
     void BindAssignedSettingButton(ESettingsField Field, UButton* Button);
     void BindFieldButton(ESettingsField Field, UButton* Button);
+    void UnbindFieldButton(ESettingsField Field, UButton* Button);
     void CopySettingsToPending(const UGameSettings* Settings);
     void ApplyPendingToSettings(UGameSettings* Settings) const;
     void CyclePendingValue(ESettingsField Field, int32 Direction);
     bool TryMatchFieldName(const FString& Input, ESettingsField& OutField) const;
+
+    UButton* GetApplyButton() const { return AssignedApplyButton.Get(); }
+    UButton* GetConfirmButton() const { return AssignedConfirmButton.Get(); }
+    UButton* GetBackButton() const { return AssignedBackButton.Get(); }
+    UButton* GetCancelButton() const { return AssignedCancelButton.Get(); }
 
     FText GetFieldValueTextFromPending(ESettingsField Field) const;
     FText GetQualityText(int32 Value) const;
@@ -422,10 +264,16 @@ private:
     FText GetDynamicGlobalIlluminationMethodText(int32 Value) const;
     FText GetReflectionMethodText(int32 Value) const;
 
-    UPROPERTY()
-    TArray<TObjectPtr<UTextBlock>> ValueTextBlocks;
+    TWeakObjectPtr<UTextBlock> AssignedTitleText;
+    TWeakObjectPtr<UButton> AssignedApplyButton;
+    TWeakObjectPtr<UButton> AssignedConfirmButton;
+    TWeakObjectPtr<UButton> AssignedBackButton;
+    TWeakObjectPtr<UButton> AssignedCancelButton;
 
-    UPROPERTY()
+    TMap<ESettingsField, TWeakObjectPtr<UTextBlock>> RegisteredValueTextWidgets;
+    TMap<ESettingsField, TWeakObjectPtr<UButton>> RegisteredSettingButtons;
+
+    TArray<TWeakObjectPtr<UTextBlock>> ValueTextBlocks;
     TArray<ESettingsField> ValueFields;
 
     TMap<TWeakObjectPtr<UButton>, ESettingsField> BoundFieldButtons;

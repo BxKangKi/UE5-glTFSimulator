@@ -11,22 +11,98 @@ void UPauseMenuWidget::NativeConstruct()
     BindButtonEvents();
 }
 
+void UPauseMenuWidget::NativeDestruct()
+{
+    UnbindButtonEvents();
+    AssignedTitleText.Reset();
+    AssignedContinueButton.Reset();
+    AssignedSettingsButton.Reset();
+    AssignedExitButton.Reset();
+    Super::NativeDestruct();
+}
+
+void UPauseMenuWidget::SetTitleText(UTextBlock* InTitleText)
+{
+    AssignedTitleText = InTitleText;
+}
+
+void UPauseMenuWidget::SetContinueButton(UButton* InButton)
+{
+    if (UButton* Button = AssignedContinueButton.Get())
+    {
+        Button->OnClicked.RemoveDynamic(this, &UPauseMenuWidget::ContinueFromUI);
+    }
+
+    AssignedContinueButton = InButton;
+    if (IsValid(InButton))
+    {
+        InButton->OnClicked.RemoveDynamic(this, &UPauseMenuWidget::ContinueFromUI);
+        InButton->OnClicked.AddDynamic(this, &UPauseMenuWidget::ContinueFromUI);
+    }
+}
+
+void UPauseMenuWidget::SetSettingsButton(UButton* InButton)
+{
+    if (UButton* Button = AssignedSettingsButton.Get())
+    {
+        Button->OnClicked.RemoveDynamic(this, &UPauseMenuWidget::OpenSettingsFromUI);
+    }
+
+    AssignedSettingsButton = InButton;
+    if (IsValid(InButton))
+    {
+        InButton->OnClicked.RemoveDynamic(this, &UPauseMenuWidget::OpenSettingsFromUI);
+        InButton->OnClicked.AddDynamic(this, &UPauseMenuWidget::OpenSettingsFromUI);
+    }
+}
+
+void UPauseMenuWidget::SetExitButton(UButton* InButton)
+{
+    if (UButton* Button = AssignedExitButton.Get())
+    {
+        Button->OnClicked.RemoveDynamic(this, &UPauseMenuWidget::ExitFromUI);
+    }
+
+    AssignedExitButton = InButton;
+    if (IsValid(InButton))
+    {
+        InButton->OnClicked.RemoveDynamic(this, &UPauseMenuWidget::ExitFromUI);
+        InButton->OnClicked.AddDynamic(this, &UPauseMenuWidget::ExitFromUI);
+    }
+}
+
 void UPauseMenuWidget::BindButtonEvents()
 {
-    if (ContinueButton)
+    if (UButton* Button = AssignedContinueButton.Get())
     {
-        ContinueButton->OnClicked.RemoveDynamic(this, &UPauseMenuWidget::ContinueFromUI);
-        ContinueButton->OnClicked.AddDynamic(this, &UPauseMenuWidget::ContinueFromUI);
+        Button->OnClicked.RemoveDynamic(this, &UPauseMenuWidget::ContinueFromUI);
+        Button->OnClicked.AddDynamic(this, &UPauseMenuWidget::ContinueFromUI);
     }
-    if (SettingsButton)
+    if (UButton* Button = AssignedSettingsButton.Get())
     {
-        SettingsButton->OnClicked.RemoveDynamic(this, &UPauseMenuWidget::OpenSettingsFromUI);
-        SettingsButton->OnClicked.AddDynamic(this, &UPauseMenuWidget::OpenSettingsFromUI);
+        Button->OnClicked.RemoveDynamic(this, &UPauseMenuWidget::OpenSettingsFromUI);
+        Button->OnClicked.AddDynamic(this, &UPauseMenuWidget::OpenSettingsFromUI);
     }
-    if (ExitButton)
+    if (UButton* Button = AssignedExitButton.Get())
     {
-        ExitButton->OnClicked.RemoveDynamic(this, &UPauseMenuWidget::ExitFromUI);
-        ExitButton->OnClicked.AddDynamic(this, &UPauseMenuWidget::ExitFromUI);
+        Button->OnClicked.RemoveDynamic(this, &UPauseMenuWidget::ExitFromUI);
+        Button->OnClicked.AddDynamic(this, &UPauseMenuWidget::ExitFromUI);
+    }
+}
+
+void UPauseMenuWidget::UnbindButtonEvents()
+{
+    if (UButton* Button = AssignedContinueButton.Get())
+    {
+        Button->OnClicked.RemoveDynamic(this, &UPauseMenuWidget::ContinueFromUI);
+    }
+    if (UButton* Button = AssignedSettingsButton.Get())
+    {
+        Button->OnClicked.RemoveDynamic(this, &UPauseMenuWidget::OpenSettingsFromUI);
+    }
+    if (UButton* Button = AssignedExitButton.Get())
+    {
+        Button->OnClicked.RemoveDynamic(this, &UPauseMenuWidget::ExitFromUI);
     }
 }
 

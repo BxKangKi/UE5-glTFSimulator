@@ -215,6 +215,127 @@ void USettingsMenuWidget::NativeConstruct()
     InitializeSettingsFromSavedData();
 }
 
+void USettingsMenuWidget::NativeDestruct()
+{
+    UnbindButtonEvents();
+    BoundFieldButtons.Empty();
+    AssignedTitleText.Reset();
+    AssignedApplyButton.Reset();
+    AssignedConfirmButton.Reset();
+    AssignedBackButton.Reset();
+    AssignedCancelButton.Reset();
+    RegisteredValueTextWidgets.Empty();
+    RegisteredSettingButtons.Empty();
+    ValueTextBlocks.Empty();
+    ValueFields.Empty();
+
+    Super::NativeDestruct();
+}
+
+void USettingsMenuWidget::SetTitleText(UTextBlock* InTitleText)
+{
+    AssignedTitleText = InTitleText;
+}
+
+void USettingsMenuWidget::SetApplyButton(UButton* InButton)
+{
+    if (UButton* Button = AssignedApplyButton.Get())
+    {
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::ApplyAndSaveSettingsFromUI);
+    }
+
+    AssignedApplyButton = InButton;
+    if (IsValid(InButton))
+    {
+        InButton->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::ApplyAndSaveSettingsFromUI);
+        InButton->OnClicked.AddDynamic(this, &USettingsMenuWidget::ApplyAndSaveSettingsFromUI);
+    }
+}
+
+void USettingsMenuWidget::SetConfirmButton(UButton* InButton)
+{
+    if (UButton* Button = AssignedConfirmButton.Get())
+    {
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::ConfirmSettingsFromUI);
+    }
+
+    AssignedConfirmButton = InButton;
+    if (IsValid(InButton) && InButton != GetApplyButton())
+    {
+        InButton->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::ConfirmSettingsFromUI);
+        InButton->OnClicked.AddDynamic(this, &USettingsMenuWidget::ConfirmSettingsFromUI);
+    }
+}
+
+void USettingsMenuWidget::SetBackButton(UButton* InButton)
+{
+    if (UButton* Button = AssignedBackButton.Get())
+    {
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CloseSettingsFromUI);
+    }
+
+    AssignedBackButton = InButton;
+    if (IsValid(InButton))
+    {
+        InButton->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CloseSettingsFromUI);
+        InButton->OnClicked.AddDynamic(this, &USettingsMenuWidget::CloseSettingsFromUI);
+    }
+}
+
+void USettingsMenuWidget::SetCancelButton(UButton* InButton)
+{
+    if (UButton* Button = AssignedCancelButton.Get())
+    {
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CloseSettingsFromUI);
+    }
+
+    AssignedCancelButton = InButton;
+    if (IsValid(InButton) && InButton != GetBackButton())
+    {
+        InButton->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CloseSettingsFromUI);
+        InButton->OnClicked.AddDynamic(this, &USettingsMenuWidget::CloseSettingsFromUI);
+    }
+}
+
+void USettingsMenuWidget::RegisterSettingValueText(ESettingsField Field, UTextBlock* InTextBlock)
+{
+    if (IsValid(InTextBlock))
+    {
+        RegisteredValueTextWidgets.FindOrAdd(Field) = InTextBlock;
+    }
+    else
+    {
+        RegisteredValueTextWidgets.Remove(Field);
+    }
+
+    CollectAssignedWidgetReferences();
+    RefreshSettingsValues();
+}
+
+void USettingsMenuWidget::RegisterSettingButton(ESettingsField Field, UButton* InButton)
+{
+    if (TWeakObjectPtr<UButton>* ExistingButtonPtr = RegisteredSettingButtons.Find(Field))
+    {
+        if (UButton* ExistingButton = ExistingButtonPtr->Get())
+        {
+            UnbindFieldButton(Field, ExistingButton);
+            BoundFieldButtons.Remove(TWeakObjectPtr<UButton>(ExistingButton));
+        }
+    }
+
+    if (IsValid(InButton))
+    {
+        RegisteredSettingButtons.FindOrAdd(Field) = InButton;
+        BindFieldButton(Field, InButton);
+    }
+    else
+    {
+        RegisteredSettingButtons.Remove(Field);
+    }
+
+    RefreshSettingsValues();
+}
+
 UGameSettings* USettingsMenuWidget::GetEditableSettings() const
 {
     if (UGameManagerSubSystem* SubSystem = UGameManagerSubSystem::GetSubSystem(GetWorld()))
@@ -232,53 +353,21 @@ void USettingsMenuWidget::InitializeSettingsFromSavedData()
 
 void USettingsMenuWidget::CollectAssignedWidgetReferences()
 {
-    if (!TitleText)
-    {
-        TitleText = Settings_TitleText;
-    }
-    if (!ApplyButton)
-    {
-        ApplyButton = Settings_ApplyButton;
-    }
-    if (!ConfirmButton)
-    {
-        ConfirmButton = Settings_ConfirmButton;
-    }
-    if (!BackButton)
-    {
-        BackButton = Settings_BackButton;
-    }
-    if (!CancelButton)
-    {
-        CancelButton = Settings_CancelButton;
-    }
-
     ValueTextBlocks.Reset();
     ValueFields.Reset();
-    RegisterValueTextBlock(ESettingsField::BloomIntensity, Settings_BloomIntensityValue);
-    RegisterValueTextBlock(ESettingsField::BloomThreshold, Settings_BloomThresholdValue);
-    RegisterValueTextBlock(ESettingsField::AmbientOcclusionIntensity, Settings_AmbientOcclusionIntensityValue);
-    RegisterValueTextBlock(ESettingsField::RayTracing, Settings_RayTracingValue);
-    RegisterValueTextBlock(ESettingsField::HeightFog, Settings_HeightFogValue);
-    RegisterValueTextBlock(ESettingsField::Cloud, Settings_CloudValue);
-    RegisterValueTextBlock(ESettingsField::ShadowQuality, Settings_ShadowQualityValue);
-    RegisterValueTextBlock(ESettingsField::TextureQuality, Settings_TextureQualityValue);
-    RegisterValueTextBlock(ESettingsField::MaxTextureResolution, Settings_MaxTextureResolutionValue);
-    RegisterValueTextBlock(ESettingsField::ViewDistanceQuality, Settings_ViewDistanceQualityValue);
-    RegisterValueTextBlock(ESettingsField::AntiAliasingQuality, Settings_AntiAliasingQualityValue);
-    RegisterValueTextBlock(ESettingsField::PostProcessingQuality, Settings_PostProcessingQualityValue);
-    RegisterValueTextBlock(ESettingsField::EffectsQuality, Settings_EffectsQualityValue);
-    RegisterValueTextBlock(ESettingsField::FoliageQuality, Settings_FoliageQualityValue);
-    RegisterValueTextBlock(ESettingsField::ShadingQuality, Settings_ShadingQualityValue);
-    RegisterValueTextBlock(ESettingsField::GlobalIlluminationQuality, Settings_GlobalIlluminationQualityValue);
-    RegisterValueTextBlock(ESettingsField::ReflectionQuality, Settings_ReflectionQualityValue);
-    RegisterValueTextBlock(ESettingsField::DynamicGlobalIlluminationMethod, Settings_DynamicGlobalIlluminationMethodValue);
-    RegisterValueTextBlock(ESettingsField::ReflectionMethod, Settings_ReflectionMethodValue);
+
+    for (ESettingsField Field : GetDefaultSettingsFields())
+    {
+        if (TWeakObjectPtr<UTextBlock>* TextBlockPtr = RegisteredValueTextWidgets.Find(Field))
+        {
+            RegisterValueTextBlock(Field, TextBlockPtr->Get());
+        }
+    }
 }
 
 void USettingsMenuWidget::RegisterValueTextBlock(ESettingsField Field, UTextBlock* TextBlock)
 {
-    if (!TextBlock)
+    if (!IsValid(TextBlock))
     {
         return;
     }
@@ -289,52 +378,75 @@ void USettingsMenuWidget::RegisterValueTextBlock(ESettingsField Field, UTextBloc
 
 void USettingsMenuWidget::BindButtonEvents()
 {
-    if (ApplyButton)
+    if (UButton* Button = GetApplyButton())
     {
-        ApplyButton->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::ApplyAndSaveSettingsFromUI);
-        ApplyButton->OnClicked.AddDynamic(this, &USettingsMenuWidget::ApplyAndSaveSettingsFromUI);
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::ApplyAndSaveSettingsFromUI);
+        Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::ApplyAndSaveSettingsFromUI);
     }
-    if (ConfirmButton && ConfirmButton != ApplyButton)
+    if (UButton* Button = GetConfirmButton())
     {
-        ConfirmButton->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::ConfirmSettingsFromUI);
-        ConfirmButton->OnClicked.AddDynamic(this, &USettingsMenuWidget::ConfirmSettingsFromUI);
+        if (Button != GetApplyButton())
+        {
+            Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::ConfirmSettingsFromUI);
+            Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::ConfirmSettingsFromUI);
+        }
     }
-    if (BackButton)
+    if (UButton* Button = GetBackButton())
     {
-        BackButton->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CloseSettingsFromUI);
-        BackButton->OnClicked.AddDynamic(this, &USettingsMenuWidget::CloseSettingsFromUI);
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CloseSettingsFromUI);
+        Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CloseSettingsFromUI);
     }
-    if (CancelButton && CancelButton != BackButton)
+    if (UButton* Button = GetCancelButton())
     {
-        CancelButton->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CloseSettingsFromUI);
-        CancelButton->OnClicked.AddDynamic(this, &USettingsMenuWidget::CloseSettingsFromUI);
+        if (Button != GetBackButton())
+        {
+            Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CloseSettingsFromUI);
+            Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CloseSettingsFromUI);
+        }
     }
 
     BindAssignedSettingButtons();
 }
 
+void USettingsMenuWidget::UnbindButtonEvents()
+{
+    if (UButton* Button = GetApplyButton())
+    {
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::ApplyAndSaveSettingsFromUI);
+    }
+    if (UButton* Button = GetConfirmButton())
+    {
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::ConfirmSettingsFromUI);
+    }
+    if (UButton* Button = GetBackButton())
+    {
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CloseSettingsFromUI);
+    }
+    if (UButton* Button = GetCancelButton())
+    {
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CloseSettingsFromUI);
+    }
+
+    for (const TPair<TWeakObjectPtr<UButton>, ESettingsField>& Pair : BoundFieldButtons)
+    {
+        if (UButton* Button = Pair.Key.Get())
+        {
+            UnbindFieldButton(Pair.Value, Button);
+        }
+    }
+}
+
 void USettingsMenuWidget::BindAssignedSettingButtons()
 {
     BoundFieldButtons.Empty();
-    BindAssignedSettingButton(ESettingsField::BloomIntensity, Settings_BloomIntensityButton);
-    BindAssignedSettingButton(ESettingsField::BloomThreshold, Settings_BloomThresholdButton);
-    BindAssignedSettingButton(ESettingsField::AmbientOcclusionIntensity, Settings_AmbientOcclusionIntensityButton);
-    BindAssignedSettingButton(ESettingsField::RayTracing, Settings_RayTracingButton);
-    BindAssignedSettingButton(ESettingsField::HeightFog, Settings_HeightFogButton);
-    BindAssignedSettingButton(ESettingsField::Cloud, Settings_CloudButton);
-    BindAssignedSettingButton(ESettingsField::ShadowQuality, Settings_ShadowQualityButton);
-    BindAssignedSettingButton(ESettingsField::TextureQuality, Settings_TextureQualityButton);
-    BindAssignedSettingButton(ESettingsField::MaxTextureResolution, Settings_MaxTextureResolutionButton);
-    BindAssignedSettingButton(ESettingsField::ViewDistanceQuality, Settings_ViewDistanceQualityButton);
-    BindAssignedSettingButton(ESettingsField::AntiAliasingQuality, Settings_AntiAliasingQualityButton);
-    BindAssignedSettingButton(ESettingsField::PostProcessingQuality, Settings_PostProcessingQualityButton);
-    BindAssignedSettingButton(ESettingsField::EffectsQuality, Settings_EffectsQualityButton);
-    BindAssignedSettingButton(ESettingsField::FoliageQuality, Settings_FoliageQualityButton);
-    BindAssignedSettingButton(ESettingsField::ShadingQuality, Settings_ShadingQualityButton);
-    BindAssignedSettingButton(ESettingsField::GlobalIlluminationQuality, Settings_GlobalIlluminationQualityButton);
-    BindAssignedSettingButton(ESettingsField::ReflectionQuality, Settings_ReflectionQualityButton);
-    BindAssignedSettingButton(ESettingsField::DynamicGlobalIlluminationMethod, Settings_DynamicGlobalIlluminationMethodButton);
-    BindAssignedSettingButton(ESettingsField::ReflectionMethod, Settings_ReflectionMethodButton);
+
+    for (ESettingsField Field : GetDefaultSettingsFields())
+    {
+        if (TWeakObjectPtr<UButton>* ButtonPtr = RegisteredSettingButtons.Find(Field))
+        {
+            BindAssignedSettingButton(Field, ButtonPtr->Get());
+        }
+    }
 }
 
 void USettingsMenuWidget::BindAssignedSettingButton(ESettingsField Field, UButton* Button)
@@ -344,7 +456,7 @@ void USettingsMenuWidget::BindAssignedSettingButton(ESettingsField Field, UButto
 
 void USettingsMenuWidget::BindFieldButton(ESettingsField Field, UButton* Button)
 {
-    if (!Button || Button == ApplyButton || Button == ConfirmButton || Button == BackButton || Button == CancelButton)
+    if (!IsValid(Button) || Button == GetApplyButton() || Button == GetConfirmButton() || Button == GetBackButton() || Button == GetCancelButton())
     {
         return;
     }
@@ -359,6 +471,7 @@ void USettingsMenuWidget::BindFieldButton(ESettingsField Field, UButton* Button)
     if (USettingsAdjustmentButton* AdjustmentButton = Cast<USettingsAdjustmentButton>(Button))
     {
         AdjustmentButton->SetupAdjustment(this, Field, AdjustmentButton->Step);
+        BoundFieldButtons.Add(TWeakObjectPtr<UButton>(Button), Field);
         return;
     }
 
@@ -446,6 +559,50 @@ void USettingsMenuWidget::BindFieldButton(ESettingsField Field, UButton* Button)
     BoundFieldButtons.Add(TWeakObjectPtr<UButton>(Button), Field);
 }
 
+void USettingsMenuWidget::UnbindFieldButton(ESettingsField Field, UButton* Button)
+{
+    if (!IsValid(Button))
+    {
+        return;
+    }
+
+    if (USettingsAdjustmentButton* AdjustmentButton = Cast<USettingsAdjustmentButton>(Button))
+    {
+        AdjustmentButton->OnClicked.RemoveDynamic(AdjustmentButton, &USettingsAdjustmentButton::HandleClicked);
+        return;
+    }
+
+    if (USettingsCycleButton* CycleButton = Cast<USettingsCycleButton>(Button))
+    {
+        CycleButton->OnClicked.RemoveDynamic(CycleButton, &USettingsCycleButton::HandleClicked);
+        return;
+    }
+
+    switch (Field)
+    {
+    case ESettingsField::BloomIntensity: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleBloomIntensityFromUI); break;
+    case ESettingsField::BloomThreshold: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleBloomThresholdFromUI); break;
+    case ESettingsField::AmbientOcclusionIntensity: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleAmbientOcclusionIntensityFromUI); break;
+    case ESettingsField::RayTracing: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleRayTracingFromUI); break;
+    case ESettingsField::HeightFog: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleHeightFogFromUI); break;
+    case ESettingsField::Cloud: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleCloudFromUI); break;
+    case ESettingsField::ShadowQuality: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleShadowQualityFromUI); break;
+    case ESettingsField::TextureQuality: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleTextureQualityFromUI); break;
+    case ESettingsField::MaxTextureResolution: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleMaxTextureResolutionFromUI); break;
+    case ESettingsField::ViewDistanceQuality: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleViewDistanceQualityFromUI); break;
+    case ESettingsField::AntiAliasingQuality: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleAntiAliasingQualityFromUI); break;
+    case ESettingsField::PostProcessingQuality: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CyclePostProcessingQualityFromUI); break;
+    case ESettingsField::EffectsQuality: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleEffectsQualityFromUI); break;
+    case ESettingsField::FoliageQuality: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleFoliageQualityFromUI); break;
+    case ESettingsField::ShadingQuality: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleShadingQualityFromUI); break;
+    case ESettingsField::GlobalIlluminationQuality: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleGlobalIlluminationQualityFromUI); break;
+    case ESettingsField::ReflectionQuality: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleReflectionQualityFromUI); break;
+    case ESettingsField::DynamicGlobalIlluminationMethod: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleDynamicGlobalIlluminationMethodFromUI); break;
+    case ESettingsField::ReflectionMethod: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleReflectionMethodFromUI); break;
+    default: break;
+    }
+}
+
 void USettingsMenuWidget::CopySettingsToPending(const UGameSettings* Settings)
 {
     if (!Settings)
@@ -506,9 +663,9 @@ void USettingsMenuWidget::RefreshSettingsValues()
 {
     for (int32 Index = 0; Index < ValueTextBlocks.Num() && Index < ValueFields.Num(); ++Index)
     {
-        if (ValueTextBlocks[Index])
+        if (UTextBlock* TextBlock = ValueTextBlocks[Index].Get())
         {
-            ValueTextBlocks[Index]->SetText(GetPendingSettingValueText(ValueFields[Index]));
+            TextBlock->SetText(GetPendingSettingValueText(ValueFields[Index]));
         }
     }
 

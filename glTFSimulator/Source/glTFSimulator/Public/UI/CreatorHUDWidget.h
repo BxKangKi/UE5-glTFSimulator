@@ -16,8 +16,8 @@ class UGameUpdateSubSystem;
 /**
  * Creator HUD bridge class.
  *
- * This class no longer creates a native/UMG fallback layout. Create your own WBP
- * and assign widget variables or bind its buttons to the BlueprintCallable functions below.
+ * Create the visual tree in a WBP child and pass widget references explicitly from the
+ * WBP Construct event. This class does not use automatic widget-name binding or widget-tree lookup.
  */
 UCLASS(Blueprintable, BlueprintType)
 class GLTFSIMULATOR_API UCreatorHUDWidget : public UUserWidget
@@ -25,6 +25,30 @@ class GLTFSIMULATOR_API UCreatorHUDWidget : public UUserWidget
     GENERATED_BODY()
 
 public:
+    /** Explicitly assigns the toolbar grid owned by the WBP. */
+    UFUNCTION(BlueprintCallable, Category="Creator HUD|Widgets")
+    void SetToolbarGrid(UUniformGridPanel* InToolbarGrid);
+
+    /** Explicitly assigns the item-list scroll box owned by the WBP. */
+    UFUNCTION(BlueprintCallable, Category="Creator HUD|Widgets")
+    void SetItemListScrollBox(UScrollBox* InItemListScrollBox);
+
+    /** Explicitly assigns the item-list panel owned by the WBP. */
+    UFUNCTION(BlueprintCallable, Category="Creator HUD|Widgets")
+    void SetItemListPanel(UBorder* InItemListPanel);
+
+    /** Explicitly assigns the status text block owned by the WBP. */
+    UFUNCTION(BlueprintCallable, Category="Creator HUD|Widgets")
+    void SetStatusText(UTextBlock* InStatusText);
+
+    /** Explicitly assigns the placement-info text block owned by the WBP. */
+    UFUNCTION(BlueprintCallable, Category="Creator HUD|Widgets")
+    void SetPlacementText(UTextBlock* InPlacementText);
+
+    /** Explicitly assigns the message text block owned by the WBP. */
+    UFUNCTION(BlueprintCallable, Category="Creator HUD|Widgets")
+    void SetMessageText(UTextBlock* InMessageText);
+
     /** Re-finds the GameManager used by this HUD and refreshes all displayed values. */
     UFUNCTION(BlueprintCallable, Category="Creator HUD")
     void RefreshManagerReference();
@@ -114,32 +138,13 @@ private:
     /** Safely removes manager event bindings. */
     void UnbindManagerEvents();
 
-protected:
-    /** Optional toolbar grid assigned directly by the WBP. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Creator HUD|Widgets")
-    TObjectPtr<UUniformGridPanel> CreatorHUD_ToolbarGrid;
+    TWeakObjectPtr<UUniformGridPanel> AssignedToolbarGrid;
+    TWeakObjectPtr<UScrollBox> AssignedItemListScrollBox;
+    TWeakObjectPtr<UBorder> AssignedItemListPanel;
+    TWeakObjectPtr<UTextBlock> AssignedStatusText;
+    TWeakObjectPtr<UTextBlock> AssignedPlacementText;
+    TWeakObjectPtr<UTextBlock> AssignedMessageText;
 
-    /** Optional item-list scroll box assigned directly by the WBP. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Creator HUD|Widgets")
-    TObjectPtr<UScrollBox> CreatorHUD_ItemListScrollBox;
-
-    /** Optional item-list panel assigned directly by the WBP. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Creator HUD|Widgets")
-    TObjectPtr<UBorder> CreatorHUD_ItemListPanel;
-
-    /** Optional status text assigned directly by the WBP. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Creator HUD|Widgets")
-    TObjectPtr<UTextBlock> CreatorHUD_StatusText;
-
-    /** Optional placement-info text assigned directly by the WBP. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Creator HUD|Widgets")
-    TObjectPtr<UTextBlock> CreatorHUD_PlacementText;
-
-    /** Optional message text assigned directly by the WBP. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Creator HUD|Widgets")
-    TObjectPtr<UTextBlock> CreatorHUD_MessageText;
-
-private:
     /** GameManager currently connected to this HUD. */
     UPROPERTY(Transient)
     mutable TObjectPtr<UGameManagerSubSystem> CachedGameManager;

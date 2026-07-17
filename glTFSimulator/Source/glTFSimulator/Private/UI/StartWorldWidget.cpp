@@ -25,6 +25,14 @@ void UStartWorldWidget::NativeConstruct()
 void UStartWorldWidget::NativeDestruct()
 {
     UnbindDefaultButtons();
+    StartButton.Reset();
+    WorldSelectionButton.Reset();
+    BackButton.Reset();
+    RefreshButton.Reset();
+    MultiplayerButton.Reset();
+    HostButton.Reset();
+    ClientButton.Reset();
+    JoinButton.Reset();
     StartActor.Reset();
     Super::NativeDestruct();
 }
@@ -32,7 +40,6 @@ void UStartWorldWidget::NativeDestruct()
 void UStartWorldWidget::SetStartActor(AStartActor* InStartActor)
 {
     StartActor = InStartActor;
-    OnStartActorAssigned(InStartActor);
 }
 
 void UStartWorldWidget::ExecuteStartGame()
@@ -103,88 +110,227 @@ void UStartWorldWidget::ExecuteRefreshWorldSelectionData()
 
 void UStartWorldWidget::BindDefaultButtons()
 {
-    if (StartButton)
+    if (UButton* Button = StartButton.Get())
     {
-        StartButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteStartGame);
-        StartButton->OnClicked.AddDynamic(this, &UStartWorldWidget::ExecuteStartGame);
+        Button->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteStartGame);
+        Button->OnClicked.AddDynamic(this, &UStartWorldWidget::ExecuteStartGame);
     }
 
-    if (WorldSelectionButton && WorldSelectionButton != StartButton)
+    if (UButton* Button = WorldSelectionButton.Get())
     {
-        WorldSelectionButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteShowWorldSelectionMenu);
-        WorldSelectionButton->OnClicked.AddDynamic(this, &UStartWorldWidget::ExecuteShowWorldSelectionMenu);
+        Button->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteShowWorldSelectionMenu);
+        if (Button != StartButton.Get())
+        {
+            Button->OnClicked.AddDynamic(this, &UStartWorldWidget::ExecuteShowWorldSelectionMenu);
+        }
     }
 
-    if (BackButton)
+    if (UButton* Button = BackButton.Get())
     {
-        BackButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteReturnToMainMenuFromWorldSelection);
-        BackButton->OnClicked.AddDynamic(this, &UStartWorldWidget::ExecuteReturnToMainMenuFromWorldSelection);
+        Button->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteReturnToMainMenuFromWorldSelection);
+        Button->OnClicked.AddDynamic(this, &UStartWorldWidget::ExecuteReturnToMainMenuFromWorldSelection);
     }
 
-    if (RefreshButton)
+    if (UButton* Button = RefreshButton.Get())
     {
-        RefreshButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteRefreshWorldSelectionData);
-        RefreshButton->OnClicked.AddDynamic(this, &UStartWorldWidget::ExecuteRefreshWorldSelectionData);
+        Button->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteRefreshWorldSelectionData);
+        Button->OnClicked.AddDynamic(this, &UStartWorldWidget::ExecuteRefreshWorldSelectionData);
     }
 
-    if (MultiplayerButton)
+    if (UButton* Button = MultiplayerButton.Get())
     {
-        MultiplayerButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteShowMultiplayerMenu);
-        MultiplayerButton->OnClicked.AddDynamic(this, &UStartWorldWidget::ExecuteShowMultiplayerMenu);
+        Button->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteShowMultiplayerMenu);
+        Button->OnClicked.AddDynamic(this, &UStartWorldWidget::ExecuteShowMultiplayerMenu);
     }
 
-    if (HostButton)
+    if (UButton* Button = HostButton.Get())
     {
-        HostButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteHostSelectedWorld);
-        HostButton->OnClicked.AddDynamic(this, &UStartWorldWidget::ExecuteHostSelectedWorld);
+        Button->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteHostSelectedWorld);
+        Button->OnClicked.AddDynamic(this, &UStartWorldWidget::ExecuteHostSelectedWorld);
     }
 
-    if (ClientButton)
+    if (UButton* Button = ClientButton.Get())
     {
-        ClientButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteOpenClientConnectionWorld);
-        ClientButton->OnClicked.AddDynamic(this, &UStartWorldWidget::ExecuteOpenClientConnectionWorld);
+        Button->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteOpenClientConnectionWorld);
+        Button->OnClicked.AddDynamic(this, &UStartWorldWidget::ExecuteOpenClientConnectionWorld);
     }
 
-    if (JoinButton)
+    if (UButton* Button = JoinButton.Get())
     {
-        JoinButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteJoinSelectedWorld);
-        JoinButton->OnClicked.AddDynamic(this, &UStartWorldWidget::ExecuteJoinSelectedWorld);
+        Button->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteJoinSelectedWorld);
+        Button->OnClicked.AddDynamic(this, &UStartWorldWidget::ExecuteJoinSelectedWorld);
     }
 }
 
 void UStartWorldWidget::UnbindDefaultButtons()
 {
-    if (StartButton)
+    if (UButton* Button = StartButton.Get())
     {
-        StartButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteStartGame);
+        Button->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteStartGame);
     }
-    if (WorldSelectionButton)
+
+    if (UButton* Button = WorldSelectionButton.Get())
     {
-        WorldSelectionButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteShowWorldSelectionMenu);
+        Button->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteShowWorldSelectionMenu);
     }
-    if (BackButton)
+
+    if (UButton* Button = BackButton.Get())
     {
-        BackButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteReturnToMainMenuFromWorldSelection);
+        Button->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteReturnToMainMenuFromWorldSelection);
     }
-    if (RefreshButton)
+
+    if (UButton* Button = RefreshButton.Get())
     {
-        RefreshButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteRefreshWorldSelectionData);
+        Button->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteRefreshWorldSelectionData);
     }
-    if (MultiplayerButton)
+
+    if (UButton* Button = MultiplayerButton.Get())
     {
-        MultiplayerButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteShowMultiplayerMenu);
+        Button->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteShowMultiplayerMenu);
     }
-    if (HostButton)
+
+    if (UButton* Button = HostButton.Get())
     {
-        HostButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteHostSelectedWorld);
+        Button->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteHostSelectedWorld);
     }
-    if (ClientButton)
+
+    if (UButton* Button = ClientButton.Get())
     {
-        ClientButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteOpenClientConnectionWorld);
+        Button->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteOpenClientConnectionWorld);
     }
-    if (JoinButton)
+
+    if (UButton* Button = JoinButton.Get())
     {
-        JoinButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteJoinSelectedWorld);
+        Button->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteJoinSelectedWorld);
+    }
+}
+
+void UStartWorldWidget::SetStartButton(UButton* InButton)
+{
+    if (UButton* Button = StartButton.Get())
+    {
+        Button->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteStartGame);
+    }
+
+    StartButton = InButton;
+
+    if (IsValid(InButton))
+    {
+        InButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteShowWorldSelectionMenu);
+        InButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteStartGame);
+        InButton->OnClicked.AddDynamic(this, &UStartWorldWidget::ExecuteStartGame);
+    }
+}
+
+void UStartWorldWidget::SetWorldSelectionButton(UButton* InButton)
+{
+    if (UButton* Button = WorldSelectionButton.Get())
+    {
+        Button->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteShowWorldSelectionMenu);
+    }
+
+    WorldSelectionButton = InButton;
+
+    if (IsValid(InButton) && InButton != StartButton.Get())
+    {
+        InButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteShowWorldSelectionMenu);
+        InButton->OnClicked.AddDynamic(this, &UStartWorldWidget::ExecuteShowWorldSelectionMenu);
+    }
+}
+
+void UStartWorldWidget::SetBackButton(UButton* InButton)
+{
+    if (UButton* Button = BackButton.Get())
+    {
+        Button->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteReturnToMainMenuFromWorldSelection);
+    }
+
+    BackButton = InButton;
+
+    if (IsValid(InButton))
+    {
+        InButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteReturnToMainMenuFromWorldSelection);
+        InButton->OnClicked.AddDynamic(this, &UStartWorldWidget::ExecuteReturnToMainMenuFromWorldSelection);
+    }
+}
+
+void UStartWorldWidget::SetRefreshButton(UButton* InButton)
+{
+    if (UButton* Button = RefreshButton.Get())
+    {
+        Button->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteRefreshWorldSelectionData);
+    }
+
+    RefreshButton = InButton;
+
+    if (IsValid(InButton))
+    {
+        InButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteRefreshWorldSelectionData);
+        InButton->OnClicked.AddDynamic(this, &UStartWorldWidget::ExecuteRefreshWorldSelectionData);
+    }
+}
+
+void UStartWorldWidget::SetMultiplayerButton(UButton* InButton)
+{
+    if (UButton* Button = MultiplayerButton.Get())
+    {
+        Button->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteShowMultiplayerMenu);
+    }
+
+    MultiplayerButton = InButton;
+
+    if (IsValid(InButton))
+    {
+        InButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteShowMultiplayerMenu);
+        InButton->OnClicked.AddDynamic(this, &UStartWorldWidget::ExecuteShowMultiplayerMenu);
+    }
+}
+
+void UStartWorldWidget::SetHostButton(UButton* InButton)
+{
+    if (UButton* Button = HostButton.Get())
+    {
+        Button->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteHostSelectedWorld);
+    }
+
+    HostButton = InButton;
+
+    if (IsValid(InButton))
+    {
+        InButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteHostSelectedWorld);
+        InButton->OnClicked.AddDynamic(this, &UStartWorldWidget::ExecuteHostSelectedWorld);
+    }
+}
+
+void UStartWorldWidget::SetClientButton(UButton* InButton)
+{
+    if (UButton* Button = ClientButton.Get())
+    {
+        Button->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteOpenClientConnectionWorld);
+    }
+
+    ClientButton = InButton;
+
+    if (IsValid(InButton))
+    {
+        InButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteOpenClientConnectionWorld);
+        InButton->OnClicked.AddDynamic(this, &UStartWorldWidget::ExecuteOpenClientConnectionWorld);
+    }
+}
+
+void UStartWorldWidget::SetJoinButton(UButton* InButton)
+{
+    if (UButton* Button = JoinButton.Get())
+    {
+        Button->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteJoinSelectedWorld);
+    }
+
+    JoinButton = InButton;
+
+    if (IsValid(InButton))
+    {
+        InButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteJoinSelectedWorld);
+        InButton->OnClicked.AddDynamic(this, &UStartWorldWidget::ExecuteJoinSelectedWorld);
     }
 }
 
@@ -359,6 +505,5 @@ TMap<FString, FString> UStartWorldWidget::GetFolderNameMap() const
 void UStartWorldWidget::SetWorldSelectionData(const TMap<FString, FString>& Values)
 {
     CachedWorldSelectionData = Values;
-    OnWorldSelectionDataUpdated(CachedWorldSelectionData);
 }
 

@@ -14,9 +14,8 @@ class UButton;
  * Base class for StartWorld UI widgets.
  *
  * AStartActor creates each menu widget, assigns itself with SetStartActor(), and passes data
- * through explicit typed functions. Widget code that needs StartActor behavior calls the stored
- * actor only after a null check; no native-event path or widget-name
- * reflection is used by this class.
+ * through explicit typed functions. WBP widgets assign their actual button references through
+ * explicit setter calls from Construct instead of relying on automatic widget-name binding.
  */
 UCLASS(Blueprintable, BlueprintType)
 class GLTFSIMULATOR_API UStartWorldWidget : public UUserWidget
@@ -59,13 +58,37 @@ public:
     UFUNCTION(BlueprintCallable, Category="Start World|Actions")
     void ExecuteRefreshWorldSelectionData();
 
-    /** Rebinds optional button variables. Blueprint can call this after assigning widgets dynamically. */
+    /** Rebinds delegates for buttons that were assigned through the explicit button setter functions. */
     UFUNCTION(BlueprintCallable, Category="Start World|Actions")
     void BindDefaultButtons();
 
     /** Removes C++ button delegates. NativeDestruct calls this automatically. */
     UFUNCTION(BlueprintCallable, Category="Start World|Actions")
     void UnbindDefaultButtons();
+
+    UFUNCTION(BlueprintCallable, Category="Start World|Widgets")
+    void SetStartButton(UButton* InButton);
+
+    UFUNCTION(BlueprintCallable, Category="Start World|Widgets")
+    void SetWorldSelectionButton(UButton* InButton);
+
+    UFUNCTION(BlueprintCallable, Category="Start World|Widgets")
+    void SetBackButton(UButton* InButton);
+
+    UFUNCTION(BlueprintCallable, Category="Start World|Widgets")
+    void SetRefreshButton(UButton* InButton);
+
+    UFUNCTION(BlueprintCallable, Category="Start World|Widgets")
+    void SetMultiplayerButton(UButton* InButton);
+
+    UFUNCTION(BlueprintCallable, Category="Start World|Widgets")
+    void SetHostButton(UButton* InButton);
+
+    UFUNCTION(BlueprintCallable, Category="Start World|Widgets")
+    void SetClientButton(UButton* InButton);
+
+    UFUNCTION(BlueprintCallable, Category="Start World|Widgets")
+    void SetJoinButton(UButton* InButton);
 
     /** Selects a world by folder key. */
     UFUNCTION(BlueprintCallable, Category="Start World|World Selection")
@@ -129,43 +152,8 @@ public:
     UFUNCTION(BlueprintCallable, Category="Start World|Data")
     virtual void SetWorldSelectionData(const TMap<FString, FString>& Values);
 
-    /** Called after SetStartActor assigns the owning actor. */
-    UFUNCTION(BlueprintImplementableEvent, Category="Start World|Events")
-    void OnStartActorAssigned(AStartActor* InStartActor);
-
-    /** Called when StartActor passes the world-selection folder-name map to this widget. */
-    UFUNCTION(BlueprintImplementableEvent, Category="Start World|Events")
-    void OnWorldSelectionDataUpdated(const TMap<FString, FString>& Values);
 
 protected:
-    /** Optional start button. Assign with the StartButton variable or call BindDefaultButtons() after setting it. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Start World|Widgets")
-    TObjectPtr<UButton> StartButton;
-
-    /** Optional alias button for opening world selection. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Start World|Widgets")
-    TObjectPtr<UButton> WorldSelectionButton;
-
-    /** Optional back button for WBP_LevelMenu. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Start World|Widgets")
-    TObjectPtr<UButton> BackButton;
-
-    /** Optional refresh button for WBP_LevelMenu. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Start World|Widgets")
-    TObjectPtr<UButton> RefreshButton;
-
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Start World|Widgets")
-    TObjectPtr<UButton> MultiplayerButton;
-
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Start World|Widgets")
-    TObjectPtr<UButton> HostButton;
-
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Start World|Widgets")
-    TObjectPtr<UButton> ClientButton;
-
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Start World|Widgets")
-    TObjectPtr<UButton> JoinButton;
-
     /** Last world-folder map passed from StartActor. */
     UPROPERTY(BlueprintReadOnly, Category="Start World|Data")
     TMap<FString, FString> CachedWorldSelectionData;
@@ -178,6 +166,16 @@ protected:
     FString ServerAddress = TEXT("127.0.0.1:7777");
 
 private:
+    /** Weak on purpose: explicit WBP-owned widget references should not keep stale REINST widgets alive. */
+    TWeakObjectPtr<UButton> StartButton;
+    TWeakObjectPtr<UButton> WorldSelectionButton;
+    TWeakObjectPtr<UButton> BackButton;
+    TWeakObjectPtr<UButton> RefreshButton;
+    TWeakObjectPtr<UButton> MultiplayerButton;
+    TWeakObjectPtr<UButton> HostButton;
+    TWeakObjectPtr<UButton> ClientButton;
+    TWeakObjectPtr<UButton> JoinButton;
+
     /** Weak on purpose: editor undo buffers can retain REINST widgets, and strong world refs cause stale world leaks. */
     TWeakObjectPtr<AStartActor> StartActor;
 };

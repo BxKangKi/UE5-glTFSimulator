@@ -4,8 +4,17 @@
 
 #include "Components/Button.h"
 #include "Components/ButtonSlot.h"
+#include "Components/CanvasPanelSlot.h"
+#include "Components/GridSlot.h"
+#include "Components/HorizontalBoxSlot.h"
+#include "Components/OverlaySlot.h"
+#include "Components/PanelSlot.h"
 #include "Components/PanelWidget.h"
+#include "Components/ScrollBoxSlot.h"
+#include "Components/SizeBox.h"
 #include "Components/TextBlock.h"
+#include "Components/UniformGridSlot.h"
+#include "Components/VerticalBoxSlot.h"
 
 namespace
 {
@@ -13,6 +22,31 @@ namespace
     {
         Value.TrimStartAndEndInline();
         return Value;
+    }
+
+    FVector2D MakeCanvasAlignment(EHorizontalAlignment HorizontalAlignment, EVerticalAlignment VerticalAlignment)
+    {
+        float X = 0.0f;
+        if (HorizontalAlignment == HAlign_Center)
+        {
+            X = 0.5f;
+        }
+        else if (HorizontalAlignment == HAlign_Right)
+        {
+            X = 1.0f;
+        }
+
+        float Y = 0.0f;
+        if (VerticalAlignment == VAlign_Center)
+        {
+            Y = 0.5f;
+        }
+        else if (VerticalAlignment == VAlign_Bottom)
+        {
+            Y = 1.0f;
+        }
+
+        return FVector2D(X, Y);
     }
 }
 
@@ -37,7 +71,11 @@ void UWorldSelectionButtonClickHandler::HandleClicked()
 void UWorldSelectionWidget::NativeConstruct()
 {
     Super::NativeConstruct();
-    RebuildWorldButtons();
+
+    if (AssignedWorldListPanel.IsValid())
+    {
+        RebuildWorldButtons();
+    }
 }
 
 void UWorldSelectionWidget::NativeDestruct()
@@ -54,13 +92,13 @@ void UWorldSelectionWidget::SetWorldSelectionData(const TMap<FString, FString>& 
 
 void UWorldSelectionWidget::SetWorldListPanel(UPanelWidget* InWorldListPanel)
 {
-    if (WorldListPanel == InWorldListPanel)
+    if (AssignedWorldListPanel.Get() == InWorldListPanel)
     {
         return;
     }
 
     ClearWorldButtons();
-    WorldListPanel = InWorldListPanel;
+    AssignedWorldListPanel = InWorldListPanel;
     RebuildWorldButtons();
 }
 
@@ -68,9 +106,10 @@ void UWorldSelectionWidget::RebuildWorldButtons()
 {
     ClearWorldButtons();
 
-    if (!WorldListPanel)
+    UPanelWidget* const ListPanel = AssignedWorldListPanel.Get();
+    if (!IsValid(ListPanel))
     {
-        UE_LOG(LogTemp, Warning, TEXT("WorldSelectionWidget cannot build world buttons because WorldListPanel is not assigned in WBP_LevelMenu."));
+        UE_LOG(LogTemp, Warning, TEXT("WorldSelectionWidget cannot build world buttons because the list panel is not assigned. Call SetWorldListPanel() from the WBP Construct event with the list panel reference."));
         return;
     }
 
@@ -106,15 +145,21 @@ void UWorldSelectionWidget::RebuildWorldButtons()
 
     for (const TPair<FString, FString>& EntryData : SortedWorlds)
     {
-        UButton* Button = CreateWorldButton(EntryData.Key, EntryData.Value);
-        if (!IsValid(Button))
+        UButton* Button = nullptr;
+        UTextBlock* Label = nullptr;
+        UWidget* EntryWidget = CreateWorldButtonEntry(EntryData.Key, EntryData.Value, Button, Label);
+        if (!IsValid(EntryWidget) || !IsValid(Button) || !IsValid(Label))
         {
             UE_LOG(LogTemp, Warning, TEXT("WorldSelectionWidget failed to create a generated button for %s."), *EntryData.Key);
             continue;
         }
 
-        WorldListPanel->AddChild(Button);
+        ListPanel->AddChild(EntryWidget);
+        ApplyGeneratedEntrySlotLayout(EntryWidget);
+
+        GeneratedWorldButtonEntries.Add(EntryWidget);
         GeneratedWorldButtons.Add(Button);
+        GeneratedWorldButtonLabels.Add(Label);
     }
 }
 
@@ -129,48 +174,302 @@ void UWorldSelectionWidget::ClearWorldButtons()
         {
             Button->OnClicked.RemoveDynamic(Handler, &UWorldSelectionButtonClickHandler::HandleClicked);
         }
+    }
 
-        if (IsValid(Button))
+    for (UWidget* EntryWidget : GeneratedWorldButtonEntries)
+    {
+        if (IsValid(EntryWidget))
         {
-            Button->RemoveFromParent();
+            EntryWidget->RemoveFromParent();
         }
     }
 
+    GeneratedWorldButtonEntries.Empty();
     GeneratedWorldButtons.Empty();
+    GeneratedWorldButtonLabels.Empty();
+    GeneratedWorldButtonSizeBoxes.Empty();
     GeneratedClickHandlers.Empty();
 }
 
-UButton* UWorldSelectionWidget::CreateWorldButton(const FString& WorldFolderName, const FString& DisplayName)
+void UWorldSelectionWidget::SetGeneratedButtonSize(const FVector2D& InButtonSize)
 {
+    GeneratedButtonSize.X = FMath::Max(0.0f, InButtonSize.X);
+    GeneratedButtonSize.Y = FMath::Max(0.0f, InButtonSize.Y);
+    RefreshGeneratedButtonLayout();
+}
+
+void UWorldSelectionWidget::SetGeneratedButtonPanelAlignment(EHorizontalAlignment InHorizontalAlignment, EVerticalAlignment InVerticalAlignment)
+{
+    GeneratedButtonPanelHorizontalAlignment = InHorizontalAlignment;
+    GeneratedButtonPanelVerticalAlignment = InVerticalAlignment;
+    RefreshGeneratedButtonLayout();
+}
+
+void UWorldSelectionWidget::SetGeneratedButtonContentAlignment(EHorizontalAlignment InHorizontalAlignment, EVerticalAlignment InVerticalAlignment)
+{
+    GeneratedButtonContentHorizontalAlignment = InHorizontalAlignment;
+    GeneratedButtonContentVerticalAlignment = InVerticalAlignment;
+    RefreshGeneratedButtonLayout();
+}
+
+void UWorldSelectionWidget::SetGeneratedButtonStyleOverrideEnabled(bool bInOverrideStyle)
+{
+    bOverrideGeneratedButtonWidgetStyle = bInOverrideStyle;
+    RefreshGeneratedButtonLayout();
+}
+
+void UWorldSelectionWidget::SetGeneratedButtonWidgetStyle(const FButtonStyle& InButtonStyle)
+{
+    GeneratedButtonWidgetStyle = InButtonStyle;
+    bOverrideGeneratedButtonWidgetStyle = true;
+    RefreshGeneratedButtonLayout();
+}
+
+void UWorldSelectionWidget::SetGeneratedButtonColors(const FLinearColor& InColorAndOpacity, const FLinearColor& InBackgroundColor)
+{
+    GeneratedButtonColorAndOpacity = InColorAndOpacity;
+    GeneratedButtonBackgroundColor = InBackgroundColor;
+    RefreshGeneratedButtonLayout();
+}
+
+void UWorldSelectionWidget::SetGeneratedButtonFontSize(int32 InFontSize)
+{
+    GeneratedButtonFontSize = FMath::Max(1, InFontSize);
+    RefreshGeneratedButtonLayout();
+}
+
+void UWorldSelectionWidget::SetGeneratedButtonTypeface(FName InTypefaceFontName)
+{
+    GeneratedButtonTypefaceFontName = InTypefaceFontName;
+    RefreshGeneratedButtonLayout();
+}
+
+void UWorldSelectionWidget::SetGeneratedButtonOutlineSettings(const FFontOutlineSettings& InOutlineSettings)
+{
+    GeneratedButtonOutlineSettings = InOutlineSettings;
+    RefreshGeneratedButtonLayout();
+}
+
+void UWorldSelectionWidget::SetGeneratedButtonTextShadow(const FVector2D& InShadowOffset, const FLinearColor& InShadowColor)
+{
+    GeneratedButtonTextShadowOffset = InShadowOffset;
+    GeneratedButtonTextShadowColor = InShadowColor;
+    RefreshGeneratedButtonLayout();
+}
+
+void UWorldSelectionWidget::RefreshGeneratedButtonLayout()
+{
+    for (USizeBox* SizeBox : GeneratedWorldButtonSizeBoxes)
+    {
+        ApplyGeneratedEntrySize(SizeBox);
+    }
+
+    for (UWidget* EntryWidget : GeneratedWorldButtonEntries)
+    {
+        ApplyGeneratedEntrySlotLayout(EntryWidget);
+    }
+
+    for (UButton* Button : GeneratedWorldButtons)
+    {
+        ApplyGeneratedButtonStyle(Button);
+        ApplyGeneratedButtonContentLayout(Button);
+    }
+
+    for (UTextBlock* Label : GeneratedWorldButtonLabels)
+    {
+        ApplyGeneratedLabelLayout(Label);
+    }
+}
+
+UWidget* UWorldSelectionWidget::CreateWorldButtonEntry(const FString& WorldFolderName, const FString& DisplayName, UButton*& OutButton, UTextBlock*& OutLabel)
+{
+    OutButton = nullptr;
+    OutLabel = nullptr;
+
+    USizeBox* EntrySizeBox = NewObject<USizeBox>(this);
     UButton* Button = NewObject<UButton>(this);
     UTextBlock* TextBlock = NewObject<UTextBlock>(this);
     UWorldSelectionButtonClickHandler* ClickHandler = NewObject<UWorldSelectionButtonClickHandler>(this);
-    if (!IsValid(Button) || !IsValid(TextBlock) || !IsValid(ClickHandler))
+    if (!IsValid(EntrySizeBox) || !IsValid(Button) || !IsValid(TextBlock) || !IsValid(ClickHandler))
     {
         return nullptr;
     }
 
+    EntrySizeBox->ClearFlags(RF_Transactional);
+    EntrySizeBox->SetFlags(RF_Transient);
+    ApplyGeneratedEntrySize(EntrySizeBox);
+
     Button->ClearFlags(RF_Transactional);
     Button->SetFlags(RF_Transient);
-    // UE 5.7 exposes focusability as a UButton property, not as a runtime setter.
-    Button->IsFocusable = true;
+    ApplyGeneratedButtonStyle(Button);
 
     TextBlock->ClearFlags(RF_Transactional);
     TextBlock->SetFlags(RF_Transient);
     TextBlock->SetText(FText::FromString(DisplayName));
-    TextBlock->SetJustification(ETextJustify::Center);
-    TextBlock->SetColorAndOpacity(GeneratedButtonTextColor);
+    ApplyGeneratedLabelLayout(TextBlock);
 
     if (UButtonSlot* ButtonSlot = Cast<UButtonSlot>(Button->AddChild(TextBlock)))
     {
         ButtonSlot->SetPadding(GeneratedButtonTextPadding);
-        ButtonSlot->SetHorizontalAlignment(HAlign_Center);
-        ButtonSlot->SetVerticalAlignment(VAlign_Center);
+        ButtonSlot->SetHorizontalAlignment(GeneratedButtonContentHorizontalAlignment.GetValue());
+        ButtonSlot->SetVerticalAlignment(GeneratedButtonContentVerticalAlignment.GetValue());
     }
+
+    EntrySizeBox->AddChild(Button);
 
     ClickHandler->Setup(this, WorldFolderName);
     Button->OnClicked.AddDynamic(ClickHandler, &UWorldSelectionButtonClickHandler::HandleClicked);
     GeneratedClickHandlers.Add(ClickHandler);
+    GeneratedWorldButtonSizeBoxes.Add(EntrySizeBox);
 
-    return Button;
+    OutButton = Button;
+    OutLabel = TextBlock;
+    return EntrySizeBox;
+}
+
+void UWorldSelectionWidget::ApplyGeneratedEntrySize(USizeBox* EntrySizeBox) const
+{
+    if (!IsValid(EntrySizeBox))
+    {
+        return;
+    }
+
+    if (GeneratedButtonSize.X > 0.0f)
+    {
+        EntrySizeBox->SetWidthOverride(GeneratedButtonSize.X);
+    }
+    else
+    {
+        EntrySizeBox->ClearWidthOverride();
+    }
+
+    if (GeneratedButtonSize.Y > 0.0f)
+    {
+        EntrySizeBox->SetHeightOverride(GeneratedButtonSize.Y);
+    }
+    else
+    {
+        EntrySizeBox->ClearHeightOverride();
+    }
+}
+
+void UWorldSelectionWidget::ApplyGeneratedEntrySlotLayout(UWidget* EntryWidget) const
+{
+    if (!IsValid(EntryWidget) || !EntryWidget->Slot)
+    {
+        return;
+    }
+
+    UPanelSlot* const ParentPanelSlot = EntryWidget->Slot;
+    const EHorizontalAlignment HorizontalAlignment = GeneratedButtonPanelHorizontalAlignment.GetValue();
+    const EVerticalAlignment VerticalAlignment = GeneratedButtonPanelVerticalAlignment.GetValue();
+
+    if (UScrollBoxSlot* ScrollBoxPanelSlot = Cast<UScrollBoxSlot>(ParentPanelSlot))
+    {
+        ScrollBoxPanelSlot->SetPadding(GeneratedButtonEntryPadding);
+        ScrollBoxPanelSlot->SetHorizontalAlignment(HorizontalAlignment);
+        ScrollBoxPanelSlot->SetVerticalAlignment(VerticalAlignment);
+        return;
+    }
+
+    if (UVerticalBoxSlot* VerticalBoxPanelSlot = Cast<UVerticalBoxSlot>(ParentPanelSlot))
+    {
+        VerticalBoxPanelSlot->SetPadding(GeneratedButtonEntryPadding);
+        VerticalBoxPanelSlot->SetHorizontalAlignment(HorizontalAlignment);
+        VerticalBoxPanelSlot->SetVerticalAlignment(VerticalAlignment);
+        return;
+    }
+
+    if (UHorizontalBoxSlot* HorizontalBoxPanelSlot = Cast<UHorizontalBoxSlot>(ParentPanelSlot))
+    {
+        HorizontalBoxPanelSlot->SetPadding(GeneratedButtonEntryPadding);
+        HorizontalBoxPanelSlot->SetHorizontalAlignment(HorizontalAlignment);
+        HorizontalBoxPanelSlot->SetVerticalAlignment(VerticalAlignment);
+        return;
+    }
+
+    if (UOverlaySlot* OverlayPanelSlot = Cast<UOverlaySlot>(ParentPanelSlot))
+    {
+        OverlayPanelSlot->SetPadding(GeneratedButtonEntryPadding);
+        OverlayPanelSlot->SetHorizontalAlignment(HorizontalAlignment);
+        OverlayPanelSlot->SetVerticalAlignment(VerticalAlignment);
+        return;
+    }
+
+    if (UGridSlot* GridPanelSlot = Cast<UGridSlot>(ParentPanelSlot))
+    {
+        GridPanelSlot->SetPadding(GeneratedButtonEntryPadding);
+        GridPanelSlot->SetHorizontalAlignment(HorizontalAlignment);
+        GridPanelSlot->SetVerticalAlignment(VerticalAlignment);
+        return;
+    }
+
+    if (UUniformGridSlot* UniformGridPanelSlot = Cast<UUniformGridSlot>(ParentPanelSlot))
+    {
+        UniformGridPanelSlot->SetHorizontalAlignment(HorizontalAlignment);
+        UniformGridPanelSlot->SetVerticalAlignment(VerticalAlignment);
+        return;
+    }
+
+    if (UCanvasPanelSlot* CanvasPanelSlot = Cast<UCanvasPanelSlot>(ParentPanelSlot))
+    {
+        if (GeneratedButtonSize.X > 0.0f && GeneratedButtonSize.Y > 0.0f)
+        {
+            CanvasPanelSlot->SetSize(GeneratedButtonSize);
+        }
+        CanvasPanelSlot->SetAlignment(MakeCanvasAlignment(HorizontalAlignment, VerticalAlignment));
+    }
+}
+
+void UWorldSelectionWidget::ApplyGeneratedButtonStyle(UButton* Button) const
+{
+    if (!IsValid(Button))
+    {
+        return;
+    }
+
+    if (bOverrideGeneratedButtonWidgetStyle)
+    {
+        Button->SetStyle(GeneratedButtonWidgetStyle);
+    }
+
+    Button->SetColorAndOpacity(GeneratedButtonColorAndOpacity);
+    Button->SetBackgroundColor(GeneratedButtonBackgroundColor);
+}
+
+void UWorldSelectionWidget::ApplyGeneratedButtonContentLayout(UButton* Button) const
+{
+    if (!IsValid(Button))
+    {
+        return;
+    }
+
+    if (UButtonSlot* ButtonSlot = Cast<UButtonSlot>(Button->GetContentSlot()))
+    {
+        ButtonSlot->SetPadding(GeneratedButtonTextPadding);
+        ButtonSlot->SetHorizontalAlignment(GeneratedButtonContentHorizontalAlignment.GetValue());
+        ButtonSlot->SetVerticalAlignment(GeneratedButtonContentVerticalAlignment.GetValue());
+    }
+}
+
+void UWorldSelectionWidget::ApplyGeneratedLabelLayout(UTextBlock* Label) const
+{
+    if (!IsValid(Label))
+    {
+        return;
+    }
+
+    FSlateFontInfo FontInfo = Label->GetFont();
+    FontInfo.Size = FMath::Max(1, GeneratedButtonFontSize);
+    if (!GeneratedButtonTypefaceFontName.IsNone())
+    {
+        FontInfo.TypefaceFontName = GeneratedButtonTypefaceFontName;
+    }
+    FontInfo.OutlineSettings = GeneratedButtonOutlineSettings;
+    Label->SetFont(FontInfo);
+
+    Label->SetJustification(GeneratedButtonTextJustification.GetValue());
+    Label->SetColorAndOpacity(GeneratedButtonTextColor);
+    Label->SetShadowOffset(GeneratedButtonTextShadowOffset);
+    Label->SetShadowColorAndOpacity(GeneratedButtonTextShadowColor);
 }

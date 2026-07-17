@@ -3,13 +3,19 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Fonts/SlateFontInfo.h"
+#include "Framework/Text/TextLayout.h"
+#include "Layout/Children.h"
 #include "Styling/SlateColor.h"
+#include "Styling/SlateTypes.h"
 #include "UI/StartWorldWidget.h"
 #include "WorldSelectionWidget.generated.h"
 
 class UButton;
 class UPanelWidget;
+class USizeBox;
 class UTextBlock;
+class UWidget;
 class UWorldSelectionWidget;
 
 /** Internal click dispatcher used by generated UButton entries in UWorldSelectionWidget. */
@@ -32,10 +38,11 @@ private:
 /**
  * World-selection menu widget used as the parent class for WBP_LevelMenu.
  *
- * Assign WorldListPanel in WBP_LevelMenu. This class creates a native UButton + UTextBlock for
- * every world folder passed by AStartActor and opens the selected world through the referenced
- * StartActor after null checking. No separate button widget class, native-event override,
- * or widget-name search is required.
+ * The owning WBP should call SetWorldListPanel() with the actual list panel reference from its
+ * Construct event. This class creates a native UButton + UTextBlock for every world folder
+ * passed by AStartActor and opens the selected world through the referenced StartActor after
+ * null checking. Button names and click behavior remain generated automatically; button size
+ * and alignment are controlled by the Generated Button Layout variables below.
  */
 UCLASS(Blueprintable, BlueprintType)
 class GLTFSIMULATOR_API UWorldSelectionWidget : public UStartWorldWidget
@@ -59,24 +66,145 @@ public:
     UFUNCTION(BlueprintCallable, Category="Start World|World Selection")
     void ClearWorldButtons();
 
+    /** Sets the generated button width/height. Values <= 0 let the widget keep its desired size on that axis. */
+    UFUNCTION(BlueprintCallable, Category="Start World|Generated Button Layout")
+    void SetGeneratedButtonSize(const FVector2D& InButtonSize);
+
+    /** Sets how each generated button entry is aligned inside the assigned list panel. */
+    UFUNCTION(BlueprintCallable, Category="Start World|Generated Button Layout")
+    void SetGeneratedButtonPanelAlignment(EHorizontalAlignment InHorizontalAlignment, EVerticalAlignment InVerticalAlignment);
+
+    /** Sets how the generated label is aligned inside each button. */
+    UFUNCTION(BlueprintCallable, Category="Start World|Generated Button Layout")
+    void SetGeneratedButtonContentAlignment(EHorizontalAlignment InHorizontalAlignment, EVerticalAlignment InVerticalAlignment);
+
+    /** Enables/disables overriding the generated UButton style variable. */
+    UFUNCTION(BlueprintCallable, Category="Start World|Generated Button Style")
+    void SetGeneratedButtonStyleOverrideEnabled(bool bInOverrideStyle);
+
+    /** Sets the generated UButton style variable. This controls normal/hover/pressed brushes and their borders. */
+    UFUNCTION(BlueprintCallable, Category="Start World|Generated Button Style")
+    void SetGeneratedButtonWidgetStyle(const FButtonStyle& InButtonStyle);
+
+    /** Sets generated UButton color multipliers. */
+    UFUNCTION(BlueprintCallable, Category="Start World|Generated Button Style")
+    void SetGeneratedButtonColors(const FLinearColor& InColorAndOpacity, const FLinearColor& InBackgroundColor);
+
+    /** Sets generated button label font size. */
+    UFUNCTION(BlueprintCallable, Category="Start World|Generated Button Text")
+    void SetGeneratedButtonFontSize(int32 InFontSize);
+
+    /** Sets generated button label typeface. NAME_None keeps the text block's current/default typeface. */
+    UFUNCTION(BlueprintCallable, Category="Start World|Generated Button Text")
+    void SetGeneratedButtonTypeface(FName InTypefaceFontName);
+
+    /** Sets generated button label outline options. */
+    UFUNCTION(BlueprintCallable, Category="Start World|Generated Button Text")
+    void SetGeneratedButtonOutlineSettings(const FFontOutlineSettings& InOutlineSettings);
+
+    /** Sets generated button label shadow options. */
+    UFUNCTION(BlueprintCallable, Category="Start World|Generated Button Text")
+    void SetGeneratedButtonTextShadow(const FVector2D& InShadowOffset, const FLinearColor& InShadowColor);
+
+    /** Reapplies the current size/alignment/text-style variables to already generated buttons. */
+    UFUNCTION(BlueprintCallable, Category="Start World|Generated Button Layout")
+    void RefreshGeneratedButtonLayout();
+
 protected:
-    /** Panel that receives generated world buttons. Assign this variable in WBP_LevelMenu. */
-    UPROPERTY(BlueprintReadWrite, meta=(BindWidgetOptional), Category="Start World|Widgets")
-    TObjectPtr<UPanelWidget> WorldListPanel;
+    /** Desired width/height for each generated button. Set either value to 0 or lower to leave that axis automatic. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Start World|Generated Button Layout", meta=(ClampMin="0.0"))
+    FVector2D GeneratedButtonSize = FVector2D(320.0f, 48.0f);
+
+    /** Alignment of each generated button entry inside the list panel slot. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Start World|Generated Button Layout")
+    TEnumAsByte<EHorizontalAlignment> GeneratedButtonPanelHorizontalAlignment = HAlign_Center;
+
+    /** Alignment of each generated button entry inside the list panel slot. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Start World|Generated Button Layout")
+    TEnumAsByte<EVerticalAlignment> GeneratedButtonPanelVerticalAlignment = VAlign_Center;
+
+    /** Optional padding applied to the generated entry slot when the parent panel slot supports padding. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Start World|Generated Button Layout")
+    FMargin GeneratedButtonEntryPadding = FMargin(0.0f, 0.0f, 0.0f, 8.0f);
+
+    /** Horizontal alignment of the text block inside each generated button. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Start World|Generated Button Layout")
+    TEnumAsByte<EHorizontalAlignment> GeneratedButtonContentHorizontalAlignment = HAlign_Center;
+
+    /** Vertical alignment of the text block inside each generated button. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Start World|Generated Button Layout")
+    TEnumAsByte<EVerticalAlignment> GeneratedButtonContentVerticalAlignment = VAlign_Center;
 
     /** Padding applied inside each generated button around its text block. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Start World|Generated Buttons")
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Start World|Generated Button Layout")
     FMargin GeneratedButtonTextPadding = FMargin(12.0f, 6.0f);
 
-    /** Text color for generated button labels. Use foreground by default so it follows the active button style. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Start World|Generated Buttons")
+    /** Text justification for generated button labels. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Start World|Generated Button Layout")
+    TEnumAsByte<ETextJustify::Type> GeneratedButtonTextJustification = ETextJustify::Center;
+
+    /** Whether GeneratedButtonWidgetStyle should be applied to each generated UButton. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Start World|Generated Button Style")
+    bool bOverrideGeneratedButtonWidgetStyle = false;
+
+    /** UButton style applied when bOverrideGeneratedButtonWidgetStyle is true. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Start World|Generated Button Style")
+    FButtonStyle GeneratedButtonWidgetStyle;
+
+    /** Color multiplier for each generated UButton. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Start World|Generated Button Style")
+    FLinearColor GeneratedButtonColorAndOpacity = FLinearColor::White;
+
+    /** Background color multiplier for each generated UButton. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Start World|Generated Button Style")
+    FLinearColor GeneratedButtonBackgroundColor = FLinearColor::White;
+
+    /** Text color for generated button labels. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Start World|Generated Button Text")
     FSlateColor GeneratedButtonTextColor = FSlateColor::UseForeground();
 
+    /** Font size for generated button labels. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Start World|Generated Button Text", meta=(ClampMin="1"))
+    int32 GeneratedButtonFontSize = 24;
+
+    /** Typeface name for generated button labels. NAME_None keeps the default typeface. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Start World|Generated Button Text")
+    FName GeneratedButtonTypefaceFontName = NAME_None;
+
+    /** Outline settings for generated button labels. Controls outline size, material, and color. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Start World|Generated Button Text")
+    FFontOutlineSettings GeneratedButtonOutlineSettings;
+
+    /** Shadow offset for generated button labels. Zero disables visible offset by default. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Start World|Generated Button Text")
+    FVector2D GeneratedButtonTextShadowOffset = FVector2D::ZeroVector;
+
+    /** Shadow color for generated button labels. Transparent disables visible shadow by default. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Start World|Generated Button Text")
+    FLinearColor GeneratedButtonTextShadowColor = FLinearColor::Transparent;
+
 private:
-    UButton* CreateWorldButton(const FString& WorldFolderName, const FString& DisplayName);
+    UWidget* CreateWorldButtonEntry(const FString& WorldFolderName, const FString& DisplayName, UButton*& OutButton, UTextBlock*& OutLabel);
+    void ApplyGeneratedEntrySize(USizeBox* EntrySizeBox) const;
+    void ApplyGeneratedEntrySlotLayout(UWidget* EntryWidget) const;
+    void ApplyGeneratedButtonStyle(UButton* Button) const;
+    void ApplyGeneratedButtonContentLayout(UButton* Button) const;
+    void ApplyGeneratedLabelLayout(UTextBlock* Label) const;
+
+    /** Explicit panel reference set through SetWorldListPanel(). Kept native-only to avoid UMG widget-variable name collisions. */
+    TWeakObjectPtr<UPanelWidget> AssignedWorldListPanel;
+
+    UPROPERTY(Transient)
+    TArray<TObjectPtr<UWidget>> GeneratedWorldButtonEntries;
 
     UPROPERTY(Transient)
     TArray<TObjectPtr<UButton>> GeneratedWorldButtons;
+
+    UPROPERTY(Transient)
+    TArray<TObjectPtr<UTextBlock>> GeneratedWorldButtonLabels;
+
+    UPROPERTY(Transient)
+    TArray<TObjectPtr<USizeBox>> GeneratedWorldButtonSizeBoxes;
 
     UPROPERTY(Transient)
     TArray<TObjectPtr<UWorldSelectionButtonClickHandler>> GeneratedClickHandlers;

@@ -26,6 +26,43 @@ static FString MakeKindLabel(EToolbarItemKind Kind)
         }
 }
 
+
+void UCreatorHUDWidget::SetToolbarGrid(UUniformGridPanel* InToolbarGrid)
+{
+    AssignedToolbarGrid = InToolbarGrid;
+    RefreshToolbar();
+}
+
+void UCreatorHUDWidget::SetItemListScrollBox(UScrollBox* InItemListScrollBox)
+{
+    AssignedItemListScrollBox = InItemListScrollBox;
+    RefreshItemList();
+}
+
+void UCreatorHUDWidget::SetItemListPanel(UBorder* InItemListPanel)
+{
+    AssignedItemListPanel = InItemListPanel;
+    RefreshItemList();
+}
+
+void UCreatorHUDWidget::SetStatusText(UTextBlock* InStatusText)
+{
+    AssignedStatusText = InStatusText;
+    RefreshStatus();
+}
+
+void UCreatorHUDWidget::SetPlacementText(UTextBlock* InPlacementText)
+{
+    AssignedPlacementText = InPlacementText;
+    RefreshStatus();
+}
+
+void UCreatorHUDWidget::SetMessageText(UTextBlock* InMessageText)
+{
+    AssignedMessageText = InMessageText;
+    RefreshStatus();
+}
+
 void UCreatorHUDWidget::NativeConstruct()
 {
     Super::NativeConstruct();
@@ -66,8 +103,8 @@ void UCreatorHUDWidget::NativeDestruct()
 
 void UCreatorHUDWidget::UpdateFromGameUpdate(float DeltaSeconds)
 {
-    if (!IsValid(CreatorHUD_StatusText) && !IsValid(CreatorHUD_PlacementText) &&
-        !IsValid(CreatorHUD_MessageText) && !IsValid(CreatorHUD_ItemListPanel))
+    if (!IsValid(AssignedStatusText.Get()) && !IsValid(AssignedPlacementText.Get()) &&
+        !IsValid(AssignedMessageText.Get()) && !IsValid(AssignedItemListPanel.Get()))
     {
         return;
     }
@@ -93,31 +130,31 @@ void UCreatorHUDWidget::RefreshItemList()
     // No native fallback item buttons are generated here anymore.
     // User-authored WBP graphs should build their own list and call SelectAvailableItemFromUI().
 
-    if (IsValid(CreatorHUD_ItemListPanel))
+    if (IsValid(AssignedItemListPanel.Get()))
     {
         const UGameManagerSubSystem* Manager = GetGameManager();
-        CreatorHUD_ItemListPanel->SetVisibility(IsValid(Manager) && Manager->IsItemListWindowOpen() ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
+        AssignedItemListPanel.Get()->SetVisibility(IsValid(Manager) && Manager->IsItemListWindowOpen() ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
     }
 }
 
 void UCreatorHUDWidget::RefreshStatus()
 {
-    if (IsValid(CreatorHUD_StatusText))
+    if (IsValid(AssignedStatusText.Get()))
     {
-        CreatorHUD_StatusText->SetText(GetStatusText());
+        AssignedStatusText.Get()->SetText(GetStatusText());
     }
-    if (IsValid(CreatorHUD_PlacementText))
+    if (IsValid(AssignedPlacementText.Get()))
     {
-        CreatorHUD_PlacementText->SetText(GetPlacementInfoText());
+        AssignedPlacementText.Get()->SetText(GetPlacementInfoText());
     }
-    if (IsValid(CreatorHUD_MessageText))
+    if (IsValid(AssignedMessageText.Get()))
     {
-        CreatorHUD_MessageText->SetText(GetMessageText());
+        AssignedMessageText.Get()->SetText(GetMessageText());
     }
-    if (IsValid(CreatorHUD_ItemListPanel))
+    if (IsValid(AssignedItemListPanel.Get()))
     {
         const UGameManagerSubSystem* Manager = GetGameManager();
-        CreatorHUD_ItemListPanel->SetVisibility(IsValid(Manager) && Manager->IsItemListWindowOpen() ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
+        AssignedItemListPanel.Get()->SetVisibility(IsValid(Manager) && Manager->IsItemListWindowOpen() ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
     }
 }
 
