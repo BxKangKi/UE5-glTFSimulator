@@ -12,7 +12,6 @@
 #include "World/WeatherActor.h"
 #include "Components/SceneComponent.h"
 #include "Materials/MaterialInterface.h"
-#include "UObject/ConstructorHelpers.h"
 
 AGameManagerActor::AGameManagerActor()
 {
@@ -21,11 +20,7 @@ AGameManagerActor::AGameManagerActor()
     USceneComponent* SceneRoot = CreateDefaultSubobject<USceneComponent>(TEXT("Root"));
     SetRootComponent(SceneRoot);
 
-    static ConstructorHelpers::FObjectFinder<UMaterialInterface> GridMaterialFinder(TEXT("/Engine/EngineDebugMaterials/VertexColorMaterial.VertexColorMaterial"));
-    if (GridMaterialFinder.Succeeded())
-    {
-        PlacementGridMaterial = GridMaterialFinder.Object;
-    }
+    // PlacementGridMaterial is assigned directly in the owning Blueprint/class defaults.
 
     PrefabActorClass = APrefabActor::StaticClass();
     EditableMeshActorClass = AEditableMeshActor::StaticClass();

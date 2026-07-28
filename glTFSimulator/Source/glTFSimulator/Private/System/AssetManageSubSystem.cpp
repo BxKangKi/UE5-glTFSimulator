@@ -7,13 +7,23 @@
 #include "Engine/StaticMesh.h"
 #include "Engine/Texture.h"
 #include "Materials/MaterialInterface.h"
-#include "Misc/Crc.h"
 #include "Misc/ScopeLock.h"
 #include "System/FileFunctionLibrary.h"
 #include "System/MacroLibrary.h"
 
 namespace
 {
+    template <typename TObjectType>
+    static void RetainGeneratedObject(TObjectType* Object)
+    {
+        if (IsValid(Object) && !Object->IsAsset() && !Object->IsRooted())
+        {
+            // The registry owns runtime-generated objects between async creation and component
+            // attachment. Release paths remove this root before marking the object as garbage.
+            Object->AddToRoot();
+        }
+    }
+
     template <typename TObjectType>
     static void MarkGeneratedObjectAsGarbage(TObjectType* Object)
     {
@@ -62,15 +72,15 @@ void UAssetManageSubSystem::DeactivateAndRelease()
 {
     FScopeLock Lock(&RegistryLock);
 
-    for (TPair<uint32, FManagedStaticMeshEntry>& Pair : StaticMeshSet)
+    for (TPair<FManagedStaticMeshKey, FManagedStaticMeshEntry>& Pair : StaticMeshSet)
     {
         MarkGeneratedObjectAsGarbage(Pair.Value.Asset.Get());
     }
-    for (TPair<uint32, FManagedMaterialEntry>& Pair : MaterialSet)
+    for (TPair<TWeakObjectPtr<UMaterialInterface>, FManagedMaterialEntry>& Pair : MaterialSet)
     {
         MarkGeneratedObjectAsGarbage(Pair.Value.Asset.Get());
     }
-    for (TPair<uint32, FManagedTextureEntry>& Pair : TextureSet)
+    for (TPair<TWeakObjectPtr<UTexture>, FManagedTextureEntry>& Pair : TextureSet)
     {
         MarkGeneratedObjectAsGarbage(Pair.Value.Asset.Get());
     }
@@ -82,19 +92,31 @@ void UAssetManageSubSystem::DeactivateAndRelease()
     WriteLogAsync(TEXT("AssetManageSubSystem deactivated and runtime asset registries were cleared"));
 }
 
-UStaticMesh* UAssetManageSubSystem::AcquireStaticMesh(UObject* WorldContextObject, const FName& MeshKey, UStaticMesh* GeneratedMeshAsset)
+UStaticMesh* UAssetManageSubSystem::AcquireStaticMesh(
+    UObject* WorldContextObject,
+    const FName& MeshKey,
+    UStaticMesh* GeneratedMeshAsset)
 {
     if (!bActive || !IsValid(GeneratedMeshAsset) || GeneratedMeshAsset->IsAsset())
     {
         return GeneratedMeshAsset;
     }
 
-    DeduplicateStaticMeshMaterials(WorldContextObject, GeneratedMeshAsset);
+    // A glTF mesh name is only unique inside its owning runtime asset. Scope it to the caller
+    // (normally AglTFStreamActor) so different world files with the same mesh name never merge.
+    UObject* RegistryScope = IsValid(WorldContextObject)
+        ? WorldContextObject
+        : GeneratedMeshAsset->GetOuter();
+    if (MeshKey.IsNone())
+    {
+        // An unnamed mesh must never be merged with another unnamed mesh.
+        RegistryScope = GeneratedMeshAsset;
+    }
 
-    const uint32 Hash = HashStaticMesh(MeshKey, GeneratedMeshAsset);
+    const FManagedStaticMeshKey RegistryKey(RegistryScope, MeshKey);
     FScopeLock Lock(&RegistryLock);
 
-    if (FManagedStaticMeshEntry* ExistingEntry = StaticMeshSet.Find(Hash))
+    if (FManagedStaticMeshEntry* ExistingEntry = StaticMeshSet.Find(RegistryKey))
     {
         if (ExistingEntry->Asset.IsValid())
         {
@@ -104,16 +126,27 @@ UStaticMesh* UAssetManageSubSystem::AcquireStaticMesh(UObject* WorldContextObjec
             {
                 MarkGeneratedObjectAsGarbage(GeneratedMeshAsset);
             }
-            WriteLogAsync(FString::Printf(TEXT("StaticMesh deduplicated. Key=%s Hash=%u RefCount=%d"), *MeshKey.ToString(), Hash, ExistingEntry->RefCount));
+            WriteLogAsync(FString::Printf(
+                TEXT("StaticMesh reused by scoped key. Scope=%s Key=%s RefCount=%d"),
+                *GetNameSafe(RegistryScope),
+                *MeshKey.ToString(),
+                ExistingEntry->RefCount));
             return ExistingMesh;
         }
+
+        StaticMeshSet.Remove(RegistryKey);
     }
+
+    RetainGeneratedObject(GeneratedMeshAsset);
 
     FManagedStaticMeshEntry NewEntry;
     NewEntry.Asset = GeneratedMeshAsset;
     NewEntry.RefCount = 1;
-    StaticMeshSet.Add(Hash, NewEntry);
-    WriteLogAsync(FString::Printf(TEXT("StaticMesh registered. Key=%s Hash=%u"), *MeshKey.ToString(), Hash));
+    StaticMeshSet.Add(RegistryKey, NewEntry);
+    WriteLogAsync(FString::Printf(
+        TEXT("StaticMesh registered by scoped key. Scope=%s Key=%s"),
+        *GetNameSafe(RegistryScope),
+        *MeshKey.ToString()));
     return GeneratedMeshAsset;
 }
 
@@ -131,7 +164,10 @@ void UAssetManageSubSystem::ReleaseStaticMesh(UObject* WorldContextObject, UStat
         if (Entry.Asset.Get() == GeneratedMeshAsset)
         {
             Entry.RefCount = FMath::Max(0, Entry.RefCount - 1);
-            WriteLogAsync(FString::Printf(TEXT("StaticMesh released. Hash=%u RefCount=%d"), It.Key(), Entry.RefCount));
+            WriteLogAsync(FString::Printf(
+                TEXT("StaticMesh released. Key=%s RefCount=%d"),
+                *It.Key().MeshKey.ToString(),
+                Entry.RefCount));
             if (Entry.RefCount <= 0)
             {
                 MarkGeneratedObjectAsGarbage(GeneratedMeshAsset);
@@ -142,57 +178,53 @@ void UAssetManageSubSystem::ReleaseStaticMesh(UObject* WorldContextObject, UStat
     }
 }
 
-UMaterialInterface* UAssetManageSubSystem::AcquireMaterial(UObject* WorldContextObject, UMaterialInterface* GeneratedMaterialAsset)
+UMaterialInterface* UAssetManageSubSystem::AcquireMaterial(
+    UObject* WorldContextObject,
+    UMaterialInterface* GeneratedMaterialAsset)
 {
     if (!bActive || !IsValid(GeneratedMaterialAsset) || GeneratedMaterialAsset->IsAsset())
     {
         return GeneratedMaterialAsset;
     }
 
-    const uint32 Hash = HashMaterial(GeneratedMaterialAsset);
+    // Runtime material instances may share the same short UObject name under different outers
+    // while containing completely different glTF texture parameters. Track exact identity only.
+    const TWeakObjectPtr<UMaterialInterface> RegistryKey(GeneratedMaterialAsset);
     FScopeLock Lock(&RegistryLock);
 
-    if (FManagedMaterialEntry* ExistingEntry = MaterialSet.Find(Hash))
+    if (FManagedMaterialEntry* ExistingEntry = MaterialSet.Find(RegistryKey))
     {
-        if (ExistingEntry->Asset.IsValid())
-        {
-            ++ExistingEntry->RefCount;
-            UMaterialInterface* ExistingMaterial = ExistingEntry->Asset.Get();
-            if (ExistingMaterial != GeneratedMaterialAsset)
-            {
-                MarkGeneratedObjectAsGarbage(GeneratedMaterialAsset);
-            }
-            return ExistingMaterial;
-        }
+        ++ExistingEntry->RefCount;
+        return GeneratedMaterialAsset;
     }
+
+    RetainGeneratedObject(GeneratedMaterialAsset);
 
     FManagedMaterialEntry NewEntry;
     NewEntry.Asset = GeneratedMaterialAsset;
     NewEntry.RefCount = 1;
-    MaterialSet.Add(Hash, NewEntry);
+    MaterialSet.Add(RegistryKey, NewEntry);
     return GeneratedMaterialAsset;
 }
 
-void UAssetManageSubSystem::ReleaseMaterial(UObject* WorldContextObject, UMaterialInterface* GeneratedMaterialAsset)
+void UAssetManageSubSystem::ReleaseMaterial(
+    UObject* WorldContextObject,
+    UMaterialInterface* GeneratedMaterialAsset)
 {
     if (!bActive || !IsValid(GeneratedMaterialAsset) || GeneratedMaterialAsset->IsAsset())
     {
         return;
     }
 
+    const TWeakObjectPtr<UMaterialInterface> RegistryKey(GeneratedMaterialAsset);
     FScopeLock Lock(&RegistryLock);
-    for (auto It = MaterialSet.CreateIterator(); It; ++It)
+    if (FManagedMaterialEntry* Entry = MaterialSet.Find(RegistryKey))
     {
-        FManagedMaterialEntry& Entry = It.Value();
-        if (Entry.Asset.Get() == GeneratedMaterialAsset)
+        Entry->RefCount = FMath::Max(0, Entry->RefCount - 1);
+        if (Entry->RefCount <= 0)
         {
-            Entry.RefCount = FMath::Max(0, Entry.RefCount - 1);
-            if (Entry.RefCount <= 0)
-            {
-                MarkGeneratedObjectAsGarbage(GeneratedMaterialAsset);
-                It.RemoveCurrent();
-            }
-            return;
+            MarkGeneratedObjectAsGarbage(GeneratedMaterialAsset);
+            MaterialSet.Remove(RegistryKey);
         }
     }
 }
@@ -204,27 +236,23 @@ UTexture* UAssetManageSubSystem::AcquireTexture(UObject* WorldContextObject, UTe
         return GeneratedTextureAsset;
     }
 
-    const uint32 Hash = HashTexture(GeneratedTextureAsset);
+    // Texture object names are not content hashes. Different imported images can legally have the
+    // same short UObject name, so only repeated acquisition of the same object is coalesced.
+    const TWeakObjectPtr<UTexture> RegistryKey(GeneratedTextureAsset);
     FScopeLock Lock(&RegistryLock);
 
-    if (FManagedTextureEntry* ExistingEntry = TextureSet.Find(Hash))
+    if (FManagedTextureEntry* ExistingEntry = TextureSet.Find(RegistryKey))
     {
-        if (ExistingEntry->Asset.IsValid())
-        {
-            ++ExistingEntry->RefCount;
-            UTexture* ExistingTexture = ExistingEntry->Asset.Get();
-            if (ExistingTexture != GeneratedTextureAsset)
-            {
-                MarkGeneratedObjectAsGarbage(GeneratedTextureAsset);
-            }
-            return ExistingTexture;
-        }
+        ++ExistingEntry->RefCount;
+        return GeneratedTextureAsset;
     }
+
+    RetainGeneratedObject(GeneratedTextureAsset);
 
     FManagedTextureEntry NewEntry;
     NewEntry.Asset = GeneratedTextureAsset;
     NewEntry.RefCount = 1;
-    TextureSet.Add(Hash, NewEntry);
+    TextureSet.Add(RegistryKey, NewEntry);
     return GeneratedTextureAsset;
 }
 
@@ -235,82 +263,15 @@ void UAssetManageSubSystem::ReleaseTexture(UObject* WorldContextObject, UTexture
         return;
     }
 
+    const TWeakObjectPtr<UTexture> RegistryKey(GeneratedTextureAsset);
     FScopeLock Lock(&RegistryLock);
-    for (auto It = TextureSet.CreateIterator(); It; ++It)
+    if (FManagedTextureEntry* Entry = TextureSet.Find(RegistryKey))
     {
-        FManagedTextureEntry& Entry = It.Value();
-        if (Entry.Asset.Get() == GeneratedTextureAsset)
+        Entry->RefCount = FMath::Max(0, Entry->RefCount - 1);
+        if (Entry->RefCount <= 0)
         {
-            Entry.RefCount = FMath::Max(0, Entry.RefCount - 1);
-            if (Entry.RefCount <= 0)
-            {
-                MarkGeneratedObjectAsGarbage(GeneratedTextureAsset);
-                It.RemoveCurrent();
-            }
-            return;
-        }
-    }
-}
-
-uint32 UAssetManageSubSystem::HashStaticMesh(const FName& MeshKey, const UStaticMesh* Mesh) const
-{
-    FString KeyString;
-    if (Mesh)
-    {
-        KeyString += Mesh->GetBoundingBox().GetSize().ToCompactString();
-        KeyString += FString::FromInt(Mesh->GetStaticMaterials().Num());
-        for (int32 Index = 0; Index < Mesh->GetStaticMaterials().Num(); ++Index)
-        {
-            if (UMaterialInterface* Material = const_cast<UStaticMesh*>(Mesh)->GetMaterial(Index))
-            {
-                KeyString += Material->GetName();
-            }
-        }
-    }
-    return FCrc::StrCrc32(*KeyString);
-}
-
-uint32 UAssetManageSubSystem::HashMaterial(const UMaterialInterface* Material) const
-{
-    if (!Material)
-    {
-        return 0;
-    }
-
-    FString KeyString = Material->GetClass()->GetName();
-    KeyString += TEXT("|");
-    KeyString += Material->GetName();
-    return FCrc::StrCrc32(*KeyString);
-}
-
-uint32 UAssetManageSubSystem::HashTexture(const UTexture* Texture) const
-{
-    if (!Texture)
-    {
-        return 0;
-    }
-
-    FString KeyString = Texture->GetClass()->GetName();
-    KeyString += TEXT("|");
-    KeyString += Texture->GetName();
-    return FCrc::StrCrc32(*KeyString);
-}
-
-void UAssetManageSubSystem::DeduplicateStaticMeshMaterials(UObject* WorldContextObject, UStaticMesh* Mesh)
-{
-    if (!IsValid(Mesh))
-    {
-        return;
-    }
-
-    const int32 MaterialCount = Mesh->GetStaticMaterials().Num();
-    for (int32 MaterialIndex = 0; MaterialIndex < MaterialCount; ++MaterialIndex)
-    {
-        UMaterialInterface* Material = Mesh->GetMaterial(MaterialIndex);
-        UMaterialInterface* ManagedMaterial = AcquireMaterial(WorldContextObject, Material);
-        if (ManagedMaterial && ManagedMaterial != Material)
-        {
-            Mesh->SetMaterial(MaterialIndex, ManagedMaterial);
+            MarkGeneratedObjectAsGarbage(GeneratedTextureAsset);
+            TextureSet.Remove(RegistryKey);
         }
     }
 }

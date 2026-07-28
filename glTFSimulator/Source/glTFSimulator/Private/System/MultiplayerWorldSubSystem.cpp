@@ -7,6 +7,23 @@
 #include "GameFramework/PlayerController.h"
 #include "Kismet/GameplayStatics.h"
 
+namespace
+{
+    bool IsReturningToWorldSelection(const UObject* WorldContextObject)
+    {
+        if (UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(WorldContextObject))
+        {
+            if (Manager->ShouldOpenWorldSelectionMenuOnNextMainWorld())
+            {
+                UE_LOG(LogTemp, Display,
+                    TEXT("[WorldSelection] Ignored stale gameplay-world travel while returning to world selection."));
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
 UMultiplayerWorldSubSystem* UMultiplayerWorldSubSystem::Get(const UObject* WorldContextObject)
 {
     if (!IsValid(WorldContextObject))
@@ -37,19 +54,39 @@ UMultiplayerWorldSubSystem* UMultiplayerWorldSubSystem::Get(const UObject* World
     return GameInstance ? GameInstance->GetSubsystem<UMultiplayerWorldSubSystem>() : nullptr;
 }
 
-bool UMultiplayerWorldSubSystem::OpenLevelByName(const UObject* WorldContextObject, FName LevelName, const FString& Options) const
+bool UMultiplayerWorldSubSystem::OpenWorldByReference(
+    const UObject* WorldContextObject,
+    TSoftObjectPtr<UWorld> WorldAsset,
+    const FString& Options) const
 {
-    if (!IsValid(WorldContextObject) || LevelName == NAME_None)
+    if (!IsValid(WorldContextObject) || WorldAsset.IsNull())
     {
         return false;
     }
 
-    UGameplayStatics::OpenLevel(WorldContextObject, LevelName, true, Options);
+    if (IsReturningToWorldSelection(WorldContextObject))
+    {
+        return false;
+    }
+
+    UE_LOG(LogTemp, Display,
+        TEXT("[WorldSelection] Opening a directly assigned world reference. Options=%s"),
+        Options.IsEmpty() ? TEXT("<none>") : *Options);
+
+    UGameplayStatics::OpenLevelBySoftObjectPtr(WorldContextObject, WorldAsset, true, Options);
     return true;
 }
 
-bool UMultiplayerWorldSubSystem::StartSinglePlayerWorld(const UObject* WorldContextObject, const FString& WorldFolderName, FName SingleWorldLevelName)
+bool UMultiplayerWorldSubSystem::StartSinglePlayerWorld(
+    const UObject* WorldContextObject,
+    const FString& WorldFolderName,
+    TSoftObjectPtr<UWorld> SinglePlayerWorld)
 {
+    if (IsReturningToWorldSelection(WorldContextObject))
+    {
+        return false;
+    }
+
     WorldMode = EMultiplayerWorldMode::SinglePlayer;
     SelectedWorldFolderName = WorldFolderName;
 
@@ -58,11 +95,28 @@ bool UMultiplayerWorldSubSystem::StartSinglePlayerWorld(const UObject* WorldCont
         Manager->SetCurrentWorldName(WorldFolderName);
     }
 
-    return OpenLevelByName(WorldContextObject, SingleWorldLevelName != NAME_None ? SingleWorldLevelName : FName(TEXT("SingleWorld")));
+    FString Options;
+    if (!WorldFolderName.IsEmpty())
+    {
+        // GameManagerSubSystem reads this option in the destination map. This is required because
+        // the old world's shutdown can clear transient references during OpenLevel.
+        Options = FString::Printf(TEXT("World=%s"), *WorldFolderName);
+    }
+
+    return OpenWorldByReference(WorldContextObject, SinglePlayerWorld, Options);
 }
 
-bool UMultiplayerWorldSubSystem::HostMultiplayerWorld(const UObject* WorldContextObject, const FString& WorldFolderName, FName HostWorldLevelName, int32 Port)
+bool UMultiplayerWorldSubSystem::HostMultiplayerWorld(
+    const UObject* WorldContextObject,
+    const FString& WorldFolderName,
+    TSoftObjectPtr<UWorld> HostWorld,
+    int32 Port)
 {
+    if (IsReturningToWorldSelection(WorldContextObject))
+    {
+        return false;
+    }
+
     WorldMode = EMultiplayerWorldMode::Host;
     SelectedWorldFolderName = WorldFolderName;
 
@@ -81,18 +135,25 @@ bool UMultiplayerWorldSubSystem::HostMultiplayerWorld(const UObject* WorldContex
         Options += FString::Printf(TEXT("?Port=%d"), Port);
     }
 
-    return OpenLevelByName(WorldContextObject, HostWorldLevelName != NAME_None ? HostWorldLevelName : FName(TEXT("HostWorld")), Options);
+    return OpenWorldByReference(WorldContextObject, HostWorld, Options);
 }
 
-bool UMultiplayerWorldSubSystem::OpenClientConnectionWorld(const UObject* WorldContextObject, FName ClientWorldLevelName)
+bool UMultiplayerWorldSubSystem::OpenClientConnectionWorld(
+    const UObject* WorldContextObject,
+    TSoftObjectPtr<UWorld> ClientWorld)
 {
+    if (IsReturningToWorldSelection(WorldContextObject))
+    {
+        return false;
+    }
+
     WorldMode = EMultiplayerWorldMode::Client;
-    return OpenLevelByName(WorldContextObject, ClientWorldLevelName != NAME_None ? ClientWorldLevelName : FName(TEXT("ClientWorld")));
+    return OpenWorldByReference(WorldContextObject, ClientWorld);
 }
 
 bool UMultiplayerWorldSubSystem::JoinMultiplayerWorld(const UObject* WorldContextObject, const FString& InServerAddress, const FString& WorldFolderName)
 {
-    if (!IsValid(WorldContextObject))
+    if (!IsValid(WorldContextObject) || IsReturningToWorldSelection(WorldContextObject))
     {
         return false;
     }

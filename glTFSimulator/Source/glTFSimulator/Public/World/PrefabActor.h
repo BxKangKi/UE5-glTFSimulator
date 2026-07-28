@@ -4,6 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
+#include "Model/glTFMaterialAssetReferences.h"
 #include "World/PlacementTypes.h"
 #include "PrefabActor.generated.h"
 
@@ -81,6 +82,10 @@ protected:
     virtual void Destroyed() override;
 
 private:
+    /** glTFRuntime material assets assigned directly in the owning Blueprint/class defaults. */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Prefab|Assets", meta=(AllowPrivateAccess="true"))
+    FglTFMaterialAssetReferences MaterialAssets;
+
     UPROPERTY(VisibleAnywhere)
     TObjectPtr<USceneComponent> Root;
 

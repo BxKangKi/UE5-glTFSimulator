@@ -6,6 +6,8 @@
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "MultiplayerWorldSubSystem.generated.h"
 
+class UWorld;
+
 UENUM(BlueprintType)
 enum class EMultiplayerWorldMode : uint8
 {
@@ -15,7 +17,7 @@ enum class EMultiplayerWorldMode : uint8
 };
 
 /**
- * Stores the current play mode and centralizes level travel for SingleWorld / HostWorld / ClientWorld.
+ * Stores the current play mode and centralizes travel to directly assigned world assets.
  * The subsystem lives for the GameInstance lifetime, so the selected world folder and server address
  * survive the MainWorld -> gameplay-world travel.
  */
@@ -43,13 +45,13 @@ public:
     FString GetServerAddress() const { return ServerAddress; }
 
     UFUNCTION(BlueprintCallable, Category="Multiplayer", meta=(WorldContext="WorldContextObject"))
-    bool StartSinglePlayerWorld(const UObject* WorldContextObject, const FString& WorldFolderName, FName SingleWorldLevelName);
+    bool StartSinglePlayerWorld(const UObject* WorldContextObject, const FString& WorldFolderName, TSoftObjectPtr<UWorld> SinglePlayerWorld);
 
     UFUNCTION(BlueprintCallable, Category="Multiplayer", meta=(WorldContext="WorldContextObject"))
-    bool HostMultiplayerWorld(const UObject* WorldContextObject, const FString& WorldFolderName, FName HostWorldLevelName, int32 Port = 7777);
+    bool HostMultiplayerWorld(const UObject* WorldContextObject, const FString& WorldFolderName, TSoftObjectPtr<UWorld> HostWorld, int32 Port = 7777);
 
     UFUNCTION(BlueprintCallable, Category="Multiplayer", meta=(WorldContext="WorldContextObject"))
-    bool OpenClientConnectionWorld(const UObject* WorldContextObject, FName ClientWorldLevelName);
+    bool OpenClientConnectionWorld(const UObject* WorldContextObject, TSoftObjectPtr<UWorld> ClientWorld);
 
     UFUNCTION(BlueprintCallable, Category="Multiplayer", meta=(WorldContext="WorldContextObject"))
     bool JoinMultiplayerWorld(const UObject* WorldContextObject, const FString& InServerAddress, const FString& WorldFolderName);
@@ -71,5 +73,5 @@ private:
     FString SelectedWorldFolderName;
     FString ServerAddress = TEXT("127.0.0.1:7777");
 
-    bool OpenLevelByName(const UObject* WorldContextObject, FName LevelName, const FString& Options = FString()) const;
+    bool OpenWorldByReference(const UObject* WorldContextObject, TSoftObjectPtr<UWorld> WorldAsset, const FString& Options = FString()) const;
 };

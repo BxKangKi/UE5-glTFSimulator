@@ -112,6 +112,12 @@ void UGameManagerSubSystem::Deinitialize()
         PostLoadMapCleanupHandle.Reset();
     }
 
+    RegisteredWorldSelectionWorld.Reset();
+    WorldSelectionTravelSourceWorld.Reset();
+    WorldNameBeforeMenuTravel.Reset();
+    bMenuTravelStatePrepared = false;
+    bMenuTravelSaveCompleted = false;
+
     Super::Deinitialize();
 }
 
@@ -202,6 +208,46 @@ UGameManagerSubSystem *UGameManagerSubSystem::GetSubSystem(UWorld *InWorld)
     }
 }
 
+
+void UGameManagerSubSystem::RegisterWorldSelectionWorld(TSoftObjectPtr<UWorld> InWorldSelectionWorld)
+{
+    if (InWorldSelectionWorld.IsNull())
+    {
+        return;
+    }
+
+    RegisteredWorldSelectionWorld = InWorldSelectionWorld;
+    UE_LOG(LogTemp, Display,
+        TEXT("[MenuTravel] StartActor registered the current menu world as the pause-Exit fallback: %s"),
+        *GetNameSafe(InWorldSelectionWorld.Get()));
+}
+
+void UGameManagerSubSystem::FinalizeWorldSelectionTravelState()
+{
+    bOpenWorldSelectionMenuOnNextMainWorld = false;
+    bWorldSelectionMenuTravelInProgress = false;
+    WorldSelectionTravelSourceWorld.Reset();
+    WorldNameBeforeMenuTravel.Reset();
+    bMenuTravelStatePrepared = false;
+    bMenuTravelSaveCompleted = false;
+}
+
+void UGameManagerSubSystem::CancelWorldSelectionMenuTravel()
+{
+    if (bMenuTravelStatePrepared)
+    {
+        CurrentWorldName = WorldNameBeforeMenuTravel;
+        if (UMultiplayerWorldSubSystem* Multiplayer = UMultiplayerWorldSubSystem::Get(this))
+        {
+            Multiplayer->SetSelectedWorldFolderName(CurrentWorldName);
+        }
+    }
+
+    bPendingMainWorldRuntimePurge = false;
+    FinalizeWorldSelectionTravelState();
+    UE_LOG(LogTemp, Warning,
+        TEXT("[MenuTravel] Cancelled the pending world-selection request and restored the active gameplay-world state."));
+}
 
 void UGameManagerSubSystem::ToggleFullscreen()
 {
@@ -350,16 +396,30 @@ void UGameManagerSubSystem::StartGameManager(AGameManagerActor* InConfigActor)
     ConfigActor = InConfigActor;
     ApplyEditorConfig(InConfigActor);
 
+    // A newly started gameplay manager belongs to a completed menu -> gameplay transition.
+    bMenuTravelStatePrepared = false;
+    bMenuTravelSaveCompleted = false;
+    WorldNameBeforeMenuTravel.Reset();
+
     if (UWorld* World = GetWorld())
     {
+        UMultiplayerWorldSubSystem* Multiplayer = UMultiplayerWorldSubSystem::Get(this);
         const TCHAR* WorldOption = World->URL.GetOption(TEXT("World="), nullptr);
         if (WorldOption && FCString::Strlen(WorldOption) > 0)
         {
             CurrentWorldName = FString(WorldOption);
-            if (UMultiplayerWorldSubSystem* Multiplayer = UMultiplayerWorldSubSystem::Get(this))
-            {
-                Multiplayer->SetSelectedWorldFolderName(CurrentWorldName);
-            }
+        }
+        else if (CurrentWorldName.IsEmpty() && IsValid(Multiplayer))
+        {
+            // Single-player OpenLevel historically omitted the World URL option. Recover from the
+            // GameInstance subsystem so the selected folder survives MainWorld -> SingleWorld travel.
+            CurrentWorldName = Multiplayer->GetSelectedWorldFolderName();
+        }
+
+        CurrentWorldName.TrimStartAndEndInline();
+        if (!CurrentWorldName.IsEmpty() && IsValid(Multiplayer))
+        {
+            Multiplayer->SetSelectedWorldFolderName(CurrentWorldName);
         }
 
         if (World->GetNetMode() != NM_Standalone && World->GetNetMode() != NM_Client)
@@ -432,26 +492,53 @@ void UGameManagerSubSystem::StopGameManager(const EEndPlayReason::Type EndPlayRe
         World->GetTimerManager().ClearAllTimersForObject(this);
     }
 
-    if (bHadActiveMainWorld && bSaveSceneOnEndPlay && EndPlayReason != EEndPlayReason::Destroyed)
+    if (bHadActiveMainWorld && bSaveSceneOnEndPlay && !bMenuTravelSaveCompleted
+        && EndPlayReason != EEndPlayReason::Destroyed)
     {
+        // Saving is intentionally performed from EndPlay rather than the pause-menu OnClicked
+        // handler. This keeps Exit responsive even when the streamed glTF scene is large.
         SaveScene();
         SaveWorldData();
         SavePlayerData();
+        bMenuTravelSaveCompleted = true;
+    }
+
+    if (bMenuTravelStatePrepared)
+    {
+        // The source folder must remain valid until the EndPlay save above finishes. Clear it only
+        // after level teardown has committed the gameplay state.
+        CurrentWorldName.Reset();
+        if (UMultiplayerWorldSubSystem* Multiplayer = UMultiplayerWorldSubSystem::Get(this))
+        {
+            Multiplayer->SetSelectedWorldFolderName(FString());
+        }
     }
 
     ReleaseMainWorldRuntimeMemory(false);
 }
 
+void UGameManagerSubSystem::PrepareForMenuLevelTravelRequest()
+{
+    if (bMenuTravelStatePrepared)
+    {
+        SetGamePaused(false);
+        return;
+    }
+
+    // The button callback only records intent and unpauses travel. Saving, actor destruction,
+    // asset release, and the expensive purge all occur during level teardown/PostLoadMap.
+    WorldNameBeforeMenuTravel = CurrentWorldName;
+    bMenuTravelStatePrepared = true;
+    bMenuTravelSaveCompleted = false;
+    RequestPostLoadRuntimeMemoryCleanup();
+    SetGamePaused(false);
+}
+
 void UGameManagerSubSystem::PrepareForReturnToMenuLevel()
 {
-    SaveScene();
-    SaveWorldData();
-    SavePlayerData();
-
-    // The old gameplay world will still exist until OpenLevel finishes. Do the destructive release now,
-    // then run the expensive full purge once the menu/world-selection level has loaded.
-    RequestPostLoadRuntimeMemoryCleanup();
-    ReleaseMainWorldRuntimeMemory(false);
+    // Backward-compatible Blueprint/C++ entry point. It is deliberately non-destructive so legacy
+    // Exit-button listeners cannot freeze the UI before OpenLevel has even been requested.
+    PrepareForMenuLevelTravelRequest();
 }
 
 void UGameManagerSubSystem::PrepareForReturnToMainWorld()
@@ -480,13 +567,13 @@ void UGameManagerSubSystem::RequestWorldSelectionMenuOnNextStartWorld()
 bool UGameManagerSubSystem::ConsumeWorldSelectionMenuRequest()
 {
     const bool bShouldOpenWorldSelection = bOpenWorldSelectionMenuOnNextMainWorld;
-    bOpenWorldSelectionMenuOnNextMainWorld = false;
+    FinalizeWorldSelectionTravelState();
     return bShouldOpenWorldSelection;
 }
 
 void UGameManagerSubSystem::ClearWorldSelectionMenuRequest()
 {
-    bOpenWorldSelectionMenuOnNextMainWorld = false;
+    FinalizeWorldSelectionTravelState();
 }
 
 void UGameManagerSubSystem::ReleaseMainWorldRuntimeMemory(bool bForceGarbageCollection)
@@ -1226,7 +1313,8 @@ void UGameManagerSubSystem::ClearTransientRuntimeReferences()
     ToolbarSlots.Reset();
     bToolbarInitialized = false;
 
-    CurrentWorldName.Reset();
+    // Keep CurrentWorldName across ordinary level travel. A confirmed menu return clears it only
+    // after StopGameManager has finished saving the source gameplay world.
     PlayerLocation = FVector::ZeroVector;
     SelectedToolbarSlotIndex = 0;
     CurrentPrefabIndex = 0;
@@ -1801,33 +1889,78 @@ void UGameManagerSubSystem::ResetEditorTransactionBufferForWorldTravel(const UOb
 #endif
 }
 
-void UGameManagerSubSystem::OpenWorldSelectionScreen(const UObject* WorldContextObject, FName WorldSelectionLevelName)
+void UGameManagerSubSystem::OpenWorldSelectionScreen(
+    const UObject* WorldContextObject,
+    TSoftObjectPtr<UWorld> WorldSelectionWorld)
 {
-    if (!WorldContextObject)
-    {
-        return;
-    }
-
-    if (UGameManagerSubSystem* Manager = FindGameManager(WorldContextObject))
-    {
-        Manager->PrepareForReturnToMenuLevel();
-        Manager->RequestWorldSelectionMenuOnNextMainWorld();
-    }
-
-    // The project uses the MainWorld map for both the main menu and the world-selection widget.
-    // StartActor consumes the pending request above and opens the level menu after MainWorld loads.
-    static const FName LegacyWorldSelectionLevelName(TEXT("WorldSelectWorld"));
-    const FName TargetLevelName = (WorldSelectionLevelName != NAME_None && WorldSelectionLevelName != LegacyWorldSelectionLevelName)
-        ? WorldSelectionLevelName
-        : FName(TEXT("MainWorld"));
-    ResetEditorTransactionBufferForWorldTravel(WorldContextObject, TEXT("Open world-selection screen"));
-    UGameplayStatics::OpenLevel(WorldContextObject, TargetLevelName);
+    TryOpenWorldSelectionScreen(WorldContextObject, WorldSelectionWorld);
 }
 
-void UGameManagerSubSystem::OpenMainMenuFromWorldSelection(const UObject* WorldContextObject, FName MainMenuLevelName)
+bool UGameManagerSubSystem::TryOpenWorldSelectionScreen(
+    const UObject* WorldContextObject,
+    TSoftObjectPtr<UWorld> WorldSelectionWorld)
 {
-    if (!WorldContextObject)
+    UWorld* SourceWorld = WorldContextObject ? WorldContextObject->GetWorld() : nullptr;
+    if (!WorldContextObject || !SourceWorld || WorldSelectionWorld.IsNull())
     {
+        UE_LOG(LogTemp, Error,
+            TEXT("[MenuTravel] Cannot open world selection because the context or directly referenced world is invalid."));
+        return false;
+    }
+
+    if (WorldSelectionWorld.Get() == SourceWorld)
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[MenuTravel] Refused pause Exit because the destination resolves to the active gameplay world."));
+        return false;
+    }
+
+    UGameManagerSubSystem* Manager = FindGameManager(WorldContextObject);
+    if (!IsValid(Manager))
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[MenuTravel] Cannot open world selection because the GameInstance manager is unavailable."));
+        return false;
+    }
+
+    if (Manager->bWorldSelectionMenuTravelInProgress)
+    {
+        if (Manager->WorldSelectionTravelSourceWorld.Get() == SourceWorld)
+        {
+            // A WBP and the native pause widget may both receive the same click. The first request
+            // owns travel; later listeners should report success without issuing another OpenLevel.
+            UE_LOG(LogTemp, Verbose,
+                TEXT("[MenuTravel] Equivalent world-selection request is already pending from this world."));
+            return true;
+        }
+
+        UE_LOG(LogTemp, Warning,
+            TEXT("[MenuTravel] Cleared a stale world-selection travel guard left by a previous world."));
+        Manager->FinalizeWorldSelectionTravelState();
+    }
+
+    // Set both guards before compatibility callbacks. Every later navigation request observes an
+    // accepted transition and cannot start a competing OpenLevel.
+    Manager->bWorldSelectionMenuTravelInProgress = true;
+    Manager->WorldSelectionTravelSourceWorld = SourceWorld;
+    Manager->RequestWorldSelectionMenuOnNextMainWorld();
+    Manager->PrepareForMenuLevelTravelRequest();
+
+    // StartActor clears the pending request only after the destination menu is input-safe.
+    ResetEditorTransactionBufferForWorldTravel(WorldContextObject, TEXT("Open world-selection screen"));
+    UE_LOG(LogTemp, Display, TEXT("[MenuTravel] Calling OpenLevelBySoftObjectPtr for world selection."));
+    UGameplayStatics::OpenLevelBySoftObjectPtr(WorldContextObject, WorldSelectionWorld, true, FString());
+    return true;
+}
+
+void UGameManagerSubSystem::OpenMainMenuFromWorldSelection(
+    const UObject* WorldContextObject,
+    TSoftObjectPtr<UWorld> MainMenuWorld)
+{
+    if (!WorldContextObject || MainMenuWorld.IsNull())
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("GameManagerSubSystem cannot open the main menu because no world asset is assigned."));
         return;
     }
 
@@ -1837,11 +1970,8 @@ void UGameManagerSubSystem::OpenMainMenuFromWorldSelection(const UObject* WorldC
         Manager->SetGamePaused(false);
     }
 
-    const FName TargetLevelName = MainMenuLevelName != NAME_None
-        ? MainMenuLevelName
-        : FName(TEXT("MainWorld"));
     ResetEditorTransactionBufferForWorldTravel(WorldContextObject, TEXT("Open main menu from world selection"));
-    UGameplayStatics::OpenLevel(WorldContextObject, TargetLevelName);
+    UGameplayStatics::OpenLevelBySoftObjectPtr(WorldContextObject, MainMenuWorld, true, FString());
 }
 
 FVector UGameManagerSubSystem::GetPendingPlacementSelection() const

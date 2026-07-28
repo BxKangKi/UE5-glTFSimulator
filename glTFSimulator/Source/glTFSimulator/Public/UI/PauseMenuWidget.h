@@ -45,6 +45,9 @@ public:
     UFUNCTION(BlueprintCallable, Category="Pause")
     void ExitFromUI();
 
+    /** Re-enables Exit after a rejected/failed level-travel request restores this cached widget. */
+    void ResetExitRequestState();
+
 private:
     void BindButtonEvents();
     void UnbindButtonEvents();
@@ -53,4 +56,7 @@ private:
     TWeakObjectPtr<UButton> AssignedContinueButton;
     TWeakObjectPtr<UButton> AssignedSettingsButton;
     TWeakObjectPtr<UButton> AssignedExitButton;
+
+    /** Prevents one click or duplicate Blueprint bindings from issuing more than one level travel. */
+    bool bExitRequestInProgress = false;
 };

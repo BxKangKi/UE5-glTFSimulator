@@ -7,6 +7,7 @@
 #include "GameFramework/PlayerController.h"
 #include "UI/CreatorHUDWidget.h"
 #include "System/GameManagerActor.h"
+#include "TimerManager.h"
 #include "PlayerCharacterController.generated.h"
 
 class AGameManagerActor;
@@ -18,6 +19,7 @@ class UUserWidget;
 class UPauseMenuWidget;
 class USettingsMenuWidget;
 class UGameUpdateSubSystem;
+class UWorld;
 
 USTRUCT(BlueprintType)
 struct GLTFSIMULATOR_API FPlayerInputMappingContextConfig
@@ -258,16 +260,13 @@ public:
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Pause")
     int32 SettingsMenuZOrder = 110;
 
-    // Leaving a gameplay world returns to MainWorld, then StartActor opens the world-selection widget.
+    /** Menu world that owns the world-selection flow. Assign the world asset directly. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Pause|Navigation")
-    FName WorldSelectionLevelName = TEXT("MainWorld");
+    TSoftObjectPtr<UWorld> WorldSelectionWorld;
 
+    /** Menu world shown when leaving the world-selection screen. Assign the world asset directly. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Pause|Navigation")
-    FName MainMenuLevelName = TEXT("MainWorld");
-
-    // Legacy property kept for older Blueprint assets. New code uses WorldSelectionLevelName.
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Pause|Navigation", meta=(DeprecatedProperty, DeprecationMessage="Use WorldSelectionLevelName instead."))
-    FName ExitLevelName = TEXT("MainWorld");
+    TSoftObjectPtr<UWorld> MainMenuWorld;
 
     UFUNCTION(BlueprintCallable, Category="Pause")
     UUserWidget* CreatePauseMenu();
@@ -293,6 +292,15 @@ public:
 
     UFUNCTION(BlueprintCallable, Category="Pause|Navigation")
     void ExitToWorldSelectionFromPauseMenu();
+
+    /** Starts pause-menu travel and reports whether this controller now owns an accepted request. */
+    bool TryExitToWorldSelectionFromPauseMenu();
+
+    /** Returns whether a directly assigned or StartActor-registered world-selection world is available. */
+    bool CanExitToWorldSelectionFromPauseMenu() const;
+
+    /** True after an accepted request, including duplicate listeners fired by the same button click. */
+    bool IsMenuWorldTravelPending() const { return bMenuWorldTravelPending; }
 
     // Assign this to the Back button on the world-selection widget.
     UFUNCTION(BlueprintCallable, Category="Pause|Navigation")
@@ -379,11 +387,11 @@ public:
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Input|Enhanced Input|System")
     TObjectPtr<UInputAction> PauseAction;
 
-    /** Boolean action for toggling the debug overlay. Defaults to /Game/Input/Actions/IA_Debug when available. */
+    /** Boolean action for toggling the debug overlay. Assign the InputAction asset directly. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Input|Enhanced Input|System")
     TObjectPtr<UInputAction> DebugAction;
 
-    // Assign the WBP_Debug class in the editor.
+    // Assign the debug widget class directly in the editor.
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "UI")
     TSubclassOf<UUserWidget> DebugWidgetClass;
 
@@ -416,6 +424,11 @@ private:
     void UpdateFallbackMoveInput();
     void StopFallbackMovement();
     void StopGameplayMotionForUI();
+    void LockInputForMenuWorldTravel();
+    TSoftObjectPtr<UWorld> ResolveWorldSelectionWorld() const;
+    void RestorePauseMenuAfterRejectedTravel();
+    void ArmMenuWorldTravelWatchdog();
+    void HandleMenuWorldTravelWatchdogExpired();
     void ReapplyHeldGameplayInput();
     void FallbackLookYaw(float Value);
     void FallbackLookPitch(float Value);
@@ -435,6 +448,10 @@ private:
     bool bPrevGamePaused = false;
     bool bIsDebug = false;
     bool bUIInputMode = false;
+    /** Blocks duplicate pause/back/Blueprint callbacks while a menu-world OpenLevel is pending. */
+    bool bMenuWorldTravelPending = false;
+    FTimerHandle MenuWorldTravelWatchdogHandle;
+    static constexpr float MenuWorldTravelWatchdogSeconds = 5.0f;
     bool bFallbackMoveForward = false;
     bool bFallbackMoveBackward = false;
     bool bFallbackMoveRight = false;

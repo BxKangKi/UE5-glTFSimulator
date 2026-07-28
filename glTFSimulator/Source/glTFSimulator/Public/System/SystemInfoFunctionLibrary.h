@@ -16,7 +16,7 @@ struct FSystemHardwareInfo
     FString GPUBrand;
 
     UPROPERTY(BlueprintReadOnly, Category = "System Info")
-    int32 CoreCount;
+    int32 CoreCount = 0;
 };
 
 UCLASS()

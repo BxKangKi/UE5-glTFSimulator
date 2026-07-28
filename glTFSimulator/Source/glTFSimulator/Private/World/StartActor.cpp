@@ -7,6 +7,7 @@
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
 #include "GameFramework/PlayerController.h"
+#include "InputCoreTypes.h"
 #include "Kismet/GameplayStatics.h"
 #include "Misc/Paths.h"
 #include "System/FileFunctionLibrary.h"
@@ -33,17 +34,27 @@ AStartActor::AStartActor()
 
     PendingServerAddress = DefaultServerAddress;
 
-    // Widget classes are intentionally assigned in BP_StartWorld. No fallback Blueprint paths are loaded here.
+    // Widget classes and world assets are assigned directly in the owning Blueprint/class defaults.
 }
 
 void AStartActor::BeginPlay()
 {
+    // Arm before Super::BeginPlay so a legacy Blueprint ReceiveBeginPlay cannot consume the
+    // carried-over Exit click and reopen gameplay before the native next-tick menu rebuild.
+    if (UGameManagerSubSystem* GameManager = UGameManagerSubSystem::GetSubSystem(this))
+    {
+        // Remember the loaded menu world as a soft object reference. Gameplay pause Exit can use
+        // this when its PlayerController Blueprint has not repeated the same world assignment.
+        GameManager->RegisterWorldSelectionWorld(TSoftObjectPtr<UWorld>(GetWorld()));
+        bWorldSelectionReturnInputGuardActive = GameManager->ShouldOpenWorldSelectionMenuOnNextMainWorld();
+    }
+
     Super::BeginPlay();
 
     // Rebuild the level list before any UI asks for it.
     BuildLevelFolderNameMap();
 
-    // Legacy BP_StartWorld graphs may still create widgets after calling the parent BeginPlay.
+    // Legacy derived Blueprint graphs may still create widgets after calling the parent BeginPlay.
     // Running on the next tick lets this native flow own the final visible menu and clean up legacy widgets.
     GetWorldTimerManager().SetTimerForNextTick(
         FTimerDelegate::CreateWeakLambda(this, [this]()
@@ -54,6 +65,11 @@ void AStartActor::BeginPlay()
 
 void AStartActor::Destroyed()
 {
+    if (UWorld* World = GetWorld())
+    {
+        World->GetTimerManager().ClearTimer(GameplayTravelWatchdogHandle);
+        World->GetTimerManager().ClearTimer(WorldSelectionReturnInputGuardHandle);
+    }
     RemoveAllMenuWidgets();
     ResetEditorTransactionBufferForMenuTravel(TEXT("StartActor destroyed"));
 
@@ -76,15 +92,21 @@ void AStartActor::InitializeStartScreenAfterBlueprintBeginPlay()
             GameManager->ReleaseMainWorldRuntimeMemory(true);
         }
 
-        bOpenWorldSelection = GameManager->ConsumeWorldSelectionMenuRequest();
+        // Keep the request alive until the return-input guard is released. This lets lower-level
+        // world-travel code reject any stale callback that tries to reopen gameplay during arrival.
+        bOpenWorldSelection = GameManager->ShouldOpenWorldSelectionMenuOnNextMainWorld();
     }
 
     if (bOpenWorldSelection)
     {
+        // Arm before widget construction so legacy WBP Construct callbacks cannot immediately
+        // reopen the previously selected gameplay world.
+        bWorldSelectionReturnInputGuardActive = true;
         ShowWorldSelectionMenu();
     }
     else
     {
+        CancelWorldSelectionReturnInputGuard();
         ShowStartMenu();
     }
 }
@@ -96,6 +118,21 @@ void AStartActor::StartGame()
 
 void AStartActor::ReturnToMainMenuFromWorldSelection()
 {
+    if (IsWorldSelectionReturnBlocked())
+    {
+        UE_LOG(LogTemp, Display,
+            TEXT("[WorldSelection] Ignored a carried-over Back callback while the return input guard is active."));
+        return;
+    }
+
+    if (bGameplayWorldTravelPending)
+    {
+        UE_LOG(LogTemp, Display,
+            TEXT("[WorldSelection] Ignored a return-to-main-menu callback because travel to world '%s' is already pending."),
+            *PendingGameplayWorldFolderName);
+        return;
+    }
+
     if (UGameManagerSubSystem* GameManager = UGameManagerSubSystem::GetSubSystem(this))
     {
         GameManager->ClearWorldSelectionMenuRequest();
@@ -107,13 +144,30 @@ void AStartActor::ReturnToMainMenuFromWorldSelection()
 
 void AStartActor::ShowStartMenu()
 {
-    if (UGameManagerSubSystem* GameManager = UGameManagerSubSystem::GetSubSystem(this))
+    if (IsWorldSelectionReturnBlocked())
+    {
+        UE_LOG(LogTemp, Display,
+            TEXT("[WorldSelection] Ignored a carried-over start-menu callback while returning from gameplay."));
+        return;
+    }
+
+    if (bGameplayWorldTravelPending)
+    {
+        UE_LOG(LogTemp, Display,
+            TEXT("[WorldSelection] Ignored ShowStartMenu while travel to world '%s' is pending."),
+            *PendingGameplayWorldFolderName);
+        return;
+    }
+
+    UGameManagerSubSystem* GameManager = UGameManagerSubSystem::GetSubSystem(this);
+    CancelWorldSelectionReturnInputGuard();
+    if (IsValid(GameManager))
     {
         GameManager->ClearWorldSelectionMenuRequest();
     }
 
     RemoveAllMenuWidgets();
-    ResetEditorTransactionBufferForMenuTravel(TEXT("Show MainWorld start menu"));
+    ResetEditorTransactionBufferForMenuTravel(TEXT("Show start menu"));
 
     StartMenuWidget = CreateAndAddMenuWidget(
         StartMenuWidgetClass.Get(),
@@ -124,9 +178,17 @@ void AStartActor::ShowStartMenu()
 
 void AStartActor::ShowWorldSelectionMenu()
 {
+    if (bGameplayWorldTravelPending)
+    {
+        UE_LOG(LogTemp, Display,
+            TEXT("[WorldSelection] Ignored a duplicate world-selection request while travel to world '%s' is pending."),
+            *PendingGameplayWorldFolderName);
+        return;
+    }
+
     BuildLevelFolderNameMap();
     RemoveAllMenuWidgets();
-    ResetEditorTransactionBufferForMenuTravel(TEXT("Show MainWorld single-player world-selection menu"));
+    ResetEditorTransactionBufferForMenuTravel(TEXT("Show single-player world-selection menu"));
 
     WorldSelectionWidget = Cast<UWorldSelectionWidget>(CreateAndAddMenuWidget(
         WorldSelectionWidgetClass.Get(),
@@ -138,13 +200,26 @@ void AStartActor::ShowWorldSelectionMenu()
     }
 
     ApplyMenuInputMode(WorldSelectionWidget.Get());
+
+    if (bWorldSelectionReturnInputGuardActive)
+    {
+        StartWorldSelectionReturnInputGuard();
+    }
 }
 
 void AStartActor::ShowMultiplayerMenu()
 {
+    if (IsWorldSelectionReturnBlocked())
+    {
+        UE_LOG(LogTemp, Display,
+            TEXT("[WorldSelection] Ignored a carried-over multiplayer-menu callback while returning from gameplay."));
+        return;
+    }
+
+    CancelWorldSelectionReturnInputGuard();
     BuildLevelFolderNameMap();
     RemoveAllMenuWidgets();
-    ResetEditorTransactionBufferForMenuTravel(TEXT("Show MainWorld multiplayer menu"));
+    ResetEditorTransactionBufferForMenuTravel(TEXT("Show multiplayer menu"));
 
     MultiplayerMenuWidget = CreateAndAddMenuWidget(
         MultiplayerMenuWidgetClass.Get(),
@@ -203,6 +278,23 @@ bool AStartActor::TryResolveWorldFolderFromDisplayName(const FString& DisplayNam
 
 void AStartActor::OpenSinglePlayerWorldByFolderName(const FString& WorldFolderName)
 {
+    if (IsWorldSelectionReturnBlocked())
+    {
+        UE_LOG(LogTemp, Display,
+            TEXT("[WorldSelection] Ignored carried-over activation for '%s' while the return input guard is active."),
+            *WorldFolderName);
+        return;
+    }
+
+    if (bGameplayWorldTravelPending)
+    {
+        UE_LOG(LogTemp, Display,
+            TEXT("[WorldSelection] Ignored duplicate world click '%s'; travel to '%s' is already pending."),
+            *WorldFolderName,
+            *PendingGameplayWorldFolderName);
+        return;
+    }
+
     FString ResolvedFolderName;
     if (!TryResolveWorldFolderFromDisplayName(WorldFolderName, ResolvedFolderName))
     {
@@ -210,9 +302,11 @@ void AStartActor::OpenSinglePlayerWorldByFolderName(const FString& WorldFolderNa
         return;
     }
 
-    if (GameplayLevelName == NAME_None)
+    if (GameplayWorld.IsNull())
     {
-        UE_LOG(LogTemp, Warning, TEXT("StartActor cannot open single-player world because GameplayLevelName is not assigned."));
+        UE_LOG(LogTemp, Error,
+            TEXT("[WorldSelection] Cannot open world '%s' because GameplayWorld is not assigned."),
+            *ResolvedFolderName);
         return;
     }
 
@@ -223,19 +317,57 @@ void AStartActor::OpenSinglePlayerWorldByFolderName(const FString& WorldFolderNa
         GameManager->SetGamePaused(false);
     }
 
+    bGameplayWorldTravelPending = true;
+    PendingGameplayWorldFolderName = ResolvedFolderName;
+
+    UE_LOG(LogTemp, Display,
+        TEXT("[WorldSelection] Opening the directly assigned gameplay world. Folder=%s"),
+        *ResolvedFolderName);
+
     PrepareMenuForWorldTravel();
+
+    // Arm this before world travel. Successful travel destroys this actor and clears the timer; a failed
+    // travel leaves the menu world alive and restores the world list instead of showing a blank screen.
+    const float WatchdogDelay = FMath::Max(1.0f, GameplayTravelFailureTimeoutSeconds);
+    GetWorldTimerManager().SetTimer(
+        GameplayTravelWatchdogHandle,
+        this,
+        &AStartActor::HandleGameplayTravelWatchdogExpired,
+        WatchdogDelay,
+        false);
+
+    bool bTravelRequested = false;
     if (UMultiplayerWorldSubSystem* Multiplayer = UMultiplayerWorldSubSystem::Get(this))
     {
-        Multiplayer->StartSinglePlayerWorld(this, ResolvedFolderName, GameplayLevelName);
+        bTravelRequested = Multiplayer->StartSinglePlayerWorld(this, ResolvedFolderName, GameplayWorld);
     }
     else
     {
-        UGameplayStatics::OpenLevel(this, GameplayLevelName);
+        const FString Options = FString::Printf(TEXT("World=%s"), *ResolvedFolderName);
+        UGameplayStatics::OpenLevelBySoftObjectPtr(this, GameplayWorld, true, Options);
+        bTravelRequested = true;
+    }
+
+    if (!bTravelRequested)
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[WorldSelection] Failed to request travel to the assigned gameplay world. Folder=%s"),
+            *ResolvedFolderName);
+        GetWorldTimerManager().ClearTimer(GameplayTravelWatchdogHandle);
+        bGameplayWorldTravelPending = false;
+        PendingGameplayWorldFolderName.Reset();
+        ShowWorldSelectionMenu();
+        return;
     }
 }
 
 void AStartActor::HostMultiplayerWorldByFolderName(const FString& WorldFolderName)
 {
+    if (IsWorldSelectionReturnBlocked())
+    {
+        return;
+    }
+
     FString ResolvedFolderName;
     if (!TryResolveWorldFolderFromDisplayName(WorldFolderName, ResolvedFolderName))
     {
@@ -243,9 +375,9 @@ void AStartActor::HostMultiplayerWorldByFolderName(const FString& WorldFolderNam
         return;
     }
 
-    if (HostWorldLevelName == NAME_None)
+    if (HostWorld.IsNull())
     {
-        UE_LOG(LogTemp, Warning, TEXT("StartActor cannot host multiplayer world because HostWorldLevelName is not assigned."));
+        UE_LOG(LogTemp, Warning, TEXT("StartActor cannot host a multiplayer world because HostWorld is not assigned."));
         return;
     }
 
@@ -259,23 +391,39 @@ void AStartActor::HostMultiplayerWorldByFolderName(const FString& WorldFolderNam
     PrepareMenuForWorldTravel();
     if (UMultiplayerWorldSubSystem* Multiplayer = UMultiplayerWorldSubSystem::Get(this))
     {
-        Multiplayer->HostMultiplayerWorld(this, ResolvedFolderName, HostWorldLevelName);
+        Multiplayer->HostMultiplayerWorld(this, ResolvedFolderName, HostWorld);
     }
 }
 
 void AStartActor::OpenClientConnectionWorld(const FString& InServerAddress)
 {
+    if (IsWorldSelectionReturnBlocked())
+    {
+        return;
+    }
+
+    if (ClientWorld.IsNull())
+    {
+        UE_LOG(LogTemp, Warning, TEXT("StartActor cannot open the client connection world because ClientWorld is not assigned."));
+        return;
+    }
+
     SetPendingServerAddress(InServerAddress);
     PrepareMenuForWorldTravel();
     if (UMultiplayerWorldSubSystem* Multiplayer = UMultiplayerWorldSubSystem::Get(this))
     {
         Multiplayer->SetServerAddress(PendingServerAddress);
-        Multiplayer->OpenClientConnectionWorld(this, ClientWorldLevelName);
+        Multiplayer->OpenClientConnectionWorld(this, ClientWorld);
     }
 }
 
 void AStartActor::JoinMultiplayerServer(const FString& InServerAddress, const FString& OptionalWorldFolderName)
 {
+    if (IsWorldSelectionReturnBlocked())
+    {
+        return;
+    }
+
     SetPendingServerAddress(InServerAddress);
     if (UGameManagerSubSystem* GameManager = UGameManagerSubSystem::GetSubSystem(this))
     {
@@ -305,10 +453,128 @@ void AStartActor::SetPendingServerAddress(const FString& InServerAddress)
     }
 }
 
+void AStartActor::HandleGameplayTravelWatchdogExpired()
+{
+    if (!bGameplayWorldTravelPending || IsActorBeingDestroyed())
+    {
+        return;
+    }
+
+    const FString FailedWorldFolder = PendingGameplayWorldFolderName;
+    bGameplayWorldTravelPending = false;
+    PendingGameplayWorldFolderName.Reset();
+
+    UE_LOG(LogTemp, Error,
+        TEXT("[WorldSelection] Travel to the assigned gameplay world did not complete. Restoring the world list. "
+             "Confirm that the world reference is assigned and included in the packaged build. World=%s"),
+        *FailedWorldFolder);
+
+    ShowWorldSelectionMenu();
+}
+
+void AStartActor::StartWorldSelectionReturnInputGuard()
+{
+    bWorldSelectionReturnInputGuardActive = true;
+    if (IsValid(WorldSelectionWidget))
+    {
+        WorldSelectionWidget->SetIsEnabled(false);
+    }
+
+    const float Delay = FMath::Clamp(WorldSelectionReturnInputGuardSeconds, 0.05f, 2.0f);
+    GetWorldTimerManager().ClearTimer(WorldSelectionReturnInputGuardHandle);
+    GetWorldTimerManager().SetTimer(
+        WorldSelectionReturnInputGuardHandle,
+        this,
+        &AStartActor::TryReleaseWorldSelectionReturnInputGuard,
+        Delay,
+        false);
+
+    UE_LOG(LogTemp, Display, TEXT("[WorldSelection] Return input guard armed for %.2f seconds."), Delay);
+}
+
+bool AStartActor::IsWorldSelectionActivationInputHeld() const
+{
+    APlayerController* PlayerController = UGameplayStatics::GetPlayerController(this, 0);
+    if (!PlayerController)
+    {
+        return false;
+    }
+
+    return PlayerController->IsInputKeyDown(EKeys::LeftMouseButton)
+        || PlayerController->IsInputKeyDown(EKeys::RightMouseButton)
+        || PlayerController->IsInputKeyDown(EKeys::Enter)
+        || PlayerController->IsInputKeyDown(EKeys::SpaceBar)
+        || PlayerController->IsInputKeyDown(EKeys::Gamepad_FaceButton_Bottom);
+}
+
+bool AStartActor::IsWorldSelectionReturnBlocked() const
+{
+    if (bWorldSelectionReturnInputGuardActive)
+    {
+        return true;
+    }
+
+    if (UGameManagerSubSystem* GameManager = UGameManagerSubSystem::GetSubSystem(this))
+    {
+        return GameManager->ShouldOpenWorldSelectionMenuOnNextMainWorld();
+    }
+
+    return false;
+}
+
+void AStartActor::TryReleaseWorldSelectionReturnInputGuard()
+{
+    if (!bWorldSelectionReturnInputGuardActive || IsActorBeingDestroyed())
+    {
+        return;
+    }
+
+    if (IsWorldSelectionActivationInputHeld())
+    {
+        // Do not expose the world buttons until the exact input that initiated Exit has been released.
+        GetWorldTimerManager().SetTimer(
+            WorldSelectionReturnInputGuardHandle,
+            this,
+            &AStartActor::TryReleaseWorldSelectionReturnInputGuard,
+            0.05f,
+            false);
+        return;
+    }
+
+    bWorldSelectionReturnInputGuardActive = false;
+    GetWorldTimerManager().ClearTimer(WorldSelectionReturnInputGuardHandle);
+    if (UGameManagerSubSystem* GameManager = UGameManagerSubSystem::GetSubSystem(this))
+    {
+        // The arrival transaction is complete only now. World travel may be initiated again by a
+        // deliberate button click after this point.
+        GameManager->ClearWorldSelectionMenuRequest();
+    }
+    if (IsValid(WorldSelectionWidget))
+    {
+        WorldSelectionWidget->SetIsEnabled(true);
+    }
+
+    UE_LOG(LogTemp, Display, TEXT("[WorldSelection] Return input guard released; world selection is ready."));
+}
+
+void AStartActor::CancelWorldSelectionReturnInputGuard()
+{
+    bWorldSelectionReturnInputGuardActive = false;
+    if (UWorld* World = GetWorld())
+    {
+        World->GetTimerManager().ClearTimer(WorldSelectionReturnInputGuardHandle);
+    }
+    if (IsValid(WorldSelectionWidget))
+    {
+        WorldSelectionWidget->SetIsEnabled(true);
+    }
+}
+
 void AStartActor::PrepareMenuForWorldTravel()
 {
+    CancelWorldSelectionReturnInputGuard();
     RemoveAllMenuWidgets();
-    ResetEditorTransactionBufferForMenuTravel(TEXT("MainWorld menu world travel"));
+    ResetEditorTransactionBufferForMenuTravel(TEXT("Menu world travel"));
 }
 
 UClass* AStartActor::ResolveMenuWidgetClass(UClass* WidgetClass, const TCHAR* DebugWidgetName) const
@@ -317,7 +583,7 @@ UClass* AStartActor::ResolveMenuWidgetClass(UClass* WidgetClass, const TCHAR* De
     if (!ResolvedClass || !ResolvedClass->IsChildOf(UStartWorldWidget::StaticClass()))
     {
         UE_LOG(LogTemp, Warning,
-               TEXT("StartActor cannot create %s because no valid widget class is assigned in BP_StartWorld."),
+               TEXT("StartActor cannot create %s because no valid widget class is assigned."),
                DebugWidgetName ? DebugWidgetName : TEXT("MenuWidgetClass"));
         return nullptr;
     }
@@ -461,5 +727,5 @@ void AStartActor::ResetEditorTransactionBufferForMenuTravel(const TCHAR* Reason)
 
     UGameManagerSubSystem::ResetEditorTransactionBufferForWorldTravel(
         this,
-        Reason ? FString(Reason) : FString(TEXT("MainWorld menu travel")));
+        Reason ? FString(Reason) : FString(TEXT("Menu world travel")));
 }

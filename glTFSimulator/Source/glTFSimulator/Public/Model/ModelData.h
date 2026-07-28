@@ -56,7 +56,7 @@ struct FLightData
     UPROPERTY()
     float Length = 10.0f;
     UPROPERTY()
-    ELightUnits Unit;
+    ELightUnits Unit = ELightUnits::Unitless;
 
     TSharedRef<FJsonObject>
     Serialization() const;

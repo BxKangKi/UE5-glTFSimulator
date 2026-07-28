@@ -3,58 +3,18 @@
 #include "World/PrefabActor.h"
 #include "Components/StaticMeshComponent.h"
 #include "Engine/StaticMesh.h"
+#include "Model/glTFMaterialOverrideUtils.h"
 #include "glTFRuntimeAsset.h"
 #include "glTFRuntimeFunctionLibrary.h"
 #include "glTFRuntimeParser.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
-#include "Materials/MaterialInterface.h"
 #include "Setting/GameSettings.h"
 #include "System/MultiplayerWorldSubSystem.h"
 #include "System/MacroLibrary.h"
 #include "Net/UnrealNetwork.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
-
-
-namespace
-{
-    TMap<EglTFRuntimeMaterialType, UMaterialInterface*> BuildLitGltfMaterialOverrides()
-    {
-        TMap<EglTFRuntimeMaterialType, UMaterialInterface*> Overrides;
-
-        if (UMaterialInterface* Opaque = LoadObject<UMaterialInterface>(nullptr, TEXT("/glTFRuntime/M_glTFRuntimeBase")))
-        {
-            Overrides.Add(EglTFRuntimeMaterialType::Opaque, Opaque);
-            Overrides.Add(EglTFRuntimeMaterialType::Masked, Opaque);
-        }
-        if (UMaterialInterface* Translucent = LoadObject<UMaterialInterface>(nullptr, TEXT("/glTFRuntime/M_glTFRuntimeTranslucent_Inst")))
-        {
-            Overrides.Add(EglTFRuntimeMaterialType::Translucent, Translucent);
-            Overrides.Add(EglTFRuntimeMaterialType::TwoSidedTranslucent, Translucent);
-        }
-        if (UMaterialInterface* TwoSided = LoadObject<UMaterialInterface>(nullptr, TEXT("/glTFRuntime/M_glTFRuntimeTwoSided_Inst")))
-        {
-            Overrides.Add(EglTFRuntimeMaterialType::TwoSided, TwoSided);
-            Overrides.Add(EglTFRuntimeMaterialType::TwoSidedMasked, TwoSided);
-        }
-        if (UMaterialInterface* Masked = LoadObject<UMaterialInterface>(nullptr, TEXT("/glTFRuntime/M_glTFRuntimeMasked_Inst")))
-        {
-            Overrides.Add(EglTFRuntimeMaterialType::Masked, Masked);
-        }
-        if (UMaterialInterface* TwoSidedMasked = LoadObject<UMaterialInterface>(nullptr, TEXT("/glTFRuntime/M_glTFRuntimeTwoSidedMasked_Inst")))
-        {
-            Overrides.Add(EglTFRuntimeMaterialType::TwoSidedMasked, TwoSidedMasked);
-        }
-        if (UMaterialInterface* TwoSidedTranslucent = LoadObject<UMaterialInterface>(nullptr, TEXT("/glTFRuntime/M_glTFRuntimeTwoSidedTranslucent_Inst")))
-        {
-            Overrides.Add(EglTFRuntimeMaterialType::TwoSidedTranslucent, TwoSidedTranslucent);
-        }
-
-        return Overrides;
-    }
-}
-
 
 namespace
 {
@@ -313,12 +273,15 @@ UStaticMesh* APrefabActor::LoadMeshByIndex(int32 MeshIndex)
     MeshConfig.MaterialsConfig.ImagesConfig.bStreaming = false;
     MeshConfig.MaterialsConfig.bLoadMipMaps = false;
     {
-        const TMap<EglTFRuntimeMaterialType, UMaterialInterface*> LitOverrides = BuildLitGltfMaterialOverrides();
+        const TMap<EglTFRuntimeMaterialType, UMaterialInterface*> LitOverrides =
+            glTFMaterialOverrideUtils::BuildOverrideMap(MaterialAssets);
         if (LitOverrides.Num() > 0)
         {
+            MeshConfig.MaterialsConfig.UberMaterialsOverrideMap = LitOverrides;
             MeshConfig.MaterialsConfig.UnlitOverrideMap = LitOverrides;
         }
     }
+    glTFMaterialOverrideUtils::ApplyNamedOverrides(MaterialAssets, MeshConfig.MaterialsConfig);
     MeshConfig.bAllowCPUAccess = true;
     MeshConfig.bBuildLumenCards = !bRenderOnlyMode;
     MeshConfig.bBuildSimpleCollision = !bRenderOnlyMode;

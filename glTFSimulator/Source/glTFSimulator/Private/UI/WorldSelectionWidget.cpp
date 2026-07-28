@@ -61,11 +61,17 @@ void UWorldSelectionButtonClickHandler::HandleClicked()
     UWorldSelectionWidget* Widget = OwnerWidget.Get();
     if (!IsValid(Widget))
     {
-        UE_LOG(LogTemp, Warning, TEXT("Generated world button cannot open %s because its owning WBP_LevelMenu widget is not valid."), *WorldFolderName);
+        UE_LOG(LogTemp, Warning, TEXT("Generated world button cannot open %s because its owning selection widget is not valid."), *WorldFolderName);
         return;
     }
 
-    Widget->OpenWorldByFolderName(WorldFolderName);
+    // Disable this widget before starting travel so a second Blueprint/parent-button callback from
+    // the same mouse release cannot route the UI back to the MainWorld start screen.
+    Widget->SetIsEnabled(false);
+    if (!Widget->OpenWorldByFolderName(WorldFolderName))
+    {
+        Widget->SetIsEnabled(true);
+    }
 }
 
 void UWorldSelectionWidget::NativeConstruct()
@@ -109,7 +115,7 @@ void UWorldSelectionWidget::RebuildWorldButtons()
     UPanelWidget* const ListPanel = AssignedWorldListPanel.Get();
     if (!IsValid(ListPanel))
     {
-        UE_LOG(LogTemp, Warning, TEXT("WorldSelectionWidget cannot build world buttons because the list panel is not assigned. Call SetWorldListPanel() from the WBP Construct event with the list panel reference."));
+        UE_LOG(LogTemp, Warning, TEXT("WorldSelectionWidget cannot build world buttons because the list panel is not assigned. Pass the panel reference from the widget construct event."));
         return;
     }
 

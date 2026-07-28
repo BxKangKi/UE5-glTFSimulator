@@ -21,6 +21,27 @@ class UPrimitiveComponent;
 class UAnimInstance;
 class UCharacterLoadAsyncAction;
 class UGameUpdateSubSystem;
+class UPhysicalMaterial;
+class USoundBase;
+class UNiagaraSystem;
+
+USTRUCT(BlueprintType)
+struct GLTFSIMULATOR_API FFootstepAssetBinding
+{
+    GENERATED_BODY()
+
+    /** Collision physical material matched by direct object reference. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Character|Footsteps")
+    TObjectPtr<UPhysicalMaterial> PhysicalMaterial = nullptr;
+
+    /** Optional sound played when the assigned physical material is hit. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Character|Footsteps")
+    TObjectPtr<USoundBase> Sound = nullptr;
+
+    /** Optional Niagara effect spawned when the assigned physical material is hit. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Character|Footsteps")
+    TObjectPtr<UNiagaraSystem> Effect = nullptr;
+};
 
 UCLASS()
 class GLTFSIMULATOR_API ACharacterController : public ACharacter, public IWaterInteract
@@ -76,6 +97,10 @@ public:
     bool RefreshWaterStateForRagdollRecovery(bool bRagdollBodyInWater, float Level);
     UFUNCTION(BlueprintCallable)
     void TriggerFootstepTrace(EControllerHand FootSide); // Foot-side selector for left/right traces.
+
+    /** Direct physical-material bindings used by footsteps. No asset-name matching is performed. */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Character|Footsteps")
+    TArray<FFootstepAssetBinding> FootstepAssetBindings;
 
 protected:
     virtual void BeginPlay() override;

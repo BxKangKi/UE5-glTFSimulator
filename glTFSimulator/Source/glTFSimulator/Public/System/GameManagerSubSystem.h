@@ -102,13 +102,25 @@ public:
     UFUNCTION(BlueprintPure, Category="Game", meta=(WorldContext="WorldContextObject"))
     static UGameManagerSubSystem* FindGameManager(const UObject* WorldContextObject);
 
-    // Opens MainWorld and asks its StartActor to show the world-selection widget after travel.
+    // Opens the directly assigned menu world and asks its StartActor to show world selection after travel.
     UFUNCTION(BlueprintCallable, Category="Game|Lifecycle", meta=(WorldContext="WorldContextObject"))
-    static void OpenWorldSelectionScreen(const UObject* WorldContextObject, FName WorldSelectionLevelName = NAME_None);
+    static void OpenWorldSelectionScreen(const UObject* WorldContextObject, TSoftObjectPtr<UWorld> WorldSelectionWorld);
 
-    // Opens the main menu from the world-selection screen. Bind this to the world-selection Back button when you want to reload MainWorld.
+    /** Native request path used by pause UI. True means this or an equivalent duplicate request owns travel. */
+    static bool TryOpenWorldSelectionScreen(const UObject* WorldContextObject, TSoftObjectPtr<UWorld> WorldSelectionWorld);
+
+    /** Remembers the currently loaded StartActor menu world without a hard-coded map name or asset path. */
+    void RegisterWorldSelectionWorld(TSoftObjectPtr<UWorld> InWorldSelectionWorld);
+
+    /** Fallback for gameplay controllers whose Blueprint default does not repeat the menu-world assignment. */
+    TSoftObjectPtr<UWorld> GetRegisteredWorldSelectionWorld() const { return RegisteredWorldSelectionWorld; }
+
+    /** Rolls back an accepted request when OpenLevel fails and the gameplay world remains active. */
+    void CancelWorldSelectionMenuTravel();
+
+    // Opens the directly assigned main-menu world from the world-selection screen.
     UFUNCTION(BlueprintCallable, Category="Game|Lifecycle", meta=(WorldContext="WorldContextObject"))
-    static void OpenMainMenuFromWorldSelection(const UObject* WorldContextObject, FName MainMenuLevelName = NAME_None);
+    static void OpenMainMenuFromWorldSelection(const UObject* WorldContextObject, TSoftObjectPtr<UWorld> MainMenuWorld);
 
     // Clears editor-only undo transactions before menu-triggered map travel. No-op outside editor builds.
     UFUNCTION(BlueprintCallable, Category="Game|Lifecycle", meta=(WorldContext="WorldContextObject"))
@@ -616,6 +628,16 @@ private:
     bool bSpawnedWorldManager = false;
     bool bPendingMainWorldRuntimePurge = false;
     bool bOpenWorldSelectionMenuOnNextMainWorld = false;
+    /** Separate from the destination-menu request so compatibility code may pre-set that request safely. */
+    bool bWorldSelectionMenuTravelInProgress = false;
+    /** Menu world captured from the active StartActor; no name/path literal is used. */
+    TSoftObjectPtr<UWorld> RegisteredWorldSelectionWorld;
+    /** Distinguishes a real same-world duplicate from a stale GameInstance-level guard. */
+    TWeakObjectPtr<UWorld> WorldSelectionTravelSourceWorld;
+    /** Restored only when the travel watchdog proves that the old gameplay world never left. */
+    FString WorldNameBeforeMenuTravel;
+    bool bMenuTravelStatePrepared = false;
+    bool bMenuTravelSaveCompleted = false;
     bool bCurrentLevelCheatsEnabled = false;
     FString ActivePlayerId = TEXT("Player");
     FDelegateHandle PostLoadMapCleanupHandle;
@@ -743,6 +765,8 @@ private:
     void ResetWorldRuntimeReferences();
     void RequestRuntimeGarbageCollection(const TCHAR* Reason) const;
     UAssetManageSubSystem* GetAssetManagerSubsystem() const;
+    void PrepareForMenuLevelTravelRequest();
+    void FinalizeWorldSelectionTravelState();
     void RequestPostLoadRuntimeMemoryCleanup();
     void HandlePostLoadMapRuntimeCleanup(UWorld* LoadedWorld);
     void RunPostLoadRuntimeMemoryCleanup();

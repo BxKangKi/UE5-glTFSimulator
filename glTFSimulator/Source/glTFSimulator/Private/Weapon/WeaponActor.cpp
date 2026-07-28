@@ -13,7 +13,7 @@
 #include "GameFramework/Pawn.h"
 #include "HAL/FileManager.h"
 #include "Kismet/GameplayStatics.h"
-#include "Materials/MaterialInterface.h"
+#include "Model/glTFMaterialOverrideUtils.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Serialization/JsonReader.h"
@@ -30,41 +30,6 @@ namespace
 {
     constexpr float DefaultWeaponVisualLengthCm = 140.0f;
     constexpr float DefaultWeaponVisualThicknessCm = 14.0f;
-
-    TMap<EglTFRuntimeMaterialType, UMaterialInterface*> BuildWeaponLitGltfMaterialOverrides()
-    {
-        TMap<EglTFRuntimeMaterialType, UMaterialInterface*> Overrides;
-
-        if (UMaterialInterface* Opaque = LoadObject<UMaterialInterface>(nullptr, TEXT("/glTFRuntime/M_glTFRuntimeBase")))
-        {
-            Overrides.Add(EglTFRuntimeMaterialType::Opaque, Opaque);
-            Overrides.Add(EglTFRuntimeMaterialType::Masked, Opaque);
-        }
-        if (UMaterialInterface* Translucent = LoadObject<UMaterialInterface>(nullptr, TEXT("/glTFRuntime/M_glTFRuntimeTranslucent_Inst")))
-        {
-            Overrides.Add(EglTFRuntimeMaterialType::Translucent, Translucent);
-            Overrides.Add(EglTFRuntimeMaterialType::TwoSidedTranslucent, Translucent);
-        }
-        if (UMaterialInterface* TwoSided = LoadObject<UMaterialInterface>(nullptr, TEXT("/glTFRuntime/M_glTFRuntimeTwoSided_Inst")))
-        {
-            Overrides.Add(EglTFRuntimeMaterialType::TwoSided, TwoSided);
-            Overrides.Add(EglTFRuntimeMaterialType::TwoSidedMasked, TwoSided);
-        }
-        if (UMaterialInterface* Masked = LoadObject<UMaterialInterface>(nullptr, TEXT("/glTFRuntime/M_glTFRuntimeMasked_Inst")))
-        {
-            Overrides.Add(EglTFRuntimeMaterialType::Masked, Masked);
-        }
-        if (UMaterialInterface* TwoSidedMasked = LoadObject<UMaterialInterface>(nullptr, TEXT("/glTFRuntime/M_glTFRuntimeTwoSidedMasked_Inst")))
-        {
-            Overrides.Add(EglTFRuntimeMaterialType::TwoSidedMasked, TwoSidedMasked);
-        }
-        if (UMaterialInterface* TwoSidedTranslucent = LoadObject<UMaterialInterface>(nullptr, TEXT("/glTFRuntime/M_glTFRuntimeTwoSidedTranslucent_Inst")))
-        {
-            Overrides.Add(EglTFRuntimeMaterialType::TwoSidedTranslucent, TwoSidedTranslucent);
-        }
-
-        return Overrides;
-    }
 
     bool TryReadVector(const TSharedPtr<FJsonObject>& Object, const TCHAR* FieldName, FVector& Value)
     {
@@ -390,7 +355,14 @@ UStaticMesh* AWeaponActor::LoadMeshByIndex(int32 MeshIndex)
     MeshConfig.MaterialsConfig.ImagesConfig.bCompressMips = false;
     MeshConfig.MaterialsConfig.ImagesConfig.bStreaming = false;
     MeshConfig.MaterialsConfig.bLoadMipMaps = false;
-    MeshConfig.MaterialsConfig.UnlitOverrideMap = BuildWeaponLitGltfMaterialOverrides();
+    const TMap<EglTFRuntimeMaterialType, UMaterialInterface*> MaterialOverrides =
+        glTFMaterialOverrideUtils::BuildOverrideMap(MaterialAssets);
+    if (MaterialOverrides.Num() > 0)
+    {
+        MeshConfig.MaterialsConfig.UberMaterialsOverrideMap = MaterialOverrides;
+        MeshConfig.MaterialsConfig.UnlitOverrideMap = MaterialOverrides;
+    }
+    glTFMaterialOverrideUtils::ApplyNamedOverrides(MaterialAssets, MeshConfig.MaterialsConfig);
     MeshConfig.bAllowCPUAccess = false;
     MeshConfig.bBuildLumenCards = true;
     MeshConfig.bBuildSimpleCollision = false;
@@ -449,9 +421,10 @@ bool AWeaponActor::CreateDefaultBoxMesh()
 {
     ClearLoadedComponents();
 
-    UStaticMesh* CubeMesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
-    if (!IsValid(CubeMesh))
+    if (!IsValid(DefaultWeaponMesh))
     {
+        UE_LOG(LogTemp, Warning,
+            TEXT("WeaponActor cannot create its default visual because DefaultWeaponMesh is not assigned."));
         return false;
     }
 
@@ -459,7 +432,7 @@ bool AWeaponActor::CreateDefaultBoxMesh()
     AddInstanceComponent(MeshComponent);
     MeshComponent->SetMobility(EComponentMobility::Movable);
     MeshComponent->SetupAttachment(Root);
-    MeshComponent->SetStaticMesh(CubeMesh);
+    MeshComponent->SetStaticMesh(DefaultWeaponMesh);
     MeshComponent->SetRelativeLocation(FVector(DefaultWeaponVisualLengthCm * 0.5f, 0.0f, 0.0f));
     MeshComponent->SetRelativeScale3D(FVector(
         DefaultWeaponVisualLengthCm / 100.0f,

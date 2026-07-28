@@ -5,6 +5,7 @@
 #include "CoreMinimal.h"
 #include "HAL/ThreadSafeCounter.h"
 #include "GameFramework/Pawn.h"
+#include "Model/glTFMaterialAssetReferences.h"
 #include "World/PlacementTypes.h"
 #include "VehiclePawn.generated.h"
 
@@ -146,6 +147,10 @@ private:
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Camera")
     bool bResetCharacterCameraOnExit = true;
+
+    /** glTFRuntime material assets assigned directly in the owning Blueprint/class defaults. */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Vehicle|Assets", meta=(AllowPrivateAccess="true"))
+    FglTFMaterialAssetReferences MaterialAssets;
 
     UPROPERTY(Transient)
     TObjectPtr<UPhysicalMaterial> LowFrictionPhysicalMaterial;

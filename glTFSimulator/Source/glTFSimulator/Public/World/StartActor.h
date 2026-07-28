@@ -5,14 +5,17 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
+#include "TimerManager.h"
 #include "UI/WorldSelectionWidget.h"
 #include "StartActor.generated.h"
+
+class UWorld;
 
 /**
  * Owns the MainWorld menu flow.
  *
- * BP_StartWorld should inherit from this actor and explicitly assign each menu widget class.
- * WBP_StartWorld should inherit UStartWorldWidget, and WBP_LevelMenu should inherit
+ * The owning Blueprint should inherit from this actor and explicitly assign each menu widget class.
+ * The start-menu widget should inherit UStartWorldWidget, and the world-selection widget should inherit
  * UWorldSelectionWidget so the native widget builds and handles the world buttons directly.
  */
 UCLASS(Blueprintable, BlueprintType)
@@ -39,7 +42,7 @@ public:
     UFUNCTION(BlueprintCallable, Category="Start World|UI")
     void ShowWorldSelectionMenu();
 
-    /** Rebuilds and shows the multiplayer menu. Assign MultiplayerMenuWidgetClass in BP_StartWorld before using this. */
+    /** Rebuilds and shows the multiplayer menu. Assign MultiplayerMenuWidgetClass before using this. */
     UFUNCTION(BlueprintCallable, Category="Start World|UI")
     void ShowMultiplayerMenu();
 
@@ -55,7 +58,7 @@ public:
     UFUNCTION(BlueprintCallable, Category="Start World|Data")
     bool TryResolveWorldFolderFromDisplayName(const FString& DisplayName, FString& OutFolderName) const;
 
-    /** Opens the single-player gameplay map after selecting a world folder from WBP_LevelMenu. */
+    /** Opens the directly assigned single-player gameplay world after selecting an external world-data folder. */
     UFUNCTION(BlueprintCallable, Category="Start World|Navigation")
     void OpenSinglePlayerWorldByFolderName(const FString& WorldFolderName);
 
@@ -82,11 +85,11 @@ protected:
     virtual void BeginPlay() override;
     virtual void Destroyed() override;
 
-    /** Start-screen widget class. Set this to a WBP_StartWorld child reparented to UStartWorldWidget. */
+    /** Start-screen widget class assigned directly in the owning Blueprint/class defaults. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Start World|UI")
     TSubclassOf<UStartWorldWidget> StartMenuWidgetClass;
 
-    /** World-selection widget class. Set this to WBP_LevelMenu reparented to UWorldSelectionWidget. */
+    /** World-selection widget class assigned directly in the owning Blueprint/class defaults. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Start World|UI")
     TSubclassOf<UWorldSelectionWidget> WorldSelectionWidgetClass;
 
@@ -94,15 +97,17 @@ protected:
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Start World|UI")
     TSubclassOf<UStartWorldWidget> MultiplayerMenuWidgetClass;
 
-    /** Single-player gameplay level opened after WBP_LevelMenu selects a world folder. */
+    /** Single-player gameplay world opened after the world-selection widget chooses a folder. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Start World|Navigation")
-    FName GameplayLevelName = TEXT("SingleWorld");
+    TSoftObjectPtr<UWorld> GameplayWorld;
 
+    /** Multiplayer host world. Assign the world asset directly. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Start World|Navigation")
-    FName HostWorldLevelName = TEXT("HostWorld");
+    TSoftObjectPtr<UWorld> HostWorld;
 
+    /** Client connection/loading world. Assign the world asset directly. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Start World|Navigation")
-    FName ClientWorldLevelName = TEXT("ClientWorld");
+    TSoftObjectPtr<UWorld> ClientWorld;
 
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Start World|Navigation")
     FString DefaultServerAddress = TEXT("127.0.0.1:7777");
@@ -119,6 +124,17 @@ protected:
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Start World|Editor")
     bool bResetEditorTransactionsBeforeTravel = true;
 
+    /** If MainWorld is still alive after this delay, restore the selection UI instead of leaving a blank/start screen. */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Start World|Navigation", meta=(ClampMin="1.0"))
+    float GameplayTravelFailureTimeoutSeconds = 5.0f;
+
+    /**
+     * Minimum delay before accepting a world button after returning from gameplay. The guard also
+     * remains active while the mouse/confirm key that initiated Exit is still held.
+     */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Start World|Input", meta=(ClampMin="0.05", ClampMax="2.0"))
+    float WorldSelectionReturnInputGuardSeconds = 0.20f;
+
 private:
     void InitializeStartScreenAfterBlueprintBeginPlay();
     UClass* ResolveMenuWidgetClass(UClass* WidgetClass, const TCHAR* DebugWidgetName) const;
@@ -127,6 +143,12 @@ private:
     void RemoveAllMenuWidgets();
     void ApplyMenuInputMode(UStartWorldWidget* FocusWidget) const;
     void BuildLevelFolderNameMap();
+    void HandleGameplayTravelWatchdogExpired();
+    void StartWorldSelectionReturnInputGuard();
+    void TryReleaseWorldSelectionReturnInputGuard();
+    void CancelWorldSelectionReturnInputGuard();
+    bool IsWorldSelectionActivationInputHeld() const;
+    bool IsWorldSelectionReturnBlocked() const;
     void ResetEditorTransactionBufferForMenuTravel(const TCHAR* Reason) const;
 
 private:
@@ -144,4 +166,18 @@ private:
 
     UPROPERTY(Transient)
     FString PendingServerAddress = TEXT("127.0.0.1:7777");
+
+    /** Blocks stale Blueprint/back-button callbacks after a valid world button has already started travel. */
+    UPROPERTY(Transient)
+    bool bGameplayWorldTravelPending = false;
+
+    UPROPERTY(Transient)
+    FString PendingGameplayWorldFolderName;
+
+    /** Blocks Construct-time callbacks and carried-over click/key releases after gameplay Exit. */
+    UPROPERTY(Transient)
+    bool bWorldSelectionReturnInputGuardActive = false;
+
+    FTimerHandle GameplayTravelWatchdogHandle;
+    FTimerHandle WorldSelectionReturnInputGuardHandle;
 };

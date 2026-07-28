@@ -14,6 +14,8 @@
 #include "Camera/CameraComponent.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "GameFramework/PlayerController.h"
+#include "Kismet/GameplayStatics.h"
+#include "NiagaraFunctionLibrary.h"
 #include "Character/CharacterLoadAsyncAction.h"
 #include "World/WaterActor.h"
 #include "World/BuoyancyComponent.h"
@@ -1179,27 +1181,29 @@ void ACharacterController::OnFootstepTraceCompleted(const FTraceHandle& TraceHan
         UPhysicalMaterial* HitPhysMat = HitResult.PhysMaterial.Get();
         if (HitPhysMat)
         {
-            // Use the physical material asset name, for example "PM_Concrete" or "PM_Wood".
-            FString PhysMatName = HitPhysMat->GetName();
-#if WITH_EDITOR
-            UE_LOG(LogTemp, Log, TEXT("Footstep raycast hit physical material: %s"), *PhysMatName);
-#endif
-            // 3. Branch by surface material to play matching sound/effects.
-            if (PhysMatName.Contains(TEXT("Concrete")))
+            const FFootstepAssetBinding* Binding = FootstepAssetBindings.FindByPredicate(
+                [HitPhysMat](const FFootstepAssetBinding& Candidate)
+                {
+                    return Candidate.PhysicalMaterial.Get() == HitPhysMat;
+                });
+
+            if (!Binding)
             {
-                // Concrete footstep playback hook, for example PlaySoundAtLocation.
+                return;
             }
-            else if (PhysMatName.Contains(TEXT("Grass")))
+
+            if (IsValid(Binding->Sound.Get()))
             {
-                // Grass footstep playback hook.
+                UGameplayStatics::PlaySoundAtLocation(this, Binding->Sound.Get(), HitResult.ImpactPoint);
             }
-            else if (PhysMatName.Contains(TEXT("Wood")))
+
+            if (IsValid(Binding->Effect.Get()))
             {
-                // Wood footstep playback hook.
-            }
-            else if (PhysMatName.Contains(TEXT("Glass")))
-            {
-                // Glass footstep playback hook.
+                UNiagaraFunctionLibrary::SpawnSystemAtLocation(
+                    this,
+                    Binding->Effect.Get(),
+                    HitResult.ImpactPoint,
+                    HitResult.ImpactNormal.Rotation());
             }
         }
     }

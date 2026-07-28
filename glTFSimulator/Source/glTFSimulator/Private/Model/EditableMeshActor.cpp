@@ -7,7 +7,6 @@
 #include "Components/SceneComponent.h"
 #include "Engine/EngineTypes.h"
 #include "Materials/MaterialInterface.h"
-#include "Materials/Material.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "ProceduralMeshComponent.h"
 
@@ -32,12 +31,8 @@ AEditableMeshActor::AEditableMeshActor()
     PreviewComponent->SetVisibility(true, true);
     PreviewComponent->SetHiddenInGame(false, true);
 
-    GeneratedMeshBaseMaterial = LoadObject<UMaterialInterface>(nullptr, TEXT("/Engine/BasicShapes/BasicShapeMaterial.BasicShapeMaterial"));
-    if (!IsValid(GeneratedMeshBaseMaterial))
-    {
-        GeneratedMeshBaseMaterial = UMaterial::GetDefaultMaterial(EMaterialDomain::MD_Surface);
-    }
-    PreviewVertexColorMaterial = LoadObject<UMaterialInterface>(nullptr, TEXT("/Engine/EngineDebugMaterials/VertexColorMaterial.VertexColorMaterial"));
+    // GeneratedMeshBaseMaterial and PreviewVertexColorMaterial are assigned directly in the
+    // owning Blueprint/class defaults. Native code intentionally performs no asset lookup.
 }
 
 void AEditableMeshActor::ApplyMaterials()

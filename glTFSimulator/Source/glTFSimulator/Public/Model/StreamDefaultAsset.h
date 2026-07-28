@@ -4,27 +4,20 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Model/glTFMaterialAssetReferences.h"
 #include "StreamDefaultAsset.generated.h"
 
-class UMaterialInterface;
-
+/** Canonical direct Unreal material references used by streamed glTF assets. */
 USTRUCT(BlueprintType)
 struct FStreamDefaultAsset
 {
     GENERATED_BODY()
+
 public:
-    UPROPERTY(EditAnywhere, BlueprintReadWrite)
-    TObjectPtr<UMaterialInterface> Opaque;
-    UPROPERTY(EditAnywhere, BlueprintReadWrite)
-    TObjectPtr<UMaterialInterface> TwoSided;
-    UPROPERTY(EditAnywhere, BlueprintReadWrite)
-    TObjectPtr<UMaterialInterface> Translucent;
-    UPROPERTY(EditAnywhere, BlueprintReadWrite)
-    TObjectPtr<UMaterialInterface> TranslucentTwoSided;
-    UPROPERTY(EditAnywhere, BlueprintReadWrite)
-    TObjectPtr<UMaterialInterface> Glass;
-    UPROPERTY(EditAnywhere, BlueprintReadWrite)
-    TObjectPtr<UMaterialInterface> TintedGlass;
-    UPROPERTY(EditAnywhere, BlueprintReadWrite)
-    TObjectPtr<UMaterialInterface> Terrain;
+    /**
+     * The only default-material configuration for streamed glTF assets.
+     * Unreal assets are assigned directly; ByMaterialName keys are glTF-internal material names.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Streaming|Assets")
+    FglTFMaterialAssetReferences Materials;
 };

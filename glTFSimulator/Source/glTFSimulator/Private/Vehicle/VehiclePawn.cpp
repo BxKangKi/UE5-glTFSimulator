@@ -26,6 +26,7 @@
 #include "HAL/FileManager.h"
 #include "HAL/PlatformTime.h"
 #include "Misc/Paths.h"
+#include "Model/glTFMaterialOverrideUtils.h"
 #include "Setting/GameSettings.h"
 #include "System/ActorHelper.h"
 #include "System/FileFunctionLibrary.h"
@@ -37,30 +38,6 @@
 #include "Vehicle/VehicleSubSystem.h"
 #include "World/BuoyancyComponent.h"
 #include "World/WaterActor.h"
-
-
-static TMap<EglTFRuntimeMaterialType, UMaterialInterface*> BuildVehicleLitMaterialOverrides()
-    {
-        TMap<EglTFRuntimeMaterialType, UMaterialInterface*> Overrides;
-
-        if (UMaterialInterface* Opaque = LoadObject<UMaterialInterface>(nullptr, TEXT("/glTFRuntime/M_glTFRuntimeBase")))
-        {
-            Overrides.Add(EglTFRuntimeMaterialType::Opaque, Opaque);
-            Overrides.Add(EglTFRuntimeMaterialType::Masked, Opaque);
-        }
-        if (UMaterialInterface* Translucent = LoadObject<UMaterialInterface>(nullptr, TEXT("/glTFRuntime/M_glTFRuntimeTranslucent_Inst")))
-        {
-            Overrides.Add(EglTFRuntimeMaterialType::Translucent, Translucent);
-            Overrides.Add(EglTFRuntimeMaterialType::TwoSidedTranslucent, Translucent);
-        }
-        if (UMaterialInterface* TwoSided = LoadObject<UMaterialInterface>(nullptr, TEXT("/glTFRuntime/M_glTFRuntimeTwoSided_Inst")))
-        {
-            Overrides.Add(EglTFRuntimeMaterialType::TwoSided, TwoSided);
-            Overrides.Add(EglTFRuntimeMaterialType::TwoSidedMasked, TwoSided);
-        }
-
-        return Overrides;
-    }
 
 static bool IsVehicleWheelTaggedName(const FString& Name)
     {
@@ -302,9 +279,14 @@ AVehiclePawn::AVehiclePawn()
     Body->SetCollisionResponseToChannel(ECC_WorldStatic, ECR_Block);
     Body->SetCollisionResponseToChannel(ECC_WorldDynamic, ECR_Block);
     Body->SetCollisionResponseToChannel(ECC_Visibility, ECR_Block);
-    Body->SetSimulatePhysics(!bUseStableGroundRideHeight);
-    ApplyVehicleBodyPhysicsSettings();
-    Body->SetUseCCD(true);
+
+    // SetMassOverrideInKg() and related body updates query physical materials internally.
+    // They must not run while Unreal is constructing the native class default object for Cook.
+    if (!HasAnyFlags(RF_ClassDefaultObject))
+    {
+        ApplyVehicleBodyPhysicsSettings();
+        Body->SetUseCCD(true);
+    }
 
     LowFrictionPhysicalMaterial = CreateDefaultSubobject<UPhysicalMaterial>(TEXT("VehicleLowFrictionMaterial"));
     if (LowFrictionPhysicalMaterial)
@@ -314,7 +296,10 @@ AVehiclePawn::AVehiclePawn()
         LowFrictionPhysicalMaterial->bOverrideFrictionCombineMode = true;
         LowFrictionPhysicalMaterial->FrictionCombineMode = EFrictionCombineMode::Min;
         LowFrictionPhysicalMaterial->Restitution = 0.0f;
-        Body->SetPhysMaterialOverride(LowFrictionPhysicalMaterial);
+        if (!HasAnyFlags(RF_ClassDefaultObject))
+        {
+            Body->SetPhysMaterialOverride(LowFrictionPhysicalMaterial);
+        }
     }
 
     BodyMesh = CreateDefaultSubobject<UProceduralMeshComponent>(TEXT("BodyMesh"));
@@ -394,6 +379,11 @@ void AVehiclePawn::BeginPlay()
     Body->SetCollisionResponseToChannel(ECC_WorldDynamic, ECR_Block);
     Body->SetCollisionResponseToChannel(ECC_Visibility, ECR_Block);
     ApplyVehicleBodyPhysicsSettings();
+    Body->SetUseCCD(true);
+    if (LowFrictionPhysicalMaterial)
+    {
+        Body->SetPhysMaterialOverride(LowFrictionPhysicalMaterial);
+    }
     BuildBodyMesh();
     BuildWheelMeshes();
 
@@ -1293,11 +1283,14 @@ UStaticMesh* AVehiclePawn::LoadMeshByIndex(int32 MeshIndex)
     MeshConfig.MaterialsConfig.ImagesConfig.bCompressMips = false;
     MeshConfig.MaterialsConfig.ImagesConfig.bStreaming = false;
     MeshConfig.MaterialsConfig.bLoadMipMaps = false;
-    const TMap<EglTFRuntimeMaterialType, UMaterialInterface*> LitOverrides = BuildVehicleLitMaterialOverrides();
+    const TMap<EglTFRuntimeMaterialType, UMaterialInterface*> LitOverrides =
+        glTFMaterialOverrideUtils::BuildOverrideMap(MaterialAssets);
     if (LitOverrides.Num() > 0)
     {
+        MeshConfig.MaterialsConfig.UberMaterialsOverrideMap = LitOverrides;
         MeshConfig.MaterialsConfig.UnlitOverrideMap = LitOverrides;
     }
+    glTFMaterialOverrideUtils::ApplyNamedOverrides(MaterialAssets, MeshConfig.MaterialsConfig);
     MeshConfig.bAllowCPUAccess = true;
     MeshConfig.bBuildLumenCards = true;
     MeshConfig.bBuildSimpleCollision = false;

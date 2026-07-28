@@ -20,7 +20,6 @@
 #include "System/GameManagerSubSystem.h"
 #include "System/GameUpdateSubSystem.h"
 #include "TimerManager.h"
-#include "UObject/ConstructorHelpers.h"
 #include "Blueprint/WidgetBlueprintLibrary.h"
 #include "Blueprint/UserWidget.h"
 #include "Components/Widget.h"
@@ -31,23 +30,11 @@ APlayerCharacterController::APlayerCharacterController()
 {
     GameManagerActorClass = nullptr;
 
-    static ConstructorHelpers::FObjectFinder<UInputAction> DebugActionFinder(TEXT("/Game/Input/Actions/IA_Debug.IA_Debug"));
-    if (DebugActionFinder.Succeeded())
-    {
-        DebugAction = DebugActionFinder.Object;
-    }
+    // InputAction assets are assigned directly in the owning Blueprint/class defaults.
 
-    static ConstructorHelpers::FObjectFinder<UInputAction> ChangeCharacterActionFinder(TEXT("/Game/Input/Actions/IA_ChangeCharacter.IA_ChangeCharacter"));
-    if (ChangeCharacterActionFinder.Succeeded())
-    {
-        ChangeCharacterAction = ChangeCharacterActionFinder.Object;
-    }
-
-    static ConstructorHelpers::FClassFinder<UUserWidget> DebugWidgetFinder(TEXT("/Game/Blueprints/MainWorld/WBP_Debug"));
-    if (DebugWidgetFinder.Succeeded())
-    {
-        DebugWidgetClass = DebugWidgetFinder.Class;
-    }
+    // Do not hard-load an optional debug widget from a project asset path in the native CDO.
+    // Assign DebugWidgetClass in a Blueprint/defaults asset when the widget exists.
+    DebugWidgetClass = nullptr;
 
     bAutoCreateCreatorHUD = false;
     PauseMenuWidgetClass = nullptr;
@@ -57,6 +44,8 @@ APlayerCharacterController::APlayerCharacterController()
 void APlayerCharacterController::BeginPlay()
 {
     Super::BeginPlay();
+    bMenuWorldTravelPending = false;
+    GetWorldTimerManager().ClearTimer(MenuWorldTravelWatchdogHandle);
     if (!IsValid(SubSystem))
     {
         SubSystem = UGameManagerSubSystem::GetSubSystem(this);
@@ -203,6 +192,11 @@ void APlayerCharacterController::BeginPlayingState()
 
 void APlayerCharacterController::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+    if (UWorld* World = GetWorld())
+    {
+        World->GetTimerManager().ClearTimer(MenuWorldTravelWatchdogHandle);
+    }
+
     if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
     {
         GameUpdate->UnregisterUpdate(GameUpdateTickHandle);
@@ -224,6 +218,12 @@ void APlayerCharacterController::UpdateFromGameUpdate(float DeltaSeconds)
 
 void APlayerCharacterController::ApplyGameInputMode()
 {
+    // Late UI/Blueprint callbacks must not re-enable gameplay input during level travel.
+    if (bMenuWorldTravelPending)
+    {
+        return;
+    }
+
     if (IsValid(SubSystem) && SubSystem->IsWorldLoading())
     {
         ApplyLoadingInputMode(nullptr);
@@ -242,6 +242,11 @@ void APlayerCharacterController::ApplyGameInputMode()
 
 void APlayerCharacterController::ApplyUIInputMode(UUserWidget* WidgetToFocus)
 {
+    if (bMenuWorldTravelPending)
+    {
+        return;
+    }
+
     bUIInputMode = true;
     UWidgetBlueprintLibrary::SetInputMode_GameAndUIEx(
         this,
@@ -292,6 +297,117 @@ void APlayerCharacterController::StopGameplayMotionForUI()
     {
         CharacterCtrl->ClearTransientInputState();
     }
+}
+
+void APlayerCharacterController::LockInputForMenuWorldTravel()
+{
+    bUIInputMode = true;
+    StopGameplayMotionForUI();
+
+    // Remove the old menu from hit testing and prevent its initiating click/key release from being
+    // interpreted as gameplay input while OpenLevel is queued.
+    UWidgetBlueprintLibrary::SetInputMode_GameOnly(this, false);
+    SetIgnoreMoveInput(true);
+    SetIgnoreLookInput(true);
+    bEnableClickEvents = false;
+    bEnableMouseOverEvents = false;
+    bShowMouseCursor = false;
+}
+
+TSoftObjectPtr<UWorld> APlayerCharacterController::ResolveWorldSelectionWorld() const
+{
+    if (!WorldSelectionWorld.IsNull())
+    {
+        return WorldSelectionWorld;
+    }
+
+    if (UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(this))
+    {
+        return Manager->GetRegisteredWorldSelectionWorld();
+    }
+
+    return TSoftObjectPtr<UWorld>();
+}
+
+bool APlayerCharacterController::CanExitToWorldSelectionFromPauseMenu() const
+{
+    return !bMenuWorldTravelPending && !ResolveWorldSelectionWorld().IsNull();
+}
+
+void APlayerCharacterController::RestorePauseMenuAfterRejectedTravel()
+{
+    bMenuWorldTravelPending = false;
+    if (UWorld* World = GetWorld())
+    {
+        World->GetTimerManager().ClearTimer(MenuWorldTravelWatchdogHandle);
+    }
+
+    if (!IsValid(SubSystem))
+    {
+        SubSystem = UGameManagerSubSystem::GetSubSystem(this);
+    }
+    if (IsValid(SubSystem))
+    {
+        SubSystem->CancelWorldSelectionMenuTravel();
+        SubSystem->SetGamePaused(true);
+    }
+
+    if (IsValid(SettingsMenuWidget))
+    {
+        SettingsMenuWidget->RemoveFromParent();
+    }
+
+    UUserWidget* Menu = PauseMenuWidget.Get();
+    if (IsValid(Menu))
+    {
+        Menu->SetIsEnabled(true);
+        if (!Menu->IsInViewport())
+        {
+            Menu->AddToViewport(PauseMenuZOrder);
+        }
+    }
+    else
+    {
+        Menu = CreatePauseMenu();
+    }
+
+    if (UPauseMenuWidget* NativePauseMenu = Cast<UPauseMenuWidget>(Menu))
+    {
+        NativePauseMenu->ResetExitRequestState();
+    }
+
+    ApplyUIInputMode(Menu);
+    bPrevGamePaused = true;
+}
+
+void APlayerCharacterController::ArmMenuWorldTravelWatchdog()
+{
+    UWorld* World = GetWorld();
+    if (!World)
+    {
+        return;
+    }
+
+    World->GetTimerManager().ClearTimer(MenuWorldTravelWatchdogHandle);
+    World->GetTimerManager().SetTimer(
+        MenuWorldTravelWatchdogHandle,
+        this,
+        &APlayerCharacterController::HandleMenuWorldTravelWatchdogExpired,
+        MenuWorldTravelWatchdogSeconds,
+        false);
+}
+
+void APlayerCharacterController::HandleMenuWorldTravelWatchdogExpired()
+{
+    if (!bMenuWorldTravelPending || IsActorBeingDestroyed())
+    {
+        return;
+    }
+
+    UE_LOG(LogTemp, Error,
+        TEXT("[MenuTravel] World-selection travel did not leave the gameplay world within %.1f seconds. Restoring the pause menu."),
+        MenuWorldTravelWatchdogSeconds);
+    RestorePauseMenuAfterRejectedTravel();
 }
 
 void APlayerCharacterController::ReapplyHeldGameplayInput()
@@ -611,7 +727,7 @@ void APlayerCharacterController::BindFallbackKeyInputs()
     {
         InputComponent->BindKey(EKeys::Escape, IE_Pressed, this, &APlayerCharacterController::Input_PausePressed);
     }
-    // Keep F3 as a hard fallback even when IA_Debug exists. Some project IMC assets may not map the
+    // Keep F3 as a hard fallback even when a debug InputAction is assigned. Some mapping contexts may not map the
     // action yet, and Input_DebugPressed is debounced so a duplicate Enhanced Input event is harmless.
     InputComponent->BindKey(EKeys::F3, IE_Pressed, this, &APlayerCharacterController::Input_DebugPressed);
 
@@ -1199,6 +1315,11 @@ void APlayerCharacterController::Input_DebugPressed()
 
 void APlayerCharacterController::Input_PausePressed()
 {
+    if (bMenuWorldTravelPending)
+    {
+        return;
+    }
+
     if (!IsValid(SubSystem))
     {
         SubSystem = UGameManagerSubSystem::GetSubSystem(this);
@@ -1228,6 +1349,11 @@ void APlayerCharacterController::Input_PausePressed()
 
 UUserWidget* APlayerCharacterController::CreatePauseMenu()
 {
+    if (bMenuWorldTravelPending)
+    {
+        return nullptr;
+    }
+
     if (!IsValid(SubSystem))
     {
         SubSystem = UGameManagerSubSystem::GetSubSystem(this);
@@ -1262,6 +1388,11 @@ UUserWidget* APlayerCharacterController::CreatePauseMenu()
 
 UUserWidget* APlayerCharacterController::CreateSettingsMenu()
 {
+    if (bMenuWorldTravelPending)
+    {
+        return nullptr;
+    }
+
     if (!IsValid(SubSystem))
     {
         SubSystem = UGameManagerSubSystem::GetSubSystem(this);
@@ -1305,6 +1436,11 @@ UUserWidget* APlayerCharacterController::CreateSettingsMenu()
 
 void APlayerCharacterController::OpenPauseMenu()
 {
+    if (bMenuWorldTravelPending)
+    {
+        return;
+    }
+
     if (!IsValid(SubSystem))
     {
         SubSystem = UGameManagerSubSystem::GetSubSystem(this);
@@ -1327,6 +1463,11 @@ void APlayerCharacterController::OpenPauseMenu()
 
 void APlayerCharacterController::ClosePauseMenu(bool bResumeGame)
 {
+    if (bMenuWorldTravelPending)
+    {
+        return;
+    }
+
     if (!IsValid(SubSystem))
     {
         SubSystem = UGameManagerSubSystem::GetSubSystem(this);
@@ -1352,6 +1493,11 @@ void APlayerCharacterController::ClosePauseMenu(bool bResumeGame)
 
 void APlayerCharacterController::ShowSettingsMenuFromPause()
 {
+    if (bMenuWorldTravelPending)
+    {
+        return;
+    }
+
     if (!IsValid(SubSystem))
     {
         SubSystem = UGameManagerSubSystem::GetSubSystem(this);
@@ -1382,6 +1528,11 @@ void APlayerCharacterController::ShowSettingsMenuFromPause()
 
 void APlayerCharacterController::ReturnToPauseMenuFromSettings()
 {
+    if (bMenuWorldTravelPending)
+    {
+        return;
+    }
+
     if (IsValid(SettingsMenuWidget))
     {
         SettingsMenuWidget->RemoveFromParent();
@@ -1409,81 +1560,90 @@ void APlayerCharacterController::ExitToMainWorldFromPauseMenu()
 
 void APlayerCharacterController::ExitToWorldSelectionFromPauseMenu()
 {
-    UGameManagerSubSystem* Manager = GetGameManager();
-    if (IsValid(Manager))
+    TryExitToWorldSelectionFromPauseMenu();
+}
+
+bool APlayerCharacterController::TryExitToWorldSelectionFromPauseMenu()
+{
+    // Multiple listeners may be serialized on the same WBP button. Once one listener has started
+    // a valid request, every later listener should treat the request as accepted rather than
+    // re-enabling the pause UI or attempting a second OpenLevel.
+    if (bMenuWorldTravelPending)
     {
-        Manager->PrepareForReturnToMenuLevel();
-        Manager->RequestWorldSelectionMenuOnNextMainWorld();
+        UE_LOG(LogTemp, Verbose, TEXT("[MenuTravel] Pause Exit is already pending on this controller."));
+        return true;
     }
+
+    const TSoftObjectPtr<UWorld> DestinationWorld = ResolveWorldSelectionWorld();
+    if (DestinationWorld.IsNull())
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[MenuTravel] Cannot leave gameplay: no WorldSelectionWorld is assigned on the PlayerController "
+                 "and no menu world was registered by StartActor."));
+        return false;
+    }
+
+    if (WorldSelectionWorld.IsNull())
+    {
+        UE_LOG(LogTemp, Display,
+            TEXT("[MenuTravel] PlayerController WorldSelectionWorld is empty; using the menu world registered by StartActor."));
+    }
+
+    bMenuWorldTravelPending = true;
 
     if (IsValid(SettingsMenuWidget))
     {
+        SettingsMenuWidget->SetIsEnabled(false);
         SettingsMenuWidget->RemoveFromParent();
     }
     if (IsValid(PauseMenuWidget))
     {
+        PauseMenuWidget->SetIsEnabled(false);
         PauseMenuWidget->RemoveFromParent();
     }
 
-    if (!IsValid(SubSystem))
+    LockInputForMenuWorldTravel();
+    UE_LOG(LogTemp, Display, TEXT("[MenuTravel] Pause Exit accepted; requesting the world-selection world."));
+
+    if (!UGameManagerSubSystem::TryOpenWorldSelectionScreen(this, DestinationWorld))
     {
-        SubSystem = UGameManagerSubSystem::GetSubSystem(this);
-    }
-    if (IsValid(SubSystem))
-    {
-        SubSystem->SetGamePaused(false);
+        UE_LOG(LogTemp, Error, TEXT("[MenuTravel] World-selection travel request was rejected before OpenLevel."));
+        RestorePauseMenuAfterRejectedTravel();
+        return false;
     }
 
-    ApplyGameInputMode();
-
-    // The world list is hosted by MainWorld. StartActor consumes the request set above and opens the list widget.
-    static const FName LegacyWorldSelectionLevelName(TEXT("WorldSelectWorld"));
-    FName TargetLevelName = WorldSelectionLevelName;
-    if (TargetLevelName == NAME_None || TargetLevelName == LegacyWorldSelectionLevelName)
-    {
-        TargetLevelName = ExitLevelName;
-    }
-    if (TargetLevelName == NAME_None || TargetLevelName == LegacyWorldSelectionLevelName)
-    {
-        TargetLevelName = FName(TEXT("MainWorld"));
-    }
-
-    if (TargetLevelName != NAME_None)
-    {
-        UGameManagerSubSystem::ResetEditorTransactionBufferForWorldTravel(this, TEXT("Pause menu exit to world selection"));
-        UGameplayStatics::OpenLevel(this, TargetLevelName);
-    }
+    ArmMenuWorldTravelWatchdog();
+    return true;
 }
 
 void APlayerCharacterController::ReturnToMainMenuFromWorldSelection()
 {
+    if (bMenuWorldTravelPending)
+    {
+        return;
+    }
+
+    if (MainMenuWorld.IsNull())
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("PlayerCharacterController cannot open the main menu because MainMenuWorld is not assigned."));
+        return;
+    }
+
+    bMenuWorldTravelPending = true;
     if (IsValid(SettingsMenuWidget))
     {
+        SettingsMenuWidget->SetIsEnabled(false);
         SettingsMenuWidget->RemoveFromParent();
     }
     if (IsValid(PauseMenuWidget))
     {
+        PauseMenuWidget->SetIsEnabled(false);
         PauseMenuWidget->RemoveFromParent();
     }
 
-    if (!IsValid(SubSystem))
-    {
-        SubSystem = UGameManagerSubSystem::GetSubSystem(this);
-    }
-    if (IsValid(SubSystem))
-    {
-        SubSystem->ClearWorldSelectionMenuRequest();
-        SubSystem->SetGamePaused(false);
-    }
-
-    ApplyGameInputMode();
-
-    const FName TargetLevelName = MainMenuLevelName != NAME_None ? MainMenuLevelName : FName(TEXT("MainWorld"));
-    if (TargetLevelName != NAME_None)
-    {
-        UGameManagerSubSystem::ResetEditorTransactionBufferForWorldTravel(this, TEXT("Return to main menu from world selection"));
-        UGameplayStatics::OpenLevel(this, TargetLevelName);
-    }
+    LockInputForMenuWorldTravel();
+    UGameManagerSubSystem::OpenMainMenuFromWorldSelection(this, MainMenuWorld);
 }
 
 UGameManagerSubSystem* APlayerCharacterController::GetGameManager()

@@ -24,6 +24,7 @@
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Model/LoadAsyncAction.h"
+#include "Model/glTFMaterialOverrideUtils.h"
 #include "Model/StreamAsyncAction.h"
 #include "System/AssetManageSubSystem.h"
 #include "Modules/ModuleManager.h"
@@ -536,49 +537,21 @@ FglTFRuntimeStaticMeshConfig AglTFStreamActor::BuildStreamingStaticMeshConfig()
     Config.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
     Config.CollisionComplexity = ECollisionTraceFlag::CTF_UseComplexAsSimple;
 
-    // Never inject null override materials. A null override can replace a valid glTF material and make textures disappear.
-    TMap<EglTFRuntimeMaterialType, UMaterialInterface*> UberMaterialsOverrideMap;
-    auto AddUberOverrideIfValid = [&UberMaterialsOverrideMap](EglTFRuntimeMaterialType Type, UMaterialInterface* Material)
-    {
-        if (IsValid(Material))
-        {
-            UberMaterialsOverrideMap.Add(Type, Material);
-        }
-    };
-
-    AddUberOverrideIfValid(EglTFRuntimeMaterialType::Opaque, Default.Opaque.Get());
-    AddUberOverrideIfValid(EglTFRuntimeMaterialType::Translucent, Default.Translucent.Get());
-    AddUberOverrideIfValid(EglTFRuntimeMaterialType::TwoSided, Default.TwoSided.Get());
-    AddUberOverrideIfValid(EglTFRuntimeMaterialType::TwoSidedTranslucent, Default.TranslucentTwoSided.Get());
-    AddUberOverrideIfValid(EglTFRuntimeMaterialType::Masked, Default.Opaque.Get());
-    AddUberOverrideIfValid(EglTFRuntimeMaterialType::TwoSidedMasked, Default.TwoSided.Get());
-
+    // One canonical editor-assigned material set. glTF-internal material names remain valid
+    // runtime metadata through Materials.ByMaterialName. No Unreal asset is found by name/path.
+    const FglTFMaterialAssetReferences& MaterialReferences = Default.Materials;
+    const TMap<EglTFRuntimeMaterialType, UMaterialInterface*> MaterialOverrides =
+        glTFMaterialOverrideUtils::BuildOverrideMap(MaterialReferences);
     Config.MaterialsConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
-    if (UberMaterialsOverrideMap.Num() > 0)
+    if (MaterialOverrides.Num() > 0)
     {
-        Config.MaterialsConfig.UberMaterialsOverrideMap = UberMaterialsOverrideMap;
-        Config.MaterialsConfig.UnlitOverrideMap = UberMaterialsOverrideMap;
+        Config.MaterialsConfig.UberMaterialsOverrideMap = MaterialOverrides;
+        Config.MaterialsConfig.UnlitOverrideMap = MaterialOverrides;
     }
 
-    TMap<FString, UMaterialInterface*> MaterialsOverrideByNameMap;
-    if (IsValid(Default.Glass.Get()))
-    {
-        MaterialsOverrideByNameMap.Add(TEXT("glass"), Default.Glass.Get());
-    }
-    if (IsValid(Default.TintedGlass.Get()))
-    {
-        MaterialsOverrideByNameMap.Add(TEXT("tinted_glass"), Default.TintedGlass.Get());
-    }
-    if (IsValid(Default.Terrain.Get()))
-    {
-        MaterialsOverrideByNameMap.Add(TEXT("terrain"), Default.Terrain.Get());
-        MaterialsOverrideByNameMap.Add(TEXT("Terrain"), Default.Terrain.Get());
-    }
-    if (MaterialsOverrideByNameMap.Num() > 0)
-    {
-        Config.MaterialsConfig.MaterialsOverrideByNameMap = MaterialsOverrideByNameMap;
-        Config.MaterialsConfig.bMaterialsOverrideMapInjectParams = true;
-    }
+    // Named overrides are keyed only by names stored inside the imported glTF document.
+    // Parameter injection preserves base-color/normal/ORM/emissive textures on the selected base material.
+    glTFMaterialOverrideUtils::ApplyNamedOverrides(MaterialReferences, Config.MaterialsConfig);
 
     Config.MaterialsConfig.bGeneratesMipMaps = false;
     Config.MaterialsConfig.SpecularFactor = 0.0f;

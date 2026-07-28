@@ -12,6 +12,29 @@ class UMaterialInterface;
 class UStaticMesh;
 class UTexture;
 
+struct FManagedStaticMeshKey
+{
+    TWeakObjectPtr<UObject> Scope;
+    FName MeshKey = NAME_None;
+
+    FManagedStaticMeshKey() = default;
+    FManagedStaticMeshKey(UObject* InScope, const FName InMeshKey)
+        : Scope(InScope)
+        , MeshKey(InMeshKey)
+    {
+    }
+
+    bool operator==(const FManagedStaticMeshKey& Other) const
+    {
+        return Scope == Other.Scope && MeshKey == Other.MeshKey;
+    }
+
+    friend uint32 GetTypeHash(const FManagedStaticMeshKey& Key)
+    {
+        return HashCombine(GetTypeHash(Key.Scope), GetTypeHash(Key.MeshKey));
+    }
+};
+
 struct FManagedAssetEntryBase
 {
     int32 RefCount = 0;
@@ -59,13 +82,12 @@ public:
 private:
     bool bActive = false;
     FCriticalSection RegistryLock;
-    TMap<uint32, FManagedStaticMeshEntry> StaticMeshSet;
-    TMap<uint32, FManagedMaterialEntry> MaterialSet;
-    TMap<uint32, FManagedTextureEntry> TextureSet;
 
-    uint32 HashStaticMesh(const FName& MeshKey, const UStaticMesh* Mesh) const;
-    uint32 HashMaterial(const UMaterialInterface* Material) const;
-    uint32 HashTexture(const UTexture* Texture) const;
-    void DeduplicateStaticMeshMaterials(UObject* WorldContextObject, UStaticMesh* Mesh);
+    // Static meshes are shared only inside the same runtime owner/scope and mesh key. Materials
+    // and textures are tracked by object identity, never by class/object name.
+    TMap<FManagedStaticMeshKey, FManagedStaticMeshEntry> StaticMeshSet;
+    TMap<TWeakObjectPtr<UMaterialInterface>, FManagedMaterialEntry> MaterialSet;
+    TMap<TWeakObjectPtr<UTexture>, FManagedTextureEntry> TextureSet;
+
     void WriteLogAsync(const FString& Message) const;
 };

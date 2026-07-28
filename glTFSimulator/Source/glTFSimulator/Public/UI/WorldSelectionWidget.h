@@ -36,7 +36,7 @@ private:
 };
 
 /**
- * World-selection menu widget used as the parent class for WBP_LevelMenu.
+ * Base class for the project's directly assigned world-selection menu widget.
  *
  * The owning WBP should call SetWorldListPanel() with the actual list panel reference from its
  * Construct event. This class creates a native UButton + UTextBlock for every world folder
