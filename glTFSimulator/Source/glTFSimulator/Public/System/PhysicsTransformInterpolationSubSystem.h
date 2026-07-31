@@ -58,6 +58,7 @@ private:
         float TeleportDistance = 500.0f;
         bool bApplyScale = false;
         bool bCanMoveSimulatingPrimitive = false;
+        bool bAtTarget = false;
     };
 
     TArray<FInterpolatedTransformEntry> Entries;

@@ -11,6 +11,7 @@
 #include "PlayerCharacterController.generated.h"
 
 class AGameManagerActor;
+class APawn;
 class UGameManagerSubSystem;
 class UInputAction;
 class UInputMappingContext;
@@ -181,6 +182,14 @@ protected:
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
     virtual void SetupInputComponent() override;
     virtual void BeginPlayingState() override;
+
+    /** Reasserts gameplay input after the controller possesses a newly loaded or replaced pawn. */
+    virtual void OnPossess(APawn* InPawn) override;
+    /** Owning-client counterpart to OnPossess for replicated Pawn assignment. */
+    virtual void AcknowledgePossession(APawn* InPawn) override;
+
+    /** Registers only this world's first player's character with shared streaming/save systems. */
+    void RegisterPrimaryCharacterPawn(APawn* InPawn);
 
 public:
     /** Backward-compatible single IMC slot. Assign your main IMC here in a Blueprint child. */
@@ -408,6 +417,10 @@ private:
 
     void BindConfiguredInputActions();
     void BindFallbackKeyInputs();
+    /** Returns true only when the supplied action is present in one of this controller's configured IMCs. */
+    bool IsActionMappedInConfiguredContexts(const UInputAction* ConfiguredAction) const;
+
+    /** Decides whether a legacy key binding is needed for an action that is missing or not actually mapped. */
     bool ShouldBindFallbackKeyForAction(const UInputAction* ConfiguredAction) const;
     int32 CountAssignedEnhancedInputActions() const;
     int32 CountConfiguredInputMappingContexts() const;
@@ -424,6 +437,12 @@ private:
     void UpdateFallbackMoveInput();
     void StopFallbackMovement();
     void StopGameplayMotionForUI();
+
+    /** Applies ignore-move/look exactly once so repeated loading/UI callbacks cannot stack controller locks. */
+    void SetGameplayInputSuppressed(bool bSuppress);
+
+    /** Reasserts viewport focus, mapping contexts, and controller input one tick after UI removal. */
+    void FinalizeGameplayInputRecovery();
     void LockInputForMenuWorldTravel();
     TSoftObjectPtr<UWorld> ResolveWorldSelectionWorld() const;
     void RestorePauseMenuAfterRejectedTravel();
@@ -445,12 +464,17 @@ private:
     void HandleVehicleSteeringTriggered(const FInputActionValue& Value);
     void HandleVehicleSteeringCompleted(const FInputActionValue& Value);
 
+    /** Previous subsystem pause state used to detect the exact frame gameplay resumes. */
     bool bPrevGamePaused = false;
+
+    /** Previous subsystem loading state used to recover keyboard/look input after async world loading. */
+    bool bPrevWorldLoading = false;
     bool bIsDebug = false;
     bool bUIInputMode = false;
     /** Blocks duplicate pause/back/Blueprint callbacks while a menu-world OpenLevel is pending. */
     bool bMenuWorldTravelPending = false;
     FTimerHandle MenuWorldTravelWatchdogHandle;
+    FTimerHandle GameplayInputRecoveryHandle;
     static constexpr float MenuWorldTravelWatchdogSeconds = 5.0f;
     bool bFallbackMoveForward = false;
     bool bFallbackMoveBackward = false;
@@ -460,6 +484,8 @@ private:
     bool bCrouchInputHeld = false;
     bool bEnhancedInputComponentWasAvailable = false;
     bool bAnyInputMappingContextApplied = false;
+    /** Prevents SetIgnoreMoveInput/SetIgnoreLookInput from accumulating an unmatched stack. */
+    bool bGameplayInputSuppressed = false;
     int32 GameUpdateTickHandle = INDEX_NONE;
     double LastPrimaryInputTime = -1.0;
     double LastSecondaryInputTime = -1.0;

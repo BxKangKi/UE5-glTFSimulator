@@ -11,21 +11,28 @@
 
 static FString MakeKindLabel(EToolbarItemKind Kind)
 {
-        switch (Kind)
-        {
-        case EToolbarItemKind::CreateObject:
-            return TEXT("Object");
-        case EToolbarItemKind::Prefab:
-            return TEXT("Prefab");
-        case EToolbarItemKind::Weapon:
-            return TEXT("Weapon");
-        case EToolbarItemKind::Vehicle:
-            return TEXT("Vehicle");
-        default:
-            return TEXT("None");
-        }
+    switch (Kind)
+    {
+    case EToolbarItemKind::CreateObject:
+        return TEXT("Object");
+    case EToolbarItemKind::Prefab:
+        return TEXT("Prefab");
+    case EToolbarItemKind::Weapon:
+        return TEXT("Weapon");
+    case EToolbarItemKind::Vehicle:
+        return TEXT("Vehicle");
+    default:
+        return TEXT("None");
+    }
 }
 
+static void SetTextIfChanged(UTextBlock* TextBlock, const FText& NewText)
+{
+    if (IsValid(TextBlock) && !TextBlock->GetText().EqualTo(NewText))
+    {
+        TextBlock->SetText(NewText);
+    }
+}
 
 void UCreatorHUDWidget::SetToolbarGrid(UUniformGridPanel* InToolbarGrid)
 {
@@ -103,13 +110,14 @@ void UCreatorHUDWidget::NativeDestruct()
 
 void UCreatorHUDWidget::UpdateFromGameUpdate(float DeltaSeconds)
 {
-    if (!IsValid(AssignedStatusText.Get()) && !IsValid(AssignedPlacementText.Get()) &&
-        !IsValid(AssignedMessageText.Get()) && !IsValid(AssignedItemListPanel.Get()))
+    if (!IsValid(AssignedPlacementText.Get()))
     {
         return;
     }
 
-    RefreshStatus();
+    // Only crosshair coordinates can change without a manager event. Status, message, and panel
+    // state are refreshed by their delegates and no longer rebuild FText every frame.
+    SetTextIfChanged(AssignedPlacementText.Get(), GetPlacementInfoText());
 }
 
 void UCreatorHUDWidget::RefreshManagerReference()
@@ -133,7 +141,14 @@ void UCreatorHUDWidget::RefreshItemList()
     if (IsValid(AssignedItemListPanel.Get()))
     {
         const UGameManagerSubSystem* Manager = GetGameManager();
-        AssignedItemListPanel.Get()->SetVisibility(IsValid(Manager) && Manager->IsItemListWindowOpen() ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
+        const ESlateVisibility NewVisibility =
+            IsValid(Manager) && Manager->IsItemListWindowOpen()
+                ? ESlateVisibility::Visible
+                : ESlateVisibility::Collapsed;
+        if (AssignedItemListPanel.Get()->GetVisibility() != NewVisibility)
+        {
+            AssignedItemListPanel.Get()->SetVisibility(NewVisibility);
+        }
     }
 }
 
@@ -141,20 +156,27 @@ void UCreatorHUDWidget::RefreshStatus()
 {
     if (IsValid(AssignedStatusText.Get()))
     {
-        AssignedStatusText.Get()->SetText(GetStatusText());
+        SetTextIfChanged(AssignedStatusText.Get(), GetStatusText());
     }
     if (IsValid(AssignedPlacementText.Get()))
     {
-        AssignedPlacementText.Get()->SetText(GetPlacementInfoText());
+        SetTextIfChanged(AssignedPlacementText.Get(), GetPlacementInfoText());
     }
     if (IsValid(AssignedMessageText.Get()))
     {
-        AssignedMessageText.Get()->SetText(GetMessageText());
+        SetTextIfChanged(AssignedMessageText.Get(), GetMessageText());
     }
     if (IsValid(AssignedItemListPanel.Get()))
     {
         const UGameManagerSubSystem* Manager = GetGameManager();
-        AssignedItemListPanel.Get()->SetVisibility(IsValid(Manager) && Manager->IsItemListWindowOpen() ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
+        const ESlateVisibility NewVisibility =
+            IsValid(Manager) && Manager->IsItemListWindowOpen()
+                ? ESlateVisibility::Visible
+                : ESlateVisibility::Collapsed;
+        if (AssignedItemListPanel.Get()->GetVisibility() != NewVisibility)
+        {
+            AssignedItemListPanel.Get()->SetVisibility(NewVisibility);
+        }
     }
 }
 

@@ -9,6 +9,7 @@
 class AActor;
 class UObject;
 class UWorld;
+struct FHitResult;
 
 struct FPhysicsHelper
 {

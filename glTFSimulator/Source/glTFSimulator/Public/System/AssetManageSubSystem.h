@@ -77,11 +77,11 @@ public:
     UTexture* AcquireTexture(UObject* WorldContextObject, UTexture* GeneratedTextureAsset);
     void ReleaseTexture(UObject* WorldContextObject, UTexture* GeneratedTextureAsset);
 
-    bool IsActive() const { return bActive; }
+    bool IsActive() const;
 
 private:
     bool bActive = false;
-    FCriticalSection RegistryLock;
+    mutable FCriticalSection RegistryLock;
 
     // Static meshes are shared only inside the same runtime owner/scope and mesh key. Materials
     // and textures are tracked by object identity, never by class/object name.
@@ -89,5 +89,12 @@ private:
     TMap<TWeakObjectPtr<UMaterialInterface>, FManagedMaterialEntry> MaterialSet;
     TMap<TWeakObjectPtr<UTexture>, FManagedTextureEntry> TextureSet;
 
+    // AddToRoot is not reference counted and does not expose its owner. Record only roots that this
+    // subsystem added, plus the number of registry entries that depend on each owned root.
+    TMap<TWeakObjectPtr<UObject>, int32> OwnedRootRegistrationCounts;
+
+    void RetainGeneratedObject(UObject* Object);
+    void ReleaseGeneratedObjectReference(UObject* Object);
+    void ReleaseAllGeneratedObjectReferences();
     void WriteLogAsync(const FString& Message) const;
 };

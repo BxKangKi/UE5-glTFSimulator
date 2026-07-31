@@ -17,11 +17,14 @@ class GLTFSIMULATOR_API USkyUpdateAsyncAction : public UBlueprintAsyncActionBase
 {
     GENERATED_BODY()
 public:
-    /** BP Async Function */
+    /** Creates the Blueprint-compatible action wrapper. */
     UFUNCTION(BlueprintCallable, meta = (BlueprintInternalUseOnly = "true", WorldContext = "WorldContextObject"), Category = "World|Async")
     static USkyUpdateAsyncAction *SkyUpdateAsync(UObject *WorldContextObject, UWorldData *Data);
 
-    /** Output after async operation is completed */
+    /** Calculates both light rotations without allocating an action object. */
+    static FLightRotation CalculateLightRotation(const UWorldData* World);
+
+    /** Output after the Blueprint action is completed. */
     UPROPERTY(BlueprintAssignable)
     FWorldAsyncCompleteDelegate OnCompleted;
 
@@ -34,6 +37,6 @@ private:
     UPROPERTY()
     TObjectPtr<UWorldData> Data;
 
-    UFUNCTION()
-    FRotator CalculateSunRotation(UWorldData *World);
+    /** Implements the numerically guarded solar-angle calculation. */
+    static FRotator CalculateSunRotation(const UWorldData* World);
 };

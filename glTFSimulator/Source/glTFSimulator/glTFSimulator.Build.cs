@@ -16,6 +16,10 @@ public class glTFSimulator : ModuleRules
                 "CoreUObject",
                 "Engine",
                 "EnhancedInput",
+                "InputCore",
+                "Json",
+                "glTFRuntime",
+                "Slate",
                 "UMG",
                 "SlateCore"
             });
@@ -23,17 +27,13 @@ public class glTFSimulator : ModuleRules
         PrivateDependencyModuleNames.AddRange(
             new string[]
             {
-                "InputCore",
-                "Json",
                 "IKRig",
                 "Niagara",
                 "RHI",
-                "Slate",
                 "ProceduralMeshComponent",
                 "PhysicsCore",
                 "ImageWrapper",
-                "RenderCore",
-                "glTFRuntime"
+                "RenderCore"
             });
 
         if (Target.bBuildEditor)

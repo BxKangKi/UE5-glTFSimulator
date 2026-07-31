@@ -55,7 +55,6 @@ namespace PlayerDataJson
 TSharedRef<FJsonObject> FWorldPlayerRecord::ToJson() const
 {
     TSharedRef<FJsonObject> Json = MakeShared<FJsonObject>();
-    Json->SetStringField(JSON_VERSION_FIELD, JSON_SCHEMA_VERSION);
     Json->SetStringField(TEXT("PlayerId"), PlayerId);
     Json->SetStringField(TEXT("DisplayName"), DisplayName);
     PlayerDataJson::SetVector(Json, TEXT("Location"), Location);

@@ -3,6 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Engine/HitResult.h"
 #include "GameFramework/Actor.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "TimerManager.h"
@@ -29,6 +30,7 @@ class UPostProcessComponent;
 class AGameManagerActor;
 class UAssetManageSubSystem;
 class UWorld;
+class APlayerController;
 
 UENUM(BlueprintType)
 enum class EToolMode : uint8
@@ -146,13 +148,20 @@ public:
     UFUNCTION(BlueprintPure, Category="Game|Loading")
     bool IsWorldLoading() const { return bIsWorldLoading; }
 
-    void SetPlayerActor(AActor* Actor) { PlayerActor = Actor; }
+    /**
+     * Registers the active character. During world bootstrap this also completes the one-shot
+     * saved-transform/PlayerStart handshake; later pawn replacements only update the reference.
+     */
+    void SetPlayerActor(AActor* Actor);
+    /** Reasserts a saved initial view rotation after GameMode finishes possessing the first player. */
+    void ApplyPendingInitialPlayerControlRotation(APlayerController* Controller);
     void SetCameraComponent(USceneComponent* InCamera) { CurrentCamera = InCamera; }
     void SetGameSettings(UGameSettings* Settings) { GameSettings = Settings; }
     void SetWorldData(UWorldData* Data) { CurrentWorldData = Data; }
     UFUNCTION(BlueprintCallable, Category="Game|World")
     void SetCurrentWorldName(FString Name) { CurrentWorldName = Name; }
-    void SetPlayerLocation(FVector Location) { PlayerLocation = Location; }
+    /** Accepts runtime location updates only from the registered primary player actor. */
+    void SetPlayerLocation(const FVector& Location, const AActor* SourceActor);
     void SetPostProcess(UPostProcessComponent* InPostProcess) { PostProcess = InPostProcess; }
     template <typename T> T* GetPlayerActor() const { return Cast<T>(PlayerActor); }
     template <typename T> T* GetCameraComponent() const { return Cast<T>(CurrentCamera); }
@@ -530,7 +539,7 @@ private:
     bool bIsGamePaused = false;
     bool bIsWorldLoading = false;
     FString CurrentWorldName;
-    FVector PlayerLocation;
+    FVector PlayerLocation = FVector::ZeroVector;
     int32 LoadingStatus = 0;
     int32 TotalSumFPS = 0;
     int32 TotalCountFPS = 0;
@@ -641,6 +650,23 @@ private:
     bool bCurrentLevelCheatsEnabled = false;
     FString ActivePlayerId = TEXT("Player");
     FDelegateHandle PostLoadMapCleanupHandle;
+
+    /** Identifies why an initial location is trustworthy; FVector::ZeroVector is a valid saved value. */
+    enum class EInitialPlayerLocationSource : uint8
+    {
+        None,
+        LegacyWorldFile,
+        PlayerFile
+    };
+
+    EInitialPlayerLocationSource InitialPlayerLocationSource = EInitialPlayerLocationSource::None;
+    FRotator LoadedInitialPlayerRotation = FRotator::ZeroRotator;
+    bool bHasLoadedInitialPlayerRotation = false;
+    bool bInitialPlayerDataLoadCompleted = false;
+    bool bInitialPlayerTransformResolved = false;
+    bool bPendingInitialControlRotation = false;
+    bool bPendingInitialWorldDataSave = false;
+    bool bPendingInitialPlayerDataSave = false;
 
     // Legacy placement distance kept so older Blueprint defaults do not lose the property.
     // The center-crosshair cursor now uses CrosshairCollisionTraceDistance and FreeSpacePlacementDistance below.
@@ -829,10 +855,15 @@ private:
     void LoadPlayerData();
     void SaveWorldData();
     void SavePlayerData();
+    void ResetInitialPlayerTransformState();
+    void TryResolveInitialPlayerTransform();
+    void FlushPendingInitialTransformSaves();
     void SaveWorldDataDelayed();
     void ApplyLevelSettings();
     void ApplyWeatherSettings();
     void ApplyGameplaySettings();
+    /** Logs and validates the actual server GameMode selected before gameplay bootstrap begins. */
+    void ValidateResolvedGameMode() const;
     void LoadWorldAsync();
     void UpdateWorldTime(float DeltaSeconds);
     FString GetWorldFilePath(const FString& FileName) const;

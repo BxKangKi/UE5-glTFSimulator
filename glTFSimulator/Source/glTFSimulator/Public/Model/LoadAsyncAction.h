@@ -76,6 +76,11 @@ private:
     int32 ChunkSize;
     int32 MaxTextureDimension = 768;
     bool bCancelled = false;
+    bool bStaticMeshLoadInFlight = false;
+
+    /** Ticket held while this action owns or waits for the process-wide glTFRuntime mesh slot. */
+    uint64 GlTFRuntimeOperationTicket = 0;
+
     FModelData GeneratedModelData;
 
     // Members used for asynchronous JSON processing.
@@ -96,7 +101,7 @@ private:
 
     // Functions that control JSON loading and merging.
     void LoadJsonAsync();
-    void MergeJsonDataToMeshMap();
+    void SanitizeParsedData();
     void RefreshGeneratedModelData();
     void SaveGeneratedJsonAsync() const;
     void WriteLogAsync(const FString& Message) const;

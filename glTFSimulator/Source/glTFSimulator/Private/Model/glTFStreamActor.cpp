@@ -4,7 +4,6 @@
 #include "Model/glTFStreamActor.h"
 #include "Setting/GameSettings.h"
 
-#include "Async/Async.h"
 #include "Components/BoxComponent.h"
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Components/LightComponent.h"
@@ -31,6 +30,9 @@
 #include "System/FileFunctionLibrary.h"
 #include "System/GameManagerSubSystem.h"
 #include "System/GameUpdateSubSystem.h"
+#include "System/GlbValidation.h"
+#include "System/SafeFileIO.h"
+#include "System/glTFRuntimeSafety.h"
 #include "System/MacroLibrary.h"
 #include "TimerManager.h"
 #include "World/WaterActor.h"
@@ -73,6 +75,9 @@ void AglTFStreamActor::BeginPlay()
     ModelMetadata = FModelData();
     bHasModelMetadata = false;
 
+    // Normalize only on the game thread. The expensive JSON/accessor/mesh preflight runs inside
+    // LoadAssetAsync's worker task so a large or malformed external GLB cannot freeze the viewport.
+    FilePath = GlbValidation::NormalizePath(FilePath);
     LoadAssetAsync(EGLTFStreamAssetPhase::SizeScan);
 }
 
@@ -153,21 +158,44 @@ void AglTFStreamActor::LoadAssetAsync(EGLTFStreamAssetPhase Phase)
     TSharedPtr<FThreadSafeCounter, ESPMode::ThreadSafe> CancelToken = MakeShared<FThreadSafeCounter, ESPMode::ThreadSafe>(0);
     ActiveAssetLoadCancelToken = CancelToken;
 
-    AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [WeakThis, RequestedFilePath, Phase, RequestId, Config, CancelToken]()
+    const bool bWorkerQueued = FSafeFileIO::RunTrackedWorker(
+        [WeakThis, RequestedFilePath, Phase, RequestId, Config, CancelToken]()
     {
         if (!CancelToken.IsValid() || CancelToken->GetValue() != 0)
         {
             return;
         }
 
-        TSharedPtr<FglTFRuntimeParser> Parser = FglTFRuntimeParser::FromFilename(RequestedFilePath, Config);
+        FString FailureReason;
+        TSharedPtr<FglTFRuntimeParser> Parser;
+
+        // Validate every untrusted allocation-driving field before entering glTFRuntime. This check
+        // rejects accessor, primitive, vertex, and index totals that could overflow an int32 or ask
+        // TArray to allocate multiple gigabytes, which is the exact class of failure seen in
+        // FglTFRuntimeParser::LoadStaticMesh_Internal.
+        if (!GlbValidation::ValidateRuntimeMeshFile(RequestedFilePath, FailureReason))
+        {
+            FailureReason = FString::Printf(TEXT("runtime mesh preflight failed: %s"), *FailureReason);
+        }
+        else
+        {
+            // Parser construction is serialized across all runtime actors. glTFRuntime owns shared
+            // parser/cache state and overlapping third-party decoder initialization increases race
+            // and peak-memory risk in packaged builds.
+            Parser = FglTFRuntimeSafety::CreateParserSerialized(RequestedFilePath, Config);
+            if (!Parser.IsValid())
+            {
+                FailureReason = TEXT("glTFRuntime parser creation was rejected or failed");
+            }
+        }
 
         if (!CancelToken.IsValid() || CancelToken->GetValue() != 0)
         {
             return;
         }
 
-        AsyncTask(ENamedThreads::GameThread, [WeakThis, RequestedFilePath, Phase, RequestId, Config, Parser, CancelToken]()
+        if (!FSafeFileIO::DispatchTrackedGameThread(
+            [WeakThis, RequestedFilePath, Phase, RequestId, Config, Parser, FailureReason, CancelToken]()
         {
             AglTFStreamActor* StrongThis = WeakThis.Get();
             const bool bRequestStillCurrent =
@@ -189,7 +217,7 @@ void AglTFStreamActor::LoadAssetAsync(EGLTFStreamAssetPhase Phase)
             UglTFRuntimeAsset* LoadedAsset = nullptr;
             if (Parser.IsValid())
             {
-                LoadedAsset = NewObject<UglTFRuntimeAsset>(StrongThis);
+                LoadedAsset = NewObject<UglTFRuntimeAsset>(GetTransientPackage(), NAME_None, RF_Transient);
                 if (LoadedAsset)
                 {
                     LoadedAsset->RuntimeContextObject = Config.RuntimeContextObject;
@@ -216,16 +244,42 @@ void AglTFStreamActor::LoadAssetAsync(EGLTFStreamAssetPhase Phase)
                     else
                     {
                         LoadedAsset->ClearCache();
-                        LoadedAsset->MarkAsGarbage();
+                        LoadedAsset->ClearFlags(RF_Public | RF_Standalone);
                     }
                 }
                 return;
             }
 
             StrongThis->ActiveAssetLoadCancelToken.Reset();
+            if (!LoadedAsset && !FailureReason.IsEmpty())
+            {
+                // Isolate this external file without terminating the process. A later streaming pass
+                // may retry only after the source file changes or the actor is recreated.
+                FglTFRuntimeSafety::ReportRecoverableFailure(RequestedFilePath, FailureReason);
+                StrongThis->WriteLogAsync(FString::Printf(
+                    TEXT("Model GLB was isolated before static-mesh construction. Path=%s Reason=%s"),
+                    *RequestedFilePath,
+                    *FailureReason));
+            }
             StrongThis->OnAssetLoaded(LoadedAsset);
-        });
+        }))
+        {
+            // Shutdown rejected the continuation; cancel only the thread-safe request token.
+            CancelToken->Set(1);
+        }
     });
+
+    if (!bWorkerQueued)
+    {
+        // The request never left the game thread, so its local actor state can be unwound safely.
+        CancelToken->Set(1);
+        if (ActiveAssetLoadCancelToken == CancelToken)
+        {
+            ActiveAssetLoadCancelToken.Reset();
+        }
+        bAsyncLoading = false;
+        AssetLoadPhase = EGLTFStreamAssetPhase::None;
+    }
 }
 
 void AglTFStreamActor::OnAssetLoaded(UglTFRuntimeAsset* Asset)
@@ -239,7 +293,10 @@ void AglTFStreamActor::OnAssetLoaded(UglTFRuntimeAsset* Asset)
     if (!IsValid(Asset))
     {
         UE_LOG(LogTemp, Warning, TEXT("AglTFStreamActor: failed to load asset: %s"), *FilePath);
+        bIsLoaded = true;
         bAsyncLoading = false;
+        LoadingStatus = 1.0f;
+        WriteLogAsync(FString::Printf(TEXT("Model GLB parser failed; the file was isolated: %s"), *FilePath));
         return;
     }
 
@@ -313,7 +370,7 @@ void AglTFStreamActor::OnChunksLoaded(const FLoadAsyncWrapper& MapWrapper)
     }
 
 #if WITH_EDITOR
-    UE_LOG(LogTemp, Warning, TEXT("AglTFStreamActor::OnChunksLoaded Executed."));
+    UE_LOG(LogTemp, Verbose, TEXT("AglTFStreamActor::OnChunksLoaded completed."));
 #endif
 
     AllNodeMap = MapWrapper.NodeMap;
@@ -379,7 +436,6 @@ void AglTFStreamActor::ReleaseAsset(UglTFRuntimeAsset* Asset)
             Asset->RemoveFromRoot();
         }
         Asset->ClearFlags(RF_Public | RF_Standalone);
-        Asset->MarkAsGarbage();
     }
 }
 
@@ -394,10 +450,7 @@ void AglTFStreamActor::ReleaseStreamingResources()
             continue;
         }
 
-        if (AssetManager)
-        {
-            AssetManager->ReleaseStaticMesh(this, ISMC->GetStaticMesh());
-        }
+        UStaticMesh* MeshToRelease = ISMC->GetStaticMesh();
         ISMC->ClearInstances();
         const int32 MaterialCount = ISMC->GetNumMaterials();
         for (int32 MaterialIndex = 0; MaterialIndex < MaterialCount; ++MaterialIndex)
@@ -407,6 +460,10 @@ void AglTFStreamActor::ReleaseStreamingResources()
         ISMC->SetStaticMesh(nullptr);
         ISMC->UnregisterComponent();
         ISMC->DestroyComponent();
+        if (AssetManager)
+        {
+            AssetManager->ReleaseStaticMesh(this, MeshToRelease);
+        }
     }
     InstanceMap.Empty();
     LoadedNodes.Empty();

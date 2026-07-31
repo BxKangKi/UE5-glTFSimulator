@@ -3,15 +3,181 @@
 #include "Model/glTFSaveLibrary.h"
 
 #include "HAL/FileManager.h"
-#include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
-#include "Serialization/JsonReader.h"
-#include "Serialization/JsonSerializer.h"
-#include "Serialization/JsonWriter.h"
 #include "System/MacroLibrary.h"
+#include "System/SafeFileIO.h"
 
 namespace GLTFSaveInternal
 {
+    // The manifest is external, user-editable data. Keep the JSON and generated-mesh budgets low
+    // enough that validation cannot drive TArray, JSON DOM, renderer, or Chaos into huge allocations.
+    constexpr int64 MaxSceneManifestBytes = 64ll * 1024ll * 1024ll;
+    constexpr int32 MaxScenePlacedObjects = 100000;
+    constexpr int32 MaxSceneGeneratedMeshes = 4096;
+    constexpr int64 MaxSceneTotalVertices = 500000;
+    constexpr int64 MaxSceneTotalTriangleIndices = 1500000;
+    constexpr int32 MaxRecordNameCharacters = 1024;
+    constexpr int32 MaxSourcePathCharacters = 32768;
+
+    static FSafeJsonLimits MakeSceneJsonLimits()
+    {
+        FSafeJsonLimits Limits;
+        Limits.MaxFileBytes = MaxSceneManifestBytes;
+        Limits.MaxDepth = 32;
+        Limits.MaxValues = 5000000;
+        Limits.MaxContainerEntries = PlacementSafetyLimits::MaxGeneratedMeshTriangleIndices;
+        Limits.MaxStringCharacters = MaxSourcePathCharacters;
+        Limits.MaxPrimitiveCharacters = 128;
+        Limits.bAllowBackupRecovery = true;
+        return Limits;
+    }
+
+    static bool IsFiniteBoundedNumber(const double Value)
+    {
+        return FMath::IsFinite(Value) &&
+            FMath::Abs(Value) <= static_cast<double>(WORLD_MAX_SIZE);
+    }
+
+    static bool IsFiniteBoundedVector(const FVector& Value)
+    {
+        return IsFiniteBoundedNumber(Value.X) &&
+            IsFiniteBoundedNumber(Value.Y) &&
+            IsFiniteBoundedNumber(Value.Z);
+    }
+
+    static bool IsFiniteTransform(const FTransform& Transform)
+    {
+        const FQuat Rotation = Transform.GetRotation();
+        return IsFiniteBoundedVector(Transform.GetLocation()) &&
+            IsFiniteBoundedVector(Transform.GetScale3D()) &&
+            FMath::IsFinite(Rotation.X) &&
+            FMath::IsFinite(Rotation.Y) &&
+            FMath::IsFinite(Rotation.Z) &&
+            FMath::IsFinite(Rotation.W) &&
+            Rotation.IsNormalized();
+    }
+
+    static bool IsPlacedObjectRecordSafe(const FPlacedObjectRecord& Record)
+    {
+        return !Record.ObjectName.IsEmpty() &&
+            Record.ObjectName.Len() <= MaxRecordNameCharacters &&
+            Record.BaseName.Len() <= MaxRecordNameCharacters &&
+            Record.SourceFile.Len() <= MaxSourcePathCharacters &&
+            IsFiniteTransform(Record.Transform);
+    }
+
+    static bool IsGeneratedMeshRecordSafe(const FGeneratedMeshRecord& Record)
+    {
+        if (Record.ObjectName.IsEmpty() ||
+            Record.ObjectName.Len() > MaxRecordNameCharacters ||
+            Record.BaseName.Len() > MaxRecordNameCharacters ||
+            !IsFiniteTransform(Record.Transform) ||
+            Record.Vertices.Num() < 3 ||
+            Record.Vertices.Num() > PlacementSafetyLimits::MaxGeneratedMeshVertices ||
+            Record.Triangles.Num() < 3 ||
+            Record.Triangles.Num() > PlacementSafetyLimits::MaxGeneratedMeshTriangleIndices ||
+            (Record.Triangles.Num() % 3) != 0)
+        {
+            return false;
+        }
+
+        for (const FVector& Vertex : Record.Vertices)
+        {
+            if (!IsFiniteBoundedVector(Vertex))
+            {
+                return false;
+            }
+        }
+
+        for (int32 TriangleOffset = 0;
+            TriangleOffset < Record.Triangles.Num();
+            TriangleOffset += 3)
+        {
+            const int32 A = Record.Triangles[TriangleOffset];
+            const int32 B = Record.Triangles[TriangleOffset + 1];
+            const int32 C = Record.Triangles[TriangleOffset + 2];
+            if (!Record.Vertices.IsValidIndex(A) ||
+                !Record.Vertices.IsValidIndex(B) ||
+                !Record.Vertices.IsValidIndex(C) ||
+                A == B || B == C || C == A)
+            {
+                return false;
+            }
+
+            const FVector Cross = FVector::CrossProduct(
+                Record.Vertices[B] - Record.Vertices[A],
+                Record.Vertices[C] - Record.Vertices[A]);
+            const double CrossSizeSquared = Cross.SizeSquared();
+            if (!FMath::IsFinite(CrossSizeSquared) || CrossSizeSquared <= 1.0)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool ValidateSceneRecords(
+        const TArray<FPlacedObjectRecord>& PlacedObjects,
+        const TArray<FGeneratedMeshRecord>& GeneratedMeshes,
+        FString& OutReason)
+    {
+        if (PlacedObjects.Num() > MaxScenePlacedObjects)
+        {
+            OutReason = FString::Printf(
+                TEXT("placed-object count exceeds the scene limit (%d > %d)"),
+                PlacedObjects.Num(),
+                MaxScenePlacedObjects);
+            return false;
+        }
+        if (GeneratedMeshes.Num() > MaxSceneGeneratedMeshes)
+        {
+            OutReason = FString::Printf(
+                TEXT("generated-mesh count exceeds the scene limit (%d > %d)"),
+                GeneratedMeshes.Num(),
+                MaxSceneGeneratedMeshes);
+            return false;
+        }
+
+        for (const FPlacedObjectRecord& Record : PlacedObjects)
+        {
+            if (!IsPlacedObjectRecordSafe(Record))
+            {
+                OutReason = FString::Printf(
+                    TEXT("placed-object record is invalid: %s"),
+                    *Record.ObjectName.Left(128));
+                return false;
+            }
+        }
+
+        int64 TotalVertices = 0;
+        int64 TotalTriangleIndices = 0;
+        for (const FGeneratedMeshRecord& Record : GeneratedMeshes)
+        {
+            if (!IsGeneratedMeshRecordSafe(Record))
+            {
+                OutReason = FString::Printf(
+                    TEXT("generated-mesh record is invalid: %s"),
+                    *Record.ObjectName.Left(128));
+                return false;
+            }
+
+            TotalVertices += Record.Vertices.Num();
+            TotalTriangleIndices += Record.Triangles.Num();
+            if (TotalVertices > MaxSceneTotalVertices ||
+                TotalTriangleIndices > MaxSceneTotalTriangleIndices)
+            {
+                OutReason = FString::Printf(
+                    TEXT("generated-mesh totals exceed scene limits (vertices=%lld indices=%lld)"),
+                    TotalVertices,
+                    TotalTriangleIndices);
+                return false;
+            }
+        }
+
+        OutReason.Reset();
+        return true;
+    }
+
     static void EnsureDirectoryForFile(const FString& FilePath)
     {
         if (FilePath.IsEmpty())
@@ -119,18 +285,34 @@ bool UGLTFSaveLibrary::SaveScene(
 {
     (void)WorldContextObject;
 
-    GLTFSaveInternal::EnsureDirectoryForFile(ManifestPath);
-
-    FString ManifestString;
-    const TSharedRef<FJsonObject> Manifest = BuildManifestJson(PlacedObjects, GeneratedMeshes);
-    const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&ManifestString);
-    if (!FJsonSerializer::Serialize(Manifest, Writer))
+    FString ValidationReason;
+    if (!GLTFSaveInternal::ValidateSceneRecords(
+            PlacedObjects, GeneratedMeshes, ValidationReason))
     {
+        UE_LOG(
+            LogTemp,
+            Warning,
+            TEXT("GLTFSaveLibrary refused an unsafe scene save. Path=%s Reason=%s"),
+            *ManifestPath,
+            *ValidationReason);
         return false;
     }
 
-    if (!FFileHelper::SaveStringToFile(ManifestString, *ManifestPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
+    GLTFSaveInternal::EnsureDirectoryForFile(ManifestPath);
+
+    const TSharedRef<FJsonObject> Manifest = BuildManifestJson(PlacedObjects, GeneratedMeshes);
+    const FSafeFileWriteResult SaveResult = FSafeFileIO::SaveJsonBlocking(
+        Manifest,
+        ManifestPath,
+        GLTFSaveInternal::MaxSceneManifestBytes);
+    if (!SaveResult.IsSuccess())
     {
+        UE_LOG(
+            LogTemp,
+            Warning,
+            TEXT("GLTFSaveLibrary scene save failed. Path=%s Reason=%s"),
+            *ManifestPath,
+            *SaveResult.Error);
         return false;
     }
 
@@ -148,51 +330,138 @@ bool UGLTFSaveLibrary::LoadScene(
     OutPlacedObjects.Empty();
     OutGeneratedMeshes.Empty();
 
-    FString JsonString;
-    if (!FFileHelper::LoadFileToString(JsonString, *ManifestPath))
+    const FSafeJsonLoadResult LoadResult = FSafeFileIO::LoadJsonBlocking(
+        ManifestPath,
+        GLTFSaveInternal::MakeSceneJsonLimits());
+    if (!LoadResult.IsSuccess())
+    {
+        // Missing manifests are an expected first-run condition; malformed existing files are not.
+        if (LoadResult.Status != ESafeFileIOStatus::Missing)
+        {
+            UE_LOG(
+                LogTemp,
+                Warning,
+                TEXT("GLTFSaveLibrary scene load failed. Path=%s Reason=%s"),
+                *ManifestPath,
+                *LoadResult.Error);
+        }
+        return false;
+    }
+
+    const TSharedPtr<FJsonObject>& Root = LoadResult.JsonObject;
+    if (!Root.IsValid())
     {
         return false;
     }
 
-    TSharedPtr<FJsonObject> Root;
-    const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonString);
-    if (!FJsonSerializer::Deserialize(Reader, Root) || !Root.IsValid())
-    {
-        return false;
-    }
+    TArray<FPlacedObjectRecord> ParsedPlacedObjects;
+    TArray<FGeneratedMeshRecord> ParsedGeneratedMeshes;
 
     const TArray<TSharedPtr<FJsonValue>>* Objects = nullptr;
-    if (Root->TryGetArrayField(TEXT("Objects"), Objects) && Objects)
+    if (Root->HasField(TEXT("Objects")))
     {
+        if (!Root->TryGetArrayField(TEXT("Objects"), Objects) ||
+            !Objects ||
+            Objects->Num() > GLTFSaveInternal::MaxScenePlacedObjects)
+        {
+            UE_LOG(
+                LogTemp,
+                Warning,
+                TEXT("GLTFSaveLibrary rejected an invalid Objects array. Path=%s"),
+                *ManifestPath);
+            return false;
+        }
+
+        ParsedPlacedObjects.Reserve(Objects->Num());
         for (const TSharedPtr<FJsonValue>& Value : *Objects)
         {
-            if (Value.IsValid() && Value->Type == EJson::Object)
+            if (!Value.IsValid() || Value->Type != EJson::Object)
             {
-                FPlacedObjectRecord Record;
-                if (Record.FromJson(Value->AsObject()))
-                {
-                    OutPlacedObjects.Add(Record);
-                }
+                UE_LOG(
+                    LogTemp,
+                    Warning,
+                    TEXT("GLTFSaveLibrary rejected a non-object entry in Objects. Path=%s"),
+                    *ManifestPath);
+                return false;
             }
+
+            FPlacedObjectRecord Record;
+            if (!Record.FromJson(Value->AsObject()) ||
+                !GLTFSaveInternal::IsPlacedObjectRecordSafe(Record))
+            {
+                UE_LOG(
+                    LogTemp,
+                    Warning,
+                    TEXT("GLTFSaveLibrary rejected an invalid placed-object record. Path=%s"),
+                    *ManifestPath);
+                return false;
+            }
+            ParsedPlacedObjects.Add(MoveTemp(Record));
         }
     }
 
     const TArray<TSharedPtr<FJsonValue>>* Meshes = nullptr;
-    if (Root->TryGetArrayField(TEXT("GeneratedMeshes"), Meshes) && Meshes)
+    if (Root->HasField(TEXT("GeneratedMeshes")))
     {
+        if (!Root->TryGetArrayField(TEXT("GeneratedMeshes"), Meshes) ||
+            !Meshes ||
+            Meshes->Num() > GLTFSaveInternal::MaxSceneGeneratedMeshes)
+        {
+            UE_LOG(
+                LogTemp,
+                Warning,
+                TEXT("GLTFSaveLibrary rejected an invalid GeneratedMeshes array. Path=%s"),
+                *ManifestPath);
+            return false;
+        }
+
+        ParsedGeneratedMeshes.Reserve(Meshes->Num());
+        int64 TotalVertices = 0;
+        int64 TotalTriangleIndices = 0;
         for (const TSharedPtr<FJsonValue>& Value : *Meshes)
         {
-            if (Value.IsValid() && Value->Type == EJson::Object)
+            if (!Value.IsValid() || Value->Type != EJson::Object)
             {
-                FGeneratedMeshRecord Record;
-                if (Record.FromJson(Value->AsObject()))
-                {
-                    OutGeneratedMeshes.Add(Record);
-                }
+                UE_LOG(
+                    LogTemp,
+                    Warning,
+                    TEXT("GLTFSaveLibrary rejected a non-object entry in GeneratedMeshes. Path=%s"),
+                    *ManifestPath);
+                return false;
             }
+
+            FGeneratedMeshRecord Record;
+            if (!Record.FromJson(Value->AsObject()) ||
+                !GLTFSaveInternal::IsGeneratedMeshRecordSafe(Record))
+            {
+                UE_LOG(
+                    LogTemp,
+                    Warning,
+                    TEXT("GLTFSaveLibrary rejected an invalid generated-mesh record. Path=%s"),
+                    *ManifestPath);
+                return false;
+            }
+
+            TotalVertices += Record.Vertices.Num();
+            TotalTriangleIndices += Record.Triangles.Num();
+            if (TotalVertices > GLTFSaveInternal::MaxSceneTotalVertices ||
+                TotalTriangleIndices > GLTFSaveInternal::MaxSceneTotalTriangleIndices)
+            {
+                UE_LOG(
+                    LogTemp,
+                    Warning,
+                    TEXT("GLTFSaveLibrary rejected generated-mesh totals above scene limits. Path=%s Vertices=%lld Indices=%lld"),
+                    *ManifestPath,
+                    TotalVertices,
+                    TotalTriangleIndices);
+                return false;
+            }
+            ParsedGeneratedMeshes.Add(MoveTemp(Record));
         }
     }
 
+    OutPlacedObjects = MoveTemp(ParsedPlacedObjects);
+    OutGeneratedMeshes = MoveTemp(ParsedGeneratedMeshes);
     return true;
 }
 

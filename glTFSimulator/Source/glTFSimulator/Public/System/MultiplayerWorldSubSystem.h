@@ -3,6 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "GameFramework/GameModeBase.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "MultiplayerWorldSubSystem.generated.h"
 
@@ -47,8 +48,25 @@ public:
     UFUNCTION(BlueprintCallable, Category="Multiplayer", meta=(WorldContext="WorldContextObject"))
     bool StartSinglePlayerWorld(const UObject* WorldContextObject, const FString& WorldFolderName, TSoftObjectPtr<UWorld> SinglePlayerWorld);
 
+    /** Direct world/GameMode travel path used by StartActor and optional Blueprint callers. */
+    UFUNCTION(BlueprintCallable, Category="Multiplayer", meta=(WorldContext="WorldContextObject"))
+    bool StartSinglePlayerWorldWithGameMode(
+        const UObject* WorldContextObject,
+        const FString& WorldFolderName,
+        TSoftObjectPtr<UWorld> SinglePlayerWorld,
+        TSoftClassPtr<AGameModeBase> GameModeOverride);
+
     UFUNCTION(BlueprintCallable, Category="Multiplayer", meta=(WorldContext="WorldContextObject"))
     bool HostMultiplayerWorld(const UObject* WorldContextObject, const FString& WorldFolderName, TSoftObjectPtr<UWorld> HostWorld, int32 Port = 7777);
+
+    /** Direct host-world/GameMode travel path used by StartActor and optional Blueprint callers. */
+    UFUNCTION(BlueprintCallable, Category="Multiplayer", meta=(WorldContext="WorldContextObject"))
+    bool HostMultiplayerWorldWithGameMode(
+        const UObject* WorldContextObject,
+        const FString& WorldFolderName,
+        TSoftObjectPtr<UWorld> HostWorld,
+        TSoftClassPtr<AGameModeBase> GameModeOverride,
+        int32 Port = 7777);
 
     UFUNCTION(BlueprintCallable, Category="Multiplayer", meta=(WorldContext="WorldContextObject"))
     bool OpenClientConnectionWorld(const UObject* WorldContextObject, TSoftObjectPtr<UWorld> ClientWorld);
@@ -68,10 +86,29 @@ public:
     UFUNCTION(BlueprintPure, Category="Multiplayer", meta=(WorldContext="WorldContextObject"))
     static bool ShouldUseClientRenderOnlyStreaming(const UObject* WorldContextObject);
 
+    /** Expected server GameMode for the most recent local map travel. Empty means use map World Settings. */
+    TSoftClassPtr<AGameModeBase> GetRequestedGameModeOverride() const { return RequestedGameModeOverride; }
+
+    /** External folder associated with the most recent explicit GameMode request. */
+    FString GetRequestedGameModeWorldFolder() const { return RequestedGameModeWorldFolder; }
+
+    /** Clears travel diagnostics after returning to the menu or starting a client-only connection flow. */
+    void ClearRequestedGameModeOverride();
+
 private:
     EMultiplayerWorldMode WorldMode = EMultiplayerWorldMode::SinglePlayer;
     FString SelectedWorldFolderName;
     FString ServerAddress = TEXT("127.0.0.1:7777");
 
-    bool OpenWorldByReference(const UObject* WorldContextObject, TSoftObjectPtr<UWorld> WorldAsset, const FString& Options = FString()) const;
+    UPROPERTY(Transient)
+    TSoftClassPtr<AGameModeBase> RequestedGameModeOverride;
+
+    UPROPERTY(Transient)
+    FString RequestedGameModeWorldFolder;
+
+    bool OpenWorldByReference(
+        const UObject* WorldContextObject,
+        TSoftObjectPtr<UWorld> WorldAsset,
+        const FString& Options,
+        TSoftClassPtr<AGameModeBase> GameModeOverride) const;
 };

@@ -2,12 +2,8 @@
 // Copyright © 2025 Epic Games, Inc. All rights reserved.
 
 #include "World/UpdateRainAsync.h"
-#include "Async/Async.h"
 #include "NiagaraComponent.h"
 #include "Components/SceneCaptureComponent2D.h"
-#include "NiagaraFunctionLibrary.h"
-#include "Kismet/KismetMathLibrary.h"
-#include "Math/RotationMatrix.h"
 
 UUpdateRainAsync *UUpdateRainAsync::UpdateRainAsync(
     UObject *WorldContextObject,
@@ -16,16 +12,23 @@ UUpdateRainAsync *UUpdateRainAsync::UpdateRainAsync(
     const float InMaxViewDist,
     const FName &InParam)
 {
-    ViewComp->MaxViewDistanceOverride = InMaxViewDist;
-    auto *Action = NewObject<UUpdateRainAsync>();
-    Action->WorldContextObject = WorldContextObject->GetWorld();
+    UUpdateRainAsync* Action = NewObject<UUpdateRainAsync>();
+    Action->WorldContextObject = WorldContextObject;
     Action->ViewCompPtr = ViewComp;
     Action->NiagaraCompPtr = NiagaraComp;
-    Action->OrthoWidth = ViewComp->OrthoWidth;
-    Action->NearPlane = ViewComp->CustomNearClippingPlane;
-    Action->MaxViewDist = InMaxViewDist;
+    Action->MaxViewDist = FMath::Max(0.0f, InMaxViewDist);
     Action->Param = InParam;
-    Action->RegisterWithGameInstance(WorldContextObject);
+
+    // Capture all component values while still on the game thread. Invalid Blueprint inputs are
+    // completed safely by Activate instead of being dereferenced in the factory.
+    if (IsValid(ViewComp))
+    {
+        ViewComp->MaxViewDistanceOverride = Action->MaxViewDist;
+    }
+    if (IsValid(WorldContextObject))
+    {
+        Action->RegisterWithGameInstance(WorldContextObject);
+    }
     return Action;
 }
 
@@ -38,43 +41,39 @@ void UUpdateRainAsync::Activate()
         return;
     }
 
-    // On game thread, before async
-    const FTransform CaptureTransform = ViewCompPtr->GetComponentTransform();
-    const float Ortho = OrthoWidth;
-    const float Near = NearPlane;
-    const float MaxView = MaxViewDist;
-    const FName LocalParam = Param;
+    ApplyRainParameters(ViewCompPtr.Get(), NiagaraCompPtr.Get(), MaxViewDist, Param);
 
-    AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask,
-              [CaptureTransform, Ortho, Near, MaxView, LocalParam, this]()
-              {
-                  const FVector Location = CaptureTransform.GetLocation();
-                  const FRotator Rot = CaptureTransform.GetRotation().Rotator();
-                  const FVector Forward = UKismetMathLibrary::GetForwardVector(Rot);
-                  const FVector Right = UKismetMathLibrary::GetRightVector(Rot);
-                  const FVector Up = UKismetMathLibrary::GetUpVector(Rot);
-                  const FPlane XPlane(Location.X, Location.Y, Location.Z, Ortho);
-                  const FPlane YPlane(Right.X, Right.Y, Right.Z, 1.0f);
-                  const FPlane ZPlane(Up.X, Up.Y, Up.Z, Near);
-                  const FPlane WPlane(Forward.X, Forward.Y, Forward.Z, MaxView);
-                  const FMatrix ViewMatrix(XPlane, YPlane, ZPlane, WPlane);
+    Completed.Broadcast();
+    SetReadyToDestroy();
+}
 
-                  AsyncTask(ENamedThreads::GameThread,
-                            [this, ViewMatrix, MaxView, LocalParam]()
-                            {
-                                if (!NiagaraCompPtr.IsValid())
-                                {
-                                    Completed.Broadcast();
-                                    SetReadyToDestroy();
-                                    return;
-                                }
+bool UUpdateRainAsync::ApplyRainParameters(
+    USceneCaptureComponent2D* ViewComp,
+    UNiagaraComponent* NiagaraComp,
+    const float InMaxViewDist,
+    const FName& InParam)
+{
+    if (!IsValid(ViewComp) || !IsValid(NiagaraComp))
+    {
+        return false;
+    }
 
-                                UNiagaraComponent *NiagaraComp = NiagaraCompPtr.Get();
-                                NiagaraComp->SetFloatParameter(TEXT("MaxViewDistanceOverride"), MaxView);
-                                NiagaraComp->SetVariableMatrix(LocalParam, ViewMatrix);
+    // The calculation is cheaper than a task-graph dispatch and only touches game-thread UObjects.
+    const float MaxView = FMath::Max(0.0f, InMaxViewDist);
+    ViewComp->MaxViewDistanceOverride = MaxView;
+    const FTransform CaptureTransform = ViewComp->GetComponentTransform();
+    const FVector Location = CaptureTransform.GetLocation();
+    const FQuat Rotation = CaptureTransform.GetRotation();
+    const FVector Forward = Rotation.GetForwardVector();
+    const FVector Right = Rotation.GetRightVector();
+    const FVector Up = Rotation.GetUpVector();
+    const FPlane XPlane(Location.X, Location.Y, Location.Z, ViewComp->OrthoWidth);
+    const FPlane YPlane(Right.X, Right.Y, Right.Z, 1.0f);
+    const FPlane ZPlane(Up.X, Up.Y, Up.Z, ViewComp->CustomNearClippingPlane);
+    const FPlane WPlane(Forward.X, Forward.Y, Forward.Z, MaxView);
+    const FMatrix ViewMatrix(XPlane, YPlane, ZPlane, WPlane);
 
-                                Completed.Broadcast();
-                                SetReadyToDestroy();
-                            });
-              });
+    NiagaraComp->SetFloatParameter(TEXT("MaxViewDistanceOverride"), MaxView);
+    NiagaraComp->SetVariableMatrix(InParam, ViewMatrix);
+    return true;
 }

@@ -31,6 +31,13 @@ public:
         const float InMaxViewDist,
         const FName &InParam);
 
+    /** Applies the inexpensive capture-to-Niagara matrix update without allocating an action. */
+    static bool ApplyRainParameters(
+        USceneCaptureComponent2D* ViewComp,
+        UNiagaraComponent* NiagaraComp,
+        float InMaxViewDist,
+        const FName& InParam);
+
     virtual void Activate() override;
 
 private:
@@ -41,8 +48,6 @@ private:
     TWeakObjectPtr<USceneCaptureComponent2D> ViewCompPtr;
     UPROPERTY()
     TWeakObjectPtr<UNiagaraComponent> NiagaraCompPtr;
-    float OrthoWidth = 0.f;
-    float NearPlane = 0.f;
     float MaxViewDist = 0.f;
     FName Param;
 };

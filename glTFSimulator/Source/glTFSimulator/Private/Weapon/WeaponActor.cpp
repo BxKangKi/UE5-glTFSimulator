@@ -20,6 +20,7 @@
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
 #include "Setting/GameSettings.h"
+#include "System/GlbValidation.h"
 #include "System/MacroLibrary.h"
 #include "Weapon/WeaponProjectileActor.h"
 #include "glTFRuntimeAsset.h"
@@ -30,6 +31,8 @@ namespace
 {
     constexpr float DefaultWeaponVisualLengthCm = 140.0f;
     constexpr float DefaultWeaponVisualThicknessCm = 14.0f;
+    constexpr int64 MaxWeaponConfigBytes = 16ll * 1024ll * 1024ll;
+    constexpr int32 MaxRuntimeWeaponNodeCount = 500000;
 
     bool TryReadVector(const TSharedPtr<FJsonObject>& Object, const TCHAR* FieldName, FVector& Value)
     {
@@ -200,6 +203,13 @@ bool AWeaponActor::EquipDefault(USceneComponent* AttachTarget)
 
 bool AWeaponActor::LoadConfigJson(const FString& JsonPath)
 {
+    const int64 JsonFileSize = IFileManager::Get().FileSize(*JsonPath);
+    if (JsonFileSize > MaxWeaponConfigBytes)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("WeaponActor: config JSON exceeds the safety limit: %s"), *JsonPath);
+        return false;
+    }
+
     FString JsonString;
     if (!FFileHelper::LoadFileToString(JsonString, *JsonPath))
     {
@@ -289,7 +299,7 @@ void AWeaponActor::ReleaseRuntimeResources()
     if (IsValid(GltfAsset))
     {
         GltfAsset->ClearCache();
-        GltfAsset->MarkAsGarbage();
+        GltfAsset->ClearFlags(RF_Public | RF_Standalone);
         GltfAsset = nullptr;
     }
 }
@@ -324,7 +334,7 @@ void AWeaponActor::ClearLoadedComponents()
     {
         if (IsValid(Mesh) && !Mesh->IsAsset())
         {
-            Mesh->MarkAsGarbage();
+            Mesh->ClearFlags(RF_Public | RF_Standalone);
         }
     }
 
@@ -334,7 +344,7 @@ void AWeaponActor::ClearLoadedComponents()
 
 UStaticMesh* AWeaponActor::LoadMeshByIndex(int32 MeshIndex)
 {
-    if (!IsValid(GltfAsset) || MeshIndex == INDEX_NONE)
+    if (!IsValid(GltfAsset) || MeshIndex < 0 || MeshIndex >= GltfAsset->GetNumMeshes())
     {
         return nullptr;
     }
@@ -380,6 +390,14 @@ bool AWeaponActor::LoadWeaponMesh()
 {
     ClearLoadedComponents();
 
+    SourceFilePath = GlbValidation::NormalizePath(SourceFilePath);
+    FString ValidationReason;
+    if (!GlbValidation::ValidateRuntimeMeshFile(SourceFilePath, ValidationReason))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("WeaponActor: invalid GLB skipped. Path=%s Reason=%s"), *SourceFilePath, *ValidationReason);
+        return false;
+    }
+
     FglTFRuntimeConfig LoaderConfig;
     LoaderConfig.bAllowExternalFiles = true;
     GltfAsset = UglTFRuntimeFunctionLibrary::glTFLoadAssetFromFilename(SourceFilePath, false, LoaderConfig);
@@ -390,9 +408,17 @@ bool AWeaponActor::LoadWeaponMesh()
 
     int32 ComponentIndex = 0;
     const TArray<FglTFRuntimeNode> Nodes = GltfAsset->GetNodes();
+    if (Nodes.Num() > MaxRuntimeWeaponNodeCount)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("WeaponActor: GLB node count exceeds the runtime safety limit. Path=%s Nodes=%d"),
+            *SourceFilePath, Nodes.Num());
+        ReleaseRuntimeResources();
+        return false;
+    }
+    const int32 MeshCount = GltfAsset->GetNumMeshes();
     for (const FglTFRuntimeNode& Node : Nodes)
     {
-        if (Node.MeshIndex == INDEX_NONE)
+        if (Node.MeshIndex < 0 || Node.MeshIndex >= MeshCount || Node.Transform.ContainsNaN())
         {
             continue;
         }

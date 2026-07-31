@@ -14,45 +14,70 @@ USkyUpdateAsyncAction *USkyUpdateAsyncAction::SkyUpdateAsync(UObject *WorldConte
     return Action;
 }
 
-FRotator USkyUpdateAsyncAction::CalculateSunRotation(UWorldData *World)
+FRotator USkyUpdateAsyncAction::CalculateSunRotation(const UWorldData* World)
 {
     FRotator Result = FRotator::ZeroRotator;
-    if (IsValid(World))
+    if (IsValid(World) &&
+        FMath::IsFinite(World->WorldTime) &&
+        FMath::IsFinite(World->OneDayTime) &&
+        FMath::IsFinite(World->OneYearDays) &&
+        FMath::IsFinite(World->AxialTilt) &&
+        FMath::IsFinite(World->Latitude) &&
+        FMath::IsFinite(World->Longitude) &&
+        World->OneDayTime > UE_SMALL_NUMBER &&
+        World->OneYearDays > UE_SMALL_NUMBER)
     {
-        float totalSeconds = FMath::Fmod(World->WorldTime, World->OneDayTime); // Seconds elapsed within the current day.
-        float dayOfYear = (totalSeconds / World->OneDayTime) * World->OneYearDays;   // Current day of year, 1-365.
-        float axialTiltRad = Deg2Rad * World->AxialTilt;
-        float latitudeRad = Deg2Rad * World->Latitude;
+        // Wrap negative and positive times into a stable [0, OneDayTime) interval.
+        float TotalSeconds = FMath::Fmod(World->WorldTime, World->OneDayTime);
+        if (TotalSeconds < 0.0f)
+        {
+            TotalSeconds += World->OneDayTime;
+        }
 
-        // Solar declination in radians.
-        float sunDeclination = axialTiltRad * FMath::Sin(2.0f * __PI__ * (dayOfYear / World->OneYearDays));
+        const float DayOfYear = (TotalSeconds / World->OneDayTime) * World->OneYearDays;
+        const float AxialTiltRadians = Deg2Rad * World->AxialTilt;
+        const float LatitudeRadians = Deg2Rad * World->Latitude;
 
-        // Time in hours.
-        float timeInHours = (totalSeconds / World->OneDayTime) * 24.0f;
+        // Solar declination follows the configured axial tilt over one simulated year.
+        const float SunDeclination =
+            AxialTiltRadians * FMath::Sin(2.0f * __PI__ * (DayOfYear / World->OneYearDays));
 
-        // Solar hour angle in degrees.
-        float hourAngle = 15.0f * (timeInHours - 12.0f) + World->Longitude * 15.0f; // Longitude correction.
+        const float TimeInHours = (TotalSeconds / World->OneDayTime) * 24.0f;
+        const float HourAngle = 15.0f * (TimeInHours - 12.0f) + World->Longitude * 15.0f;
+        const float HourAngleRadians = Deg2Rad * HourAngle;
 
-        // Altitude in radians.
-        float altitude = FMath::Asin(
-            FMath::Sin(latitudeRad) * FMath::Sin(sunDeclination) +
-            FMath::Cos(latitudeRad) * FMath::Cos(sunDeclination) * FMath::Cos(Deg2Rad * hourAngle));
+        // Clamp numerical drift before asin so extreme settings cannot produce NaNs.
+        const float AltitudeSine = FMath::Clamp(
+            FMath::Sin(LatitudeRadians) * FMath::Sin(SunDeclination) +
+                FMath::Cos(LatitudeRadians) * FMath::Cos(SunDeclination) * FMath::Cos(HourAngleRadians),
+            -1.0f,
+            1.0f);
+        const float Altitude = FMath::Asin(AltitudeSine);
 
-        // Azimuth in radians.
-        float azimuth = FMath::Atan2(
-            -FMath::Cos(sunDeclination) * FMath::Sin(Deg2Rad * hourAngle),
-            FMath::Cos(latitudeRad) * FMath::Sin(sunDeclination) -
-                FMath::Sin(latitudeRad) * FMath::Cos(sunDeclination) * FMath::Cos(Deg2Rad * hourAngle));
+        const float Azimuth = FMath::Atan2(
+            -FMath::Cos(SunDeclination) * FMath::Sin(HourAngleRadians),
+            FMath::Cos(LatitudeRadians) * FMath::Sin(SunDeclination) -
+                FMath::Sin(LatitudeRadians) * FMath::Cos(SunDeclination) * FMath::Cos(HourAngleRadians));
 
-        // Convert to Cartesian coordinates.
-        float x = FMath::Cos(altitude) * FMath::Cos(azimuth);
-        float y = FMath::Cos(altitude) * FMath::Sin(azimuth);
-        float z = FMath::Sin(altitude);
-
-        FVector direction = FVector(x, y, z).GetSafeNormal();
-        Result = FRotationMatrix::MakeFromX(direction).Rotator();
-        Result.Normalize();
+        const FVector Direction(
+            FMath::Cos(Altitude) * FMath::Cos(Azimuth),
+            FMath::Cos(Altitude) * FMath::Sin(Azimuth),
+            FMath::Sin(Altitude));
+        if (!Direction.IsNearlyZero())
+        {
+            Result = FRotationMatrix::MakeFromX(Direction.GetSafeNormal()).Rotator();
+            Result.Normalize();
+        }
     }
+    return Result;
+}
+
+FLightRotation USkyUpdateAsyncAction::CalculateLightRotation(const UWorldData* World)
+{
+    FLightRotation Result = FLightRotation::Default();
+    Result.Sun = CalculateSunRotation(World);
+    Result.Moon = FRotator(-Result.Sun.Pitch, Result.Sun.Yaw + 180.0f, -Result.Sun.Roll);
+    Result.Moon.Normalize();
     return Result;
 }
 
@@ -65,19 +90,8 @@ void USkyUpdateAsyncAction::Activate()
         SetReadyToDestroy();
         return;
     }
-    // Run the calculation on a background thread.
-    Async(EAsyncExecution::ThreadPool, [this]()
-          {
-        // Perform the actual calculation.
-        FLightRotation Result;
-        FRotator SunRotator = CalculateSunRotation(Data);
-        Result.Sun = SunRotator;
-        FRotator MoonRotator = FRotator(-SunRotator.Pitch, SunRotator.Yaw + 180.0f, -SunRotator.Roll);
-        MoonRotator.Normalize(); // Normalize the value to the 0-360 degree range.
-        Result.Moon = MoonRotator;
-        // Return to the game thread before broadcasting the delegate.
-        AsyncTask(ENamedThreads::GameThread, [this, Result]()
-                  {
-            OnCompleted.Broadcast(Result);
-            SetReadyToDestroy();}); });
+    // This is only a handful of trigonometric operations. Keeping it on the game thread avoids
+    // thread-pool scheduling overhead and, critically, avoids reading UObject properties off-thread.
+    OnCompleted.Broadcast(CalculateLightRotation(Data));
+    SetReadyToDestroy();
 }

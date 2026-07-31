@@ -71,8 +71,13 @@ struct GLTFSIMULATOR_API FLevelGameplaySettings
 {
     GENERATED_BODY()
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level|Gameplay")
-    FString WorldGameMode = TEXT("SinglePlayer");
+    /**
+     * Runtime rule-mode key consumed by GameManagerSubSystem. Accepted explicit values are Creator
+     * and RealLife; empty, Default, or legacy SinglePlayer uses the current map's GameManagerActor
+     * default. This field does not choose Unreal's AGameModeBase.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level|Gameplay", meta=(DisplayName="Runtime Play Mode Key"))
+    FString WorldGameMode = TEXT("Default");
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level|Gameplay")
     bool bCheatsEnabled = false;

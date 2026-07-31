@@ -22,6 +22,7 @@
 #include "TimerManager.h"
 #include "Blueprint/WidgetBlueprintLibrary.h"
 #include "Blueprint/UserWidget.h"
+#include "Camera/CameraComponent.h"
 #include "Components/Widget.h"
 #include "Engine/Engine.h"
 #include "Kismet/GameplayStatics.h"
@@ -45,11 +46,24 @@ void APlayerCharacterController::BeginPlay()
 {
     Super::BeginPlay();
     bMenuWorldTravelPending = false;
+    bGameplayInputSuppressed = false;
     GetWorldTimerManager().ClearTimer(MenuWorldTravelWatchdogHandle);
+    GetWorldTimerManager().ClearTimer(GameplayInputRecoveryHandle);
+
+    // APlayerController ignore-input calls are stack based. Clear any stale state before the
+    // loading/UI flow starts so repeated mode callbacks cannot leave keyboard and mouse look locked.
+    ResetIgnoreMoveInput();
+    ResetIgnoreLookInput();
     if (!IsValid(SubSystem))
     {
         SubSystem = UGameManagerSubSystem::GetSubSystem(this);
     }
+
+    // Snapshot the initial state so the update hook can detect the first completed loading/pause
+    // transition instead of repeatedly forcing input mode every frame.
+    bPrevWorldLoading = IsValid(SubSystem) && SubSystem->IsWorldLoading();
+    bPrevGamePaused = IsValid(SubSystem) && SubSystem->GetGamePaused();
+
     if (bApplyInputMappingContextsOnBeginPlay)
     {
         ApplyConfiguredInputMappingContexts();
@@ -184,9 +198,98 @@ void APlayerCharacterController::BeginPlayingState()
     {
         ApplyConfiguredInputMappingContexts();
     }
+
+    // BeginPlayingState runs after possession and input-component initialization. Reassert gameplay
+    // focus here because a loading widget created during BeginPlay may have consumed keyboard focus.
+    if (IsLocalController() && !bMenuWorldTravelPending)
+    {
+        if (!IsValid(SubSystem))
+        {
+            SubSystem = UGameManagerSubSystem::GetSubSystem(this);
+        }
+
+        if (!IsValid(SubSystem) || (!SubSystem->IsWorldLoading() && !SubSystem->GetGamePaused()))
+        {
+            ApplyGameInputMode();
+        }
+    }
+
     if (bLogInputSetup)
     {
         PrintInputSetupStatus();
+    }
+}
+
+void APlayerCharacterController::OnPossess(APawn* InPawn)
+{
+    Super::OnPossess(InPawn);
+
+    RegisterPrimaryCharacterPawn(InPawn);
+
+    // A streamed character or vehicle can be possessed after the original loading UI has already
+    // changed focus. Clear stale held state and recover mappings/focus on the next game-thread tick.
+    ClearLatchedMovementInput();
+    if (bApplyInputMappingContextsOnBeginPlay)
+    {
+        ApplyConfiguredInputMappingContexts();
+    }
+
+    if (!IsLocalController() || bMenuWorldTravelPending)
+    {
+        return;
+    }
+
+    if (UWorld* World = GetWorld())
+    {
+        GameplayInputRecoveryHandle = World->GetTimerManager().SetTimerForNextTick(
+            FTimerDelegate::CreateWeakLambda(this, [this]()
+            {
+                if (!IsValid(SubSystem))
+                {
+                    SubSystem = UGameManagerSubSystem::GetSubSystem(this);
+                }
+
+                if (IsValid(SubSystem))
+                {
+                    SubSystem->ApplyPendingInitialPlayerControlRotation(this);
+                }
+
+                if (!IsValid(SubSystem) || (!SubSystem->IsWorldLoading() && !SubSystem->GetGamePaused()))
+                {
+                    ApplyGameInputMode();
+                }
+            }));
+    }
+}
+
+void APlayerCharacterController::AcknowledgePossession(APawn* InPawn)
+{
+    Super::AcknowledgePossession(InPawn);
+    RegisterPrimaryCharacterPawn(InPawn);
+}
+
+void APlayerCharacterController::RegisterPrimaryCharacterPawn(APawn* InPawn)
+{
+    if (!IsValid(SubSystem))
+    {
+        SubSystem = UGameManagerSubSystem::GetSubSystem(this);
+    }
+
+    UWorld* World = GetWorld();
+    const bool bIsFirstPlayerController =
+        World && World->GetFirstPlayerController() == this;
+    if (bIsFirstPlayerController)
+    {
+        if (ACharacterController* PlayerCharacter = Cast<ACharacterController>(InPawn))
+        {
+            // Register only the primary character after possession has established ownership.
+            // The next-tick callback below runs after FinishRestartPlayer's rotation override.
+            if (IsValid(SubSystem))
+            {
+                SubSystem->SetPlayerActor(PlayerCharacter);
+                SubSystem->SetCameraComponent(PlayerCharacter->GetFollowCameraComponent());
+            }
+        }
     }
 }
 
@@ -195,6 +298,7 @@ void APlayerCharacterController::EndPlay(const EEndPlayReason::Type EndPlayReaso
     if (UWorld* World = GetWorld())
     {
         World->GetTimerManager().ClearTimer(MenuWorldTravelWatchdogHandle);
+        World->GetTimerManager().ClearTimer(GameplayInputRecoveryHandle);
     }
 
     if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
@@ -209,6 +313,27 @@ void APlayerCharacterController::EndPlay(const EEndPlayReason::Type EndPlayReaso
 
 void APlayerCharacterController::UpdateFromGameUpdate(float DeltaSeconds)
 {
+    if (!IsValid(SubSystem))
+    {
+        SubSystem = UGameManagerSubSystem::GetSubSystem(this);
+    }
+
+    const bool bWorldLoadingNow = IsValid(SubSystem) && SubSystem->IsWorldLoading();
+    const bool bGamePausedNow = IsValid(SubSystem) && SubSystem->GetGamePaused();
+
+    // Recover exactly when asynchronous world loading or pause ends. This closes the failure mode
+    // where the UI accepted LMB while keyboard movement and mouse-look remained on an ignore stack.
+    const bool bReturnedToGameplay =
+        (bPrevWorldLoading && !bWorldLoadingNow) ||
+        (bPrevGamePaused && !bGamePausedNow);
+    if (bReturnedToGameplay && !bWorldLoadingNow && !bGamePausedNow && !bMenuWorldTravelPending)
+    {
+        ApplyGameInputMode();
+    }
+
+    bPrevWorldLoading = bWorldLoadingNow;
+    bPrevGamePaused = bGamePausedNow;
+
     if (bEnableFallbackKeyBindings && !bUIInputMode &&
         (bFallbackMoveForward || bFallbackMoveBackward || bFallbackMoveRight || bFallbackMoveLeft))
     {
@@ -230,14 +355,45 @@ void APlayerCharacterController::ApplyGameInputMode()
         return;
     }
 
+    if (UWorld* World = GetWorld())
+    {
+        World->GetTimerManager().ClearTimer(GameplayInputRecoveryHandle);
+    }
+
+    // Keep the engine pause flag and the persistent subsystem state synchronized. A stale engine
+    // pause after a loading/pause widget is removed can make UI clicks work while gameplay input
+    // and pawn ticking remain stopped.
+    if ((!IsValid(SubSystem) || !SubSystem->GetGamePaused()) && UGameplayStatics::IsGamePaused(this))
+    {
+        UGameplayStatics::SetGamePaused(this, false);
+    }
+
     bUIInputMode = false;
     UWidgetBlueprintLibrary::SetInputMode_GameOnly(this, false);
+    UWidgetBlueprintLibrary::SetFocusToGameViewport();
     bShowMouseCursor = !bHideMouseCursorDuringGameplay;
     bEnableClickEvents = false;
     bEnableMouseOverEvents = false;
-    SetIgnoreLookInput(false);
-    SetIgnoreMoveInput(false);
+
+    // Reset the entire controller ignore-input stack. Calling SetIgnore*Input(false) only pops one
+    // layer, while loading, pause, and widget callbacks may previously have pushed several layers.
+    SetGameplayInputSuppressed(false);
+
+    // Reapply configured contexts in an idempotent way in case a level transition or UI flow removed
+    // the Enhanced Input subsystem mappings. Legacy fallback keys cover actions that remain unmapped.
+    ApplyConfiguredInputMappingContexts();
     ReapplyHeldGameplayInput();
+
+    // Slate focus changes are finalized at the end of the current frame. Reassert GameOnly mode on
+    // the next tick so a just-removed widget cannot steal keyboard or mouse-axis input afterward.
+    if (UWorld* World = GetWorld())
+    {
+        GameplayInputRecoveryHandle = World->GetTimerManager().SetTimerForNextTick(
+            FTimerDelegate::CreateWeakLambda(this, [this]()
+            {
+                FinalizeGameplayInputRecovery();
+            }));
+    }
 }
 
 void APlayerCharacterController::ApplyUIInputMode(UUserWidget* WidgetToFocus)
@@ -258,8 +414,7 @@ void APlayerCharacterController::ApplyUIInputMode(UUserWidget* WidgetToFocus)
     bEnableClickEvents = true;
     bEnableMouseOverEvents = true;
     StopGameplayMotionForUI();
-    SetIgnoreMoveInput(true);
-    SetIgnoreLookInput(true);
+    SetGameplayInputSuppressed(true);
 }
 
 void APlayerCharacterController::ApplyLoadingInputMode(UUserWidget* WidgetToFocus)
@@ -276,8 +431,7 @@ void APlayerCharacterController::ApplyLoadingInputMode(UUserWidget* WidgetToFocu
     bEnableClickEvents = true;
     bEnableMouseOverEvents = true;
     StopGameplayMotionForUI();
-    SetIgnoreMoveInput(true);
-    SetIgnoreLookInput(true);
+    SetGameplayInputSuppressed(true);
 }
 
 void APlayerCharacterController::StopGameplayMotionForUI()
@@ -299,6 +453,61 @@ void APlayerCharacterController::StopGameplayMotionForUI()
     }
 }
 
+void APlayerCharacterController::SetGameplayInputSuppressed(const bool bSuppress)
+{
+    if (bSuppress)
+    {
+        // SetIgnoreMoveInput and SetIgnoreLookInput are stack based. Push only once for this
+        // controller-owned UI/loading lock, no matter how many widgets request the same mode.
+        if (!bGameplayInputSuppressed)
+        {
+            SetIgnoreMoveInput(true);
+            SetIgnoreLookInput(true);
+            bGameplayInputSuppressed = true;
+        }
+        return;
+    }
+
+    // Reset rather than popping one layer. This also recovers from stale Blueprint or legacy C++
+    // calls that pushed ignore input more than once and caused the packaged game to accept only LMB.
+    ResetIgnoreMoveInput();
+    ResetIgnoreLookInput();
+    bGameplayInputSuppressed = false;
+}
+
+void APlayerCharacterController::FinalizeGameplayInputRecovery()
+{
+    if (!IsLocalController() || IsActorBeingDestroyed() || bMenuWorldTravelPending || bUIInputMode)
+    {
+        return;
+    }
+
+    if (!IsValid(SubSystem))
+    {
+        SubSystem = UGameManagerSubSystem::GetSubSystem(this);
+    }
+    if (IsValid(SubSystem) && (SubSystem->IsWorldLoading() || SubSystem->GetGamePaused()))
+    {
+        return;
+    }
+
+    if ((!IsValid(SubSystem) || !SubSystem->GetGamePaused()) && UGameplayStatics::IsGamePaused(this))
+    {
+        UGameplayStatics::SetGamePaused(this, false);
+    }
+
+    UWidgetBlueprintLibrary::SetInputMode_GameOnly(this, false);
+    UWidgetBlueprintLibrary::SetFocusToGameViewport();
+    bShowMouseCursor = !bHideMouseCursorDuringGameplay;
+    bEnableClickEvents = false;
+    bEnableMouseOverEvents = false;
+    SetGameplayInputSuppressed(false);
+    ApplyConfiguredInputMappingContexts();
+    ReapplyHeldGameplayInput();
+
+    UE_LOG(LogTemp, Verbose, TEXT("[GameplayInput] Viewport focus and gameplay input were recovered after UI/loading mode."));
+}
+
 void APlayerCharacterController::LockInputForMenuWorldTravel()
 {
     bUIInputMode = true;
@@ -307,8 +516,7 @@ void APlayerCharacterController::LockInputForMenuWorldTravel()
     // Remove the old menu from hit testing and prevent its initiating click/key release from being
     // interpreted as gameplay input while OpenLevel is queued.
     UWidgetBlueprintLibrary::SetInputMode_GameOnly(this, false);
-    SetIgnoreMoveInput(true);
-    SetIgnoreLookInput(true);
+    SetGameplayInputSuppressed(true);
     bEnableClickEvents = false;
     bEnableMouseOverEvents = false;
     bShowMouseCursor = false;
@@ -452,14 +660,18 @@ void APlayerCharacterController::ApplyConfiguredInputMappingContexts()
         EnhancedInputSubsystem->ClearAllMappings();
     }
 
-    const auto AddContextIfValid = [EnhancedInputSubsystem](const UInputMappingContext* MappingContext, int32 Priority) -> bool
+    const auto AddContextIfValid = [EnhancedInputSubsystem](const UInputMappingContext* MappingContext, const int32 Priority) -> bool
     {
-        if (IsValid(MappingContext))
+        if (!IsValid(MappingContext))
         {
-            EnhancedInputSubsystem->AddMappingContext(MappingContext, Priority);
-            return true;
+            return false;
         }
-        return false;
+
+        // Remove first so repeated BeginPlay, possession, loading, and focus-recovery callbacks do
+        // not accumulate duplicate mapping registrations or preserve an obsolete priority.
+        EnhancedInputSubsystem->RemoveMappingContext(MappingContext);
+        EnhancedInputSubsystem->AddMappingContext(MappingContext, Priority);
+        return true;
     };
 
     bAnyInputMappingContextApplied |= AddContextIfValid(InputMappingContext.Get(), InputMappingPriority);
@@ -478,14 +690,14 @@ void APlayerCharacterController::RefreshConfiguredEnhancedInput()
 
 FString APlayerCharacterController::GetInputFixVersion() const
 {
-    return TEXT("GameplayInput");
+    return TEXT("GameplayInputRecovery-v4");
 }
 
 FString APlayerCharacterController::GetInputSetupStatus() const
 {
     return FString::Printf(
         TEXT("%s | Controller=%s | Class=%s | PrimaryIMC=%s | IMCCount=%d | IAAssigned=%d | EnhancedInputComponent=%s | MappingApplied=%s | GameplayMouse=%s | ManagerClass=%s"),
-        TEXT("GameplayInput"),
+        TEXT("GameplayInputRecovery-v4"),
         *GetNameSafe(this),
         *GetNameSafe(GetClass()),
         *GetNameSafe(InputMappingContext.Get()),
@@ -664,6 +876,45 @@ int32 APlayerCharacterController::CountAssignedEnhancedInputActions() const
     return Count;
 }
 
+bool APlayerCharacterController::IsActionMappedInConfiguredContexts(const UInputAction* ConfiguredAction) const
+{
+    if (!IsValid(ConfiguredAction))
+    {
+        return false;
+    }
+
+    const auto ContextContainsAction = [ConfiguredAction](const UInputMappingContext* MappingContext)
+    {
+        if (!IsValid(MappingContext))
+        {
+            return false;
+        }
+
+        for (const auto& Mapping : MappingContext->GetMappings())
+        {
+            if (Mapping.Action == ConfiguredAction)
+            {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    if (ContextContainsAction(InputMappingContext.Get()))
+    {
+        return true;
+    }
+
+    for (const FPlayerInputMappingContextConfig& ContextConfig : AdditionalInputMappingContexts)
+    {
+        if (ContextContainsAction(ContextConfig.MappingContext.Get()))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool APlayerCharacterController::ShouldBindFallbackKeyForAction(const UInputAction* ConfiguredAction) const
 {
     if (!bBindFallbackKeysOnlyForUnassignedInputActions)
@@ -671,13 +922,14 @@ bool APlayerCharacterController::ShouldBindFallbackKeyForAction(const UInputActi
         return true;
     }
 
-    // If Enhanced Input is not fully ready, keep legacy keys alive instead of silently losing input.
+    // An assigned InputAction is not sufficient: the action must actually appear in one of the
+    // mapping contexts applied by this controller. Otherwise movement/look fallback keys stay alive.
     if (!bEnhancedInputComponentWasAvailable || !bAnyInputMappingContextApplied)
     {
         return true;
     }
 
-    return !IsValid(ConfiguredAction);
+    return !IsActionMappedInConfiguredContexts(ConfiguredAction);
 }
 
 void APlayerCharacterController::BindFallbackKeyInputs()

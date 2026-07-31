@@ -4,3 +4,11 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Modules/ModuleManager.h"
+
+/** Primary game module that drains tracked runtime work before the module DLL is unloaded. */
+class FglTFSimulatorModule final : public FDefaultGameModuleImpl
+{
+public:
+    virtual void ShutdownModule() override;
+};

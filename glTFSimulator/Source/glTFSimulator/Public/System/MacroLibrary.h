@@ -36,19 +36,3 @@
 #define BONE_LEFT_FOOT TEXT("leftFoot")
 #define BONE_HEAD TEXT("head")
 #define BONE_NECK TEXT("neck")
-#define MAX_INT32 TNumericLimits<int32>::Max()
-#define MAX_INT64 TNumericLimits<int64>::Max()
-#define MAX_FLOAT TNumericLimits<float>::Max()
-#define MAX_DOUBLE =TNumericLimits<double>::Max()
-
-template <typename... Args>
-FORCEINLINE bool CheckValid(const Args &...args)
-{
-    return (... && (::IsValid(GetRawPointer(args))));
-}
-
-template <typename T>
-FORCEINLINE T *GetRawPointer(T *Ptr) { return Ptr; }
-
-template <typename T>
-FORCEINLINE T *GetRawPointer(const TObjectPtr<T> &Ptr) { return Ptr.Get(); }

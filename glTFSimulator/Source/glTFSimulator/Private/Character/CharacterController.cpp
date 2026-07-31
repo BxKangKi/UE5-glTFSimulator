@@ -9,6 +9,7 @@
 #include "GameFramework/SpringArmComponent.h"
 #include "System/GameManagerSubSystem.h"
 #include "System/GameUpdateSubSystem.h"
+#include "System/SafeFileIO.h"
 #include "Components/CapsuleComponent.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Camera/CameraComponent.h"
@@ -21,6 +22,9 @@
 #include "World/BuoyancyComponent.h"
 #include "System/MacroLibrary.h"
 #include "Components/PrimitiveComponent.h"
+#include "Animation/Skeleton.h"
+#include "Engine/SkeletalMesh.h"
+#include "PhysicsEngine/PhysicsAsset.h"
 
 namespace CharacterControllerTuning
 {
@@ -142,12 +146,8 @@ void ACharacterController::BeginPlay()
         Capsule->OnComponentHit.AddDynamic(this, &ACharacterController::HandleCapsulePhysicsHit);
     }
     SubSystem = UGameManagerSubSystem::GetSubSystem(this);
-    if (IsValid(SubSystem))
-    {
-        SubSystem->SetPlayerActor(this);
-        SubSystem->SetCameraComponent(FollowCamera);
-        SetActorLocation(SubSystem->GetPlayerLocation(), false, nullptr, ETeleportType::TeleportPhysics);
-    }
+    // PlayerCharacterController::OnPossess performs primary-player registration. BeginPlay can run
+    // before possession, when this Pawn cannot yet be distinguished from remote or secondary Pawns.
     Activate(false);
 
     if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
@@ -165,75 +165,285 @@ void ACharacterController::BeginPlay()
 
 void ACharacterController::Load(const FString &Path)
 {
-    bIsLoaded = false;
-    LoadProgress = 0.0f;
-
-    PrepareForMeshReload();
-
-    if (IsValid(Component.Get()))
+    if (!ensureMsgf(IsInGameThread(), TEXT("ACharacterController::Load must run on the game thread")))
     {
-        // A new async mesh invalidates the previous waterline reference. The new
-        // BONE_HEAD/capsule offset will be committed only after OnLoadCompleted.
-        Component->InvalidateWaterReferenceForPendingMeshLoad();
+        TWeakObjectPtr<ACharacterController> WeakThis(this);
+        const FString DeferredPath = Path;
+        FSafeFileIO::DispatchTrackedGameThread([WeakThis, DeferredPath]()
+        {
+            if (ACharacterController* StrongThis = WeakThis.Get())
+            {
+                StrongThis->Load(DeferredPath);
+            }
+        });
+        return;
     }
+
+    if (Path.IsEmpty())
+    {
+        UE_LOG(LogTemp, Warning, TEXT("Character load ignored because the GLB path is empty."));
+        bLastMeshLoadSucceeded = false;
+        LoadProgress = 1.0f;
+        bIsLoaded = true;
+        return;
+    }
+
+    bIsLoaded = false;
+    bLastMeshLoadSucceeded = false;
+    LoadProgress = 0.0f;
 
     if (IsValid(ActiveLoadAction.Get()))
     {
+        // glTFRuntime cannot be force-stopped once mesh construction/finalization is in flight.
+        // Keep only the latest requested path and start it after the cancelled action reports that
+        // its callback has drained. This guarantees at most one character build at a time.
+        QueuedCharacterPath = Path;
         ActiveLoadAction->CancelAndRelease();
-        ActiveLoadAction = nullptr;
+        return;
     }
 
-    // 1. Create a fresh glTFRuntime asset load action and pass WorldContextObject, Owner, and Path.
+    QueuedCharacterPath.Reset();
+
+    // Only one generated character is kept resident. Detach the old runtime mesh before
+    // the next GLB is parsed, then keep the default character animated during the async load.
+    ReleaseRuntimeCharacterResources(true);
+
+    if (IsValid(Component.Get()))
+    {
+        Component->InvalidateWaterReferenceForPendingMeshLoad();
+    }
+
     UCharacterLoadAsyncAction *LoadAction = UCharacterLoadAsyncAction::LoadCharacterAsync(this, this, Path);
     if (LoadAction)
     {
         ActiveLoadAction = LoadAction;
-        // 2. Connect completed delegate (Optional)
-        // Optional hook for UI/state work after loading completes.
         LoadAction->OnCompleted.AddDynamic(this, &ACharacterController::OnLoadCompleted);
         LoadAction->OnProgress.AddDynamic(this, &ACharacterController::OnLoadProgress);
-        // 3. Start async loading
-        // Activate() runs glTF loading, BoneMap loading, and mesh creation in order.
         LoadAction->Activate();
     }
     else
     {
-        RestoreAfterMeshReload();
         LoadProgress = 1.0f;
+        bLastMeshLoadSucceeded = false;
+        bIsLoaded = true;
+    }
+}
+
+void ACharacterController::CancelCharacterLoad(bool bRestoreDefaultMesh)
+{
+    if (!ensureMsgf(IsInGameThread(), TEXT("ACharacterController::CancelCharacterLoad must run on the game thread")))
+    {
+        TWeakObjectPtr<ACharacterController> WeakThis(this);
+        FSafeFileIO::DispatchTrackedGameThread([WeakThis, bRestoreDefaultMesh]()
+        {
+            if (ACharacterController* StrongThis = WeakThis.Get())
+            {
+                StrongThis->CancelCharacterLoad(bRestoreDefaultMesh);
+            }
+        });
+        return;
+    }
+
+    QueuedCharacterPath.Reset();
+    if (IsValid(ActiveLoadAction.Get()))
+    {
+        ActiveLoadAction->CancelAndRelease();
+    }
+
+    ReleaseRuntimeCharacterResources(bRestoreDefaultMesh);
+    bLastMeshLoadSucceeded = false;
+    LoadProgress = 1.0f;
+    bIsLoaded = true;
+}
+
+void ACharacterController::HandleCharacterLoadActionReleased(
+    UCharacterLoadAsyncAction* ReleasedAction)
+{
+    if (!ensureMsgf(IsInGameThread(), TEXT("Character load release notification must run on the game thread")))
+    {
+        return;
+    }
+
+    if (ActiveLoadAction.Get() != ReleasedAction)
+    {
+        return;
+    }
+
+    ActiveLoadAction = nullptr;
+    if (QueuedCharacterPath.IsEmpty() || IsActorBeingDestroyed())
+    {
+        QueuedCharacterPath.Reset();
+        return;
+    }
+
+    FString NextPath = MoveTemp(QueuedCharacterPath);
+    QueuedCharacterPath.Reset();
+    Load(NextPath);
+}
+
+bool ACharacterController::CommitRuntimeCharacterResources(
+    USkeletalMesh* SkeletalMesh,
+    UPhysicsAsset* PhysicsAsset,
+    USkeleton* InRuntimeSkeleton)
+{
+    if (!ensureMsgf(IsInGameThread(), TEXT("CommitRuntimeCharacterResources must run on the game thread")))
+    {
+        return false;
+    }
+
+    USkeletalMeshComponent* MeshComp = GetMesh();
+    if (!IsValid(MeshComp) || !IsValid(SkeletalMesh) || SkeletalMesh->GetRefSkeleton().GetNum() <= 0)
+    {
+        return false;
+    }
+
+    PrepareForMeshReload();
+
+    MeshComp->SetAllBodiesSimulatePhysics(false);
+    MeshComp->SetSimulatePhysics(false);
+    MeshComp->PutAllRigidBodiesToSleep();
+    MeshComp->SetSkinnedAssetAndUpdate(SkeletalMesh, true);
+
+    UPhysicsAsset* PhysicsToUse = IsValid(PhysicsAsset) ? PhysicsAsset : DefaultAsset.PhysicsAsset.Get();
+    if (IsValid(PhysicsToUse))
+    {
+        MeshComp->SetPhysicsAsset(PhysicsToUse, true);
+    }
+
+    MeshComp->SetCollisionProfileName(RAGDOLL);
+
+    RuntimeSkeletalMesh = SkeletalMesh;
+    RuntimePhysicsAsset = IsValid(PhysicsAsset) ? PhysicsAsset : nullptr;
+    RuntimeSkeleton = IsValid(SkeletalMesh->GetSkeleton())
+        ? SkeletalMesh->GetSkeleton()
+        : InRuntimeSkeleton;
+
+    // OnLoadCompleted restores animation/physics exactly once after the async action broadcasts
+    // completion. Keeping the swap itself minimal reduces the game-thread spike.
+    return true;
+}
+
+void ACharacterController::ReleaseRuntimeCharacterResources(bool bRestoreDefaultMesh)
+{
+    if (!ensureMsgf(IsInGameThread(), TEXT("ReleaseRuntimeCharacterResources must run on the game thread")))
+    {
+        return;
+    }
+
+    USkeletalMeshComponent* MeshComp = GetMesh();
+    if (!IsValid(MeshComp))
+    {
+        RuntimeSkeletalMesh = nullptr;
+        RuntimePhysicsAsset = nullptr;
+        RuntimeSkeleton = nullptr;
+        return;
+    }
+
+    const bool bHasRuntimeResources =
+        IsValid(RuntimeSkeletalMesh) || IsValid(RuntimePhysicsAsset) || IsValid(RuntimeSkeleton);
+    const bool bDefaultMeshAlreadyInstalled =
+        !IsValid(DefaultAsset.SkeletalMesh) ||
+        MeshComp->GetSkinnedAsset() == DefaultAsset.SkeletalMesh.Get();
+    const bool bDefaultPhysicsAlreadyInstalled =
+        !IsValid(DefaultAsset.PhysicsAsset) ||
+        MeshComp->GetPhysicsAsset() == DefaultAsset.PhysicsAsset.Get();
+
+    // Initial world entry normally starts on the directly assigned default character. Avoid an
+    // unnecessary animation reset and physics-state recreation when there is nothing to release.
+    if (!bHasRuntimeResources && bDefaultMeshAlreadyInstalled && bDefaultPhysicsAlreadyInstalled)
+    {
+        return;
+    }
+
+    PrepareForMeshReload();
+
+    USkeletalMesh* OldRuntimeMesh = RuntimeSkeletalMesh.Get();
+    UPhysicsAsset* OldRuntimePhysics = RuntimePhysicsAsset.Get();
+    USkeleton* OldRuntimeSkeleton = RuntimeSkeleton.Get();
+
+    MeshComp->SetAllBodiesSimulatePhysics(false);
+    MeshComp->SetSimulatePhysics(false);
+    MeshComp->PutAllRigidBodiesToSleep();
+
+    // Never install a null skinned asset while an AnimBP/ControlRig may still own worker tasks.
+    // The directly assigned default mesh is the stable placeholder during the next async load.
+    if (IsValid(DefaultAsset.SkeletalMesh))
+    {
+        MeshComp->SetSkinnedAssetAndUpdate(DefaultAsset.SkeletalMesh, true);
+    }
+    if (IsValid(DefaultAsset.PhysicsAsset))
+    {
+        MeshComp->SetPhysicsAsset(DefaultAsset.PhysicsAsset, true);
+    }
+    RuntimeSkeletalMesh = nullptr;
+    RuntimePhysicsAsset = nullptr;
+    RuntimeSkeleton = nullptr;
+
+    auto ReleaseTransientObject = [](UObject* Object)
+    {
+        if (IsValid(Object) && !Object->IsAsset())
+        {
+            Object->ClearFlags(RF_Public | RF_Standalone);
+            Object->SetFlags(RF_Transient);
+        }
+    };
+    ReleaseTransientObject(OldRuntimePhysics);
+    ReleaseTransientObject(OldRuntimeSkeleton);
+    ReleaseTransientObject(OldRuntimeMesh);
+
+    // Do not call CollectGarbage here. Once references are detached, Unreal's normal incremental
+    // GC can reclaim the old mesh/material/texture graph without a character-switch hitch.
+    if (bRestoreDefaultMesh)
+    {
+        RestoreAfterMeshReload();
     }
 }
 
 void ACharacterController::OnLoadProgress(float Progress)
 {
+    ensureMsgf(IsInGameThread(), TEXT("Character load progress must be delivered on the game thread"));
     LoadProgress = FMath::Max(LoadProgress, FMath::Clamp(Progress, 0.0f, 1.0f));
 }
 
 void ACharacterController::OnLoadCompleted(bool Result)
 {
-    ActiveLoadAction = nullptr;
+    ensureMsgf(IsInGameThread(), TEXT("Character load completion must be delivered on the game thread"));
+    bLastMeshLoadSucceeded = Result;
 
     if (!Result)
     {
-        USkeletalMeshComponent *MeshComp = GetMesh();
-        if (IsValid(MeshComp) && IsValid(DefaultAsset.SkeletalMesh))
+        // The old runtime character was intentionally released before loading. Keep the directly
+        // assigned default mesh as the stable fallback rather than attempting to retain every GLB.
+        if (USkeletalMeshComponent* MeshComp = GetMesh())
         {
-            MeshComp->SetSkinnedAssetAndUpdate(DefaultAsset.SkeletalMesh, true);
+            if (IsValid(DefaultAsset.SkeletalMesh) &&
+                MeshComp->GetSkinnedAsset() != DefaultAsset.SkeletalMesh.Get())
+            {
+                MeshComp->SetSkinnedAssetAndUpdate(DefaultAsset.SkeletalMesh, true);
+            }
+            if (IsValid(DefaultAsset.PhysicsAsset))
+            {
+                MeshComp->SetPhysicsAsset(DefaultAsset.PhysicsAsset, true);
+            }
         }
-        UE_LOG(LogTemp, Warning, TEXT("Character glTF load failed. Falling back to the default mesh so world/runtime loading can continue."));
+        UE_LOG(LogTemp, Warning, TEXT("Character glTF load failed. The default character remains active."));
     }
 
     RestoreAfterMeshReload();
 
+    if (Result)
+    {
+        if (USkeletalMeshComponent* MeshComp = GetMesh())
+        {
+            UCharacterFunctionLibrary::BlendRagdoll(*MeshComp, 0.0f);
+        }
+    }
+
     if (IsValid(Component.Get()))
     {
-        // Waterline reference sampling is intentionally delayed until the final
-        // loaded mesh has produced valid bone transforms. Do not cache BONE_HEAD
-        // or a capsule fallback from CharacterComponent::BeginPlay.
         Component->RequestWaterReferenceRefreshAfterMeshLoad();
     }
 
-    // bIsLoaded is used by glTFStreamSubSystem as a player load-completion gate. Treat the
-    // default-mesh fallback as a completed load; otherwise main-world startup can never finish.
     LoadProgress = 1.0f;
     bIsLoaded = true;
 }
@@ -273,6 +483,7 @@ void ACharacterController::RestoreAfterMeshReload()
         return;
     }
 
+    const bool bWasMeshReloadPrepared = bHasSavedAnimationState;
     if (bHasSavedAnimationState)
     {
         if (SavedAnimationMode == EAnimationMode::AnimationBlueprint && SavedAnimClass)
@@ -288,11 +499,17 @@ void ACharacterController::RestoreAfterMeshReload()
 
     MeshComp->SetComponentTickEnabled(true);
     MeshComp->bPauseAnims = false;
-    MeshComp->RecreatePhysicsState();
+    if (bWasMeshReloadPrepared)
+    {
+        MeshComp->RecreatePhysicsState();
+    }
+    bNeedsPostRagdollCleanup = true;
+    PhysicsStateAuditAccumulator = 0.0f;
 }
 
 void ACharacterController::PrepareForPawnReplacement()
 {
+    QueuedCharacterPath.Reset();
     if (IsValid(ActiveLoadAction.Get()))
     {
         ActiveLoadAction->CancelAndRelease();
@@ -300,7 +517,7 @@ void ACharacterController::PrepareForPawnReplacement()
     }
 
     Activate(false);
-    PrepareForMeshReload();
+    ReleaseRuntimeCharacterResources(false);
 
     USkeletalMeshComponent* MeshComp = GetMesh();
     if (IsValid(MeshComp))
@@ -325,6 +542,14 @@ void ACharacterController::PrepareForPawnReplacement()
 
 void ACharacterController::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+    QueuedCharacterPath.Reset();
+    if (IsValid(ActiveLoadAction.Get()))
+    {
+        ActiveLoadAction->CancelAndRelease();
+        ActiveLoadAction = nullptr;
+    }
+    ReleaseRuntimeCharacterResources(false);
+
     if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
     {
         GameUpdate->UnregisterUpdate(GameUpdateTickHandle);
@@ -393,14 +618,21 @@ void ACharacterController::RestoreControlAfterRagdollRecovery()
 
     if (APlayerController* PlayerController = Cast<APlayerController>(GetController()))
     {
-        PlayerController->SetIgnoreMoveInput(false);
-        PlayerController->SetIgnoreLookInput(false);
+        // PlayerCharacterController::ApplyGameInputMode resets the complete ignore-input stack.
+        // Do not pop a single layer here; a partial pop can leave packaged builds with LMB-only input.
         PlayerController->SetViewTarget(this);
 
         if (APlayerCharacterController* PlayerCharacterController = Cast<APlayerCharacterController>(PlayerController))
         {
             PlayerCharacterController->ApplyGameInputMode();
             PlayerCharacterController->ClearLatchedMovementInput();
+        }
+        else
+        {
+            // Generic controllers do not own the project recovery helper, so clear their complete
+            // ignore stacks directly instead of leaving ragdoll recovery input locked.
+            PlayerController->ResetIgnoreMoveInput();
+            PlayerController->ResetIgnoreLookInput();
         }
     }
 }
@@ -502,35 +734,56 @@ void ACharacterController::UpdateFromGameUpdate(float DeltaSeconds)
     // Buoyancy is only allowed to touch simulated ragdoll bodies. While ragdoll/get-up is
     // transitioning, do not reattach or reset the mesh here; the animation snapshot blend
     // owns the mesh transform until the component clears the ragdoll weight.
-    if (!bRagdollTransitionInProgress)
+    if (bRagdollTransitionInProgress)
     {
-        if (USkeletalMeshComponent* MeshComp = GetMesh())
+        bNeedsPostRagdollCleanup = true;
+        PhysicsStateAuditAccumulator = 0.0f;
+    }
+    else
+    {
+        constexpr float PhysicsStateAuditIntervalSeconds = 1.0f;
+        PhysicsStateAuditAccumulator += FMath::Max(0.0f, DeltaSeconds);
+        const bool bRunSafetyAudit = PhysicsStateAuditAccumulator >= PhysicsStateAuditIntervalSeconds;
+        if (bNeedsPostRagdollCleanup || bRunSafetyAudit)
         {
-            if (UCharacterFunctionLibrary::HasNonSecondarySimulatingPhysicsBodies(*MeshComp))
+            PhysicsStateAuditAccumulator = 0.0f;
+            if (USkeletalMeshComponent* MeshComp = GetMesh())
             {
-                UCharacterFunctionLibrary::DisableRagdollPhysicsButKeepSecondary(*MeshComp);
-            }
-            else
-            {
-                UCharacterFunctionLibrary::KeepSecondaryPhysicsBodies(*MeshComp);
-            }
-            MeshComp->SetVisibility(true, true);
-            if (!bFirstPersonMode)
-            {
-                MeshComp->SetOwnerNoSee(false);
-            }
-            if (UCapsuleComponent* Capsule = GetCapsuleComponent())
-            {
-                if (MeshComp->GetAttachParent() != Capsule)
+                const bool bUnexpectedRagdollPhysics =
+                    UCharacterFunctionLibrary::HasNonSecondarySimulatingPhysicsBodies(*MeshComp);
+                if (bUnexpectedRagdollPhysics)
                 {
-                    MeshComp->AttachToComponent(Capsule, FAttachmentTransformRules::KeepRelativeTransform);
+                    UCharacterFunctionLibrary::DisableRagdollPhysicsButKeepSecondary(*MeshComp);
                 }
-                if (!bIsCrouched)
+
+                // Full attachment/pose restoration is required once per transition. The periodic
+                // audit only repairs physics if another system unexpectedly enabled a body.
+                if (bNeedsPostRagdollCleanup)
                 {
-                    MeshComp->SetRelativeLocation(CharacterControllerTuning::MeshDefaultRelativeLocation);
-                    MeshComp->SetRelativeRotation(CharacterControllerTuning::MeshDefaultRelativeRotation);
+                    if (!bUnexpectedRagdollPhysics)
+                    {
+                        UCharacterFunctionLibrary::KeepSecondaryPhysicsBodies(*MeshComp);
+                    }
+                    MeshComp->SetVisibility(true, true);
+                    if (!bFirstPersonMode)
+                    {
+                        MeshComp->SetOwnerNoSee(false);
+                    }
+                    if (UCapsuleComponent* Capsule = GetCapsuleComponent())
+                    {
+                        if (MeshComp->GetAttachParent() != Capsule)
+                        {
+                            MeshComp->AttachToComponent(Capsule, FAttachmentTransformRules::KeepRelativeTransform);
+                        }
+                        if (!bIsCrouched)
+                        {
+                            MeshComp->SetRelativeLocation(CharacterControllerTuning::MeshDefaultRelativeLocation);
+                            MeshComp->SetRelativeRotation(CharacterControllerTuning::MeshDefaultRelativeRotation);
+                        }
+                    }
                 }
             }
+            bNeedsPostRagdollCleanup = false;
         }
     }
 
@@ -553,7 +806,7 @@ void ACharacterController::UpdateFromGameUpdate(float DeltaSeconds)
 
     if (IsValid(SubSystem))
     {
-        SubSystem->SetPlayerLocation(GetActorLocation());
+        SubSystem->SetPlayerLocation(GetActorLocation(), this);
     }
 }
 

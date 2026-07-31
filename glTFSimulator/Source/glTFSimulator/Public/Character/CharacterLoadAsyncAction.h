@@ -6,6 +6,7 @@
 #include "CoreMinimal.h"
 #include "HAL/ThreadSafeCounter.h"
 #include "Kismet/BlueprintAsyncActionBase.h"
+#include "TimerManager.h"
 #include "CharacterLoadAsyncAction.generated.h"
 
 USTRUCT(BlueprintType)
@@ -19,8 +20,10 @@ struct FBoneMapWrapper
 
 class ACharacterController;
 class UglTFRuntimeAsset;
+class USkeleton;
+class USkeletalMesh;
+class UPhysicsAsset;
 
-// Multicast delegate used for the Blueprint output pin.
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FCharacterLoadCallback, bool, Result);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FCharacterLoadProgress, float, Progress);
 
@@ -30,7 +33,6 @@ class GLTFSIMULATOR_API UCharacterLoadAsyncAction : public UBlueprintAsyncAction
     GENERATED_BODY()
 
 public:
-    // Static factory function callable from Blueprint.
     UFUNCTION(BlueprintCallable, meta = (BlueprintInternalUseOnly = "true", WorldContext = "WorldContextObject"), Category = "glTFSimulator|Async")
     static UCharacterLoadAsyncAction *LoadCharacterAsync(UObject *WorldContextObject, ACharacterController *InOwner, FString InPath);
 
@@ -44,28 +46,76 @@ public:
     FCharacterLoadProgress OnProgress;
 
 private:
-    // Variables that keep async load state between steps.
     TWeakObjectPtr<ACharacterController> OwnerCharacter;
+    /** Kept only as a weak cancellation observer so rapid character changes remain serialized. */
+    TWeakObjectPtr<ACharacterController> ReleaseObserver;
     FString FilePath;
     UPROPERTY()
-    UglTFRuntimeAsset *CurrentLoadedAsset;
+    TObjectPtr<UglTFRuntimeAsset> CurrentLoadedAsset = nullptr;
+    UPROPERTY(Transient)
+    TObjectPtr<USkeleton> CurrentRuntimeSkeleton = nullptr;
+
+    UPROPERTY(Transient)
+    TObjectPtr<USkeletalMesh> PendingSkeletalMesh = nullptr;
+
+    UPROPERTY(Transient)
+    TObjectPtr<UPhysicsAsset> PendingRuntimePhysicsAsset = nullptr;
+
+    TMap<FString, FString> PendingBoneMap;
+    FTimerHandle GameThreadStageTimer;
     TSharedPtr<FThreadSafeCounter, ESPMode::ThreadSafe> AssetLoadCancelToken;
     int32 AssetLoadRequestSerial = 0;
     bool bCancelled = false;
     bool bFinished = false;
+    /** Background GLB validation/parser construction is active. Written on the game thread only. */
+    bool bAssetLoadInFlight = false;
+    /** Background bone-map file/JSON parsing is active. Written on the game thread only. */
+    bool bBoneMapLoadInFlight = false;
+    /** glTFRuntime worker/finalizer is active. Written on the game thread only. */
     bool bMeshLoadInFlight = false;
-    // Internal callbacks for each async step.
+
+    /** Ticket held while this request owns or waits for the global glTFRuntime mesh slot. */
+    uint64 GlTFRuntimeOperationTicket = 0;
+
+    /** Mesh/skin pair selected from a validated skinned node in the external GLB. */
+    int32 DetectedMeshIndex = INDEX_NONE;
+    int32 DetectedSkinIndex = INDEX_NONE;
+
     UFUNCTION()
     void LoadAssetAsync();
     UFUNCTION()
     void OnglTFAssetLoaded(UglTFRuntimeAsset *Asset);
     void LoadBoneMapAsync();
+
+    /** Game-thread stage: creates only the UObject configuration needed to start glTFRuntime's worker-thread mesh build. */
+    void BeginSkeletalMeshLoad_GameThread();
+
     UFUNCTION()
     void OnMeshLoaded(USkeletalMesh *SkeletalMesh);
-    // Helper functions ported from the previous flow.
+
+    /** Game-thread stage: builds the transient physics asset on a separate frame from mesh finalization. */
+    void BuildRuntimePhysics_GameThread();
+
+    /** Game-thread stage: adds optional hair-chain bodies/constraints in its own frame. */
+    void BuildHairPhysics_GameThread();
+
+    /** Game-thread stage: adds optional dynamic-chain bodies/constraints in its own frame. */
+    void BuildDynamicPhysics_GameThread();
+
+    /** Game-thread stage: reapplies directly assigned template bodies and finalizes lookup tables. */
+    void FinalizeRuntimePhysics_GameThread();
+
+    /** Game-thread stage: performs the final atomic component swap. */
+    void CommitRuntimeMesh_GameThread();
+
+    void ScheduleGameThreadStage(void (UCharacterLoadAsyncAction::*StageFunction)());
+    void ClearGameThreadStageTimer();
     bool CheckRootBoneName(UglTFRuntimeAsset *Asset);
-    void FinalizePhysics(USkeletalMesh *SkeletalMesh);
+    bool ResolveCharacterSkin(UglTFRuntimeAsset *Asset);
+    void FailLoad(const FString& Reason);
     void ReleaseCurrentAsset();
     void CancelActiveAssetLoad();
+    bool HasAsyncWorkInFlight() const;
+    void TryFinishCancelledRequest();
     void FinishAndRelease();
 };

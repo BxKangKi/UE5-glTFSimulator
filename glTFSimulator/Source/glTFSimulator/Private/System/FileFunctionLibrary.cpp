@@ -2,22 +2,26 @@
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
 #include "System/FileFunctionLibrary.h"
+#include "System/SafeFileIO.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "HAL/FileManager.h"
-#include "Async/Async.h"
-#include "Misc/ScopeLock.h"
-#include "HAL/PlatformFilemanager.h"
-#include "Serialization/JsonWriter.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonReader.h"
 #include "System/MacroLibrary.h"
 
+namespace
+{
+    constexpr int64 MAX_SAFE_JSON_FILE_BYTES = 64ll * 1024ll * 1024ll;
+
+    bool IsSafeJsonFileSize(const FString& Path)
+    {
+        const int64 FileSize = IFileManager::Get().FileSize(*Path);
+        return FileSize >= 0 && FileSize <= MAX_SAFE_JSON_FILE_BYTES;
+    }
+}
 
 #pragma region File IO
-// Static member definitions.
-FCriticalSection UFileFunctionLibrary::FileWriteCriticalSection;
-
 bool UFileFunctionLibrary::CheckFile(const FString &FilePath)
 {
     if (!GenerateDirectory(FilePath) || !IFileManager::Get().FileExists(*FilePath))
@@ -52,13 +56,36 @@ FString UFileFunctionLibrary::GetPathWithoutExtension(const FString &Path)
 TArray<FString> UFileFunctionLibrary::GetFileNamesWithExtension(const FString &Directory, const FString &Extension)
 {
     TArray<FString> FoundFiles;
-    // Build a search pattern that includes the extension, for example "*.png".
-    FString FilePattern = FString::Printf(TEXT("*.%s"), *Extension);
-    // Search files with IFileManager, optionally including child folders recursively.
-    IFileManager &FileManager = IFileManager::Get();
-    // Convert the directory path to an absolute path when needed.
-    FString AbsoluteDirectory = FPaths::ConvertRelativePathToFull(Directory);
-    FileManager.FindFilesRecursive(FoundFiles, *AbsoluteDirectory, *FilePattern, true, false, false);
+    const FString AbsoluteDirectory = FPaths::ConvertRelativePathToFull(Directory);
+    if (!IFileManager::Get().DirectoryExists(*AbsoluteDirectory))
+    {
+        return FoundFiles;
+    }
+
+    // Enumerate once and compare extensions without case sensitivity. Literal "*.glb" patterns
+    // can miss valid ".GLB" files on case-sensitive packaged platforms.
+    IFileManager::Get().FindFilesRecursive(
+        FoundFiles,
+        *AbsoluteDirectory,
+        TEXT("*"),
+        true,
+        false,
+        false);
+
+    FString NormalizedExtension = Extension;
+    NormalizedExtension.RemoveFromStart(TEXT("."));
+    FoundFiles.RemoveAllSwap(
+        [&NormalizedExtension](const FString& FilePath)
+        {
+            return !FPaths::GetExtension(FilePath).Equals(
+                NormalizedExtension,
+                ESearchCase::IgnoreCase);
+        },
+        EAllowShrinking::No);
+    FoundFiles.Sort([](const FString& A, const FString& B)
+    {
+        return A.Compare(B, ESearchCase::IgnoreCase) < 0;
+    });
     return FoundFiles;
 }
 
@@ -69,20 +96,25 @@ bool UFileFunctionLibrary::ToBinary(FBufferArchive Ar, const FString &FilePath)
 
 void UFileFunctionLibrary::ToBinaryAsync(FBufferArchive Ar, const FString &FilePath)
 {
-    Async(EAsyncExecution::ThreadPool, [Ar, FilePath]()
-          {
-              FScopeLock Lock(&FileWriteCriticalSection);
-              bool bSuccess = ToBinary(Ar, FilePath);
-              if (bSuccess)
-              {
+    // SafeFileIO copies the archive into a tracked worker and commits through temp + backup files.
+    FSafeFileIO::SaveBinaryAsync(
+        Ar,
+        FilePath,
+        static_cast<int64>(Ar.Num()),
+        [FilePath](FSafeFileWriteResult Result)
+        {
+            if (Result.IsSuccess())
+            {
 #if WITH_EDITOR
-                  UE_LOG(LogTemp, Log, TEXT("Successfully saved Binary to %s"), *FilePath);
+                UE_LOG(LogTemp, Verbose, TEXT("Successfully saved binary to %s"), *FilePath);
 #endif
-              }
-              else
-              {
-                  UE_LOG(LogTemp, Error, TEXT("Failed to save Binary to : %s"), *FilePath);
-              } });
+            }
+            else if (Result.Status != ESafeFileIOStatus::ShuttingDown &&
+                Result.Status != ESafeFileIOStatus::Superseded)
+            {
+                UE_LOG(LogTemp, Error, TEXT("Failed to save binary to %s: %s"), *FilePath, *Result.Error);
+            }
+        });
 }
 
 bool UFileFunctionLibrary::FromBinary(TArray<uint8> &FileData, const FString &FilePath)
@@ -104,22 +136,19 @@ bool UFileFunctionLibrary::AppendLineToFile(const FString &Line, const FString &
 
 void UFileFunctionLibrary::AppendLineToFileAsync(const FString &Line, const FString &FilePath)
 {
-    Async(EAsyncExecution::ThreadPool, [Line, FilePath]()
-          {
-              FScopeLock Lock(&FileWriteCriticalSection);
-              const FString TextToAppend = Line.EndsWith(LINE_TERMINATOR) ? Line : Line + LINE_TERMINATOR;
-              bool bSuccess = AppendStringToFileInternal(TextToAppend, FilePath);
+    const FString TextToAppend = Line.EndsWith(LINE_TERMINATOR) ? Line : Line + LINE_TERMINATOR;
+    FSafeFileIO::AppendTextAsync(
+        TextToAppend,
+        FilePath,
+        [FilePath](FSafeFileWriteResult Result)
+        {
 #if WITH_EDITOR
-              if (bSuccess)
-              {
-                  UE_LOG(LogTemp, Log, TEXT("Successfully appended line to %s"), *FilePath);
-              }
-              else
-              {
-                  UE_LOG(LogTemp, Error, TEXT("Failed to append line to %s"), *FilePath);
-              }
+            if (!Result.IsSuccess() && Result.Status != ESafeFileIOStatus::ShuttingDown)
+            {
+                UE_LOG(LogTemp, Error, TEXT("Failed to append line to %s: %s"), *FilePath, *Result.Error);
+            }
 #endif
-          });
+        });
 }
 
 FString UFileFunctionLibrary::GetSimulatorLogFilePath()
@@ -138,40 +167,58 @@ bool UFileFunctionLibrary::WriteSimulatorLog(const FString& Category, const FStr
 
 void UFileFunctionLibrary::WriteSimulatorLogAsync(const FString& Category, const FString& Message)
 {
-    Async(EAsyncExecution::ThreadPool, [Category, Message]()
-    {
-        FScopeLock Lock(&FileWriteCriticalSection);
-        const bool bSuccess = WriteSimulatorLog(Category, Message);
-#if WITH_EDITOR
-        if (!bSuccess)
+    const FString SafeCategory = Category.IsEmpty() ? TEXT("General") : Category;
+    const FString Line = FString::Printf(
+        TEXT("[%s][%s] %s%s"),
+        *FDateTime::Now().ToString(),
+        *SafeCategory,
+        *Message,
+        LINE_TERMINATOR);
+    const FString SimulatorLogPath = GetSimulatorLogFilePath();
+
+    FSafeFileIO::AppendTextAsync(
+        Line,
+        SimulatorLogPath,
+        [SafeCategory](FSafeFileWriteResult Result)
         {
-            UE_LOG(LogTemp, Error, TEXT("Failed to write simulator log. Category=%s Message=%s"), *Category, *Message);
+#if WITH_EDITOR
+        if (!Result.IsSuccess() && Result.Status != ESafeFileIOStatus::ShuttingDown)
+        {
+            UE_LOG(
+                LogTemp,
+                Error,
+                TEXT("Failed to write simulator log. Category=%s Error=%s"),
+                *SafeCategory,
+                *Result.Error);
         }
 #endif
-    });
+        });
 }
 
 // CoreSystem/Source/CoreSystem/Private/FileFunctionLibrary.cpp
 bool UFileFunctionLibrary::GetSubFolders(const FString& ParentFolderPath, TArray<FString>& OutSubFolders)
 {
     OutSubFolders.Empty();
-    
+
     IFileManager& FileManager = IFileManager::Get();
-    
-    // UE5.7 path: use FindFilesRecursive or DirectoryExists plus FindFiles.
+
     TArray<FString> AllItems;
-    FileManager.FindFiles(AllItems, *(ParentFolderPath + TEXT("*")), true, true);
+    FileManager.FindFiles(AllItems, *FPaths::Combine(ParentFolderPath, TEXT("*")), true, true);
 
     // Keep only directories.
     for (const FString& Item : AllItems)
     {
-        FString FullPath = ParentFolderPath + Item;
+        const FString FullPath = FPaths::Combine(ParentFolderPath, Item);
         if (FPaths::DirectoryExists(FullPath))
         {
             OutSubFolders.Add(Item);
         }
     }
-    
+
+    OutSubFolders.Sort([](const FString& A, const FString& B)
+    {
+        return A.Compare(B, ESearchCase::IgnoreCase) < 0;
+    });
     return !OutSubFolders.IsEmpty();
 }
 
@@ -180,61 +227,61 @@ bool UFileFunctionLibrary::GetSubFolders(const FString& ParentFolderPath, TArray
 
 void UFileFunctionLibrary::ToJsonAsync(TSharedRef<FJsonObject> Json, const FString &Path)
 {
-    Async(EAsyncExecution::ThreadPool, [Json, Path]()
-          {
-            FScopeLock Lock(&FileWriteCriticalSection);
-            bool bSuccess = ToJson(Json, Path);
-            if (bSuccess)
+    FSafeFileIO::SaveJsonAsync(
+        Json,
+        Path,
+        [Path](FSafeFileWriteResult Result)
+        {
+            if (Result.IsSuccess())
             {
 #if WITH_EDITOR
-                UE_LOG(LogTemp, Log, TEXT("Successfully saved JSON to %s"), *Path);
+                UE_LOG(LogTemp, Verbose, TEXT("Successfully saved JSON to %s"), *Path);
 #endif
             }
-            else
+            else if (Result.Status != ESafeFileIOStatus::ShuttingDown &&
+                Result.Status != ESafeFileIOStatus::Superseded)
             {
-                UE_LOG(LogTemp, Error, TEXT("Failed to saved JSON to %s"), *Path);
-            } });
+                UE_LOG(LogTemp, Error, TEXT("Failed to save JSON to %s: %s"), *Path, *Result.Error);
+            }
+        },
+        MAX_SAFE_JSON_FILE_BYTES);
 }
 
 bool UFileFunctionLibrary::ToJson(TSharedRef<FJsonObject> Json, const FString &FilePath)
 {
-    FString OutputString;
-    if (!FJsonSerializer::Serialize(Json, TJsonWriterFactory<TCHAR>::Create(&OutputString)))
+    const FSafeFileWriteResult Result =
+        FSafeFileIO::SaveJsonBlocking(Json, FilePath, MAX_SAFE_JSON_FILE_BYTES);
+    if (!Result.IsSuccess())
     {
-        UE_LOG(LogTemp, Error, TEXT("JSON serialization failed"));
+        UE_LOG(LogTemp, Error, TEXT("Failed to save JSON to %s: %s"), *FilePath, *Result.Error);
         return false;
     }
-
-    // Extract the folder path and create it when missing.
-    GenerateDirectory(FilePath);
-
-    if (!FFileHelper::SaveStringToFile(OutputString, *FilePath))
-    {
-        UE_LOG(LogTemp, Error, TEXT("Failed to save file: %s"), *FilePath);
-        return false;
-    }
-
     return true;
 }
 
 TSharedPtr<FJsonObject> UFileFunctionLibrary::FromJson(const FString &Path)
 {
-    FString FileContent;
-    if (!FFileHelper::LoadFileToString(FileContent, *Path))
+    FSafeJsonLimits Limits;
+    Limits.MaxFileBytes = MAX_SAFE_JSON_FILE_BYTES;
+    const FSafeJsonLoadResult Result = FSafeFileIO::LoadJsonBlocking(Path, Limits);
+    if (Result.IsSuccess())
     {
-        UE_LOG(LogTemp, Error, TEXT("Failed to load file: %s"), *Path);
+        if (Result.bRecoveredFromBackup)
+        {
+            UE_LOG(LogTemp, Warning, TEXT("Recovered JSON from backup: %s"), *Path);
+        }
+        return Result.JsonObject;
+    }
+
+    if (Result.Status == ESafeFileIOStatus::Missing)
+    {
+        // Several callers intentionally probe optional save files before creating defaults.
+        UE_LOG(LogTemp, Verbose, TEXT("Optional JSON file does not exist: %s"), *Path);
         return nullptr;
     }
 
-    TSharedRef<TJsonReader<TCHAR>> Reader = TJsonReaderFactory<TCHAR>::Create(FileContent);
-    TSharedPtr<FJsonObject> JsonObject;
-    if (!FJsonSerializer::Deserialize(Reader, JsonObject) || !JsonObject.IsValid())
-    {
-        UE_LOG(LogTemp, Error, TEXT("Failed to deserialize JSON from file: %s"), *Path);
-        return nullptr;
-    }
-
-    return JsonObject;
+    UE_LOG(LogTemp, Error, TEXT("Failed to load JSON from %s: %s"), *Path, *Result.Error);
+    return nullptr;
 }
 
 // Extracts a string value from a file path and key name.
@@ -245,6 +292,11 @@ bool UFileFunctionLibrary::LoadJsonStringValue(
     FString &OutValue)
 {
     OutValue.Reset();
+
+    if (!IsSafeJsonFileSize(JsonFilePath))
+    {
+        return false;
+    }
 
     // Check whether the file exists and read its contents.
     FString JsonRaw;

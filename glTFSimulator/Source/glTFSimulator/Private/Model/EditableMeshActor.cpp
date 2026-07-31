@@ -9,6 +9,35 @@
 #include "Materials/MaterialInterface.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "ProceduralMeshComponent.h"
+#include "System/MacroLibrary.h"
+
+namespace EditableMeshSafety
+{
+    static bool IsFiniteBoundedNumber(const double Value)
+    {
+        return FMath::IsFinite(Value) &&
+            FMath::Abs(Value) <= static_cast<double>(WORLD_MAX_SIZE);
+    }
+
+    static bool IsFiniteBoundedVector(const FVector& Value)
+    {
+        return IsFiniteBoundedNumber(Value.X) &&
+            IsFiniteBoundedNumber(Value.Y) &&
+            IsFiniteBoundedNumber(Value.Z);
+    }
+
+    static bool IsFiniteTransform(const FTransform& Transform)
+    {
+        const FQuat Rotation = Transform.GetRotation();
+        return IsFiniteBoundedVector(Transform.GetLocation()) &&
+            IsFiniteBoundedVector(Transform.GetScale3D()) &&
+            FMath::IsFinite(Rotation.X) &&
+            FMath::IsFinite(Rotation.Y) &&
+            FMath::IsFinite(Rotation.Z) &&
+            FMath::IsFinite(Rotation.W) &&
+            Rotation.IsNormalized();
+    }
+}
 
 AEditableMeshActor::AEditableMeshActor()
 {
@@ -463,9 +492,21 @@ void AEditableMeshActor::AddOrUpdateFace()
 
 bool AEditableMeshActor::IsTopologyValidFor(const TArray<FVector>& TestVertices, const TArray<int32>& TestTriangles) const
 {
-    if (TestTriangles.Num() < 3 || (TestTriangles.Num() % 3) != 0)
+    if (TestVertices.Num() < 3 ||
+        TestVertices.Num() > PlacementSafetyLimits::MaxGeneratedMeshVertices ||
+        TestTriangles.Num() < 3 ||
+        TestTriangles.Num() > PlacementSafetyLimits::MaxGeneratedMeshTriangleIndices ||
+        (TestTriangles.Num() % 3) != 0)
     {
         return false;
+    }
+
+    for (const FVector& Vertex : TestVertices)
+    {
+        if (!EditableMeshSafety::IsFiniteBoundedVector(Vertex))
+        {
+            return false;
+        }
     }
 
     for (int32 TriIndex = 0; TriIndex + 2 < TestTriangles.Num(); TriIndex += 3)
@@ -484,7 +525,8 @@ bool AEditableMeshActor::IsTopologyValidFor(const TArray<FVector>& TestVertices,
 
         const FVector AB = TestVertices[B] - TestVertices[A];
         const FVector AC = TestVertices[C] - TestVertices[A];
-        if (FVector::CrossProduct(AB, AC).SizeSquared() <= 1.0f)
+        const double CrossSizeSquared = FVector::CrossProduct(AB, AC).SizeSquared();
+        if (!FMath::IsFinite(CrossSizeSquared) || CrossSizeSquared <= 1.0)
         {
             return false;
         }
@@ -747,7 +789,14 @@ void AEditableMeshActor::RebuildMesh(bool bCreateCollision)
         return;
     }
 
-    const bool bValidTopology = IsTopologyValid();
+    // ProceduralMeshComponent assumes every index and vertex is valid. Do not pass malformed
+    // topology to its renderer or Chaos paths, even when collision generation is disabled.
+    if (!IsTopologyValid())
+    {
+        MeshComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+        return;
+    }
+
     TArray<FVector> Normals;
     Normals.Init(FVector::UpVector, Vertices.Num());
     for (int32 TriIndex = 0; TriIndex + 2 < Triangles.Num(); TriIndex += 3)
@@ -771,12 +820,12 @@ void AEditableMeshActor::RebuildMesh(bool bCreateCollision)
         UV0.Add(FVector2D(Vertex.X * 0.01f, Vertex.Y * 0.01f));
     }
     TArray<FColor> VertexColors;
-    VertexColors.Init(bValidTopology ? FColor::Green : FColor::Red, Vertices.Num());
+    VertexColors.Init(FColor::Green, Vertices.Num());
     TArray<FProcMeshTangent> Tangents;
     Tangents.Init(FProcMeshTangent(1.0f, 0.0f, 0.0f), Vertices.Num());
 
-    MeshComponent->CreateMeshSection(0, Vertices, Triangles, Normals, UV0, VertexColors, Tangents, bCreateCollision && bValidTopology);
-    MeshComponent->SetCollisionEnabled((bCreateCollision && bValidTopology) ? ECollisionEnabled::QueryAndPhysics : ECollisionEnabled::QueryOnly);
+    MeshComponent->CreateMeshSection(0, Vertices, Triangles, Normals, UV0, VertexColors, Tangents, bCreateCollision);
+    MeshComponent->SetCollisionEnabled(bCreateCollision ? ECollisionEnabled::QueryAndPhysics : ECollisionEnabled::QueryOnly);
     ApplyMaterials();
 }
 
@@ -1184,6 +1233,23 @@ FGeneratedMeshRecord AEditableMeshActor::ToGeneratedMeshRecord() const
 
 void AEditableMeshActor::LoadFromGeneratedMeshRecord(const FGeneratedMeshRecord& Record)
 {
+    if (!EditableMeshSafety::IsFiniteTransform(Record.Transform) ||
+        !IsTopologyValidFor(Record.Vertices, Record.Triangles))
+    {
+        UE_LOG(
+            LogTemp,
+            Warning,
+            TEXT("Rejected invalid generated-mesh record before procedural mesh creation. Object=%s Vertices=%d Indices=%d"),
+            *Record.ObjectName,
+            Record.Vertices.Num(),
+            Record.Triangles.Num());
+        ClearMesh();
+        bFinalized = false;
+        SetActorEnableCollision(false);
+        SetActorHiddenInGame(true);
+        return;
+    }
+
     ObjectName = Record.ObjectName;
     BaseName = Record.BaseName.IsEmpty() ? Record.ObjectName : Record.BaseName;
     if (BaseName.Contains(TEXT(";")))

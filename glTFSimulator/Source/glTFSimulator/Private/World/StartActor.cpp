@@ -6,6 +6,7 @@
 #include "Blueprint/WidgetLayoutLibrary.h"
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
+#include "GameFramework/GameModeBase.h"
 #include "GameFramework/PlayerController.h"
 #include "InputCoreTypes.h"
 #include "Kismet/GameplayStatics.h"
@@ -25,6 +26,23 @@ namespace
     {
         Value.TrimStartAndEndInline();
         return Value;
+    }
+
+    /** Adds one travel option without inheriting any option from the menu map. */
+    void AppendStartWorldTravelOption(FString& InOutOptions, const FString& Key, const FString& Value)
+    {
+        if (Key.IsEmpty() || Value.IsEmpty())
+        {
+            return;
+        }
+
+        if (!InOutOptions.IsEmpty())
+        {
+            InOutOptions += TEXT("?");
+        }
+        InOutOptions += Key;
+        InOutOptions += TEXT("=");
+        InOutOptions += Value;
     }
 }
 
@@ -47,6 +65,13 @@ void AStartActor::BeginPlay()
         // this when its PlayerController Blueprint has not repeated the same world assignment.
         GameManager->RegisterWorldSelectionWorld(TSoftObjectPtr<UWorld>(GetWorld()));
         bWorldSelectionReturnInputGuardActive = GameManager->ShouldOpenWorldSelectionMenuOnNextMainWorld();
+    }
+
+    // The menu world must not retain an explicit gameplay GameMode request from the previous travel.
+    // A later world with no override must be free to use its own World Settings.
+    if (UMultiplayerWorldSubSystem* Multiplayer = UMultiplayerWorldSubSystem::Get(this))
+    {
+        Multiplayer->ClearRequestedGameModeOverride();
     }
 
     Super::BeginPlay();
@@ -276,6 +301,80 @@ bool AStartActor::TryResolveWorldFolderFromDisplayName(const FString& DisplayNam
     return false;
 }
 
+const FWorldLaunchProfile* AStartActor::FindWorldLaunchProfile(const FString& WorldFolderName) const
+{
+    const FString NormalizedFolderName = NormalizeStartWorldString(WorldFolderName);
+    if (NormalizedFolderName.IsEmpty())
+    {
+        return nullptr;
+    }
+
+    const FWorldLaunchProfile* Match = nullptr;
+    for (const FWorldLaunchProfile& Profile : WorldLaunchProfiles)
+    {
+        const FString ProfileFolderName = NormalizeStartWorldString(Profile.WorldFolderName);
+        if (!ProfileFolderName.Equals(NormalizedFolderName, ESearchCase::IgnoreCase))
+        {
+            continue;
+        }
+
+        if (Match)
+        {
+            UE_LOG(LogTemp, Warning,
+                TEXT("[GameModeTravel] Duplicate launch profile for folder '%s'. The first profile is used."),
+                *NormalizedFolderName);
+            continue;
+        }
+        Match = &Profile;
+    }
+
+    return Match;
+}
+
+void AStartActor::ResolveWorldLaunch(
+    const FString& WorldFolderName,
+    bool bForHost,
+    TSoftObjectPtr<UWorld>& OutWorld,
+    TSoftClassPtr<AGameModeBase>& OutGameModeOverride,
+    FString& OutResolutionSource) const
+{
+    OutWorld = bForHost ? HostWorld : GameplayWorld;
+    OutGameModeOverride = TSoftClassPtr<AGameModeBase>();
+    OutResolutionSource = bForHost
+        ? FString(TEXT("Common HostWorld + map World Settings"))
+        : FString(TEXT("Common GameplayWorld + map World Settings"));
+
+    const FWorldLaunchProfile* Profile = FindWorldLaunchProfile(WorldFolderName);
+    if (!Profile)
+    {
+        return;
+    }
+
+    TSoftObjectPtr<UWorld> ProfileWorld = bForHost
+        ? Profile->HostWorld
+        : Profile->SinglePlayerWorld;
+    if (bForHost && ProfileWorld.IsNull() && !Profile->SinglePlayerWorld.IsNull())
+    {
+        // Most projects use the same persistent map for standalone and listen-server play. Reuse the
+        // explicitly assigned per-folder map rather than silently falling back to an unrelated common host map.
+        ProfileWorld = Profile->SinglePlayerWorld;
+    }
+
+    if (!ProfileWorld.IsNull())
+    {
+        OutWorld = ProfileWorld;
+        OutResolutionSource = bForHost
+            ? FString(TEXT("Profile world + map World Settings"))
+            : FString(TEXT("Profile SinglePlayerWorld + map World Settings"));
+    }
+
+    if (!Profile->GameModeOverride.IsNull())
+    {
+        OutGameModeOverride = Profile->GameModeOverride;
+        OutResolutionSource += TEXT(" + explicit GameMode");
+    }
+}
+
 void AStartActor::OpenSinglePlayerWorldByFolderName(const FString& WorldFolderName)
 {
     if (IsWorldSelectionReturnBlocked())
@@ -302,10 +401,20 @@ void AStartActor::OpenSinglePlayerWorldByFolderName(const FString& WorldFolderNa
         return;
     }
 
-    if (GameplayWorld.IsNull())
+    TSoftObjectPtr<UWorld> SelectedGameplayWorld;
+    TSoftClassPtr<AGameModeBase> SelectedGameModeOverride;
+    FString LaunchResolutionSource;
+    ResolveWorldLaunch(
+        ResolvedFolderName,
+        false,
+        SelectedGameplayWorld,
+        SelectedGameModeOverride,
+        LaunchResolutionSource);
+
+    if (SelectedGameplayWorld.IsNull())
     {
         UE_LOG(LogTemp, Error,
-            TEXT("[WorldSelection] Cannot open world '%s' because GameplayWorld is not assigned."),
+            TEXT("[WorldSelection] Cannot open world '%s': neither the folder profile nor GameplayWorld has a map assigned."),
             *ResolvedFolderName);
         return;
     }
@@ -321,8 +430,13 @@ void AStartActor::OpenSinglePlayerWorldByFolderName(const FString& WorldFolderNa
     PendingGameplayWorldFolderName = ResolvedFolderName;
 
     UE_LOG(LogTemp, Display,
-        TEXT("[WorldSelection] Opening the directly assigned gameplay world. Folder=%s"),
-        *ResolvedFolderName);
+        TEXT("[GameModeTravel] Single-player selection. Folder=%s World=%s GameMode=%s Source=%s"),
+        *ResolvedFolderName,
+        *SelectedGameplayWorld.ToSoftObjectPath().ToString(),
+        SelectedGameModeOverride.IsNull()
+            ? TEXT("<map World Settings>")
+            : *SelectedGameModeOverride.ToSoftObjectPath().ToString(),
+        *LaunchResolutionSource);
 
     PrepareMenuForWorldTravel();
 
@@ -339,12 +453,24 @@ void AStartActor::OpenSinglePlayerWorldByFolderName(const FString& WorldFolderNa
     bool bTravelRequested = false;
     if (UMultiplayerWorldSubSystem* Multiplayer = UMultiplayerWorldSubSystem::Get(this))
     {
-        bTravelRequested = Multiplayer->StartSinglePlayerWorld(this, ResolvedFolderName, GameplayWorld);
+        bTravelRequested = Multiplayer->StartSinglePlayerWorldWithGameMode(
+            this,
+            ResolvedFolderName,
+            SelectedGameplayWorld,
+            SelectedGameModeOverride);
     }
     else
     {
-        const FString Options = FString::Printf(TEXT("World=%s"), *ResolvedFolderName);
-        UGameplayStatics::OpenLevelBySoftObjectPtr(this, GameplayWorld, true, Options);
+        FString Options;
+        AppendStartWorldTravelOption(Options, TEXT("World"), ResolvedFolderName);
+        if (!SelectedGameModeOverride.IsNull())
+        {
+            AppendStartWorldTravelOption(
+                Options,
+                TEXT("game"),
+                SelectedGameModeOverride.ToSoftObjectPath().ToString());
+        }
+        UGameplayStatics::OpenLevelBySoftObjectPtr(this, SelectedGameplayWorld, true, Options);
         bTravelRequested = true;
     }
 
@@ -356,6 +482,10 @@ void AStartActor::OpenSinglePlayerWorldByFolderName(const FString& WorldFolderNa
         GetWorldTimerManager().ClearTimer(GameplayTravelWatchdogHandle);
         bGameplayWorldTravelPending = false;
         PendingGameplayWorldFolderName.Reset();
+        if (UMultiplayerWorldSubSystem* Multiplayer = UMultiplayerWorldSubSystem::Get(this))
+        {
+            Multiplayer->ClearRequestedGameModeOverride();
+        }
         ShowWorldSelectionMenu();
         return;
     }
@@ -375,9 +505,21 @@ void AStartActor::HostMultiplayerWorldByFolderName(const FString& WorldFolderNam
         return;
     }
 
-    if (HostWorld.IsNull())
+    TSoftObjectPtr<UWorld> SelectedHostWorld;
+    TSoftClassPtr<AGameModeBase> SelectedGameModeOverride;
+    FString LaunchResolutionSource;
+    ResolveWorldLaunch(
+        ResolvedFolderName,
+        true,
+        SelectedHostWorld,
+        SelectedGameModeOverride,
+        LaunchResolutionSource);
+
+    if (SelectedHostWorld.IsNull())
     {
-        UE_LOG(LogTemp, Warning, TEXT("StartActor cannot host a multiplayer world because HostWorld is not assigned."));
+        UE_LOG(LogTemp, Warning,
+            TEXT("StartActor cannot host world '%s': neither the folder profile nor HostWorld has a map assigned."),
+            *ResolvedFolderName);
         return;
     }
 
@@ -388,10 +530,36 @@ void AStartActor::HostMultiplayerWorldByFolderName(const FString& WorldFolderNam
         GameManager->SetGamePaused(false);
     }
 
+    UE_LOG(LogTemp, Display,
+        TEXT("[GameModeTravel] Host selection. Folder=%s World=%s GameMode=%s Source=%s"),
+        *ResolvedFolderName,
+        *SelectedHostWorld.ToSoftObjectPath().ToString(),
+        SelectedGameModeOverride.IsNull()
+            ? TEXT("<map World Settings>")
+            : *SelectedGameModeOverride.ToSoftObjectPath().ToString(),
+        *LaunchResolutionSource);
+
     PrepareMenuForWorldTravel();
     if (UMultiplayerWorldSubSystem* Multiplayer = UMultiplayerWorldSubSystem::Get(this))
     {
-        Multiplayer->HostMultiplayerWorld(this, ResolvedFolderName, HostWorld);
+        Multiplayer->HostMultiplayerWorldWithGameMode(
+            this,
+            ResolvedFolderName,
+            SelectedHostWorld,
+            SelectedGameModeOverride);
+    }
+    else
+    {
+        FString Options(TEXT("listen"));
+        AppendStartWorldTravelOption(Options, TEXT("World"), ResolvedFolderName);
+        if (!SelectedGameModeOverride.IsNull())
+        {
+            AppendStartWorldTravelOption(
+                Options,
+                TEXT("game"),
+                SelectedGameModeOverride.ToSoftObjectPath().ToString());
+        }
+        UGameplayStatics::OpenLevelBySoftObjectPtr(this, SelectedHostWorld, true, Options);
     }
 }
 
@@ -463,6 +631,10 @@ void AStartActor::HandleGameplayTravelWatchdogExpired()
     const FString FailedWorldFolder = PendingGameplayWorldFolderName;
     bGameplayWorldTravelPending = false;
     PendingGameplayWorldFolderName.Reset();
+    if (UMultiplayerWorldSubSystem* Multiplayer = UMultiplayerWorldSubSystem::Get(this))
+    {
+        Multiplayer->ClearRequestedGameModeOverride();
+    }
 
     UE_LOG(LogTemp, Error,
         TEXT("[WorldSelection] Travel to the assigned gameplay world did not complete. Restoring the world list. "
@@ -680,7 +852,9 @@ void AStartActor::ApplyMenuInputMode(UStartWorldWidget* FocusWidget) const
 
     FInputModeUIOnly InputMode;
     InputMode.SetLockMouseToViewportBehavior(EMouseLockMode::DoNotLock);
-    if (IsValid(FocusWidget))
+    // Supplying a non-focusable SObjectWidget makes PlayerController emit an error every time a
+    // menu opens. Mouse-only menu roots do not need explicit keyboard focus.
+    if (IsValid(FocusWidget) && FocusWidget->IsFocusable())
     {
         InputMode.SetWidgetToFocus(FocusWidget->TakeWidget());
     }

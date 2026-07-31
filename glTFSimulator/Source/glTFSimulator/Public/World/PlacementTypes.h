@@ -7,6 +7,14 @@
 #include "Dom/JsonObject.h"
 #include "PlacementTypes.generated.h"
 
+/** Shared limits for user-authored procedural mesh data across parse, save, and render paths. */
+namespace PlacementSafetyLimits
+{
+    inline constexpr int32 MaxGeneratedMeshVertices = 250000;
+    inline constexpr int32 MaxGeneratedMeshTriangles = 250000;
+    inline constexpr int32 MaxGeneratedMeshTriangleIndices = MaxGeneratedMeshTriangles * 3;
+}
+
 UENUM(BlueprintType)
 enum class EPlacedObjectKind : uint8
 {

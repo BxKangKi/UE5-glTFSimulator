@@ -3,7 +3,6 @@
 
 #include "Model/LoadAsyncAction.h"
 
-#include "Async/Async.h"
 #include "Dom/JsonObject.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/Texture2D.h"
@@ -21,6 +20,8 @@
 #include "Setting/GameSettings.h"
 #include "System/FileFunctionLibrary.h"
 #include "System/JsonHelper.h"
+#include "System/SafeFileIO.h"
+#include "System/glTFRuntimeSafety.h"
 #include "System/MacroLibrary.h"
 #include "System/StringHelper.h"
 #include "TimerManager.h"
@@ -30,6 +31,39 @@ namespace
     static bool IsValidModelBounds(const FModelData& ModelData)
     {
         return !ModelData.Size.IsNearlyZero(0.001f);
+    }
+
+    constexpr int64 MAX_MODEL_JSON_BYTES = 64ll * 1024ll * 1024ll;
+    constexpr int32 MAX_MODEL_NODE_COUNT = 500000;
+
+    static bool IsFiniteVector(const FVector& Vector)
+    {
+        return FMath::IsFinite(Vector.X) &&
+            FMath::IsFinite(Vector.Y) &&
+            FMath::IsFinite(Vector.Z);
+    }
+
+    static bool IsFiniteQuat(const FQuat& Rotation)
+    {
+        return FMath::IsFinite(Rotation.X) &&
+            FMath::IsFinite(Rotation.Y) &&
+            FMath::IsFinite(Rotation.Z) &&
+            FMath::IsFinite(Rotation.W);
+    }
+
+    static bool IsFiniteTransform(const FTransform& Transform)
+    {
+        const FQuat Rotation = Transform.GetRotation();
+        return !Transform.ContainsNaN() &&
+            IsFiniteVector(Transform.GetLocation()) &&
+            IsFiniteVector(Transform.GetScale3D()) &&
+            IsFiniteQuat(Rotation) &&
+            Rotation.IsNormalized();
+    }
+
+    static bool IsWaterNodeName(const FString& NodeName)
+    {
+        return FStringHelper::GetTextAfterChar(NodeName, ';').ToUpper().Contains(TEXT("WATER"));
     }
 
     static void ResizeRGBA8Texture(const TArray<uint8>& SourcePixels, int32 SourceWidth, int32 SourceHeight, int32 TargetWidth, int32 TargetHeight, TArray<uint8>& OutPixels)
@@ -82,6 +116,8 @@ ULoadAsyncAction *ULoadAsyncAction::LoadAsync(
 void ULoadAsyncAction::Activate()
 {
     bCancelled = false;
+    bStaticMeshLoadInFlight = false;
+    GlTFRuntimeOperationTicket = 0;
 
     if (!IsValid(WorldContextObject) || !IsValid(Asset))
     {
@@ -92,7 +128,39 @@ void ULoadAsyncAction::Activate()
         return;
     }
 
-    Nodes = Asset->GetNodes();
+    const TArray<FglTFRuntimeNode> ParsedNodes = Asset->GetNodes();
+    const int32 MeshCount = Asset->GetNumMeshes();
+    if (ParsedNodes.Num() > MAX_MODEL_NODE_COUNT)
+    {
+        WriteLogAsync(FString::Printf(TEXT("Model node count exceeds the safety limit. Count=%d Limit=%d"), ParsedNodes.Num(), MAX_MODEL_NODE_COUNT));
+        FLoadAsyncWrapper Wrapper;
+        Completed.Broadcast(Wrapper);
+        ReleaseActionReferences();
+        SetReadyToDestroy();
+        return;
+    }
+
+    Nodes.Reset();
+    Nodes.Reserve(ParsedNodes.Num());
+    TSet<FName> SeenNodeNames;
+    for (const FglTFRuntimeNode& Node : ParsedNodes)
+    {
+        const FString TrimmedName = Node.Name.TrimStartAndEnd();
+        const FName NodeName(*TrimmedName);
+        const bool bWaterNode = IsWaterNodeName(TrimmedName);
+        const bool bHasValidMesh = Node.MeshIndex >= 0 && Node.MeshIndex < MeshCount;
+        if (TrimmedName.IsEmpty() || NodeName.IsNone() || !IsFiniteTransform(Node.Transform) ||
+            (!bWaterNode && !bHasValidMesh) || SeenNodeNames.Contains(NodeName))
+        {
+            continue;
+        }
+
+        FglTFRuntimeNode SafeNode = Node;
+        SafeNode.Name = TrimmedName;
+        Nodes.Add(MoveTemp(SafeNode));
+        SeenNodeNames.Add(NodeName);
+    }
+
     MaxCount = Nodes.Num();
     CurrentIndex = 0;
     NodeMap.Reserve(MaxCount);
@@ -107,7 +175,7 @@ void ULoadAsyncAction::LoadJsonAsync()
     const FString LocalJsonPath = JsonFilePath;
     TWeakObjectPtr<ULoadAsyncAction> WeakThis(this);
 
-    AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [WeakThis, LocalJsonPath]()
+    const bool bWorkerQueued = FSafeFileIO::RunTrackedWorker([WeakThis, LocalJsonPath]()
     {
         auto WriteLoadLog = [](const FString& Message)
         {
@@ -142,8 +210,10 @@ void ULoadAsyncAction::LoadJsonAsync()
 
         FString JsonString;
         FModelData TemporaryModelData;
+        const int64 JsonFileSize = IFileManager::Get().FileSize(*LocalJsonPath);
 
-        if (FFileHelper::LoadFileToString(JsonString, *LocalJsonPath))
+        if (JsonFileSize >= 0 && JsonFileSize <= MAX_MODEL_JSON_BYTES &&
+            FFileHelper::LoadFileToString(JsonString, *LocalJsonPath))
         {
             TSharedPtr<FJsonObject> JsonObject;
             TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonString);
@@ -180,10 +250,10 @@ void ULoadAsyncAction::LoadJsonAsync()
         }
         else
         {
-            WriteLoadLog(FString::Printf(TEXT("Failed to read JSON: %s"), *LocalJsonPath));
+            WriteLoadLog(FString::Printf(TEXT("Failed to read JSON or file exceeds %lld bytes: %s"), MAX_MODEL_JSON_BYTES, *LocalJsonPath));
         }
 
-        AsyncTask(ENamedThreads::GameThread, [WeakThis, TemporaryModelData]()
+        if (!FSafeFileIO::DispatchTrackedGameThread([WeakThis, TemporaryModelData]()
         {
             ULoadAsyncAction* StrongThis = WeakThis.Get();
             if (!StrongThis)
@@ -200,8 +270,20 @@ void ULoadAsyncAction::LoadJsonAsync()
 
             StrongThis->LoadedJsonModelData = TemporaryModelData;
             StrongThis->ProcessChunk();
-        });
+        }))
+        {
+            // Shutdown rejected the continuation; UObject cleanup remains on the shutdown path.
+            return;
+        }
     });
+
+    if (!bWorkerQueued)
+    {
+        // LoadJsonAsync originates on the game thread, so a rejected worker can be released here.
+        bCancelled = true;
+        ReleaseActionReferences();
+        SetReadyToDestroy();
+    }
 }
 
 bool ULoadAsyncAction::CreateDefaultJsonFile(const FString& Path)
@@ -246,7 +328,7 @@ void ULoadAsyncAction::ProcessChunk()
     }
     else
     {
-        MergeJsonDataToMeshMap();
+        SanitizeParsedData();
         RefreshGeneratedModelData();
         SaveGeneratedJsonAsync();
 
@@ -265,13 +347,42 @@ void ULoadAsyncAction::ProcessChunk()
 void ULoadAsyncAction::CancelAndRelease()
 {
     bCancelled = true;
-    ReleaseActionReferences();
-    SetReadyToDestroy();
+    Completed.Clear();
+    Progress.Clear();
+
+    // Remove a request that is waiting in the process-wide queue. Native work already running is
+    // allowed to finish and will release its ticket from the plugin's terminal callback.
+    FglTFRuntimeSafety::CancelQueuedOperations(this);
+
+    if (UWorld* World = IsValid(WorldContextObject.Get()) ? WorldContextObject->GetWorld() : nullptr)
+    {
+        World->GetTimerManager().ClearTimer(ProcessTimerHandle);
+    }
+
+    // glTFRuntime can still be generating a mesh on a worker thread. Keep the action and
+    // parser asset alive until its callback returns; the cancel flag prevents any owner mutation.
+    if (!bStaticMeshLoadInFlight)
+    {
+        ReleaseActionReferences();
+        SetReadyToDestroy();
+    }
 }
 
 void ULoadAsyncAction::ReleaseActionReferences()
 {
     bCancelled = true;
+
+    // Never clear an active ticket or parser while glTFRuntime still owns native work. The terminal
+    // callback is responsible for releasing the queue slot and then re-entering this cleanup path.
+    if (bStaticMeshLoadInFlight && GlTFRuntimeOperationTicket != 0)
+    {
+        FglTFRuntimeSafety::CancelQueuedOperations(this);
+        return;
+    }
+
+    bStaticMeshLoadInFlight = false;
+    GlTFRuntimeOperationTicket = 0;
+    FglTFRuntimeSafety::CancelQueuedOperations(this);
 
     if (UWorld* World = IsValid(WorldContextObject.Get()) ? WorldContextObject->GetWorld() : nullptr)
     {
@@ -286,7 +397,6 @@ void ULoadAsyncAction::ReleaseActionReferences()
             Asset->RemoveFromRoot();
         }
         Asset->ClearFlags(RF_Public | RF_Standalone);
-        Asset->MarkAsGarbage();
     }
 
     Completed.Clear();
@@ -305,21 +415,53 @@ void ULoadAsyncAction::ReleaseActionReferences()
     JsonFilePath.Reset();
 }
 
-void ULoadAsyncAction::MergeJsonDataToMeshMap()
+void ULoadAsyncAction::SanitizeParsedData()
 {
-    if (LoadedJsonModelData.MeshData.Num() == 0)
+    for (auto It = MeshMap.CreateIterator(); It; ++It)
     {
-        return;
+        FModelMeshData& RuntimeMeshData = It.Value();
+        if (RuntimeMeshData.LOD0 == INDEX_NONE || RuntimeMeshData.Size.ContainsNaN())
+        {
+            It.RemoveCurrent();
+            continue;
+        }
+
+        if (const FMeshData* ParsedMeshData = LoadedJsonModelData.MeshData.Find(It.Key()))
+        {
+            RuntimeMeshData.Data = *ParsedMeshData;
+        }
     }
 
-    for (auto& Pair : MeshMap)
+    for (auto It = NodeMap.CreateIterator(); It; ++It)
     {
-        FName MeshName = Pair.Key;
-        FModelMeshData& MeshData = Pair.Value;
-
-        if (FMeshData* FoundJsonData = LoadedJsonModelData.MeshData.Find(MeshName))
+        const FModelNodeData& NodeData = It.Value();
+        if (It.Key().IsNone() || NodeData.MeshName.IsNone() ||
+            !IsFiniteTransform(NodeData.Transform) || !MeshMap.Contains(NodeData.MeshName))
         {
-            MeshData.Data = *FoundJsonData;
+            It.RemoveCurrent();
+        }
+    }
+
+    for (auto It = WaterNodeMap.CreateIterator(); It; ++It)
+    {
+        if (It.Key().IsNone() || !IsFiniteTransform(It.Value().Transform) ||
+            !FMath::IsFinite(It.Value().StreamRadius) || It.Value().StreamRadius <= 0.0f)
+        {
+            It.RemoveCurrent();
+        }
+    }
+
+    TSet<FName> ReferencedMeshes;
+    ReferencedMeshes.Reserve(NodeMap.Num());
+    for (const TPair<FName, FModelNodeData>& Pair : NodeMap)
+    {
+        ReferencedMeshes.Add(Pair.Value.MeshName);
+    }
+    for (auto It = MeshMap.CreateIterator(); It; ++It)
+    {
+        if (!ReferencedMeshes.Contains(It.Key()))
+        {
+            It.RemoveCurrent();
         }
     }
 }
@@ -327,12 +469,8 @@ void ULoadAsyncAction::MergeJsonDataToMeshMap()
 void ULoadAsyncAction::RefreshGeneratedModelData()
 {
     GeneratedModelData = LoadedJsonModelData;
+    // Mesh customization is optional user-authored data. Never auto-generate one entry per glTF node/mesh.
     GeneratedModelData.MeshData.Empty();
-
-    for (const TPair<FName, FModelMeshData>& Pair : MeshMap)
-    {
-        GeneratedModelData.MeshData.Add(Pair.Key, Pair.Value.Data);
-    }
 
     FBox Bounds(ForceInit);
     for (const TPair<FName, FModelNodeData>& Pair : NodeMap)
@@ -391,7 +529,13 @@ void ULoadAsyncAction::CalculateSize()
         return;
     }
 
-    const FString Prefix = FStringHelper::GetTextBeforeChar(CurrentNode.Name, ';');
+    if (CurrentNode.Name.TrimStartAndEnd().IsEmpty() || !IsFiniteTransform(CurrentNode.Transform))
+    {
+        UpdateNext();
+        return;
+    }
+
+    const FString Prefix = FStringHelper::GetTextBeforeChar(CurrentNode.Name, ';').TrimStartAndEnd();
     const FString Suffix = FStringHelper::GetTextAfterChar(CurrentNode.Name, ';');
     const FString SuffixUpper = Suffix.ToUpper();
 
@@ -403,7 +547,18 @@ void ULoadAsyncAction::CalculateSize()
         return;
     }
 
-    CurrentMeshName = FName(Prefix);
+    if (Prefix.IsEmpty() || CurrentNode.MeshIndex < 0 || CurrentNode.MeshIndex >= Asset->GetNumMeshes())
+    {
+        UpdateNext();
+        return;
+    }
+
+    CurrentMeshName = FName(*Prefix);
+    if (CurrentMeshName.IsNone())
+    {
+        UpdateNext();
+        return;
+    }
     FModelMeshData &Info = MeshMap.FindOrAdd(CurrentMeshName);
 
     if (SuffixUpper.Contains(TEXT("NCOL")))
@@ -433,16 +588,71 @@ void ULoadAsyncAction::CalculateSize()
     }
     else
     {
-        FglTFRuntimeStaticMeshAsync Callback;
-        Callback.BindDynamic(this, &ULoadAsyncAction::GetStaticMesh);
-        Asset->LoadStaticMeshAsync(CurrentNode.MeshIndex, Callback, StaticMeshConfig);
+        // Serialize allocation-heavy plugin builders. This prevents world metadata, streamed
+        // meshes, prefabs, vehicles, weapons, and characters from building concurrently.
+        const int32 RequestedMeshIndex = CurrentNode.MeshIndex;
+        const FglTFRuntimeStaticMeshConfig RequestedConfig = StaticMeshConfig;
+        TWeakObjectPtr<ULoadAsyncAction> WeakThis(this);
+        bStaticMeshLoadInFlight = true;
+        GlTFRuntimeOperationTicket = FglTFRuntimeSafety::EnqueueOperation(
+            this,
+            FString::Printf(TEXT("Model metadata mesh %d"), RequestedMeshIndex),
+            [WeakThis, RequestedMeshIndex, RequestedConfig](const uint64 Ticket)
+            {
+                ULoadAsyncAction* StrongThis = WeakThis.Get();
+                if (!IsValid(StrongThis) || StrongThis->bCancelled || !IsValid(StrongThis->Asset))
+                {
+                    FglTFRuntimeSafety::CompleteOperation(Ticket);
+                    if (IsValid(StrongThis))
+                    {
+                        StrongThis->GlTFRuntimeOperationTicket = 0;
+                        StrongThis->bStaticMeshLoadInFlight = false;
+                        StrongThis->ReleaseActionReferences();
+                        StrongThis->SetReadyToDestroy();
+                    }
+                    return;
+                }
+
+                StrongThis->GlTFRuntimeOperationTicket = Ticket;
+                FglTFRuntimeStaticMeshAsync Callback;
+                Callback.BindDynamic(StrongThis, &ULoadAsyncAction::GetStaticMesh);
+                StrongThis->Asset->LoadStaticMeshAsync(RequestedMeshIndex, Callback, RequestedConfig);
+            },
+            [WeakThis](const FString& Reason)
+            {
+                ULoadAsyncAction* StrongThis = WeakThis.Get();
+                if (!IsValid(StrongThis))
+                {
+                    return;
+                }
+
+                StrongThis->GlTFRuntimeOperationTicket = 0;
+                StrongThis->bStaticMeshLoadInFlight = false;
+                if (StrongThis->bCancelled)
+                {
+                    StrongThis->ReleaseActionReferences();
+                    StrongThis->SetReadyToDestroy();
+                    return;
+                }
+
+                StrongThis->WriteLogAsync(FString::Printf(
+                    TEXT("Static mesh request was rejected by the glTFRuntime safety queue: %s"),
+                    *Reason));
+                StrongThis->MeshMap.Remove(StrongThis->CurrentMeshName);
+                StrongThis->UpdateNext();
+            });
     }
 }
 
 
 void ULoadAsyncAction::UpdateWaterNodeData()
 {
-    const FName NodeName(CurrentNode.Name);
+    const FName NodeName(*CurrentNode.Name.TrimStartAndEnd());
+    if (NodeName.IsNone() || !IsFiniteTransform(CurrentNode.Transform))
+    {
+        UpdateNext();
+        return;
+    }
     if (!WaterNodeMap.Contains(NodeName))
     {
         FWaterStreamNodeData WaterInfo;
@@ -456,7 +666,13 @@ void ULoadAsyncAction::UpdateWaterNodeData()
 
 void ULoadAsyncAction::UpdateModelNodeData()
 {
-    FName NodeName = FName(CurrentNode.Name);
+    const FName NodeName(*CurrentNode.Name.TrimStartAndEnd());
+    if (NodeName.IsNone() || CurrentMeshName.IsNone() || !MeshMap.Contains(CurrentMeshName) ||
+        !IsFiniteTransform(CurrentNode.Transform))
+    {
+        UpdateNext();
+        return;
+    }
     if (!NodeMap.Contains(NodeName))
     {
         FModelNodeData NodeInfo;
@@ -469,34 +685,51 @@ void ULoadAsyncAction::UpdateModelNodeData()
 
 void ULoadAsyncAction::GetStaticMesh(UStaticMesh *StaticMesh)
 {
+    // The plugin callback is the only safe point to release an active native-operation ticket.
+    const uint64 CompletedTicket = GlTFRuntimeOperationTicket;
+    GlTFRuntimeOperationTicket = 0;
+    FglTFRuntimeSafety::CompleteOperation(CompletedTicket);
+    bStaticMeshLoadInFlight = false;
     if (bCancelled)
     {
         if (IsValid(StaticMesh) && !StaticMesh->IsAsset())
         {
-            StaticMesh->MarkAsGarbage();
+            StaticMesh->ClearFlags(RF_Public | RF_Standalone);
         }
         ReleaseActionReferences();
         SetReadyToDestroy();
         return;
     }
 
-    if (FModelMeshData *Info = MeshMap.Find(CurrentMeshName))
+    const bool bMeshValid = IsValid(StaticMesh) && IsValid(Asset) && CurrentNode.MeshIndex >= 0 &&
+        CurrentNode.MeshIndex < Asset->GetNumMeshes();
+    if (bMeshValid)
     {
-        Info->LOD0 = CurrentNode.MeshIndex;
-        if (StaticMesh)
+        if (FModelMeshData *Info = MeshMap.Find(CurrentMeshName))
         {
+            Info->LOD0 = CurrentNode.MeshIndex;
             const FVector NodeScale = CurrentNode.Transform.GetScale3D().GetAbs();
             Info->Size = StaticMesh->GetBoundingBox().GetSize() * NodeScale;
         }
     }
+    else
+    {
+        MeshMap.Remove(CurrentMeshName);
+    }
 
     if (IsValid(StaticMesh) && !StaticMesh->IsAsset())
     {
-        StaticMesh->MarkAsGarbage();
-        StaticMesh = nullptr;
+        StaticMesh->ClearFlags(RF_Public | RF_Standalone);
     }
 
-    UpdateModelNodeData();
+    if (bMeshValid)
+    {
+        UpdateModelNodeData();
+    }
+    else
+    {
+        UpdateNext();
+    }
 }
 
 void ULoadAsyncAction::UpdateNext()
@@ -540,7 +773,8 @@ void ULoadAsyncAction::LoadTextureAsync(FString ImagePath)
 {
     TWeakObjectPtr<ULoadAsyncAction> WeakThis(this);
     const int32 TextureDimensionLimit = FMath::Clamp(MaxTextureDimension, 64, 8192);
-    AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [ImagePath, WeakThis, TextureDimensionLimit]()
+    const bool bWorkerQueued = FSafeFileIO::RunTrackedWorker(
+        [ImagePath, WeakThis, TextureDimensionLimit]()
     {
         TArray<uint8> RawFileData;
         if (!FFileHelper::LoadFileToArray(RawFileData, *ImagePath))
@@ -577,14 +811,13 @@ void ULoadAsyncAction::LoadTextureAsync(FString ImagePath)
                     }
                 }
 
-                AsyncTask(ENamedThreads::GameThread, [WeakThis, Width, Height, PixelData = MoveTemp(UncompressedRGBA)]() mutable
+                if (!FSafeFileIO::DispatchTrackedGameThread(
+                    [WeakThis, Width, Height, PixelData = MoveTemp(UncompressedRGBA)]() mutable
                 {
-                    if (ULoadAsyncAction* StrongThis = WeakThis.Get())
+                    ULoadAsyncAction* StrongThis = WeakThis.Get();
+                    if (!IsValid(StrongThis) || StrongThis->bCancelled)
                     {
-                        if (StrongThis->bCancelled)
-                        {
-                            return;
-                        }
+                        return;
                     }
 
                     UTexture2D* NewTexture = UTexture2D::CreateTransient(Width, Height, PF_R8G8B8A8);
@@ -595,10 +828,20 @@ void ULoadAsyncAction::LoadTextureAsync(FString ImagePath)
                         NewTexture->GetPlatformData()->Mips[0].BulkData.Unlock();
                         NewTexture->UpdateResource();
                     }
-                });
+                }))
+                {
+                    // Pixel data is released with the rejected continuation during shutdown.
+                    return;
+                }
             }
         }
     });
+
+    if (!bWorkerQueued)
+    {
+        // Texture loading is optional; shutdown rejection requires no UObject-side completion.
+        return;
+    }
 }
 
 void ULoadAsyncAction::WriteLogAsync(const FString& Message) const

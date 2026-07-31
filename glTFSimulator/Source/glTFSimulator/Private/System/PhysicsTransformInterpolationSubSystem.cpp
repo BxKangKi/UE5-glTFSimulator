@@ -110,11 +110,21 @@ void UPhysicsTransformInterpolationSubSystem::SubmitTransform(
     {
         if (Entry.Component.Get() == Component)
         {
+            const float SafeInterpSpeed = FMath::Max(0.0f, InterpSpeed);
+            const float SafeTeleportDistance = FMath::Max(0.0f, TeleportDistance);
+            const bool bSettingsChanged =
+                !FMath::IsNearlyEqual(Entry.InterpSpeed, SafeInterpSpeed) ||
+                !FMath::IsNearlyEqual(Entry.TeleportDistance, SafeTeleportDistance) ||
+                Entry.bApplyScale != bApplyScale ||
+                Entry.bCanMoveSimulatingPrimitive != bCanMoveSimulatingPrimitive;
+            const bool bTargetChanged = !Entry.TargetTransform.Equals(TargetTransform, 0.001f);
+
             Entry.TargetTransform = TargetTransform;
-            Entry.InterpSpeed = FMath::Max(0.0f, InterpSpeed);
-            Entry.TeleportDistance = FMath::Max(0.0f, TeleportDistance);
+            Entry.InterpSpeed = SafeInterpSpeed;
+            Entry.TeleportDistance = SafeTeleportDistance;
             Entry.bApplyScale = bApplyScale;
             Entry.bCanMoveSimulatingPrimitive = bCanMoveSimulatingPrimitive;
+            Entry.bAtTarget = Entry.bAtTarget && !bTargetChanged && !bSettingsChanged;
             return;
         }
     }
@@ -200,20 +210,48 @@ void UPhysicsTransformInterpolationSubSystem::UpdateFromGameUpdate(float DeltaTi
             continue;
         }
 
+        // Stable targets stay registered for future submissions but do not dirty scene transforms.
+        if (Entry.bAtTarget)
+        {
+            continue;
+        }
+
         const FTransform CurrentTransform = Component->GetComponentTransform();
         const FVector CurrentLocation = CurrentTransform.GetLocation();
         const FVector TargetLocation = Entry.TargetTransform.GetLocation();
+        const FQuat CurrentRotation = CurrentTransform.GetRotation().GetNormalized();
+        const FQuat TargetRotation = Entry.TargetTransform.GetRotation().GetNormalized();
+        const bool bLocationAtTarget = CurrentLocation.Equals(TargetLocation, 0.01f);
+        const bool bRotationAtTarget = CurrentRotation.Equals(TargetRotation, 0.0001f);
+        const bool bScaleAtTarget =
+            !Entry.bApplyScale ||
+            CurrentTransform.GetScale3D().Equals(Entry.TargetTransform.GetScale3D(), 0.001f);
+        if (bLocationAtTarget && bRotationAtTarget && bScaleAtTarget)
+        {
+            Entry.bAtTarget = true;
+            continue;
+        }
+
         const float DistanceSquared = FVector::DistSquared(CurrentLocation, TargetLocation);
         const bool bTeleport = Entry.TeleportDistance > 0.0f && DistanceSquared > FMath::Square(Entry.TeleportDistance);
 
         FVector NewLocation = TargetLocation;
-        FQuat NewRotation = Entry.TargetTransform.GetRotation().GetNormalized();
+        FQuat NewRotation = TargetRotation;
 
         if (!bTeleport && Entry.InterpSpeed > KINDA_SMALL_NUMBER)
         {
             const float Alpha = FMath::Clamp(1.0f - FMath::Exp(-Entry.InterpSpeed * DeltaTime), 0.0f, 1.0f);
             NewLocation = FMath::Lerp(CurrentLocation, TargetLocation, Alpha);
-            NewRotation = FQuat::Slerp(CurrentTransform.GetRotation().GetNormalized(), NewRotation, Alpha).GetNormalized();
+            NewRotation = FQuat::Slerp(CurrentRotation, NewRotation, Alpha).GetNormalized();
+        }
+
+        const bool bReachedLocation = NewLocation.Equals(TargetLocation, 0.01f);
+        const bool bReachedRotation = NewRotation.Equals(TargetRotation, 0.0001f);
+        if (bReachedLocation && bReachedRotation)
+        {
+            // Snap once at convergence so later frames can skip the entry without residual drift.
+            NewLocation = TargetLocation;
+            NewRotation = TargetRotation;
         }
 
         Component->SetWorldLocationAndRotation(NewLocation, NewRotation.Rotator(), false, nullptr, ETeleportType::TeleportPhysics);
@@ -221,5 +259,6 @@ void UPhysicsTransformInterpolationSubSystem::UpdateFromGameUpdate(float DeltaTi
         {
             Component->SetWorldScale3D(Entry.TargetTransform.GetScale3D());
         }
+        Entry.bAtTarget = bReachedLocation && bReachedRotation;
     }
 }

@@ -5,6 +5,7 @@
 
 #include "CoreMinimal.h"
 #include "Dom/JsonObject.h"
+#include "Engine/Scene.h"
 #include "ModelData.generated.h"
 
 class UInstancedStaticMeshComponent;

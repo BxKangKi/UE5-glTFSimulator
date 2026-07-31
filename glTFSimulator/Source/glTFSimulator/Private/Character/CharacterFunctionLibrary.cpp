@@ -25,15 +25,27 @@
 
 FTransform UCharacterFunctionLibrary::GetBoneDeltaTransform(const USkeletalMesh &MeshAsset, const int32 BoneIndex, const int32 InParentIndex)
 {
-    FTransform Transform = MeshAsset.GetRefSkeleton().GetRefBonePose()[BoneIndex];
-    int32 ParentIndex = MeshAsset.GetRefSkeleton().GetParentIndex(BoneIndex);
-
-    while (ParentIndex > INDEX_NONE && ParentIndex != InParentIndex)
+    const FReferenceSkeleton& RefSkeleton = MeshAsset.GetRefSkeleton();
+    if (!RefSkeleton.GetRefBonePose().IsValidIndex(BoneIndex))
     {
-        Transform *= MeshAsset.GetRefSkeleton().GetRefBonePose()[ParentIndex];
-        ParentIndex = MeshAsset.GetRefSkeleton().GetParentIndex(ParentIndex);
+        return FTransform::Identity;
     }
-    return Transform;
+
+    FTransform Transform = RefSkeleton.GetRefBonePose()[BoneIndex];
+    int32 ParentIndex = RefSkeleton.GetParentIndex(BoneIndex);
+    int32 SafetyCounter = 0;
+    const int32 MaxBoneCount = RefSkeleton.GetNum();
+
+    while (ParentIndex > INDEX_NONE && ParentIndex != InParentIndex && SafetyCounter++ < MaxBoneCount)
+    {
+        if (!RefSkeleton.GetRefBonePose().IsValidIndex(ParentIndex))
+        {
+            return FTransform::Identity;
+        }
+        Transform *= RefSkeleton.GetRefBonePose()[ParentIndex];
+        ParentIndex = RefSkeleton.GetParentIndex(ParentIndex);
+    }
+    return Transform.ContainsNaN() ? FTransform::Identity : Transform;
 }
 
 
@@ -120,231 +132,367 @@ void UCharacterFunctionLibrary::BlendRagdoll(USkeletalMeshComponent &SkeletalMes
     SetBodiesBelowPhysics(SkeletalMesh);
 }
 
-UPhysicsAsset *UCharacterFunctionLibrary::MergePhysicsAsset(UPhysicsAsset *Target, UPhysicsAsset *Source)
+namespace
 {
-    if (!IsValid(Target) || !IsValid(Source))
+    static bool PhysicsBoneExists(const USkeletalMesh* MeshAsset, const FName BoneName)
     {
-        UE_LOG(LogTemp, Warning, TEXT("Null PhysicsAsset given."));
+        return IsValid(MeshAsset) && BoneName != NAME_None &&
+            MeshAsset->GetRefSkeleton().FindBoneIndex(BoneName) != INDEX_NONE;
+    }
+
+    static int32 FindBodySetupByBone(const UPhysicsAsset* PhysicsAsset, const FName BoneName)
+    {
+        if (!IsValid(PhysicsAsset) || BoneName == NAME_None)
+        {
+            return INDEX_NONE;
+        }
+
+        for (int32 Index = 0; Index < PhysicsAsset->SkeletalBodySetups.Num(); ++Index)
+        {
+            const USkeletalBodySetup* BodySetup = PhysicsAsset->SkeletalBodySetups[Index];
+            if (IsValid(BodySetup) && BodySetup->BoneName == BoneName)
+            {
+                return Index;
+            }
+        }
+        return INDEX_NONE;
+    }
+
+    static int32 FindConstraintByBones(const UPhysicsAsset* PhysicsAsset, const FName BoneA, const FName BoneB)
+    {
+        if (!IsValid(PhysicsAsset))
+        {
+            return INDEX_NONE;
+        }
+
+        for (int32 Index = 0; Index < PhysicsAsset->ConstraintSetup.Num(); ++Index)
+        {
+            const UPhysicsConstraintTemplate* Constraint = PhysicsAsset->ConstraintSetup[Index];
+            if (!IsValid(Constraint))
+            {
+                continue;
+            }
+
+            const FConstraintInstance& Instance = Constraint->DefaultInstance;
+            const bool bSameOrder = Instance.ConstraintBone1 == BoneA && Instance.ConstraintBone2 == BoneB;
+            const bool bReverseOrder = Instance.ConstraintBone1 == BoneB && Instance.ConstraintBone2 == BoneA;
+            if (bSameOrder || bReverseOrder)
+            {
+                return Index;
+            }
+        }
+        return INDEX_NONE;
+    }
+
+    static void ConfigureGeneratedBody(USkeletalBodySetup& BodySetup)
+    {
+        static const TArray<ECollisionChannel> Channels = {ECC_WorldStatic, ECC_WorldDynamic};
+        for (const ECollisionChannel Channel : Channels)
+        {
+            BodySetup.DefaultInstance.SetResponseToChannel(Channel, ECollisionResponse::ECR_Ignore);
+        }
+        BodySetup.CollisionReponse = EBodyCollisionResponse::BodyCollision_Disabled;
+        BodySetup.DefaultInstance.SetCollisionEnabled(ECollisionEnabled::NoCollision);
+        BodySetup.DefaultInstance.SetMassScale(0.001f);
+    }
+
+    static void ConfigureSourceBody(USkeletalBodySetup& BodySetup)
+    {
+        static const TArray<ECollisionChannel> Channels = {ECC_WorldStatic, ECC_WorldDynamic};
+        for (const ECollisionChannel Channel : Channels)
+        {
+            BodySetup.DefaultInstance.SetResponseToChannel(Channel, ECollisionResponse::ECR_Block);
+        }
+        BodySetup.CollisionReponse = EBodyCollisionResponse::BodyCollision_Enabled;
+        BodySetup.DefaultInstance.SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+    }
+}
+
+UPhysicsAsset *UCharacterFunctionLibrary::MergePhysicsAsset(UPhysicsAsset *Target, UPhysicsAsset *Source, const USkeletalMesh *MeshAsset)
+{
+    if (!ensureMsgf(IsInGameThread(), TEXT("MergePhysicsAsset must run on the game thread")))
+    {
         return nullptr;
     }
 
-    static const TArray<ECollisionChannel> Channels = {ECC_WorldStatic, ECC_WorldDynamic};
-
-    // Reset target bodies to no collision and a tiny mass.
-    for (USkeletalBodySetup *TargetBodySetup : Target->SkeletalBodySetups)
+    if (!IsValid(Target) || !IsValid(MeshAsset))
     {
-        if (!IsValid(TargetBodySetup))
-            continue;
-
-        // int32 Index = Target->FindBodyIndex(TargetBodySetup->BoneName);
-
-        auto &DefaultInstance = TargetBodySetup->DefaultInstance;
-        for (ECollisionChannel Channel : Channels)
-        {
-            DefaultInstance.SetResponseToChannel(Channel, ECollisionResponse::ECR_Ignore);
-        }
-        TargetBodySetup->CollisionReponse = EBodyCollisionResponse::BodyCollision_Disabled;
-        DefaultInstance.SetCollisionEnabled(ECollisionEnabled::NoCollision);
-        DefaultInstance.SetMassScale(0.001f);
-        // DefaultInstance.SetEnableGravity(false);
+        UE_LOG(LogTemp, Warning, TEXT("MergePhysicsAsset skipped: target physics asset or mesh is invalid."));
+        return nullptr;
     }
 
-    // Replace matching source bodies on the target or append missing bodies.
-    for (const USkeletalBodySetup *SourceBodySetup : Source->SkeletalBodySetups)
+    TSet<FName> SeenTargetBones;
+    for (int32 Index = Target->SkeletalBodySetups.Num() - 1; Index >= 0; --Index)
     {
-        if (!IsValid(SourceBodySetup))
-            continue;
-
-        int32 TargetIndex = Target->FindBodyIndex(SourceBodySetup->BoneName);
-
-        if (TargetIndex != INDEX_NONE)
+        USkeletalBodySetup* BodySetup = Target->SkeletalBodySetups[Index];
+        if (!IsValid(BodySetup) || !PhysicsBoneExists(MeshAsset, BodySetup->BoneName) || SeenTargetBones.Contains(BodySetup->BoneName))
         {
-            // Replace an existing target body with a duplicated source body.
-            Target->SkeletalBodySetups.RemoveAt(TargetIndex);
+            Target->SkeletalBodySetups.RemoveAt(Index);
+            continue;
+        }
+        SeenTargetBones.Add(BodySetup->BoneName);
+        ConfigureGeneratedBody(*BodySetup);
+    }
 
-            USkeletalBodySetup *NewBodySetup = DuplicateObject<USkeletalBodySetup>(SourceBodySetup, Target);
-            for (ECollisionChannel Channel : Channels)
+    for (int32 Index = Target->ConstraintSetup.Num() - 1; Index >= 0; --Index)
+    {
+        const UPhysicsConstraintTemplate* Constraint = Target->ConstraintSetup[Index];
+        if (!IsValid(Constraint) ||
+            !PhysicsBoneExists(MeshAsset, Constraint->DefaultInstance.ConstraintBone1) ||
+            !PhysicsBoneExists(MeshAsset, Constraint->DefaultInstance.ConstraintBone2) ||
+            FindBodySetupByBone(Target, Constraint->DefaultInstance.ConstraintBone1) == INDEX_NONE ||
+            FindBodySetupByBone(Target, Constraint->DefaultInstance.ConstraintBone2) == INDEX_NONE)
+        {
+            Target->ConstraintSetup.RemoveAt(Index);
+        }
+    }
+
+    if (IsValid(Source))
+    {
+        for (const USkeletalBodySetup* SourceBodySetup : Source->SkeletalBodySetups)
+        {
+            if (!IsValid(SourceBodySetup) || !PhysicsBoneExists(MeshAsset, SourceBodySetup->BoneName))
             {
-                NewBodySetup->DefaultInstance.SetResponseToChannel(Channel, ECollisionResponse::ECR_Block);
+                continue;
             }
-            Target->SkeletalBodySetups.Insert(NewBodySetup, TargetIndex);
-        }
-        else
-        {
-            // Append bodies that do not exist on the target asset.
-            USkeletalBodySetup *NewBodySetup = DuplicateObject<USkeletalBodySetup>(SourceBodySetup, Target);
-            for (ECollisionChannel Channel : Channels)
+
+            USkeletalBodySetup* NewBodySetup = DuplicateObject<USkeletalBodySetup>(
+                SourceBodySetup,
+                Target,
+                MakeUniqueObjectName(Target, USkeletalBodySetup::StaticClass(), SourceBodySetup->GetFName()));
+            if (!IsValid(NewBodySetup))
             {
-                NewBodySetup->DefaultInstance.SetResponseToChannel(Channel, ECollisionResponse::ECR_Block);
+                continue;
             }
-            Target->SkeletalBodySetups.Add(NewBodySetup);
-        }
-    }
+            NewBodySetup->ClearFlags(RF_Public | RF_Standalone);
+            NewBodySetup->SetFlags(RF_Transient);
+            ConfigureSourceBody(*NewBodySetup);
 
-    // Reset target constraints.
-    for (UPhysicsConstraintTemplate *TargetConstraint : Target->ConstraintSetup)
-    {
-        if (!TargetConstraint)
-            continue;
-        auto &DefaultInstance = TargetConstraint->DefaultInstance;
-        DefaultInstance.SetDisableCollision(true);
-        DefaultInstance.EnableProjection();
-    }
-
-    // Replace matching source constraints on the target or append missing constraints.
-    for (const UPhysicsConstraintTemplate *SourceConstraint : Source->ConstraintSetup)
-    {
-        if (!IsValid(SourceConstraint))
-            continue;
-        int32 ExistingIndex = INDEX_NONE;
-        for (int32 i = 0; i < Target->ConstraintSetup.Num(); ++i)
-        {
-            UPhysicsConstraintTemplate *TargetConstraint = Target->ConstraintSetup[i];
-            if (TargetConstraint &&
-                TargetConstraint->DefaultInstance.ConstraintBone1 == SourceConstraint->DefaultInstance.ConstraintBone1 &&
-                TargetConstraint->DefaultInstance.ConstraintBone2 == SourceConstraint->DefaultInstance.ConstraintBone2)
+            const int32 ExistingIndex = FindBodySetupByBone(Target, SourceBodySetup->BoneName);
+            if (ExistingIndex != INDEX_NONE && Target->SkeletalBodySetups.IsValidIndex(ExistingIndex))
             {
-                ExistingIndex = i;
-                break;
+                Target->SkeletalBodySetups[ExistingIndex] = NewBodySetup;
+            }
+            else
+            {
+                Target->SkeletalBodySetups.Add(NewBodySetup);
             }
         }
 
-        if (ExistingIndex != INDEX_NONE)
+        for (const UPhysicsConstraintTemplate* SourceConstraint : Source->ConstraintSetup)
         {
-            // Replace the existing constraint with a duplicated source constraint.
-            Target->ConstraintSetup.RemoveAt(ExistingIndex);
-            UPhysicsConstraintTemplate *NewConstraint = DuplicateObject<UPhysicsConstraintTemplate>(SourceConstraint, Target);
-            Target->ConstraintSetup.Insert(NewConstraint, ExistingIndex);
-        }
-        else
-        {
-            // Add constraints that do not exist on the target asset.
-            UPhysicsConstraintTemplate *NewConstraint = DuplicateObject<UPhysicsConstraintTemplate>(SourceConstraint, Target);
-            Target->ConstraintSetup.Add(NewConstraint);
+            if (!IsValid(SourceConstraint))
+            {
+                continue;
+            }
+
+            const FName BoneA = SourceConstraint->DefaultInstance.ConstraintBone1;
+            const FName BoneB = SourceConstraint->DefaultInstance.ConstraintBone2;
+            if (!PhysicsBoneExists(MeshAsset, BoneA) || !PhysicsBoneExists(MeshAsset, BoneB) ||
+                FindBodySetupByBone(Target, BoneA) == INDEX_NONE || FindBodySetupByBone(Target, BoneB) == INDEX_NONE)
+            {
+                continue;
+            }
+
+            UPhysicsConstraintTemplate* NewConstraint = DuplicateObject<UPhysicsConstraintTemplate>(
+                SourceConstraint,
+                Target,
+                MakeUniqueObjectName(Target, UPhysicsConstraintTemplate::StaticClass(), SourceConstraint->GetFName()));
+            if (!IsValid(NewConstraint))
+            {
+                continue;
+            }
+            NewConstraint->ClearFlags(RF_Public | RF_Standalone);
+            NewConstraint->SetFlags(RF_Transient);
+
+            const int32 ExistingIndex = FindConstraintByBones(Target, BoneA, BoneB);
+            if (ExistingIndex != INDEX_NONE && Target->ConstraintSetup.IsValidIndex(ExistingIndex))
+            {
+                Target->ConstraintSetup[ExistingIndex] = NewConstraint;
+            }
+            else
+            {
+                Target->ConstraintSetup.Add(NewConstraint);
+            }
         }
     }
 
+    Target->CollisionDisableTable.Empty();
     Target->UpdateBodySetupIndexMap();
     Target->UpdateBoundsBodiesArray();
+
+    for (UPhysicsConstraintTemplate* Constraint : Target->ConstraintSetup)
+    {
+        if (!IsValid(Constraint))
+        {
+            continue;
+        }
+        Constraint->DefaultInstance.SetDisableCollision(true);
+        Constraint->DefaultInstance.EnableProjection();
+
+        const int32 BodyA = Target->FindBodyIndex(Constraint->DefaultInstance.ConstraintBone1);
+        const int32 BodyB = Target->FindBodyIndex(Constraint->DefaultInstance.ConstraintBone2);
+        if (BodyA != INDEX_NONE && BodyB != INDEX_NONE && BodyA != BodyB)
+        {
+            Target->DisableCollision(BodyA, BodyB);
+        }
+    }
 
 #if WITH_EDITOR
     Target->InvalidateAllPhysicsMeshes();
     Target->RefreshPhysicsAssetChange();
 #endif
-
     return Target;
 }
 
 void UCharacterFunctionLibrary::SetupAllBodiesBelowCollidersAndConstraints(
     UPhysicsAsset *PhysicsAsset,
-    USkeletalMeshComponent *SkeletalMesh,
+    const USkeletalMesh *MeshAsset,
     const FName &RootBoneName)
 {
-    if (!IsValid(PhysicsAsset) || !IsValid(SkeletalMesh))
+    if (!ensureMsgf(IsInGameThread(), TEXT("PhysicsAsset body/constraint creation must run on the game thread")))
     {
-        UE_LOG(LogTemp, Warning, TEXT("Invalid PhysicsAsset or SkeletalMesh"));
         return;
     }
 
-    USkeletalMesh *MeshAsset = SkeletalMesh->GetSkeletalMeshAsset();
-    if (!IsValid(MeshAsset))
+    if (!IsValid(PhysicsAsset) || !IsValid(MeshAsset))
+    {
         return;
+    }
 
-    int32 RootBoneIndex = MeshAsset->GetRefSkeleton().FindBoneIndex(RootBoneName);
+    const FReferenceSkeleton& RefSkeleton = MeshAsset->GetRefSkeleton();
+    const int32 RootBoneIndex = RefSkeleton.FindBoneIndex(RootBoneName);
     if (RootBoneIndex == INDEX_NONE)
     {
-        UE_LOG(LogTemp, Warning, TEXT("Root bone not found: %s"), *RootBoneName.ToString());
         return;
+    }
+
+    // Build a child adjacency table once. The previous implementation rescanned the whole
+    // skeleton for every queued bone (O(N^2)), which could hitch on large character rigs.
+    TArray<TArray<int32>> ChildrenByParent;
+    ChildrenByParent.SetNum(RefSkeleton.GetNum());
+    for (int32 BoneIndex = 0; BoneIndex < RefSkeleton.GetNum(); ++BoneIndex)
+    {
+        const int32 ParentIndex = RefSkeleton.GetParentIndex(BoneIndex);
+        if (ChildrenByParent.IsValidIndex(ParentIndex))
+        {
+            ChildrenByParent[ParentIndex].Add(BoneIndex);
+        }
     }
 
     TArray<int32> BoneIndicesToProcess;
+    BoneIndicesToProcess.Reserve(RefSkeleton.GetNum());
     BoneIndicesToProcess.Add(RootBoneIndex);
-
-    int32 NumBones = MeshAsset->GetRefSkeleton().GetNum();
-
-    // Traverse child bones iteratively instead of recursively.
-    for (int32 i = 0; i < BoneIndicesToProcess.Num(); ++i)
+    for (int32 QueueIndex = 0; QueueIndex < BoneIndicesToProcess.Num(); ++QueueIndex)
     {
-        int32 CurrentBoneIndex = BoneIndicesToProcess[i];
-        for (int32 ChildIdx = 0; ChildIdx < NumBones; ++ChildIdx)
+        const int32 ParentIndex = BoneIndicesToProcess[QueueIndex];
+        if (ChildrenByParent.IsValidIndex(ParentIndex))
         {
-            if (MeshAsset->GetRefSkeleton().GetParentIndex(ChildIdx) == CurrentBoneIndex)
-            {
-                BoneIndicesToProcess.Add(ChildIdx);
-            }
+            BoneIndicesToProcess.Append(ChildrenByParent[ParentIndex]);
         }
     }
 
-    // Add colliders.
-    for (int32 BoneIndex : BoneIndicesToProcess)
+    TMap<FName, USkeletalBodySetup*> BodyByBone;
+    BodyByBone.Reserve(PhysicsAsset->SkeletalBodySetups.Num() + BoneIndicesToProcess.Num());
+    for (USkeletalBodySetup* ExistingBody : PhysicsAsset->SkeletalBodySetups)
     {
-        FName BoneName = MeshAsset->GetRefSkeleton().GetBoneName(BoneIndex);
-
-        int32 BodyIndex = PhysicsAsset->FindBodyIndex(BoneName);
-        if (BodyIndex != INDEX_NONE)
+        if (IsValid(ExistingBody) && ExistingBody->BoneName != NAME_None)
         {
-            PhysicsAsset->SkeletalBodySetups[BodyIndex]->RemoveSimpleCollision();
+            BodyByBone.FindOrAdd(ExistingBody->BoneName) = ExistingBody;
+        }
+    }
+
+    for (const int32 BoneIndex : BoneIndicesToProcess)
+    {
+        if (!RefSkeleton.GetRawRefBoneInfo().IsValidIndex(BoneIndex))
+        {
+            continue;
+        }
+        const FName BoneName = RefSkeleton.GetBoneName(BoneIndex);
+        USkeletalBodySetup* BodySetup = BodyByBone.FindRef(BoneName);
+        if (!IsValid(BodySetup))
+        {
+            BodySetup = NewObject<USkeletalBodySetup>(
+                PhysicsAsset,
+                MakeUniqueObjectName(PhysicsAsset, USkeletalBodySetup::StaticClass(), BoneName),
+                RF_Transient);
+            if (!IsValid(BodySetup))
+            {
+                continue;
+            }
+            BodySetup->BoneName = BoneName;
+            PhysicsAsset->SkeletalBodySetups.Add(BodySetup);
+            BodyByBone.Add(BoneName, BodySetup);
         }
 
-        USkeletalBodySetup *NewBodySetup = NewObject<USkeletalBodySetup>(PhysicsAsset, NAME_None, RF_Public);
-        NewBodySetup->BoneName = BoneName;
-
+        BodySetup->RemoveSimpleCollision();
         FKSphereElem Sphere;
         Sphere.Radius = DEFAULT_RADIUS;
         Sphere.SetName(BoneName);
-        NewBodySetup->AggGeom.SphereElems.Add(Sphere);
-        NewBodySetup->DefaultInstance.SetUpdateKinematicFromSimulation(true);
-        PhysicsAsset->SkeletalBodySetups.Add(NewBodySetup);
-
-#if WITH_EDITOR
-        UE_LOG(LogTemp, Log, TEXT("Added collider to bone %s"), *BoneName.ToString());
-#endif
+        BodySetup->AggGeom.SphereElems.Add(Sphere);
+        BodySetup->DefaultInstance.SetUpdateKinematicFromSimulation(true);
+        ConfigureGeneratedBody(*BodySetup);
     }
 
-    // Add parent-child constraints, including the requested root bone.
-    for (int32 i = 0; i < BoneIndicesToProcess.Num(); ++i)
+    PhysicsAsset->UpdateBodySetupIndexMap();
+
+    for (const int32 ChildBoneIndex : BoneIndicesToProcess)
     {
-        int32 ChildBoneIndex = BoneIndicesToProcess[i];
-        int32 ParentBoneIndex = MeshAsset->GetRefSkeleton().GetParentIndex(ChildBoneIndex);
-        if (ParentBoneIndex == INDEX_NONE)
-            continue;
-
-        FName ParentBoneName = MeshAsset->GetRefSkeleton().GetBoneName(ParentBoneIndex);
-        FName ChildBoneName = MeshAsset->GetRefSkeleton().GetBoneName(ChildBoneIndex);
-
-        int32 ConstraintIndex = PhysicsAsset->FindConstraintIndex(ParentBoneName, ChildBoneName);
-        if (ConstraintIndex != INDEX_NONE)
+        const int32 ParentBoneIndex = RefSkeleton.GetParentIndex(ChildBoneIndex);
+        if (ParentBoneIndex == INDEX_NONE || !RefSkeleton.GetRawRefBoneInfo().IsValidIndex(ChildBoneIndex) ||
+            !RefSkeleton.GetRawRefBoneInfo().IsValidIndex(ParentBoneIndex))
         {
-            PhysicsAsset->ConstraintSetup.RemoveAt(ConstraintIndex);
+            continue;
         }
 
-        UPhysicsConstraintTemplate *NewConstraint = NewObject<UPhysicsConstraintTemplate>(PhysicsAsset, NAME_None, RF_Public);
-        FTransform ChildToParentTransform = GetBoneDeltaTransform(*MeshAsset, ChildBoneIndex, ParentBoneIndex);
+        const FName ChildBoneName = RefSkeleton.GetBoneName(ChildBoneIndex);
+        const FName ParentBoneName = RefSkeleton.GetBoneName(ParentBoneIndex);
+        const int32 ChildBodyIndex = PhysicsAsset->FindBodyIndex(ChildBoneName);
+        const int32 ParentBodyIndex = PhysicsAsset->FindBodyIndex(ParentBoneName);
+        if (ChildBodyIndex == INDEX_NONE || ParentBodyIndex == INDEX_NONE || ChildBodyIndex == ParentBodyIndex)
+        {
+            continue;
+        }
 
-        auto &DefaultInstance = NewConstraint->DefaultInstance;
+        const int32 ExistingConstraintIndex = FindConstraintByBones(PhysicsAsset, ChildBoneName, ParentBoneName);
+        if (ExistingConstraintIndex != INDEX_NONE)
+        {
+            PhysicsAsset->ConstraintSetup.RemoveAt(ExistingConstraintIndex);
+        }
+
+        UPhysicsConstraintTemplate* NewConstraint = NewObject<UPhysicsConstraintTemplate>(
+            PhysicsAsset,
+            MakeUniqueObjectName(PhysicsAsset, UPhysicsConstraintTemplate::StaticClass(), ChildBoneName),
+            RF_Transient);
+        if (!IsValid(NewConstraint))
+        {
+            continue;
+        }
+
+        const FTransform ChildToParentTransform = GetBoneDeltaTransform(*MeshAsset, ChildBoneIndex, ParentBoneIndex);
+        FConstraintInstance& DefaultInstance = NewConstraint->DefaultInstance;
         DefaultInstance.JointName = ChildBoneName;
         DefaultInstance.ConstraintBone1 = ChildBoneName;
         DefaultInstance.ConstraintBone2 = ParentBoneName;
-
         DefaultInstance.SetRefPosition(EConstraintFrame::Frame2, ChildToParentTransform.GetLocation());
-        DefaultInstance.SetRefOrientation(EConstraintFrame::Frame2, ChildToParentTransform.GetUnitAxis(EAxis::X), ChildToParentTransform.GetUnitAxis(EAxis::Y));
+        DefaultInstance.SetRefOrientation(
+            EConstraintFrame::Frame2,
+            ChildToParentTransform.GetUnitAxis(EAxis::X),
+            ChildToParentTransform.GetUnitAxis(EAxis::Y));
         DefaultInstance.SetAngularSwing1Motion(EAngularConstraintMotion::ACM_Limited);
         DefaultInstance.SetAngularSwing2Motion(EAngularConstraintMotion::ACM_Limited);
         DefaultInstance.SetAngularTwistMotion(EAngularConstraintMotion::ACM_Limited);
-
+        DefaultInstance.SetDisableCollision(true);
 #if WITH_EDITOR
         NewConstraint->SetDefaultProfile(DefaultInstance);
 #endif
         PhysicsAsset->ConstraintSetup.Add(NewConstraint);
-        PhysicsAsset->DisableCollision(ChildBoneIndex, ParentBoneIndex);
-#if WITH_EDITOR
-        UE_LOG(LogTemp, Log, TEXT("Added constraint between %s and %s"), *ParentBoneName.ToString(), *ChildBoneName.ToString());
-#endif
+
+        PhysicsAsset->DisableCollision(ChildBodyIndex, ParentBodyIndex);
     }
 
     PhysicsAsset->UpdateBodySetupIndexMap();
     PhysicsAsset->UpdateBoundsBodiesArray();
-
 #if WITH_EDITOR
     PhysicsAsset->InvalidateAllPhysicsMeshes();
     PhysicsAsset->RefreshPhysicsAssetChange();
@@ -426,55 +574,81 @@ TMap<FString, FTransform> UCharacterFunctionLibrary::GenerateBoneTransformMap(US
 
 USkeleton *UCharacterFunctionLibrary::DuplicateSkeleton(const USkeleton *SourceSkeleton)
 {
+    if (!ensureMsgf(IsInGameThread(), TEXT("DuplicateSkeleton must run on the game thread")))
+    {
+        return nullptr;
+    }
+
     if (!IsValid(SourceSkeleton))
     {
         return nullptr;
     }
-    // Deep-copy into the runtime transient package, which is the safest ownership model here.
-    USkeleton *NewSkeleton = DuplicateObject<USkeleton>(
+
+    USkeleton* NewSkeleton = DuplicateObject<USkeleton>(
         SourceSkeleton,
         GetTransientPackage(),
-        FName(TEXT("Skeleton")));
-
-    NewSkeleton->SetFlags(RF_Transient);
+        MakeUniqueObjectName(GetTransientPackage(), USkeleton::StaticClass(), FName(TEXT("RuntimeCharacterSkeleton"))));
+    if (IsValid(NewSkeleton))
+    {
+        NewSkeleton->ClearFlags(RF_Public | RF_Standalone);
+        NewSkeleton->SetFlags(RF_Transient);
+    }
     return NewSkeleton;
 }
 
 USkeleton *UCharacterFunctionLibrary::MergeSkeleton(const USkeleton *Source, const USkeleton *Target)
 {
-    if (!Source || !Target)
-        return nullptr;
-
-    // 1. Start by duplicating the source skeleton.
-    USkeleton *NewSkeleton = DuplicateObject<USkeleton>(Source, nullptr);
-
-    // 2. Get the editable reference skeleton.
-    const FReferenceSkeleton &TargetRefSkeleton = Target->GetReferenceSkeleton();
-    FReferenceSkeletonModifier SkeletonModifier(NewSkeleton);
-
-    // 3. Iterate all target bones and add missing bones.
-    for (int32 i = 0; i < TargetRefSkeleton.GetRawBoneNum(); ++i)
+    if (!ensureMsgf(IsInGameThread(), TEXT("MergeSkeleton must run on the game thread")))
     {
-        const FMeshBoneInfo &BoneInfo = TargetRefSkeleton.GetRawRefBoneInfo()[i];
-        const FTransform &BoneTransform = TargetRefSkeleton.GetRawRefBonePose()[i];
-
-        // Skip bones that already exist to avoid duplicates.
-        if (SkeletonModifier.FindBoneIndex(BoneInfo.Name) == INDEX_NONE)
-        {
-            // Resolve the parent bone name.
-            int32 ParentIndex = TargetRefSkeleton.GetParentIndex(i);
-            FName ParentName = (ParentIndex != INDEX_NONE) ? TargetRefSkeleton.GetRawRefBoneInfo()[ParentIndex].Name : NAME_None;
-            int32 NewParentIndex = SkeletonModifier.FindBoneIndex(ParentName);
-
-            // Add the bone by name, parent index, and transform.
-            FMeshBoneInfo NewBoneInfo(BoneInfo.Name, BoneInfo.Name.ToString(), NewParentIndex);
-            SkeletonModifier.Add(NewBoneInfo, BoneTransform);
-        }
+        return nullptr;
     }
 
-    // 4. Apply changes and rebuild skeleton data.
-    // SkeletonModifier also rebuilds on destruction, but an explicit rebuild is safer here.
-    // NewSkeleton->RecreateBoneTree();
+    if (!IsValid(Source))
+    {
+        return nullptr;
+    }
+
+    USkeleton* NewSkeleton = DuplicateSkeleton(Source);
+    if (!IsValid(NewSkeleton) || !IsValid(Target))
+    {
+        return NewSkeleton;
+    }
+
+    const FReferenceSkeleton& TargetRefSkeleton = Target->GetReferenceSkeleton();
+    FReferenceSkeletonModifier SkeletonModifier(NewSkeleton);
+
+    for (int32 BoneIndex = 0; BoneIndex < TargetRefSkeleton.GetRawBoneNum(); ++BoneIndex)
+    {
+        const FMeshBoneInfo& BoneInfo = TargetRefSkeleton.GetRawRefBoneInfo()[BoneIndex];
+        if (BoneInfo.Name == NAME_None || SkeletonModifier.FindBoneIndex(BoneInfo.Name) != INDEX_NONE)
+        {
+            continue;
+        }
+
+        const int32 TargetParentIndex = TargetRefSkeleton.GetParentIndex(BoneIndex);
+        if (TargetParentIndex == INDEX_NONE || !TargetRefSkeleton.GetRawRefBoneInfo().IsValidIndex(TargetParentIndex))
+        {
+            // A merged runtime skeleton must keep a single valid root. Ignore an unrelated root.
+            continue;
+        }
+
+        const FName ParentName = TargetRefSkeleton.GetRawRefBoneInfo()[TargetParentIndex].Name;
+        const int32 NewParentIndex = SkeletonModifier.FindBoneIndex(ParentName);
+        if (NewParentIndex == INDEX_NONE)
+        {
+            // Parentless/orphaned target bones are unsafe for runtime animation evaluation.
+            continue;
+        }
+
+        const FTransform& BoneTransform = TargetRefSkeleton.GetRawRefBonePose()[BoneIndex];
+        if (BoneTransform.ContainsNaN())
+        {
+            continue;
+        }
+
+        FMeshBoneInfo NewBoneInfo(BoneInfo.Name, BoneInfo.Name.ToString(), NewParentIndex);
+        SkeletonModifier.Add(NewBoneInfo, BoneTransform);
+    }
     return NewSkeleton;
 }
 

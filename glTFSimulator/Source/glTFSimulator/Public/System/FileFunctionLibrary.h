@@ -4,9 +4,10 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Dom/JsonObject.h"
+#include "Kismet/BlueprintFunctionLibrary.h"
 #include "Serialization/BufferArchive.h"
 #include "Templates/SharedPointer.h"
-#include "HAL/CriticalSection.h"
 #include "FileFunctionLibrary.generated.h"
 
 UCLASS()
@@ -63,7 +64,6 @@ public:
     static bool GetSubFolders(const FString &ParentFolderPath, TArray<FString> &OutSubFolders);
 
 private:
-    static FCriticalSection FileWriteCriticalSection;
     // Internal helper that appends text to a file.
     static bool AppendStringToFileInternal(const FString &Line, const FString &FilePath);
 };

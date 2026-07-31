@@ -5,11 +5,42 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
+#include "GameFramework/GameModeBase.h"
 #include "TimerManager.h"
 #include "UI/WorldSelectionWidget.h"
 #include "StartActor.generated.h"
 
 class UWorld;
+
+/**
+ * Direct editor assignments used to choose the actual Unreal map and optional GameMode for an
+ * external world-data folder. Asset fields intentionally have no name/path defaults.
+ *
+ * When SinglePlayerWorld or HostWorld is empty, AStartActor falls back to its common world field.
+ * When GameModeOverride is empty, Unreal resolves the GameMode from the selected map's World
+ * Settings, then from the project defaults.
+ */
+USTRUCT(BlueprintType)
+struct GLTFSIMULATOR_API FWorldLaunchProfile
+{
+    GENERATED_BODY()
+
+    /** External data-folder key. This is not an Unreal asset name or package path. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="World Launch")
+    FString WorldFolderName;
+
+    /** Optional map used only for this folder in single-player. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="World Launch")
+    TSoftObjectPtr<UWorld> SinglePlayerWorld;
+
+    /** Optional map used only for this folder when hosting. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="World Launch")
+    TSoftObjectPtr<UWorld> HostWorld;
+
+    /** Optional explicit GameMode class. Leave empty to use the selected map's GameMode Override. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="World Launch")
+    TSoftClassPtr<AGameModeBase> GameModeOverride;
+};
 
 /**
  * Owns the MainWorld menu flow.
@@ -109,6 +140,14 @@ protected:
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Start World|Navigation")
     TSoftObjectPtr<UWorld> ClientWorld;
 
+    /**
+     * Per-folder map/GameMode assignments. This is the path that makes separate map World Settings
+     * effective: assign each external folder to its actual world asset. A profile may also select a
+     * GameMode class explicitly while continuing to use the common GameplayWorld/HostWorld.
+     */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Start World|Navigation", meta=(TitleProperty="WorldFolderName"))
+    TArray<FWorldLaunchProfile> WorldLaunchProfiles;
+
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Start World|Navigation")
     FString DefaultServerAddress = TEXT("127.0.0.1:7777");
 
@@ -149,6 +188,13 @@ private:
     void CancelWorldSelectionReturnInputGuard();
     bool IsWorldSelectionActivationInputHeld() const;
     bool IsWorldSelectionReturnBlocked() const;
+    const FWorldLaunchProfile* FindWorldLaunchProfile(const FString& WorldFolderName) const;
+    void ResolveWorldLaunch(
+        const FString& WorldFolderName,
+        bool bForHost,
+        TSoftObjectPtr<UWorld>& OutWorld,
+        TSoftClassPtr<AGameModeBase>& OutGameModeOverride,
+        FString& OutResolutionSource) const;
     void ResetEditorTransactionBufferForMenuTravel(const TCHAR* Reason) const;
 
 private:

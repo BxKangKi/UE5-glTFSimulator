@@ -43,13 +43,8 @@ private:
     FVector Location;
     FVector LocationOffset;
     int32 GameUpdateTickHandle = INDEX_NONE;
-    bool bRainUpdateInFlight = false;
     void UpdateFromGameUpdate(float DeltaSeconds);
-    void StartRainAsyncUpdate();
-
-    // Callback invoked when the asynchronous task completes.
-    UFUNCTION()
-    void OnRainUpdateCompleted();
+    void UpdateRainParameters();
 
     TObjectPtr<UGameManagerSubSystem> SubSystem;
     double MaxDistance;

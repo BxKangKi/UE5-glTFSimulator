@@ -4,13 +4,13 @@
 #include "Model/glTFStreamSubSystem.h"
 
 #include "Character/CharacterController.h"
+#include "Camera/CameraComponent.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
-#include "GameFramework/PlayerController.h"
-#include "Kismet/GameplayStatics.h"
 #include "HAL/FileManager.h"
+#include "HAL/PlatformTime.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "System/AssetManageSubSystem.h"
@@ -20,6 +20,7 @@
 #include "System/ActorHelper.h"
 #include "System/FileFunctionLibrary.h"
 #include "System/GameManagerSubSystem.h"
+#include "System/GlbValidation.h"
 #include "System/MacroLibrary.h"
 #include "TimerManager.h"
 #include "World/WorldData.h"
@@ -27,6 +28,41 @@
 namespace
 {
     constexpr float GLTF_STREAM_DISTANCE_SCALE = 64.0f;
+    constexpr float STREAM_POLL_INTERVAL_SECONDS = 0.10f;
+    constexpr double PLAYER_ACTOR_WAIT_TIMEOUT_SECONDS = 30.0;
+    constexpr double PLAYER_LOAD_TIMEOUT_SECONDS = 120.0;
+    constexpr double MODEL_LOAD_TIMEOUT_SECONDS = 180.0;
+    constexpr int64 MAX_MODEL_METADATA_JSON_BYTES = 64ll * 1024ll * 1024ll;
+
+    void NormalizeAndDeduplicatePaths(TArray<FString>& Paths)
+    {
+        TArray<FString> UniquePaths;
+        UniquePaths.Reserve(Paths.Num());
+        TSet<FString> SeenPathKeys;
+        SeenPathKeys.Reserve(Paths.Num());
+
+        for (const FString& Path : Paths)
+        {
+            const FString NormalizedPath = GlbValidation::NormalizePath(Path);
+            if (NormalizedPath.IsEmpty())
+            {
+                continue;
+            }
+
+            const FString CaseInsensitiveKey = NormalizedPath.ToLower();
+            if (!SeenPathKeys.Contains(CaseInsensitiveKey))
+            {
+                SeenPathKeys.Add(CaseInsensitiveKey);
+                UniquePaths.Add(NormalizedPath);
+            }
+        }
+
+        UniquePaths.Sort([](const FString& A, const FString& B)
+        {
+            return A.Compare(B, ESearchCase::IgnoreCase) < 0;
+        });
+        Paths = MoveTemp(UniquePaths);
+    }
 }
 
 UglTFStreamSubSystem* UglTFStreamSubSystem::Get(UObject* WorldContextObject)
@@ -69,20 +105,28 @@ void UglTFStreamSubSystem::StartMainWorldStreaming(AActor* InOwnerActor, TSubcla
     bInitialPlayerLoadStarted = false;
     bWaitingForPlayerLoad = false;
     bPlayerActivated = false;
+    bPendingPlayerIsInitialLoad = false;
+    PlayerActorWaitStartedAt = 0.0;
+    PlayerLoadStartedAt = 0.0;
+    ModelWaitStartedAt = 0.0;
+    NextModelFileAuditTime = 0.0;
     CurrentPathIndex = 0;
     CurrentPlayerPathIndex = INDEX_NONE;
+    PendingPlayerPathIndex = INDEX_NONE;
     CurrentPlayerPath.Reset();
+    PendingPlayerPath.Reset();
     WaitingPath.Reset();
     ActivePlayerCharacter.Reset();
-    PendingPlayerCharacter.Reset();
-    PreviousPlayerCharacter.Reset();
     CompletedInitialPaths.Empty();
     MissingFilePaths.Empty();
+    ValidatedModelPaths.Empty();
+    FailedPlayerPaths.Empty();
+    MetadataUnavailablePaths.Empty();
     ModelMetadataMap.Empty();
     SpawnActorMap.Empty();
 
     GlbFilePaths = UFileFunctionLibrary::GetFileNamesWithExtension(ModelDirectory, TEXT("glb"));
-    GlbFilePaths.Sort();
+    NormalizeAndDeduplicatePaths(GlbFilePaths);
     DiscoverPlayerPaths();
 
     if (UAssetManageSubSystem* AssetManager = UAssetManageSubSystem::Get(InOwnerActor))
@@ -98,7 +142,8 @@ void UglTFStreamSubSystem::StartMainWorldStreaming(AActor* InOwnerActor, TSubcla
         *InitialPlayerName,
         bRenderOnlyStreaming ? TEXT("true") : TEXT("false")));
 
-    BeginInitialPlayerStreamingIfNeeded();
+    // Load external world models first. Serializing the character build avoids overlapping
+    // glTF parser, skeletal-mesh, physics-asset, texture, and render-resource creation peaks.
     ScheduleProcessNextPath();
 }
 
@@ -120,45 +165,41 @@ void UglTFStreamSubSystem::StopMainWorldStreaming()
 
     DeactivatePlayerCharacter();
 
-    if (ACharacterController* PendingCharacter = PendingPlayerCharacter.Get())
+    // Character streaming now owns only one gameplay pawn. Cancel its in-flight loader,
+    // detach the current runtime mesh, and destroy the pawn once during world shutdown.
+    if (ACharacterController* Character = GetPlayerCharacter())
     {
-        if (IsValid(PendingCharacter))
-        {
-            PendingCharacter->PrepareForPawnReplacement();
-            PendingCharacter->Destroy();
-        }
-    }
-
-    DestroyPreviousPlayerCharacter();
-
-    if (ACharacterController* ActiveCharacter = ActivePlayerCharacter.Get())
-    {
-        if (IsValid(ActiveCharacter))
-        {
-            ActiveCharacter->PrepareForPawnReplacement();
-            ActiveCharacter->Destroy();
-        }
+        Character->PrepareForPawnReplacement();
+        Character->Destroy();
     }
 
     GlbFilePaths.Empty();
     PlayerGlbFilePaths.Empty();
     CurrentPlayerPath.Reset();
+    PendingPlayerPath.Reset();
     PlayerDirectory.Reset();
     InitialPlayerName.Reset();
     CompletedInitialPaths.Empty();
     MissingFilePaths.Empty();
+    ValidatedModelPaths.Empty();
+    FailedPlayerPaths.Empty();
+    MetadataUnavailablePaths.Empty();
     ModelMetadataMap.Empty();
     WaitingPath.Reset();
     ActivePlayerCharacter.Reset();
-    PendingPlayerCharacter.Reset();
-    PreviousPlayerCharacter.Reset();
     CurrentPathIndex = 0;
     CurrentPlayerPathIndex = INDEX_NONE;
+    PendingPlayerPathIndex = INDEX_NONE;
     bInitialPathScanComplete = false;
     bInitialPlayerLoadComplete = false;
     bInitialPlayerLoadStarted = false;
     bWaitingForPlayerLoad = false;
     bPlayerActivated = false;
+    bPendingPlayerIsInitialLoad = false;
+    PlayerActorWaitStartedAt = 0.0;
+    PlayerLoadStartedAt = 0.0;
+    ModelWaitStartedAt = 0.0;
+    NextModelFileAuditTime = 0.0;
 
     UAssetManageSubSystem* AssetManager = UAssetManageSubSystem::Get(OwnerActor);
     if (!AssetManager)
@@ -210,7 +251,7 @@ bool UglTFStreamSubSystem::IsPlayerLoaded() const
     const ACharacterController* Ctrl = GetPlayerCharacter();
     if (!IsValid(Ctrl))
     {
-        return false;
+        return bInitialPlayerLoadComplete && !bWaitingForPlayerLoad;
     }
 
     if (PlayerGlbFilePaths.Num() == 0)
@@ -301,19 +342,24 @@ void UglTFStreamSubSystem::ProcessNextPathAsync()
     {
         bInitialPathScanComplete = true;
         WriteLogAsync(TEXT("Initial GLB path scan completed"));
+        BeginInitialPlayerStreamingIfNeeded();
         ScheduleUpdateStreaming();
         return;
     }
 
     const FString GlbPath = GlbFilePaths[CurrentPathIndex++];
-    if (!IFileManager::Get().FileExists(*GlbPath))
+    FString ValidationReason;
+    if (!GlbValidation::ValidateFile(GlbPath, ValidationReason))
     {
+        ValidatedModelPaths.Remove(GlbPath);
         MissingFilePaths.Add(GlbPath);
         CompletedInitialPaths.Add(GlbPath);
-        WriteLogAsync(FString::Printf(TEXT("GLB file missing. Skipped: %s"), *GlbPath));
+        WriteLogAsync(FString::Printf(TEXT("Invalid model GLB skipped. Path=%s Reason=%s"), *GlbPath, *ValidationReason));
         ScheduleProcessNextPath();
         return;
     }
+    ValidatedModelPaths.Add(GlbPath);
+    MissingFilePaths.Remove(GlbPath);
 
     bool bJsonExists = false;
     FModelData Metadata;
@@ -343,11 +389,13 @@ void UglTFStreamSubSystem::ProcessNextPathAsync()
         return;
     }
 
-    WriteLogAsync(FString::Printf(TEXT("Model metadata missing, damaged, or still default. GLB=%s JsonExists=%s"),
+    MetadataUnavailablePaths.Add(GlbPath);
+    WriteLogAsync(FString::Printf(TEXT("Model metadata missing, damaged, oversized, or still default. GLB=%s JsonExists=%s"),
         *GlbPath,
         bJsonExists ? TEXT("true") : TEXT("false")));
 
     WaitingPath = GlbPath;
+    ModelWaitStartedAt = FPlatformTime::Seconds();
     EnsureSpawnActor(GlbPath);
 
     if (UWorld* World = OwnerActor->GetWorld())
@@ -379,15 +427,35 @@ void UglTFStreamSubSystem::WaitForCurrentActorAsync()
 
     if (!Actor->GetIsLoaded())
     {
+        if (FPlatformTime::Seconds() - ModelWaitStartedAt >= MODEL_LOAD_TIMEOUT_SECONDS)
+        {
+            const FString TimedOutPath = WaitingPath;
+            WriteLogAsync(FString::Printf(TEXT("Model GLB load timed out and was isolated: %s"), *TimedOutPath));
+            DestroySpawnActor(TimedOutPath);
+            MissingFilePaths.Add(TimedOutPath);
+            CompletedInitialPaths.Add(TimedOutPath);
+            WaitingPath.Reset();
+            ModelWaitStartedAt = 0.0;
+            ScheduleProcessNextPath();
+            return;
+        }
+
         if (UWorld* World = OwnerActor->GetWorld())
         {
-            TimerHandle_WaitActor = World->GetTimerManager().SetTimerForNextTick(
-                FTimerDelegate::CreateUObject(this, &UglTFStreamSubSystem::WaitForCurrentActorAsync));
+            World->GetTimerManager().SetTimer(
+                TimerHandle_WaitActor,
+                FTimerDelegate::CreateUObject(this, &UglTFStreamSubSystem::WaitForCurrentActorAsync),
+                STREAM_POLL_INTERVAL_SECONDS,
+                false);
         }
         return;
     }
 
     CacheActorMetadata(WaitingPath, Actor);
+    if (ModelMetadataMap.Contains(WaitingPath))
+    {
+        MetadataUnavailablePaths.Remove(WaitingPath);
+    }
     if (const FModelData* Metadata = ModelMetadataMap.Find(WaitingPath))
     {
         if (!IsPlayerInsideModelRange(*Metadata))
@@ -398,6 +466,7 @@ void UglTFStreamSubSystem::WaitForCurrentActorAsync()
 
     CompletedInitialPaths.Add(WaitingPath);
     WaitingPath.Reset();
+    ModelWaitStartedAt = 0.0;
     ScheduleProcessNextPath();
 }
 
@@ -408,46 +477,96 @@ void UglTFStreamSubSystem::UpdateStreamingAsync()
         return;
     }
 
+    constexpr double ModelFileAuditIntervalSeconds = 5.0;
+    const double Now = FPlatformTime::Seconds();
+    const bool bAuditModelFiles = Now >= NextModelFileAuditTime;
+    if (bAuditModelFiles)
+    {
+        NextModelFileAuditTime = Now + ModelFileAuditIntervalSeconds;
+    }
+
     for (const FString& GlbPath : GlbFilePaths)
     {
-        if (!IFileManager::Get().FileExists(*GlbPath))
+        const bool bKnownMissing = MissingFilePaths.Contains(GlbPath);
+        const bool bNeedsInitialValidation =
+            !ValidatedModelPaths.Contains(GlbPath) && !bKnownMissing;
+
+        // Range decisions remain responsive, while stable paths avoid one filesystem syscall per
+        // GLB every 250 ms. Missing/replaced files are retried by the low-frequency audit.
+        if (bAuditModelFiles || bNeedsInitialValidation)
         {
-            if (!MissingFilePaths.Contains(GlbPath))
+            if (!IFileManager::Get().FileExists(*GlbPath))
             {
-                MissingFilePaths.Add(GlbPath);
-                WriteLogAsync(FString::Printf(TEXT("GLB file missing during streaming update. Skipped: %s"), *GlbPath));
+                ValidatedModelPaths.Remove(GlbPath);
+                if (!bKnownMissing)
+                {
+                    MissingFilePaths.Add(GlbPath);
+                    WriteLogAsync(FString::Printf(TEXT("Model GLB disappeared during streaming and was isolated. Path=%s"), *GlbPath));
+                }
+                DestroySpawnActor(GlbPath);
+                continue;
             }
-            DestroySpawnActor(GlbPath);
+
+            if (!ValidatedModelPaths.Contains(GlbPath))
+            {
+                FString ValidationReason;
+                if (!GlbValidation::ValidateFile(GlbPath, ValidationReason))
+                {
+                    if (!MissingFilePaths.Contains(GlbPath))
+                    {
+                        MissingFilePaths.Add(GlbPath);
+                        WriteLogAsync(FString::Printf(TEXT("Invalid model GLB isolated during streaming. Path=%s Reason=%s"), *GlbPath, *ValidationReason));
+                    }
+                    DestroySpawnActor(GlbPath);
+                    continue;
+                }
+                ValidatedModelPaths.Add(GlbPath);
+                MissingFilePaths.Remove(GlbPath);
+            }
+        }
+
+        if (MissingFilePaths.Contains(GlbPath) || !ValidatedModelPaths.Contains(GlbPath))
+        {
             continue;
         }
 
-        FModelData Metadata;
-        bool bJsonExists = false;
-        if (TryLoadValidModelMetadata(GlbPath, Metadata, bJsonExists))
+        if (const FModelData* CachedMetadata = ModelMetadataMap.Find(GlbPath))
         {
-            ModelMetadataMap.Add(GlbPath, Metadata);
-            WriteLogAsync(FString::Printf(TEXT("Streaming metadata refreshed. GLB=%s Center=%s Size=%s"),
-                *GlbPath,
-                *Metadata.Center.ToCompactString(),
-                *Metadata.Size.ToCompactString()));
-
-            if (IsPlayerInsideModelRange(Metadata))
+            const TObjectPtr<AglTFStreamActor>* ActorPtr = SpawnActorMap.Find(GlbPath);
+            const bool bActorLoaded = ActorPtr && IsValid(ActorPtr->Get());
+            const float RadiusMultiplier = bActorLoaded ? 1.10f : 1.0f;
+            if (IsPlayerInsideModelRange(*CachedMetadata, RadiusMultiplier))
             {
                 EnsureSpawnActor(GlbPath);
             }
             else
             {
-                WriteLogAsync(FString::Printf(TEXT("Streaming GLB load skipped during streaming update by metadata range. GLB=%s Center=%s Size=%s"),
-                    *GlbPath,
-                    *Metadata.Center.ToCompactString(),
-                    *Metadata.Size.ToCompactString()));
                 DestroySpawnActor(GlbPath);
             }
+            continue;
         }
-        else if (!SpawnActorMap.Contains(GlbPath))
+
+        AglTFStreamActor* ExistingActor = nullptr;
+        if (const TObjectPtr<AglTFStreamActor>* ActorPtr = SpawnActorMap.Find(GlbPath))
         {
-            EnsureSpawnActor(GlbPath);
+            ExistingActor = ActorPtr->Get();
         }
+        if (IsValid(ExistingActor) && ExistingActor->GetIsLoaded())
+        {
+            CacheActorMetadata(GlbPath, ExistingActor);
+            if (const FModelData* GeneratedMetadata = ModelMetadataMap.Find(GlbPath))
+            {
+                MetadataUnavailablePaths.Remove(GlbPath);
+                if (!IsPlayerInsideModelRange(*GeneratedMetadata, 1.10f))
+                {
+                    DestroySpawnActor(GlbPath);
+                }
+            }
+            continue;
+        }
+
+        // Metadata was already checked during the initial scan. Do not reparse the same JSON every update.
+        EnsureSpawnActor(GlbPath);
     }
 
     ScheduleUpdateStreaming();
@@ -457,67 +576,154 @@ void UglTFStreamSubSystem::UpdateStreamingAsync()
 void UglTFStreamSubSystem::DiscoverPlayerPaths()
 {
     PlayerGlbFilePaths.Empty();
-
     if (!PlayerDirectory.IsEmpty())
     {
+        // This scans file names only. Character GLB contents are not parsed or loaded here.
         PlayerGlbFilePaths = UFileFunctionLibrary::GetFileNamesWithExtension(PlayerDirectory, TEXT("glb"));
-        PlayerGlbFilePaths.Sort();
+        NormalizeAndDeduplicatePaths(PlayerGlbFilePaths);
     }
 
-    WriteLogAsync(FString::Printf(TEXT("Player GLB path scan completed. Directory=%s Count=%d"), *PlayerDirectory, PlayerGlbFilePaths.Num()));
+    WriteLogAsync(FString::Printf(
+        TEXT("Player GLB path scan completed without loading character assets. Directory=%s Count=%d"),
+        *PlayerDirectory,
+        PlayerGlbFilePaths.Num()));
+}
+
+int32 UglTFStreamSubSystem::FindNextLoadablePlayerIndex(int32 StartIndex) const
+{
+    const int32 Count = PlayerGlbFilePaths.Num();
+    if (Count <= 0)
+    {
+        return INDEX_NONE;
+    }
+
+    const int32 SafeStart = StartIndex == INDEX_NONE ? 0 : ((StartIndex % Count) + Count) % Count;
+    for (int32 Offset = 0; Offset < Count; ++Offset)
+    {
+        const int32 CandidateIndex = (SafeStart + Offset) % Count;
+        const FString& CandidatePath = PlayerGlbFilePaths[CandidateIndex];
+        if (!CandidatePath.IsEmpty() && !IsPlayerPathQuarantined(CandidatePath))
+        {
+            return CandidateIndex;
+        }
+    }
+    return INDEX_NONE;
+}
+
+bool UglTFStreamSubSystem::IsPlayerPathQuarantined(const FString& PlayerPath) const
+{
+    const FFailedPlayerFileState* FailedState = FailedPlayerPaths.Find(PlayerPath);
+    if (!FailedState)
+    {
+        return false;
+    }
+
+    // A file replaced in-place is a new load candidate. Keep quarantining only the exact bytes
+    // (identified cheaply by size + timestamp) that previously failed this session.
+    return FailedState->FileSize == IFileManager::Get().FileSize(*PlayerPath) &&
+        FailedState->Timestamp == IFileManager::Get().GetTimeStamp(*PlayerPath);
+}
+
+void UglTFStreamSubSystem::QuarantinePlayerPath(const FString& PlayerPath)
+{
+    if (PlayerPath.IsEmpty())
+    {
+        return;
+    }
+
+    FFailedPlayerFileState& FailedState = FailedPlayerPaths.FindOrAdd(PlayerPath);
+    FailedState.FileSize = IFileManager::Get().FileSize(*PlayerPath);
+    FailedState.Timestamp = IFileManager::Get().GetTimeStamp(*PlayerPath);
 }
 
 bool UglTFStreamSubSystem::ResolveInitialPlayerIndex()
 {
+    PendingPlayerPathIndex = INDEX_NONE;
+
     if (PlayerGlbFilePaths.Num() == 0)
     {
-        CurrentPlayerPathIndex = INDEX_NONE;
+        return false;
+    }
+
+    // Empty and legacy "Player" values mean that no external character has been selected yet.
+    // Choose the first deterministic, loadable GLB so a newly imported character works on first run.
+    const FString TrimmedInitialName = InitialPlayerName.TrimStartAndEnd();
+    if (TrimmedInitialName.IsEmpty() ||
+        TrimmedInitialName.Equals(TEXT("Player"), ESearchCase::IgnoreCase))
+    {
+        PendingPlayerPathIndex = FindNextLoadablePlayerIndex(0);
+        if (PendingPlayerPathIndex != INDEX_NONE)
+        {
+            WriteLogAsync(FString::Printf(
+                TEXT("No explicit external character was selected; using the first available GLB: %s"),
+                *PlayerGlbFilePaths[PendingPlayerPathIndex]));
+            return true;
+        }
         return false;
     }
 
     const FString WantedName = FPaths::GetCleanFilename(InitialPlayerName);
     const FString WantedBaseName = FPaths::GetBaseFilename(InitialPlayerName);
+    int32 PreferredIndex = INDEX_NONE;
 
-    if (!InitialPlayerName.IsEmpty())
+    for (int32 Index = 0; Index < PlayerGlbFilePaths.Num(); ++Index)
     {
-        for (int32 Index = 0; Index < PlayerGlbFilePaths.Num(); ++Index)
+        const FString& CandidatePath = PlayerGlbFilePaths[Index];
+        const FString CandidateName = FPaths::GetCleanFilename(CandidatePath);
+        const FString CandidateBaseName = FPaths::GetBaseFilename(CandidatePath);
+        if (CandidatePath.Equals(InitialPlayerName, ESearchCase::IgnoreCase) ||
+            CandidateName.Equals(WantedName, ESearchCase::IgnoreCase) ||
+            CandidateBaseName.Equals(WantedBaseName, ESearchCase::IgnoreCase))
         {
-            const FString& CandidatePath = PlayerGlbFilePaths[Index];
-            const FString CandidateName = FPaths::GetCleanFilename(CandidatePath);
-            const FString CandidateBaseName = FPaths::GetBaseFilename(CandidatePath);
-
-            if (CandidatePath == InitialPlayerName || CandidateName == WantedName || CandidateBaseName == WantedBaseName)
-            {
-                CurrentPlayerPathIndex = Index;
-                return true;
-            }
+            PreferredIndex = Index;
+            break;
         }
+    }
 
-        const FString CombinedPath = FPaths::Combine(PlayerDirectory, InitialPlayerName);
+    if (PreferredIndex == INDEX_NONE)
+    {
+        const FString CombinedPath = GlbValidation::NormalizePath(
+            FPaths::Combine(PlayerDirectory, InitialPlayerName));
         if (IFileManager::Get().FileExists(*CombinedPath))
         {
             PlayerGlbFilePaths.AddUnique(CombinedPath);
-            PlayerGlbFilePaths.Sort();
-            CurrentPlayerPathIndex = PlayerGlbFilePaths.IndexOfByKey(CombinedPath);
-            return CurrentPlayerPathIndex != INDEX_NONE;
+            PlayerGlbFilePaths.Sort([](const FString& A, const FString& B)
+            {
+                return A.Compare(B, ESearchCase::IgnoreCase) < 0;
+            });
+            PreferredIndex = PlayerGlbFilePaths.IndexOfByKey(CombinedPath);
         }
-
-        WriteLogAsync(FString::Printf(TEXT("Initial player GLB was not found in player list. Requested=%s"), *InitialPlayerName));
     }
 
-    CurrentPlayerPathIndex = 0;
+    if (!PlayerGlbFilePaths.IsValidIndex(PreferredIndex))
+    {
+        WriteLogAsync(FString::Printf(
+            TEXT("Initial player GLB was not found; keeping the default character. Requested=%s"),
+            *InitialPlayerName));
+        return false;
+    }
+
+    if (IsPlayerPathQuarantined(PlayerGlbFilePaths[PreferredIndex]))
+    {
+        WriteLogAsync(FString::Printf(
+            TEXT("Initial player GLB is quarantined for this session; keeping the default character. Path=%s"),
+            *PlayerGlbFilePaths[PreferredIndex]));
+        return false;
+    }
+
+    PendingPlayerPathIndex = PreferredIndex;
     return true;
 }
 
 void UglTFStreamSubSystem::BeginInitialPlayerStreamingIfNeeded()
 {
-    if (!bActive || bInitialPlayerLoadStarted)
+    if (!bActive || bInitialPlayerLoadStarted || !bInitialPathScanComplete)
     {
         return;
     }
 
     bInitialPlayerLoadStarted = true;
-    WriteLogAsync(TEXT("Initial player streaming starts in parallel with initial world GLB loading"));
+    WriteLogAsync(TEXT("Initial character selection begins after world-model scanning; only the selected character is loaded"));
     StartPlayerStreaming();
 }
 
@@ -530,18 +736,22 @@ void UglTFStreamSubSystem::StartPlayerStreaming()
 
     if (!ResolveInitialPlayerIndex())
     {
-        bInitialPlayerLoadComplete = true;
-        bWaitingForPlayerLoad = false;
-        WriteLogAsync(TEXT("No player GLB was found. Player streaming is marked complete with existing/default character."));
-        ActivatePlayerIfWorldReady();
+        CompletePlayerStreamingWithExistingCharacter(
+            TEXT("No explicit valid initial character was selected"));
         return;
     }
 
+    PlayerActorWaitStartedAt = FPlatformTime::Seconds();
     ScheduleWaitForPlayerActor();
 }
 
 void UglTFStreamSubSystem::WaitForPlayerActorAsync()
 {
+    if (!ensureMsgf(IsInGameThread(), TEXT("WaitForPlayerActorAsync must run on the game thread")))
+    {
+        return;
+    }
+
     if (!bActive || !IsValid(OwnerActor))
     {
         return;
@@ -550,198 +760,186 @@ void UglTFStreamSubSystem::WaitForPlayerActorAsync()
     ACharacterController* Ctrl = GetPlayerCharacter();
     if (!IsValid(Ctrl))
     {
+        if (FPlatformTime::Seconds() - PlayerActorWaitStartedAt >= PLAYER_ACTOR_WAIT_TIMEOUT_SECONDS)
+        {
+            CompletePlayerStreamingWithExistingCharacter(
+                TEXT("Timed out waiting for the default player pawn"));
+            return;
+        }
         ScheduleWaitForPlayerActor();
         return;
     }
 
-    RequestLoadPlayerAtIndex(CurrentPlayerPathIndex, true);
+    ActivePlayerCharacter = Ctrl;
+    RequestLoadPlayerAtIndex(PendingPlayerPathIndex, true);
 }
 
 void UglTFStreamSubSystem::RequestLoadPlayerAtIndex(int32 PlayerPathIndex, bool bIsInitialLoad)
 {
-    if (!bActive || PlayerGlbFilePaths.Num() == 0)
+    if (!ensureMsgf(IsInGameThread(), TEXT("RequestLoadPlayerAtIndex must run on the game thread")))
+    {
+        return;
+    }
+
+    if (!bActive || PlayerGlbFilePaths.Num() == 0 || bWaitingForPlayerLoad)
     {
         return;
     }
 
     if (!PlayerGlbFilePaths.IsValidIndex(PlayerPathIndex))
     {
-        WriteLogAsync(FString::Printf(TEXT("Player load skipped. Invalid player index=%d Count=%d"), PlayerPathIndex, PlayerGlbFilePaths.Num()));
-        return;
-    }
-
-    const FString PlayerPath = PlayerGlbFilePaths[PlayerPathIndex];
-    if (!IFileManager::Get().FileExists(*PlayerPath))
-    {
-        WriteLogAsync(FString::Printf(TEXT("Player GLB file missing. Skipped: %s"), *PlayerPath));
         if (bIsInitialLoad)
         {
-            bInitialPlayerLoadComplete = true;
-            bWaitingForPlayerLoad = false;
-            ActivatePlayerIfWorldReady();
+            CompletePlayerStreamingWithExistingCharacter(
+                FString::Printf(TEXT("Invalid initial player path index %d"), PlayerPathIndex));
         }
         return;
     }
 
-    ACharacterController* Ctrl = SpawnReplacementPlayerCharacterForLoad(PlayerPath);
+    ACharacterController* Ctrl = GetPlayerCharacter();
     if (!IsValid(Ctrl))
     {
-        CurrentPlayerPathIndex = PlayerPathIndex;
-        ScheduleWaitForPlayerActor();
+        if (bIsInitialLoad)
+        {
+            CompletePlayerStreamingWithExistingCharacter(
+                TEXT("The gameplay pawn was unavailable for character loading"));
+        }
         return;
     }
 
-    CurrentPlayerPathIndex = PlayerPathIndex;
-    CurrentPlayerPath = PlayerPath;
-    bInitialPlayerLoadComplete = false;
+    PendingPlayerPathIndex = PlayerPathIndex;
+    PendingPlayerPath = PlayerGlbFilePaths[PlayerPathIndex];
+    bPendingPlayerIsInitialLoad = bIsInitialLoad;
+    ActivePlayerCharacter = Ctrl;
+
+    if (bIsInitialLoad)
+    {
+        bInitialPlayerLoadComplete = false;
+        bPlayerActivated = false;
+        Ctrl->Activate(false);
+    }
+
     bWaitingForPlayerLoad = true;
-    bPlayerActivated = false;
-
-    Ctrl->Activate(false);
+    PlayerLoadStartedAt = FPlatformTime::Seconds();
     Ctrl->bIsLoaded = false;
-    Ctrl->Load(PlayerPath);
 
-    WriteLogAsync(FString::Printf(TEXT("Player character respawn/load requested. Index=%d Path=%s"), CurrentPlayerPathIndex, *CurrentPlayerPath));
+    // ACharacterController releases the previous generated mesh first, keeps the directly
+    // assigned default mesh active, and starts one background validation/parser/mesh request.
+    Ctrl->Load(PendingPlayerPath);
+
+    WriteLogAsync(FString::Printf(
+        TEXT("On-demand character load requested on the existing pawn. Initial=%s Index=%d Path=%s"),
+        bIsInitialLoad ? TEXT("true") : TEXT("false"),
+        PendingPlayerPathIndex,
+        *PendingPlayerPath));
     ScheduleWaitForPlayerLoad();
 }
 
-ACharacterController* UglTFStreamSubSystem::SpawnReplacementPlayerCharacterForLoad(const FString& PlayerPath)
+void UglTFStreamSubSystem::HandlePlayerLoadFailure(const FString& Reason)
 {
-    if (!IsValid(OwnerActor))
+    if (!ensureMsgf(IsInGameThread(), TEXT("HandlePlayerLoadFailure must run on the game thread")))
     {
-        return nullptr;
+        return;
     }
 
-    UWorld* World = OwnerActor->GetWorld();
-    if (!World)
+    const FString FailedPath = PendingPlayerPath;
+    const bool bWasInitialLoad = bPendingPlayerIsInitialLoad;
+    if (!FailedPath.IsEmpty())
     {
-        return nullptr;
+        QuarantinePlayerPath(FailedPath);
     }
 
-    APlayerController* PlayerController = UGameplayStatics::GetPlayerController(OwnerActor, 0);
-    ACharacterController* CurrentCharacter = GetPlayerCharacter();
-    if (!IsValid(CurrentCharacter) && PlayerController)
+    if (ACharacterController* Ctrl = GetPlayerCharacter())
     {
-        CurrentCharacter = Cast<ACharacterController>(PlayerController->GetPawn());
+        Ctrl->CancelCharacterLoad(true);
+        Ctrl->bIsLoaded = true;
+        ActivePlayerCharacter = Ctrl;
     }
 
-    if (IsValid(PendingPlayerCharacter.Get()))
+    WriteLogAsync(FString::Printf(
+        TEXT("Character GLB quarantined; default character remains active. Path=%s Reason=%s"),
+        *FailedPath,
+        *Reason));
+
+    PendingPlayerPath.Reset();
+    PendingPlayerPathIndex = INDEX_NONE;
+    bPendingPlayerIsInitialLoad = false;
+    bWaitingForPlayerLoad = false;
+    PlayerLoadStartedAt = 0.0;
+
+    // Never iterate through and load every character while entering a world. A failed selected
+    // character falls back immediately; other GLBs are loaded only when the player requests them.
+    if (bWasInitialLoad)
     {
-        PendingPlayerCharacter->PrepareForPawnReplacement();
-        PendingPlayerCharacter->Destroy();
-        PendingPlayerCharacter.Reset();
+        CompletePlayerStreamingWithExistingCharacter(
+            TEXT("The selected character failed; other character GLBs were not preloaded"));
     }
-
-    TSubclassOf<ACharacterController> CharacterClass = IsValid(CurrentCharacter) ? CurrentCharacter->GetClass() : ACharacterController::StaticClass();
-    if (!CharacterClass)
+    else
     {
-        WriteLogAsync(FString::Printf(TEXT("Player respawn failed: no valid CharacterClass for %s"), *PlayerPath));
-        return nullptr;
+        bInitialPlayerLoadComplete = true;
+        ActivatePlayerIfWorldReady();
     }
-
-    const FVector SpawnLocation = IsValid(CurrentCharacter) ? CurrentCharacter->GetActorLocation() : GetPlayerLocation();
-    const FRotator SpawnRotation = IsValid(CurrentCharacter) ? CurrentCharacter->GetActorRotation() : FRotator::ZeroRotator;
-    FTransform SpawnTransform(SpawnRotation, SpawnLocation);
-
-    FActorSpawnParameters SpawnParams;
-    SpawnParams.Owner = OwnerActor;
-    SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-
-    ACharacterController* NewCharacter = World->SpawnActor<ACharacterController>(CharacterClass, SpawnTransform, SpawnParams);
-    if (!IsValid(NewCharacter))
-    {
-        WriteLogAsync(FString::Printf(TEXT("Player respawn failed: SpawnActor returned null. Path=%s"), *PlayerPath));
-        return nullptr;
-    }
-
-    NewCharacter->SetActorHiddenInGame(true);
-    NewCharacter->SetActorEnableCollision(false);
-    NewCharacter->Activate(false);
-    NewCharacter->bIsLoaded = false;
-    NewCharacter->PrepareForMeshReload();
-
-    PreviousPlayerCharacter = CurrentCharacter;
-    PendingPlayerCharacter = NewCharacter;
-
-    if (UGameManagerSubSystem* GameSystem = UGameManagerSubSystem::GetSubSystem(OwnerActor))
-    {
-        GameSystem->SetPlayerActor(NewCharacter);
-        GameSystem->SetPlayerLocation(SpawnLocation);
-    }
-
-    WriteLogAsync(FString::Printf(TEXT("Replacement player pawn spawned for runtime GLB load. Old=%s New=%s Path=%s"),
-        IsValid(CurrentCharacter) ? *CurrentCharacter->GetName() : TEXT("None"),
-        *NewCharacter->GetName(),
-        *PlayerPath));
-
-    return NewCharacter;
 }
 
-bool UglTFStreamSubSystem::CommitPendingPlayerCharacter()
+void UglTFStreamSubSystem::CompletePlayerStreamingWithExistingCharacter(const FString& Reason)
 {
-    ACharacterController* NewCharacter = PendingPlayerCharacter.Get();
-    if (!IsValid(NewCharacter))
+    if (!ensureMsgf(IsInGameThread(), TEXT("CompletePlayerStreamingWithExistingCharacter must run on the game thread")))
     {
-        NewCharacter = GetPlayerCharacter();
+        return;
     }
 
-    if (!IsValid(NewCharacter))
+    ACharacterController* ExistingCharacter = GetPlayerCharacter();
+    if (IsValid(ExistingCharacter))
     {
-        return false;
+        ActivePlayerCharacter = ExistingCharacter;
+        ExistingCharacter->bIsLoaded = true;
+        ExistingCharacter->SetActorHiddenInGame(false);
+        ExistingCharacter->SetActorEnableCollision(true);
+
+        if (UGameManagerSubSystem* GameSystem = UGameManagerSubSystem::GetSubSystem(OwnerActor))
+        {
+            GameSystem->SetPlayerActor(ExistingCharacter);
+            GameSystem->SetCameraComponent(ExistingCharacter->GetFollowCameraComponent());
+            GameSystem->SetPlayerLocation(ExistingCharacter->GetActorLocation(), ExistingCharacter);
+        }
     }
 
-    APlayerController* PlayerController = UGameplayStatics::GetPlayerController(OwnerActor, 0);
-    if (PlayerController && PlayerController->GetPawn() != NewCharacter)
-    {
-        PlayerController->Possess(NewCharacter);
-    }
+    PendingPlayerPath.Reset();
+    PendingPlayerPathIndex = INDEX_NONE;
+    bPendingPlayerIsInitialLoad = false;
+    bWaitingForPlayerLoad = false;
+    bInitialPlayerLoadComplete = true;
+    PlayerActorWaitStartedAt = 0.0;
+    PlayerLoadStartedAt = 0.0;
 
-    NewCharacter->SetActorHiddenInGame(false);
-    NewCharacter->SetActorEnableCollision(true);
-    NewCharacter->Activate(false);
-
-    if (UGameManagerSubSystem* GameSystem = UGameManagerSubSystem::GetSubSystem(OwnerActor))
-    {
-        GameSystem->SetPlayerActor(NewCharacter);
-        GameSystem->SetPlayerLocation(NewCharacter->GetActorLocation());
-    }
-
-    ActivePlayerCharacter = NewCharacter;
-    PendingPlayerCharacter.Reset();
-    DestroyPreviousPlayerCharacter();
-    return true;
-}
-
-void UglTFStreamSubSystem::DestroyPreviousPlayerCharacter()
-{
-    ACharacterController* OldCharacter = PreviousPlayerCharacter.Get();
-    ACharacterController* ActiveCharacter = ActivePlayerCharacter.Get();
-
-    if (IsValid(OldCharacter) && OldCharacter != ActiveCharacter)
-    {
-        OldCharacter->PrepareForPawnReplacement();
-        OldCharacter->Destroy();
-    }
-
-    PreviousPlayerCharacter.Reset();
+    WriteLogAsync(FString::Printf(
+        TEXT("Player streaming completed with the existing/default character. Reason=%s"),
+        *Reason));
+    ActivatePlayerIfWorldReady();
 }
 
 void UglTFStreamSubSystem::WaitForPlayerLoadAsync()
 {
+    if (!ensureMsgf(IsInGameThread(), TEXT("WaitForPlayerLoadAsync must run on the game thread")))
+    {
+        return;
+    }
+
     if (!bActive || !IsValid(OwnerActor))
     {
         return;
     }
 
-    ACharacterController* Ctrl = PendingPlayerCharacter.Get();
+    ACharacterController* Ctrl = GetPlayerCharacter();
     if (!IsValid(Ctrl))
     {
-        Ctrl = GetPlayerCharacter();
+        HandlePlayerLoadFailure(TEXT("Gameplay pawn was destroyed before character load completion"));
+        return;
     }
 
-    if (!IsValid(Ctrl))
+    if (FPlatformTime::Seconds() - PlayerLoadStartedAt >= PLAYER_LOAD_TIMEOUT_SECONDS)
     {
-        ScheduleWaitForPlayerActor();
+        HandlePlayerLoadFailure(TEXT("Character mesh load timed out"));
         return;
     }
 
@@ -751,59 +949,63 @@ void UglTFStreamSubSystem::WaitForPlayerLoadAsync()
         return;
     }
 
-    if (!CommitPendingPlayerCharacter())
+    if (!Ctrl->WasLastMeshLoadSuccessful())
     {
-        ScheduleWaitForPlayerActor();
+        HandlePlayerLoadFailure(TEXT("Character loader completed with the default-mesh fallback"));
         return;
     }
 
+    CurrentPlayerPathIndex = PendingPlayerPathIndex;
+    CurrentPlayerPath = PendingPlayerPath;
+    PendingPlayerPath.Reset();
+    PendingPlayerPathIndex = INDEX_NONE;
+    bPendingPlayerIsInitialLoad = false;
     bWaitingForPlayerLoad = false;
     bInitialPlayerLoadComplete = true;
+    PlayerLoadStartedAt = 0.0;
 
     PersistCurrentPlayerSelection();
-
-    WriteLogAsync(FString::Printf(TEXT("Player character load completed. Index=%d Path=%s"), CurrentPlayerPathIndex, *CurrentPlayerPath));
+    WriteLogAsync(FString::Printf(
+        TEXT("On-demand character load completed. Index=%d Path=%s"),
+        CurrentPlayerPathIndex,
+        *CurrentPlayerPath));
     ActivatePlayerIfWorldReady();
 }
 
 bool UglTFStreamSubSystem::CycleNextPlayerCharacter()
 {
-    if (!bActive)
+    if (!ensureMsgf(IsInGameThread(), TEXT("CycleNextPlayerCharacter must run on the game thread")))
     {
-        WriteLogAsync(TEXT("CycleNextPlayerCharacter skipped: glTFStreamSubSystem is not active"));
         return false;
     }
 
-    if (!bInitialPlayerLoadComplete || bWaitingForPlayerLoad)
+    if (!bActive || !bInitialPlayerLoadComplete || bWaitingForPlayerLoad)
     {
-        WriteLogAsync(TEXT("CycleNextPlayerCharacter skipped: player character loading is not ready"));
         return false;
     }
 
-    if (PlayerGlbFilePaths.Num() == 0)
-    {
-        DiscoverPlayerPaths();
-    }
+    // Always refresh so characters copied into the folder after world load become available.
+    DiscoverPlayerPaths();
+    CurrentPlayerPathIndex = CurrentPlayerPath.IsEmpty()
+        ? INDEX_NONE
+        : PlayerGlbFilePaths.IndexOfByKey(CurrentPlayerPath);
 
-    if (PlayerGlbFilePaths.Num() == 0)
+    const int32 BaseIndex = PlayerGlbFilePaths.IsValidIndex(CurrentPlayerPathIndex)
+        ? CurrentPlayerPathIndex + 1
+        : 0;
+    const int32 NextIndex = FindNextLoadablePlayerIndex(BaseIndex);
+    if (NextIndex == INDEX_NONE || NextIndex == CurrentPlayerPathIndex)
     {
-        WriteLogAsync(TEXT("CycleNextPlayerCharacter skipped: there are no player GLB files"));
+        WriteLogAsync(TEXT("CycleNextPlayerCharacter skipped: no additional valid player GLB is available"));
         return false;
     }
 
-    const int32 BaseIndex = PlayerGlbFilePaths.IsValidIndex(CurrentPlayerPathIndex) ? CurrentPlayerPathIndex : 0;
-    const int32 NextIndex = (BaseIndex + 1) % PlayerGlbFilePaths.Num();
     RequestLoadPlayerAtIndex(NextIndex, false);
-    return true;
+    return bWaitingForPlayerLoad;
 }
 
 ACharacterController* UglTFStreamSubSystem::GetPlayerCharacter() const
 {
-    if (IsValid(PendingPlayerCharacter.Get()))
-    {
-        return PendingPlayerCharacter.Get();
-    }
-
     if (IsValid(ActivePlayerCharacter.Get()))
     {
         return ActivePlayerCharacter.Get();
@@ -811,7 +1013,10 @@ ACharacterController* UglTFStreamSubSystem::GetPlayerCharacter() const
 
     if (UGameManagerSubSystem* GameSystem = UGameManagerSubSystem::GetSubSystem(OwnerActor))
     {
-        return GameSystem->GetPlayerActor<ACharacterController>();
+        if (ACharacterController* Character = GameSystem->GetPlayerActor<ACharacterController>())
+        {
+            return Character;
+        }
     }
     return nullptr;
 }
@@ -829,11 +1034,8 @@ void UglTFStreamSubSystem::DeactivatePlayerCharacter()
 
     if (USkeletalMeshComponent* MeshComponent = Ctrl->GetMesh())
     {
-        // Never clear the player skeletal mesh to nullptr during world exit or character
-        // streaming. AnimBP/ControlRig can still be evaluating on worker threads and may
-        // crash if the mesh suddenly has no bone container. Generated character memory is
-        // released by swapping to the next freshly generated glTFRuntime skeletal mesh or
-        // by destroying the owning actor/world, not by installing an empty mesh.
+        // Never clear the skinned asset to nullptr while an AnimBP/ControlRig may still own
+        // worker tasks. PrepareForPawnReplacement performs the final GT-only default-mesh swap.
         MeshComponent->SetAllBodiesSimulatePhysics(false);
         MeshComponent->SetSimulatePhysics(false);
         MeshComponent->PutAllRigidBodiesToSleep();
@@ -855,11 +1057,6 @@ void UglTFStreamSubSystem::ActivatePlayerIfWorldReady()
         return;
     }
 
-    if (PlayerGlbFilePaths.Num() == 0)
-    {
-        Ctrl->bIsLoaded = true;
-    }
-
     if (!Ctrl->bIsLoaded)
     {
         return;
@@ -867,7 +1064,9 @@ void UglTFStreamSubSystem::ActivatePlayerIfWorldReady()
 
     Ctrl->Activate(true);
     bPlayerActivated = true;
-    WriteLogAsync(FString::Printf(TEXT("Player character activated. Path=%s"), *CurrentPlayerPath));
+    WriteLogAsync(FString::Printf(
+        TEXT("Player character activated. Path=%s"),
+        *CurrentPlayerPath));
 }
 
 void UglTFStreamSubSystem::PersistCurrentPlayerSelection()
@@ -897,7 +1096,10 @@ void UglTFStreamSubSystem::PersistCurrentPlayerSelection()
         FString LevelJsonPath = FPaths::Combine(PATH_ROOT, WorldName);
         LevelJsonPath.Append(LEVEL_FILE_NAME);
         UFileFunctionLibrary::ToJsonAsync(UWorldData::SerializeData(WorldData), LevelJsonPath);
-        WriteLogAsync(FString::Printf(TEXT("Current player selection saved to level.json. Player=%s Path=%s"), *WorldData->Player, *LevelJsonPath));
+        WriteLogAsync(FString::Printf(
+            TEXT("Current player selection saved to level.json. Player=%s Path=%s"),
+            *WorldData->Player,
+            *LevelJsonPath));
     }
 }
 
@@ -913,6 +1115,12 @@ bool UglTFStreamSubSystem::TryLoadValidModelMetadata(const FString& GlbPath, FMo
     }
 
     bOutJsonExists = true;
+    const int64 JsonFileSize = IFileManager::Get().FileSize(*JsonPath);
+    if (JsonFileSize < 0 || JsonFileSize > MAX_MODEL_METADATA_JSON_BYTES)
+    {
+        return false;
+    }
+
     FString JsonString;
     if (!FFileHelper::LoadFileToString(JsonString, *JsonPath))
     {
@@ -935,7 +1143,9 @@ bool UglTFStreamSubSystem::IsValidModelMetadata(const FModelData& ModelData) con
     return !ModelData.Size.IsNearlyZero(0.001f);
 }
 
-bool UglTFStreamSubSystem::IsPlayerInsideModelRange(const FModelData& ModelData) const
+bool UglTFStreamSubSystem::IsPlayerInsideModelRange(
+    const FModelData& ModelData,
+    const float RadiusMultiplier) const
 {
     if (!IsValidModelMetadata(ModelData))
     {
@@ -944,7 +1154,8 @@ bool UglTFStreamSubSystem::IsPlayerInsideModelRange(const FModelData& ModelData)
 
     const FVector PlayerLocation = GetPlayerLocation();
     const float Radius = FMath::Max3(ModelData.Size.X, ModelData.Size.Y, ModelData.Size.Z) * GLTF_STREAM_DISTANCE_SCALE;
-    const float SafeRadius = FMath::Max(1.0f, Radius);
+    const float SafeRadius =
+        FMath::Max(1.0f, Radius) * FMath::Clamp(RadiusMultiplier, 1.0f, 2.0f);
     return FVector::DistSquared(PlayerLocation, ModelData.Center) <= FMath::Square(SafeRadius);
 }
 
@@ -965,6 +1176,20 @@ AglTFStreamActor* UglTFStreamSubSystem::EnsureSpawnActor(const FString& GlbPath)
         {
             return ActorPtr->Get();
         }
+    }
+
+    if (!ValidatedModelPaths.Contains(GlbPath))
+    {
+        FString ValidationReason;
+        if (!GlbValidation::ValidateFile(GlbPath, ValidationReason))
+        {
+            ValidatedModelPaths.Remove(GlbPath);
+            MissingFilePaths.Add(GlbPath);
+            WriteLogAsync(FString::Printf(TEXT("SpawnActor skipped for invalid GLB. Path=%s Reason=%s"), *GlbPath, *ValidationReason));
+            return nullptr;
+        }
+        ValidatedModelPaths.Add(GlbPath);
+        MissingFilePaths.Remove(GlbPath);
     }
 
     if (!IsValid(OwnerActor) || !SpawnActorClass)
@@ -1075,8 +1300,11 @@ void UglTFStreamSubSystem::ScheduleWaitForPlayerActor()
 
     if (UWorld* World = OwnerActor->GetWorld())
     {
-        TimerHandle_WaitPlayer = World->GetTimerManager().SetTimerForNextTick(
-            FTimerDelegate::CreateUObject(this, &UglTFStreamSubSystem::WaitForPlayerActorAsync));
+        World->GetTimerManager().SetTimer(
+            TimerHandle_WaitPlayer,
+            FTimerDelegate::CreateUObject(this, &UglTFStreamSubSystem::WaitForPlayerActorAsync),
+            STREAM_POLL_INTERVAL_SECONDS,
+            false);
     }
 }
 
@@ -1089,8 +1317,11 @@ void UglTFStreamSubSystem::ScheduleWaitForPlayerLoad()
 
     if (UWorld* World = OwnerActor->GetWorld())
     {
-        TimerHandle_WaitPlayer = World->GetTimerManager().SetTimerForNextTick(
-            FTimerDelegate::CreateUObject(this, &UglTFStreamSubSystem::WaitForPlayerLoadAsync));
+        World->GetTimerManager().SetTimer(
+            TimerHandle_WaitPlayer,
+            FTimerDelegate::CreateUObject(this, &UglTFStreamSubSystem::WaitForPlayerLoadAsync),
+            STREAM_POLL_INTERVAL_SECONDS,
+            false);
     }
 }
 

@@ -10,6 +10,7 @@ class UPhysicsAsset;
 class USkeleton;
 class UInputMappingContext;
 class UMaterialInterface;
+class USkeletalMesh;
 
 USTRUCT(BlueprintType)
 struct FCharacterDefaultAsset

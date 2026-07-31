@@ -5,6 +5,7 @@
 #include "CoreMinimal.h"
 #include "HAL/ThreadSafeCounter.h"
 #include "GameFramework/Pawn.h"
+#include "GameFramework/PlayerController.h"
 #include "Model/glTFMaterialAssetReferences.h"
 #include "World/PlacementTypes.h"
 #include "VehiclePawn.generated.h"

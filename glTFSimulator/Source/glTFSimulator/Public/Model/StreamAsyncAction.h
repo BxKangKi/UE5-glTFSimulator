@@ -100,6 +100,11 @@ private:
     FVector CurrentSize;
     bool bIsLoading = false;
     bool bAbortRequested = false;
+    bool bStaticMeshLoadInFlight = false;
+
+    /** Ticket held while this action owns or waits for the global glTFRuntime mesh slot. */
+    uint64 GlTFRuntimeOperationTicket = 0;
+
     bool bRenderOnly = false;
     FName CurrentLoadingNode;
     FName CurrentLoadingMesh;
@@ -120,6 +125,7 @@ private:
     void SetStaticMesh(UStaticMesh *StaticMesh);
 
     void ProcessChunk();
+    void SanitizeRuntimeMaps();
     void AbortAndRelease(UStaticMesh* OrphanedMesh = nullptr);
     void ResetLoadState();
     void LoadStaticMeshAsync(const FName &Name);

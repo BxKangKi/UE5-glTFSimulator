@@ -94,13 +94,12 @@ void AWorldManager::InitializeRendering(UWorldData* InWorldData)
     ConfigureRenderingSettings();
     ApplyCloudSettings();
     RegisterGameUpdate();
-    StartSkyAsyncUpdate();
+    UpdateSkyLighting();
 }
 
 void AWorldManager::StopRendering()
 {
     bRenderingActive = false;
-    bSkyUpdateInFlight = false;
     UnregisterGameUpdate();
     Data = nullptr;
 }
@@ -221,35 +220,18 @@ void AWorldManager::UnregisterGameUpdate()
 
 void AWorldManager::UpdateFromGameUpdate(float DeltaSeconds)
 {
-    ApplyCloudSettings();
-    StartSkyAsyncUpdate();
+    // Cloud settings are applied when rendering/settings change, not redundantly every frame.
+    UpdateSkyLighting();
 }
 
-void AWorldManager::StartSkyAsyncUpdate()
+void AWorldManager::UpdateSkyLighting()
 {
-    if (bSkyUpdateInFlight || !bRenderingActive || !IsValid(Data))
+    if (!bRenderingActive || !IsValid(Data))
     {
         return;
     }
 
-    USkyUpdateAsyncAction* AsyncAction = USkyUpdateAsyncAction::SkyUpdateAsync(this, Data);
-    if (!AsyncAction)
-    {
-        return;
-    }
-
-    bSkyUpdateInFlight = true;
-    AsyncAction->OnCompleted.AddDynamic(this, &AWorldManager::SkyUpdate);
-    AsyncAction->Activate();
-}
-
-void AWorldManager::SkyUpdate(FLightRotation Result)
-{
-    bSkyUpdateInFlight = false;
-    if (!bRenderingActive)
-    {
-        return;
-    }
+    const FLightRotation Result = USkyUpdateAsyncAction::CalculateLightRotation(Data);
 
     if (IsValid(Sun))
     {

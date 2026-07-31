@@ -75,7 +75,6 @@ void AWeatherActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
         GameUpdate->UnregisterUpdate(GameUpdateTickHandle);
     }
     GameUpdateTickHandle = INDEX_NONE;
-    bRainUpdateInFlight = false;
 
     Super::EndPlay(EndPlayReason);
 }
@@ -89,34 +88,15 @@ void AWeatherActor::UpdateFromGameUpdate(float DeltaSeconds)
         SetActorLocation(Location + LocationOffset, false, nullptr, ETeleportType::TeleportPhysics);
     }
 
-    StartRainAsyncUpdate();
+    UpdateRainParameters();
 }
 
-void AWeatherActor::StartRainAsyncUpdate()
+void AWeatherActor::UpdateRainParameters()
 {
-    if (bRainUpdateInFlight || !IsValid(SceneCapture) || !IsValid(Niagara))
-    {
-        return;
-    }
-
-    UUpdateRainAsync* RainAction = UUpdateRainAsync::UpdateRainAsync(
-        this,
+    // Native updates avoid allocating and binding a transient Blueprint action every frame.
+    UUpdateRainAsync::ApplyRainParameters(
         SceneCapture,
         Niagara,
         MaxDistance,
         Param);
-
-    if (!RainAction)
-    {
-        return;
-    }
-
-    bRainUpdateInFlight = true;
-    RainAction->Completed.AddDynamic(this, &AWeatherActor::OnRainUpdateCompleted);
-    RainAction->Activate();
-}
-
-void AWeatherActor::OnRainUpdateCompleted()
-{
-    bRainUpdateInFlight = false;
 }

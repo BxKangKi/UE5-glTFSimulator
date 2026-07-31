@@ -5,7 +5,6 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
-#include "World/LightRotation.h"
 #include "WorldManager.generated.h"
 
 class UGameManagerSubSystem;
@@ -81,11 +80,9 @@ private:
     void RegisterGameUpdate();
     void UnregisterGameUpdate();
     void UpdateFromGameUpdate(float DeltaSeconds);
-    void StartSkyAsyncUpdate();
 
-    /** Applies the asynchronous sun/moon rotation result. */
-    UFUNCTION()
-    void SkyUpdate(FLightRotation Result);
+    /** Calculates and applies the current sun/moon rotations without a per-frame UObject. */
+    void UpdateSkyLighting();
 
     UPROPERTY()
     TObjectPtr<UWorldData> Data;
@@ -104,5 +101,4 @@ private:
 
     int32 GameUpdateTickHandle = INDEX_NONE;
     bool bRenderingActive = false;
-    bool bSkyUpdateInFlight = false;
 };

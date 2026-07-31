@@ -21,6 +21,9 @@ class UPrimitiveComponent;
 class UAnimInstance;
 class UCharacterLoadAsyncAction;
 class UGameUpdateSubSystem;
+class USkeletalMesh;
+class USkeleton;
+class UPhysicsAsset;
 class UPhysicalMaterial;
 class USoundBase;
 class UNiagaraSystem;
@@ -54,7 +57,22 @@ public:
     virtual void ExitWater(const float Level) override;
     UFUNCTION()
     void Activate(bool bValue);
+    /** Starts a single on-demand character load. The previous runtime character resources are detached first.
+     *  Must be called on the game thread. File parsing and mesh construction continue asynchronously. */
     void Load(const FString &Path);
+
+    /** Cancels the current character request and detaches any generated runtime resources. Game-thread only. */
+    void CancelCharacterLoad(bool bRestoreDefaultMesh = true);
+
+    /** Atomically installs a completed runtime character mesh. UObject/component mutation is game-thread only. */
+    bool CommitRuntimeCharacterResources(USkeletalMesh* SkeletalMesh, UPhysicsAsset* PhysicsAsset, USkeleton* RuntimeSkeleton);
+
+    /** Detaches the current runtime character mesh and releases all strong references without forcing a blocking GC. */
+    void ReleaseRuntimeCharacterResources(bool bRestoreDefaultMesh = true);
+
+    /** Internal completion hook used to serialize cancelled/in-flight glTFRuntime requests. Game-thread only. */
+    void HandleCharacterLoadActionReleased(UCharacterLoadAsyncAction* ReleasedAction);
+
     void PrepareForMeshReload();
     void RestoreAfterMeshReload();
     void PrepareForPawnReplacement();
@@ -88,12 +106,15 @@ public:
     bool bIsLoaded; // Current glTF file path.
     UFUNCTION(BlueprintPure, Category="Character|Loading")
     float GetLoadProgress() const { return LoadProgress; }
+    UFUNCTION(BlueprintPure, Category="Character|Loading")
+    bool WasLastMeshLoadSuccessful() const { return bLastMeshLoadSucceeded; }
     UPROPERTY(BlueprintReadOnly)
     bool bIsMoveable; // Current glTF file path.
     UPROPERTY(EditAnywhere, BlueprintReadWrite)
     FCharacterDefaultAsset DefaultAsset;
     UCharacterComponent *GetCharacterComponent() { return Component.Get(); }
     USpringArmComponent *GetSpringArm() { return SpringArm.Get(); }
+    UCameraComponent *GetFollowCameraComponent() const { return FollowCamera.Get(); }
     bool RefreshWaterStateForRagdollRecovery(bool bRagdollBodyInWater, float Level);
     UFUNCTION(BlueprintCallable)
     void TriggerFootstepTrace(EControllerHand FootSide); // Foot-side selector for left/right traces.
@@ -139,6 +160,20 @@ private:
     TObjectPtr<UGameManagerSubSystem> SubSystem;
     UPROPERTY()
     TObjectPtr<UCharacterLoadAsyncAction> ActiveLoadAction;
+
+    /** Latest on-demand request waiting for a cancelled glTFRuntime worker/finalizer to drain. */
+    FString QueuedCharacterPath;
+
+    /** Explicit ownership of the currently installed runtime resources. Resetting these after detaching the mesh
+     *  lets Unreal's incremental GC reclaim the old character without a synchronous collection hitch. */
+    UPROPERTY(Transient)
+    TObjectPtr<USkeletalMesh> RuntimeSkeletalMesh = nullptr;
+
+    UPROPERTY(Transient)
+    TObjectPtr<UPhysicsAsset> RuntimePhysicsAsset = nullptr;
+
+    UPROPERTY(Transient)
+    TObjectPtr<USkeleton> RuntimeSkeleton = nullptr;
     void SetWaterState(bool bValue, float Level, bool bForceRagdollWaterState = false);
     bool FindDirectWaterLevel(float& OutLevel) const;
     void ClearDryWaterState(float Level, bool bUpdateMovementMode);
@@ -150,11 +185,17 @@ private:
     float WaterLevel = 0.0f;
     UPROPERTY(Transient)
     float LoadProgress = 0.0f;
+    UPROPERTY(Transient)
+    bool bLastMeshLoadSucceeded = false;
     double LastPhysicsObjectImpactTime = -1.0;
     bool bFirstPersonMode = false;
     bool bWaterStateFromOverlap = false;
     bool bWaterStateForcedByRagdoll = false;
     bool bHasSavedAnimationState = false;
+    /** Requests one authoritative mesh/physics cleanup after load or ragdoll transitions. */
+    bool bNeedsPostRagdollCleanup = true;
+    /** Low-frequency safety audit replaces the previous full skeleton scan every frame. */
+    float PhysicsStateAuditAccumulator = 0.0f;
     TEnumAsByte<EAnimationMode::Type> SavedAnimationMode;
     UPROPERTY()
     TSubclassOf<UAnimInstance> SavedAnimClass;

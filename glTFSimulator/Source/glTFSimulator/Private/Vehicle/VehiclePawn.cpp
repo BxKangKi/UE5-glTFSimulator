@@ -30,6 +30,7 @@
 #include "Setting/GameSettings.h"
 #include "System/ActorHelper.h"
 #include "System/FileFunctionLibrary.h"
+#include "System/GlbValidation.h"
 #include "System/MathHelper.h"
 #include "System/MacroLibrary.h"
 #include "System/PhysicsHelper.h"
@@ -71,7 +72,7 @@ static FTransform GetVehicleNodeWorldTransform(const TMap<int32, FglTFRuntimeNod
 
         while (const FglTFRuntimeNode* Parent = NodeMap.Find(ParentIndex))
         {
-            if (VisitedParents.Contains(ParentIndex))
+            if (VisitedParents.Contains(ParentIndex) || Parent->Transform.ContainsNaN())
             {
                 break;
             }
@@ -80,7 +81,7 @@ static FTransform GetVehicleNodeWorldTransform(const TMap<int32, FglTFRuntimeNod
             ParentIndex = Parent->ParentIndex;
         }
 
-        return WorldTransform;
+        return WorldTransform.ContainsNaN() ? FTransform::Identity : WorldTransform;
     }
 
 struct FVehicleWheelVisual
@@ -97,6 +98,7 @@ namespace
     constexpr float VehiclePhysicsMaxCatchUpSeconds = 1.0f;
     constexpr int32 VehiclePhysicsHardMaxSubsteps = 64;
     constexpr float VehicleTuningMaxForce = 5000000.0f;
+    constexpr int32 MaxRuntimeVehicleNodeCount = 500000;
     constexpr float VehicleTuningMaxTorque = 2000000.0f;
     constexpr float VehicleTuningMaxSpeed = 12000.0f;
     constexpr float VehicleTuningMaxGrip = 10.0f;
@@ -940,7 +942,7 @@ void AVehiclePawn::ClearLoadedVehicleModel()
     {
         if (IsValid(Mesh) && !Mesh->IsAsset())
         {
-            Mesh->MarkAsGarbage();
+            Mesh->ClearFlags(RF_Public | RF_Standalone);
         }
     }
 
@@ -964,7 +966,7 @@ void AVehiclePawn::ClearLoadedVehicleModel()
     if (IsValid(GltfAsset))
     {
         GltfAsset->ClearCache();
-        GltfAsset->MarkAsGarbage();
+        GltfAsset->ClearFlags(RF_Public | RF_Standalone);
         GltfAsset = nullptr;
     }
 
@@ -1262,7 +1264,7 @@ bool AVehiclePawn::SaveVehicleTuningJsonTemplate(const FString& JsonPath) const
 
 UStaticMesh* AVehiclePawn::LoadMeshByIndex(int32 MeshIndex)
 {
-    if (!IsValid(GltfAsset) || MeshIndex == INDEX_NONE)
+    if (!IsValid(GltfAsset) || MeshIndex < 0 || MeshIndex >= GltfAsset->GetNumMeshes())
     {
         return nullptr;
     }
@@ -1310,9 +1312,19 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InFilePath, const FString& In
     LoadedBodyVisualBounds.Init();
     LoadedWheelVisualRestBounds.Init();
 
-    SourceFilePath = FPaths::ConvertRelativePathToFull(InFilePath);
+    SourceFilePath = GlbValidation::NormalizePath(InFilePath);
     BaseName = FPaths::GetBaseFilename(SourceFilePath);
     ObjectName = InObjectName.IsEmpty() ? BaseName : InObjectName;
+
+    FString ValidationReason;
+    if (!GlbValidation::ValidateRuntimeMeshFile(SourceFilePath, ValidationReason))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("VehiclePawn: invalid GLB skipped. Path=%s Reason=%s"), *SourceFilePath, *ValidationReason);
+        SourceFilePath.Reset();
+        BaseName = TEXT("Vehicle");
+        ObjectName = TEXT("Vehicle");
+        return false;
+    }
 
     ResetVehicleTuningToClassDefaults();
 
@@ -1343,10 +1355,23 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InFilePath, const FString& In
     }
 
     const TArray<FglTFRuntimeNode> Nodes = GltfAsset->GetNodes();
+    if (Nodes.Num() > MaxRuntimeVehicleNodeCount)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("VehiclePawn: GLB node count exceeds the runtime safety limit. Path=%s Nodes=%d"),
+            *SourceFilePath, Nodes.Num());
+        GltfAsset->ClearCache();
+        GltfAsset->ClearFlags(RF_Public | RF_Standalone);
+        GltfAsset = nullptr;
+        return false;
+    }
+    const int32 MeshCount = GltfAsset->GetNumMeshes();
     TMap<int32, FglTFRuntimeNode> NodeMap;
     for (const FglTFRuntimeNode& Node : Nodes)
     {
-        NodeMap.Add(Node.Index, Node);
+        if (Node.Index >= 0 && Node.Index < Nodes.Num() && !Node.Transform.ContainsNaN())
+        {
+            NodeMap.Add(Node.Index, Node);
+        }
     }
 
     TMap<int32, FString> MeshNamesByIndex;
@@ -1367,7 +1392,8 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InFilePath, const FString& In
     int32 BodyComponentIndex = 0;
     for (const FglTFRuntimeNode& Node : Nodes)
     {
-        if (Node.MeshIndex == INDEX_NONE)
+        if (Node.Index < 0 || !NodeMap.Contains(Node.Index) ||
+            Node.MeshIndex < 0 || Node.MeshIndex >= MeshCount || Node.Transform.ContainsNaN())
         {
             continue;
         }

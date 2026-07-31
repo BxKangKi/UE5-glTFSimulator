@@ -4,6 +4,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Kismet/BlueprintFunctionLibrary.h"
 #include "CharacterFunctionLibrary.generated.h"
 
 class USkeletalMeshComponent;
@@ -22,9 +23,9 @@ public:
     static void KeepSecondaryPhysicsBodies(USkeletalMeshComponent &Mesh);
     static void DisableRagdollPhysicsButKeepSecondary(USkeletalMeshComponent &Mesh);
     static bool HasNonSecondarySimulatingPhysicsBodies(USkeletalMeshComponent &Mesh);
-    static UPhysicsAsset *MergePhysicsAsset(UPhysicsAsset *Target, UPhysicsAsset *Source);
+    static UPhysicsAsset *MergePhysicsAsset(UPhysicsAsset *Target, UPhysicsAsset *Source, const USkeletalMesh *MeshAsset);
     static void SetupAllBodiesBelowCollidersAndConstraints(UPhysicsAsset *PhysicsAsset,
-                                                           USkeletalMeshComponent *SkeletalMesh,
+                                                           const USkeletalMesh *MeshAsset,
                                                            const FName &RootBoneName);
     static FVector GetBoneLocation(const USkeletalMeshComponent &SkeletalMesh, const FName &BoneName);
     static FRotator GetBoneRotation(const USkeletalMeshComponent &SkeletalMesh, const FName &BoneName);

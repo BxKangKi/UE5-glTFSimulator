@@ -11,7 +11,46 @@
 #include "Materials/MaterialInterface.h"
 #include "Components/DecalComponent.h"
 #include "Components/ActorComponent.h"
-#include "EngineUtils.h"
+#include "Engine/World.h"
+
+namespace
+{
+    // Water probes can execute several times per frame. A weak per-world registry avoids a full
+    // actor iterator for each probe while still allowing actors to disappear safely during travel.
+    TMap<const UWorld*, TArray<TWeakObjectPtr<AWaterActor>>> GWaterActorsByWorld;
+
+    void RegisterWaterActor(AWaterActor* WaterActor)
+    {
+        if (IsValid(WaterActor) && WaterActor->GetWorld())
+        {
+            GWaterActorsByWorld.FindOrAdd(WaterActor->GetWorld()).AddUnique(WaterActor);
+        }
+    }
+
+    void UnregisterWaterActor(AWaterActor* WaterActor)
+    {
+        if (!WaterActor)
+        {
+            return;
+        }
+
+        const UWorld* World = WaterActor->GetWorld();
+        TArray<TWeakObjectPtr<AWaterActor>>* WaterActors = GWaterActorsByWorld.Find(World);
+        if (!WaterActors)
+        {
+            return;
+        }
+
+        WaterActors->RemoveAll([WaterActor](const TWeakObjectPtr<AWaterActor>& Entry)
+        {
+            return !Entry.IsValid() || Entry.Get() == WaterActor;
+        });
+        if (WaterActors->IsEmpty())
+        {
+            GWaterActorsByWorld.Remove(World);
+        }
+    }
+}
 
 AWaterActor::AWaterActor()
 {
@@ -41,6 +80,7 @@ AWaterActor::AWaterActor()
 void AWaterActor::BeginPlay()
 {
     Super::BeginPlay();
+    RegisterWaterActor(this);
     SetCurrentLevel();
     APhysicsVolume *Volume = Collision->GetPhysicsVolume();
     if (Volume)
@@ -62,6 +102,12 @@ void AWaterActor::BeginPlay()
     }
 }
 
+void AWaterActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+    UnregisterWaterActor(this);
+    Super::EndPlay(EndPlayReason);
+}
+
 void AWaterActor::WaterTrigger(AActor *OtherActor, bool InWater)
 {
     if (!OtherActor)
@@ -81,7 +127,7 @@ void AWaterActor::WaterTrigger(AActor *OtherActor, bool InWater)
         }
     }
 
-    TArray<UActorComponent*> Components;
+    TInlineComponentArray<UActorComponent*, 16> Components;
     OtherActor->GetComponents(Components);
     for (UActorComponent* Component : Components)
     {
@@ -154,11 +200,18 @@ bool AWaterActor::FindWaterLevelAtLocationStrict(const UObject *WorldContextObje
     constexpr float SurfaceTolerance = 5.0f;
     constexpr float LowerBoundsTolerance = 2.0f;
 
-    for (TActorIterator<AWaterActor> It(World); It; ++It)
+    TArray<TWeakObjectPtr<AWaterActor>>* WaterActors = GWaterActorsByWorld.Find(World);
+    if (!WaterActors)
     {
-        AWaterActor *WaterActor = *It;
+        return false;
+    }
+
+    for (int32 Index = WaterActors->Num() - 1; Index >= 0; --Index)
+    {
+        AWaterActor* WaterActor = (*WaterActors)[Index].Get();
         if (!IsValid(WaterActor))
         {
+            WaterActors->RemoveAtSwap(Index, 1, EAllowShrinking::No);
             continue;
         }
 
@@ -228,11 +281,18 @@ bool AWaterActor::FindWaterLevelAtLocation(const UObject *WorldContextObject, co
     constexpr float SurfaceTolerance = 20.0f;
     constexpr float LowerBoundsTolerance = 400.0f;
 
-    for (TActorIterator<AWaterActor> It(World); It; ++It)
+    TArray<TWeakObjectPtr<AWaterActor>>* WaterActors = GWaterActorsByWorld.Find(World);
+    if (!WaterActors)
     {
-        AWaterActor *WaterActor = *It;
+        return false;
+    }
+
+    for (int32 Index = WaterActors->Num() - 1; Index >= 0; --Index)
+    {
+        AWaterActor* WaterActor = (*WaterActors)[Index].Get();
         if (!IsValid(WaterActor))
         {
+            WaterActors->RemoveAtSwap(Index, 1, EAllowShrinking::No);
             continue;
         }
 

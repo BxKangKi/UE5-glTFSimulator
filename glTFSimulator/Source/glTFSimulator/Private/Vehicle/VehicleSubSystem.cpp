@@ -140,7 +140,9 @@ void UVehicleSubSystem::UpdateVehiclesFromGameUpdate(float DeltaSeconds)
     TArray<AVehiclePawn::FVehicleParallelControlOutput> Outputs;
     Outputs.SetNum(ValidVehicleCount);
 
-    if (ValidVehicleCount >= 4)
+    // Task-graph setup costs more than this small scalar calculation for ordinary vehicle counts.
+    constexpr int32 ParallelVehicleThreshold = 32;
+    if (ValidVehicleCount >= ParallelVehicleThreshold)
     {
         ParallelFor(ValidVehicleCount, [&Inputs, &Outputs](const int32 Index)
         {

@@ -820,7 +820,7 @@ bool UBuoyancyComponent::ApplySkeletalMeshBuoyancy(USkeletalMeshComponent* Skele
         TArray<FBuoyancySampleResult> Results;
         Results.SetNum(SampleItems.Num());
 
-        ParallelFor(SampleItems.Num(), [CurrentWaterLevel, UpVector, GravityMagnitude, TotalMass, PrimarySampleCount, MassPerPrimarySample, &SampleItems, &WorldPoints, &PointVelocities, &PointPhysicsSettings, &Results](int32 Index)
+        const auto CalculateSkeletalSample = [CurrentWaterLevel, UpVector, GravityMagnitude, TotalMass, PrimarySampleCount, MassPerPrimarySample, &SampleItems, &WorldPoints, &PointVelocities, &PointPhysicsSettings, &Results](int32 Index)
         {
             const FVector& WorldPoint = WorldPoints[Index];
             const FBuoyancyPhysicsSettings& PhysicsSettings = PointPhysicsSettings[Index];
@@ -857,7 +857,13 @@ bool UBuoyancyComponent::ApplySkeletalMeshBuoyancy(USkeletalMeshComponent* Skele
             Results[Index].SubmergedAlpha = SubmergedAlpha;
             Results[Index].Force = (BuoyancyForce + DragForce + LinearDampingForce).GetClampedToMaxSize(ForceLimitPerSample + DragLimitPerSample);
             Results[Index].bActive = true;
-        });
+        };
+
+        // Skeletal sampling is capped at 32 entries, below the point where task dispatch wins.
+        for (int32 Index = 0; Index < SampleItems.Num(); ++Index)
+        {
+            CalculateSkeletalSample(Index);
+        }
 
         for (int32 SubstepIndex = 0; SubstepIndex < SubstepCount; ++SubstepIndex)
         {
@@ -1047,7 +1053,7 @@ void UBuoyancyComponent::UpdateBuoyancyFromGameUpdate(float DeltaTime)
     TArray<FBuoyancySampleResult> Results;
     Results.SetNum(LocalSamplePoints.Num());
 
-    ParallelFor(LocalSamplePoints.Num(), [CurrentWaterLevel, UpVector, SafeSubmersionDepth, ForceLimitPerSample, DragLimitPerSample, MassPerSample, PhysicsSettings, &WorldPoints, &PointVelocities, &Results](int32 Index)
+    const auto CalculatePrimitiveSample = [CurrentWaterLevel, UpVector, SafeSubmersionDepth, ForceLimitPerSample, DragLimitPerSample, MassPerSample, PhysicsSettings, &WorldPoints, &PointVelocities, &Results](int32 Index)
     {
         const FVector& WorldPoint = WorldPoints[Index];
         const float Depth = CurrentWaterLevel - WorldPoint.Z;
@@ -1073,7 +1079,20 @@ void UBuoyancyComponent::UpdateBuoyancyFromGameUpdate(float DeltaTime)
         Results[Index].SubmergedAlpha = SubmergedAlpha;
         Results[Index].Force = (BuoyancyForce + DragForce + LinearDampingForce).GetClampedToMaxSize(ForceLimitPerSample + DragLimitPerSample);
         Results[Index].bActive = true;
-    });
+    };
+
+    constexpr int32 ParallelBuoyancySampleThreshold = 64;
+    if (LocalSamplePoints.Num() >= ParallelBuoyancySampleThreshold)
+    {
+        ParallelFor(LocalSamplePoints.Num(), CalculatePrimitiveSample);
+    }
+    else
+    {
+        for (int32 Index = 0; Index < LocalSamplePoints.Num(); ++Index)
+        {
+            CalculatePrimitiveSample(Index);
+        }
+    }
 
     const int32 SubstepCount = GetBuoyancySubstepCount(DeltaTime, PhysicsSettings.MaxBuoyancyStepSeconds);
     const float StepDeltaTime = DeltaTime / static_cast<float>(SubstepCount);

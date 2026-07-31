@@ -11,34 +11,6 @@
 #include "System/FileFunctionLibrary.h"
 #include "System/MacroLibrary.h"
 
-namespace
-{
-    template <typename TObjectType>
-    static void RetainGeneratedObject(TObjectType* Object)
-    {
-        if (IsValid(Object) && !Object->IsAsset() && !Object->IsRooted())
-        {
-            // The registry owns runtime-generated objects between async creation and component
-            // attachment. Release paths remove this root before marking the object as garbage.
-            Object->AddToRoot();
-        }
-    }
-
-    template <typename TObjectType>
-    static void MarkGeneratedObjectAsGarbage(TObjectType* Object)
-    {
-        if (IsValid(Object) && !Object->IsAsset())
-        {
-            if (Object->IsRooted())
-            {
-                Object->RemoveFromRoot();
-            }
-            Object->ClearFlags(RF_Public | RF_Standalone);
-            Object->MarkAsGarbage();
-        }
-    }
-}
-
 UAssetManageSubSystem* UAssetManageSubSystem::Get(UObject* WorldContextObject)
 {
     if (!IsValid(WorldContextObject))
@@ -59,36 +31,33 @@ void UAssetManageSubSystem::Deinitialize()
 
 void UAssetManageSubSystem::ActivateForMainWorld(UObject* WorldContextObject)
 {
-    if (bActive)
     {
-        return;
+        FScopeLock Lock(&RegistryLock);
+        if (bActive)
+        {
+            return;
+        }
+        bActive = true;
     }
 
-    bActive = true;
     WriteLogAsync(TEXT("AssetManageSubSystem activated for main world"));
 }
 
 void UAssetManageSubSystem::DeactivateAndRelease()
 {
-    FScopeLock Lock(&RegistryLock);
+    {
+        FScopeLock Lock(&RegistryLock);
 
-    for (TPair<FManagedStaticMeshKey, FManagedStaticMeshEntry>& Pair : StaticMeshSet)
-    {
-        MarkGeneratedObjectAsGarbage(Pair.Value.Asset.Get());
-    }
-    for (TPair<TWeakObjectPtr<UMaterialInterface>, FManagedMaterialEntry>& Pair : MaterialSet)
-    {
-        MarkGeneratedObjectAsGarbage(Pair.Value.Asset.Get());
-    }
-    for (TPair<TWeakObjectPtr<UTexture>, FManagedTextureEntry>& Pair : TextureSet)
-    {
-        MarkGeneratedObjectAsGarbage(Pair.Value.Asset.Get());
+        // Block new registrations before releasing roots. Acquire calls re-check this state while
+        // holding the same lock, so a request that raced with shutdown cannot repopulate a cleared
+        // registry.
+        bActive = false;
+        ReleaseAllGeneratedObjectReferences();
+        StaticMeshSet.Empty();
+        MaterialSet.Empty();
+        TextureSet.Empty();
     }
 
-    StaticMeshSet.Empty();
-    MaterialSet.Empty();
-    TextureSet.Empty();
-    bActive = false;
     WriteLogAsync(TEXT("AssetManageSubSystem deactivated and runtime asset registries were cleared"));
 }
 
@@ -97,7 +66,7 @@ UStaticMesh* UAssetManageSubSystem::AcquireStaticMesh(
     const FName& MeshKey,
     UStaticMesh* GeneratedMeshAsset)
 {
-    if (!bActive || !IsValid(GeneratedMeshAsset) || GeneratedMeshAsset->IsAsset())
+    if (!IsValid(GeneratedMeshAsset) || GeneratedMeshAsset->IsAsset())
     {
         return GeneratedMeshAsset;
     }
@@ -115,6 +84,10 @@ UStaticMesh* UAssetManageSubSystem::AcquireStaticMesh(
 
     const FManagedStaticMeshKey RegistryKey(RegistryScope, MeshKey);
     FScopeLock Lock(&RegistryLock);
+    if (!bActive)
+    {
+        return GeneratedMeshAsset;
+    }
 
     if (FManagedStaticMeshEntry* ExistingEntry = StaticMeshSet.Find(RegistryKey))
     {
@@ -122,10 +95,6 @@ UStaticMesh* UAssetManageSubSystem::AcquireStaticMesh(
         {
             ++ExistingEntry->RefCount;
             UStaticMesh* ExistingMesh = ExistingEntry->Asset.Get();
-            if (ExistingMesh != GeneratedMeshAsset)
-            {
-                MarkGeneratedObjectAsGarbage(GeneratedMeshAsset);
-            }
             WriteLogAsync(FString::Printf(
                 TEXT("StaticMesh reused by scoped key. Scope=%s Key=%s RefCount=%d"),
                 *GetNameSafe(RegistryScope),
@@ -134,6 +103,7 @@ UStaticMesh* UAssetManageSubSystem::AcquireStaticMesh(
             return ExistingMesh;
         }
 
+        ReleaseGeneratedObjectReference(ExistingEntry->Asset.Get());
         StaticMeshSet.Remove(RegistryKey);
     }
 
@@ -152,12 +122,17 @@ UStaticMesh* UAssetManageSubSystem::AcquireStaticMesh(
 
 void UAssetManageSubSystem::ReleaseStaticMesh(UObject* WorldContextObject, UStaticMesh* GeneratedMeshAsset)
 {
-    if (!bActive || !IsValid(GeneratedMeshAsset) || GeneratedMeshAsset->IsAsset())
+    if (!IsValid(GeneratedMeshAsset) || GeneratedMeshAsset->IsAsset())
     {
         return;
     }
 
     FScopeLock Lock(&RegistryLock);
+    if (!bActive)
+    {
+        return;
+    }
+
     for (auto It = StaticMeshSet.CreateIterator(); It; ++It)
     {
         FManagedStaticMeshEntry& Entry = It.Value();
@@ -170,7 +145,7 @@ void UAssetManageSubSystem::ReleaseStaticMesh(UObject* WorldContextObject, UStat
                 Entry.RefCount));
             if (Entry.RefCount <= 0)
             {
-                MarkGeneratedObjectAsGarbage(GeneratedMeshAsset);
+                ReleaseGeneratedObjectReference(GeneratedMeshAsset);
                 It.RemoveCurrent();
             }
             return;
@@ -182,7 +157,7 @@ UMaterialInterface* UAssetManageSubSystem::AcquireMaterial(
     UObject* WorldContextObject,
     UMaterialInterface* GeneratedMaterialAsset)
 {
-    if (!bActive || !IsValid(GeneratedMaterialAsset) || GeneratedMaterialAsset->IsAsset())
+    if (!IsValid(GeneratedMaterialAsset) || GeneratedMaterialAsset->IsAsset())
     {
         return GeneratedMaterialAsset;
     }
@@ -191,6 +166,10 @@ UMaterialInterface* UAssetManageSubSystem::AcquireMaterial(
     // while containing completely different glTF texture parameters. Track exact identity only.
     const TWeakObjectPtr<UMaterialInterface> RegistryKey(GeneratedMaterialAsset);
     FScopeLock Lock(&RegistryLock);
+    if (!bActive)
+    {
+        return GeneratedMaterialAsset;
+    }
 
     if (FManagedMaterialEntry* ExistingEntry = MaterialSet.Find(RegistryKey))
     {
@@ -211,19 +190,24 @@ void UAssetManageSubSystem::ReleaseMaterial(
     UObject* WorldContextObject,
     UMaterialInterface* GeneratedMaterialAsset)
 {
-    if (!bActive || !IsValid(GeneratedMaterialAsset) || GeneratedMaterialAsset->IsAsset())
+    if (!IsValid(GeneratedMaterialAsset) || GeneratedMaterialAsset->IsAsset())
     {
         return;
     }
 
     const TWeakObjectPtr<UMaterialInterface> RegistryKey(GeneratedMaterialAsset);
     FScopeLock Lock(&RegistryLock);
+    if (!bActive)
+    {
+        return;
+    }
+
     if (FManagedMaterialEntry* Entry = MaterialSet.Find(RegistryKey))
     {
         Entry->RefCount = FMath::Max(0, Entry->RefCount - 1);
         if (Entry->RefCount <= 0)
         {
-            MarkGeneratedObjectAsGarbage(GeneratedMaterialAsset);
+            ReleaseGeneratedObjectReference(GeneratedMaterialAsset);
             MaterialSet.Remove(RegistryKey);
         }
     }
@@ -231,7 +215,7 @@ void UAssetManageSubSystem::ReleaseMaterial(
 
 UTexture* UAssetManageSubSystem::AcquireTexture(UObject* WorldContextObject, UTexture* GeneratedTextureAsset)
 {
-    if (!bActive || !IsValid(GeneratedTextureAsset) || GeneratedTextureAsset->IsAsset())
+    if (!IsValid(GeneratedTextureAsset) || GeneratedTextureAsset->IsAsset())
     {
         return GeneratedTextureAsset;
     }
@@ -240,6 +224,10 @@ UTexture* UAssetManageSubSystem::AcquireTexture(UObject* WorldContextObject, UTe
     // same short UObject name, so only repeated acquisition of the same object is coalesced.
     const TWeakObjectPtr<UTexture> RegistryKey(GeneratedTextureAsset);
     FScopeLock Lock(&RegistryLock);
+    if (!bActive)
+    {
+        return GeneratedTextureAsset;
+    }
 
     if (FManagedTextureEntry* ExistingEntry = TextureSet.Find(RegistryKey))
     {
@@ -258,22 +246,114 @@ UTexture* UAssetManageSubSystem::AcquireTexture(UObject* WorldContextObject, UTe
 
 void UAssetManageSubSystem::ReleaseTexture(UObject* WorldContextObject, UTexture* GeneratedTextureAsset)
 {
-    if (!bActive || !IsValid(GeneratedTextureAsset) || GeneratedTextureAsset->IsAsset())
+    if (!IsValid(GeneratedTextureAsset) || GeneratedTextureAsset->IsAsset())
     {
         return;
     }
 
     const TWeakObjectPtr<UTexture> RegistryKey(GeneratedTextureAsset);
     FScopeLock Lock(&RegistryLock);
+    if (!bActive)
+    {
+        return;
+    }
+
     if (FManagedTextureEntry* Entry = TextureSet.Find(RegistryKey))
     {
         Entry->RefCount = FMath::Max(0, Entry->RefCount - 1);
         if (Entry->RefCount <= 0)
         {
-            MarkGeneratedObjectAsGarbage(GeneratedTextureAsset);
+            ReleaseGeneratedObjectReference(GeneratedTextureAsset);
             TextureSet.Remove(RegistryKey);
         }
     }
+}
+
+bool UAssetManageSubSystem::IsActive() const
+{
+    FScopeLock Lock(&RegistryLock);
+    return bActive;
+}
+
+void UAssetManageSubSystem::RetainGeneratedObject(UObject* Object)
+{
+    if (!IsValid(Object) || Object->IsAsset())
+    {
+        return;
+    }
+
+    const TWeakObjectPtr<UObject> ObjectKey(Object);
+    if (int32* RegistrationCount = OwnedRootRegistrationCounts.Find(ObjectKey))
+    {
+        ++(*RegistrationCount);
+        return;
+    }
+
+    // An existing root belongs to another system. AddToRoot is a global bit rather than an
+    // ownership-counted operation, so this subsystem must leave that root and its flags untouched.
+    if (Object->IsRooted())
+    {
+        return;
+    }
+
+    Object->AddToRoot();
+    OwnedRootRegistrationCounts.Add(ObjectKey, 1);
+}
+
+void UAssetManageSubSystem::ReleaseGeneratedObjectReference(UObject* Object)
+{
+    if (!Object)
+    {
+        return;
+    }
+
+    const TWeakObjectPtr<UObject> ObjectKey(Object);
+    int32* RegistrationCount = OwnedRootRegistrationCounts.Find(ObjectKey);
+    if (!RegistrationCount)
+    {
+        // The subsystem never added this object's root, so it does not own either the root or the
+        // lifetime-related flags.
+        return;
+    }
+
+    --(*RegistrationCount);
+    if (*RegistrationCount > 0)
+    {
+        return;
+    }
+
+    OwnedRootRegistrationCounts.Remove(ObjectKey);
+    if (!IsValid(Object))
+    {
+        return;
+    }
+
+    if (Object->IsRooted())
+    {
+        Object->RemoveFromRoot();
+    }
+    Object->ClearFlags(RF_Public | RF_Standalone);
+    // Do not force MarkAsGarbage while render/physics commands can still hold a transient
+    // reference. Normal GC reclaims the object after registry/component references disappear.
+}
+
+void UAssetManageSubSystem::ReleaseAllGeneratedObjectReferences()
+{
+    for (const TPair<TWeakObjectPtr<UObject>, int32>& Pair : OwnedRootRegistrationCounts)
+    {
+        UObject* Object = Pair.Key.Get();
+        if (!IsValid(Object))
+        {
+            continue;
+        }
+
+        if (Object->IsRooted())
+        {
+            Object->RemoveFromRoot();
+        }
+        Object->ClearFlags(RF_Public | RF_Standalone);
+    }
+    OwnedRootRegistrationCounts.Empty();
 }
 
 void UAssetManageSubSystem::WriteLogAsync(const FString& Message) const

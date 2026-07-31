@@ -3726,9 +3726,12 @@ void UCharacterComponent::ProcessRagdollCheck()
     if (CheckRagdollStay())
     {
         const FCharacterRagdollEnvironmentState FirstReleaseState = RagdollEnvironmentState;
-        FTimerDelegate NextCheckDelegate;
-        NextCheckDelegate.BindLambda([this, FirstReleaseState]()
-                                     {
+        // The component can be destroyed while the confirmation delay is pending (for example
+        // during world travel), so bind the timer through a weak UObject-aware delegate.
+        FTimerDelegate NextCheckDelegate = FTimerDelegate::CreateWeakLambda(
+            this,
+            [this, FirstReleaseState]()
+        {
             if (CheckRagdollStay())
             {
                 const bool bFirstWantedWater = ShouldUseRagdollWaterRecoveryForState(FirstReleaseState);

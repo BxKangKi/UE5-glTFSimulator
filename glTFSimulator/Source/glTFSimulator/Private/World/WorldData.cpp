@@ -38,7 +38,6 @@ namespace WorldDataJson
 TSharedRef<FJsonObject> FLevelCloudSettings::ToJson() const
 {
     TSharedRef<FJsonObject> Json = MakeShared<FJsonObject>();
-    Json->SetStringField(JSON_VERSION_FIELD, JSON_SCHEMA_VERSION);
     Json->SetBoolField(TEXT("bEnabled"), bEnabled);
     Json->SetNumberField(TEXT("Coverage"), Coverage);
     Json->SetNumberField(TEXT("Density"), Density);
@@ -67,7 +66,6 @@ bool FLevelCloudSettings::FromJson(const TSharedPtr<FJsonObject>& Json)
 TSharedRef<FJsonObject> FLevelWeatherSettings::ToJson() const
 {
     TSharedRef<FJsonObject> Json = MakeShared<FJsonObject>();
-    Json->SetStringField(JSON_VERSION_FIELD, JSON_SCHEMA_VERSION);
     Json->SetBoolField(TEXT("bEnabled"), bEnabled);
     Json->SetStringField(TEXT("Preset"), Preset);
     Json->SetNumberField(TEXT("Intensity"), Intensity);
@@ -90,7 +88,6 @@ bool FLevelWeatherSettings::FromJson(const TSharedPtr<FJsonObject>& Json)
 TSharedRef<FJsonObject> FLevelGameplaySettings::ToJson() const
 {
     TSharedRef<FJsonObject> Json = MakeShared<FJsonObject>();
-    Json->SetStringField(JSON_VERSION_FIELD, JSON_SCHEMA_VERSION);
     Json->SetStringField(TEXT("WorldGameMode"), WorldGameMode);
     Json->SetBoolField(TEXT("bCheatsEnabled"), bCheatsEnabled);
     return Json;
@@ -121,7 +118,9 @@ UWorldData::UWorldData()
     TimeSpeed = 60.0f;
     bOcean = false;
     PlayerLocation = FVector::ZeroVector;
-    Player = TEXT("Player");
+    // An empty value means that no external character has been selected yet. The previous
+    // "Player" placeholder was indistinguishable from a real filename and blocked first-run GLBs.
+    Player.Reset();
 }
 
 TSharedRef<FJsonObject> UWorldData::SerializeData(UWorldData *Data)

@@ -11,7 +11,7 @@
 class UDynamicPointLightComponent;
 class UGameUpdateSubSystem;
 
-/** Lightweight data-oriented structure for thread-safe distance calculations. */
+/** Compact state used to batch distance culling and avoid redundant render-state changes. */
 struct FLightOptimizationData
 {
     FVector Position;
@@ -22,7 +22,7 @@ struct FLightOptimizationData
     TWeakObjectPtr<UDecalComponent> DecalComponent;
     TWeakObjectPtr<UMaterialInterface> TargetDecalMaterial;
 
-    // Cached calculation flag used by worker threads.
+    // Desired visibility calculated during the current update.
     bool bTargetLightVisibility = true;
     bool bTargetDecalVisibility = false;
 
