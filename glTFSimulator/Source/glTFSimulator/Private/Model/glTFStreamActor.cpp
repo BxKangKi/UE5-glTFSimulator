@@ -610,19 +610,19 @@ FglTFRuntimeStaticMeshConfig AglTFStreamActor::BuildStreamingStaticMeshConfig()
     // Parameter injection preserves base-color/normal/ORM/emissive textures on the selected base material.
     glTFMaterialOverrideUtils::ApplyNamedOverrides(MaterialReferences, Config.MaterialsConfig);
 
-    Config.MaterialsConfig.bGeneratesMipMaps = false;
+    Config.MaterialsConfig.bGeneratesMipMaps = true;
     Config.MaterialsConfig.SpecularFactor = 0.0f;
     const int32 TextureDimensionLimit = UGameSettings::ResolveMaxTextureResolution(this);
     Config.MaterialsConfig.ImagesConfig.MaxWidth = TextureDimensionLimit;
     Config.MaterialsConfig.ImagesConfig.MaxHeight = TextureDimensionLimit;
-    Config.MaterialsConfig.ImagesConfig.bCompressMips = false;
-    Config.MaterialsConfig.ImagesConfig.bStreaming = false;
-    Config.MaterialsConfig.bLoadMipMaps = false;
+    Config.MaterialsConfig.ImagesConfig.bCompressMips = true;
+    Config.MaterialsConfig.ImagesConfig.bStreaming = true;
+    Config.MaterialsConfig.bLoadMipMaps = true;
     Config.Outer = this;
     Config.bAllowCPUAccess = true;
     // Single-player and listen-server worlds need runtime lighting cards and nav collision.
     // Client render-only streaming skips them because authority/collision lives on the server.
-    Config.bBuildLumenCards = !bRenderOnlyStreaming;
+    Config.bBuildLumenCards = true;
     Config.bBuildNavCollision = !bRenderOnlyStreaming;
     if (bRenderOnlyStreaming)
     {

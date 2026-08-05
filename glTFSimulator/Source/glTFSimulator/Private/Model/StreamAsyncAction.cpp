@@ -704,7 +704,7 @@ void UStreamAsyncAction::LoadStaticMeshAsync(const FName &MeshName)
         Config.bBuildComplexCollision = !bRenderOnly && Mesh->Data.bComplexCollision;
         Config.bBuildSimpleCollision = !bRenderOnly && Mesh->Data.bSimpleCollision;
         Config.bBuildNavCollision = !bRenderOnly && Config.bBuildNavCollision;
-        Config.bBuildLumenCards = !bRenderOnly && Config.bBuildLumenCards;
+        Config.bBuildLumenCards = Config.bBuildLumenCards;
         if (bRenderOnly)
         {
             Config.CollisionComplexity = ECollisionTraceFlag::CTF_UseDefault;

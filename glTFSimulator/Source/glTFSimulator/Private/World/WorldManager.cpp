@@ -50,15 +50,22 @@ AWorldManager::AWorldManager()
     SkyAtmosphere = CreateDefaultSubobject<USkyAtmosphereComponent>(TEXT("SkyAtmosphere"));
     SkyAtmosphere->SetupAttachment(RootComponent);
     SkyAtmosphere->RayleighScatteringScale = 0.003996f;
+    SkyAtmosphere->GroundAlbedo = FColor(255.0f, 255.0f, 255.0f);
+    SkyAtmosphere->AtmosphereHeight = 200.0f;
+    SkyAtmosphere->MultiScatteringFactor = 2.0f;
 
     Skybox = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("Skybox"));
     Skybox->SetupAttachment(RootComponent);
     Skybox->SetWorldScale3D(FVector(8192.0f, 8192.0f, 8192.0f));
+    Skybox->SetEnableGravity(false);
 
     SkyLight = CreateDefaultSubobject<USkyLightComponent>(TEXT("SkyLight"));
     SkyLight->SetupAttachment(RootComponent);
     SkyLight->bRealTimeCapture = true;
     SkyLight->SetIntensity(0.5f);
+    SkyLight->bCastDeepShadow = true;
+    SkyLight->bTransmission = true;
+    SkyLight->bAffectTranslucentLighting = true;
 }
 
 void AWorldManager::BeginPlay()
