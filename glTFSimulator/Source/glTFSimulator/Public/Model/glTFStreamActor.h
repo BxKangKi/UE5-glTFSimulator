@@ -74,6 +74,7 @@ public:
     const TMap<FName, FComponentGroup>& GetDynamicComponentMapRef() const { return DynamicComponentMap; }
     const TMap<FName, TObjectPtr<AWaterActor>>& GetWaterActorMapRef() const { return WaterActorMap; }
     UMaterialInterface* GetDecalLight() const { return DecalLight; }
+    TSubclassOf<AWaterActor> GetWaterClass() const { return WaterClass; }
 
     UFUNCTION(BlueprintCallable)
     float GetLoadingStatus() const { return LoadingStatus; }
@@ -89,6 +90,9 @@ public:
 
     UPROPERTY(EditAnywhere, BlueprintReadOnly)
     TObjectPtr<UMaterialInterface> DecalLight;
+
+    UPROPERTY(EditAnywhere, BlueprintReadOnly)
+    TSubclassOf<AWaterActor> WaterClass;
 
     UPROPERTY(BlueprintReadOnly)
     bool bIsLoaded = false;

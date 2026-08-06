@@ -68,6 +68,8 @@ private:
     TSet<FName> LoadedWaterNodes;
     UPROPERTY()
     TMap<FName, TObjectPtr<UInstancedStaticMeshComponent>> InstanceMap;
+    UPROPERTY()
+    TSubclassOf<AWaterActor> WaterClass;
 
     // Excluded from UPROPERTY to avoid UHT nested-container build errors.
     UPROPERTY()

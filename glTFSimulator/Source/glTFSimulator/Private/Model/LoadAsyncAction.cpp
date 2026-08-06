@@ -657,6 +657,8 @@ void ULoadAsyncAction::UpdateWaterNodeData()
     {
         FWaterStreamNodeData WaterInfo;
         WaterInfo.Transform = CurrentNode.Transform;
+        // Unreal scale should be multiplied by 100
+        WaterInfo.Transform.SetScale3D(CurrentNode.Transform.GetScale3D() * 100.0f);
         const FVector AbsScale = CurrentNode.Transform.GetScale3D().GetAbs();
         WaterInfo.StreamRadius = FMath::Max(2048.0f, FMath::Max3(AbsScale.X, AbsScale.Y, AbsScale.Z) * 65536.0f);
         WaterNodeMap.Add(NodeName, WaterInfo);

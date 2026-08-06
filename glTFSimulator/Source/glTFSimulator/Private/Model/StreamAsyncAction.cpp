@@ -43,6 +43,7 @@ UStreamAsyncAction *UStreamAsyncAction::StreamAsync(
         Action->LoadedWaterNodes = Actor->GetLoadedWaterNodesRef();
         Action->InstanceMap = Actor->GetInstanceMapRef();
         Action->Asset = Actor->GetAsset();
+        Action->WaterClass = Actor->GetWaterClass();
     }
     Action->PlayerLocation = InPlayerLocation;
     Action->Distance = InDistance;
@@ -455,7 +456,7 @@ void UStreamAsyncAction::ProcessLoadWaterNode(const FName& Name)
     Params.Owner = OwnerActor.Get();
     Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
 
-    AWaterActor* WaterActor = World->SpawnActor<AWaterActor>(AWaterActor::StaticClass(), WaterInfo->Transform, Params);
+    AWaterActor *WaterActor = World->SpawnActor<AWaterActor>(WaterClass, WaterInfo->Transform, Params);
     if (IsValid(WaterActor))
     {
         if (bRenderOnly)
