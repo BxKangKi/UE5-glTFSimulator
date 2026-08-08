@@ -12,6 +12,12 @@ UUpdateRainAsync *UUpdateRainAsync::UpdateRainAsync(
     const float InMaxViewDist,
     const FName &InParam)
 {
+    if (!ensureMsgf(IsInGameThread(),
+        TEXT("UUpdateRainAsync::UpdateRainAsync must create and inspect UObjects on the game thread")))
+    {
+        return nullptr;
+    }
+
     UUpdateRainAsync* Action = NewObject<UUpdateRainAsync>();
     Action->WorldContextObject = WorldContextObject;
     Action->ViewCompPtr = ViewComp;
@@ -34,6 +40,11 @@ UUpdateRainAsync *UUpdateRainAsync::UpdateRainAsync(
 
 void UUpdateRainAsync::Activate()
 {
+    if (!ensureMsgf(IsInGameThread(), TEXT("UUpdateRainAsync::Activate must run on the game thread")))
+    {
+        return;
+    }
+
     if (!ViewCompPtr.IsValid() || !NiagaraCompPtr.IsValid())
     {
         Completed.Broadcast();
@@ -53,6 +64,12 @@ bool UUpdateRainAsync::ApplyRainParameters(
     const float InMaxViewDist,
     const FName& InParam)
 {
+    if (!ensureMsgf(IsInGameThread(),
+        TEXT("UUpdateRainAsync::ApplyRainParameters must mutate components on the game thread")))
+    {
+        return false;
+    }
+
     if (!IsValid(ViewComp) || !IsValid(NiagaraComp))
     {
         return false;

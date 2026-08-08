@@ -13,10 +13,19 @@
 #include "Engine/Texture.h"
 #include "Engine/StaticMesh.h"
 #include "Model/glTFStreamActor.h"
-#include "System/AssetManageSubSystem.h"
+#include "Misc/ScopeExit.h"
 #include "System/glTFRuntimeSafety.h"
 #include "TimerManager.h"
 #include "World/WaterActor.h"
+
+namespace
+{
+    /** Every UObject/component mutation in this action is intentionally game-thread-only. */
+    bool EnsureStreamActionGameThread(const TCHAR* FunctionName)
+    {
+        return ensureMsgf(IsInGameThread(), TEXT("%s must run on the game thread"), FunctionName);
+    }
+}
 
 UStreamAsyncAction *UStreamAsyncAction::StreamAsync(
     UObject *WorldContextObject,
@@ -27,6 +36,11 @@ UStreamAsyncAction *UStreamAsyncAction::StreamAsync(
     int32 InChunkSize,
     bool bInRenderOnly)
 {
+    if (!EnsureStreamActionGameThread(TEXT("UStreamAsyncAction::StreamAsync")))
+    {
+        return nullptr;
+    }
+
     auto *Action = NewObject<UStreamAsyncAction>();
     Action->WorldContextObject = WorldContextObject;
     if (IsValid(Actor))
@@ -57,11 +71,21 @@ UStreamAsyncAction *UStreamAsyncAction::StreamAsync(
 
 void UStreamAsyncAction::CancelAndRelease()
 {
+    if (!EnsureStreamActionGameThread(TEXT("UStreamAsyncAction::CancelAndRelease")))
+    {
+        return;
+    }
+
     AbortAndRelease();
 }
 
 void UStreamAsyncAction::AbortAndRelease(UStaticMesh* OrphanedMesh)
 {
+    if (!EnsureStreamActionGameThread(TEXT("UStreamAsyncAction::AbortAndRelease")))
+    {
+        return;
+    }
+
     bAbortRequested = true;
 
     // Remove only queued work. Active native mesh construction is not interrupted because doing so
@@ -92,7 +116,6 @@ void UStreamAsyncAction::AbortAndRelease(UStaticMesh* OrphanedMesh)
     {
         OwnerActor = nullptr;
         WorldContextObject = nullptr;
-        PendingComp = nullptr;
         return;
     }
 
@@ -105,7 +128,9 @@ void UStreamAsyncAction::AbortAndRelease(UStaticMesh* OrphanedMesh)
 
     if (IsValid(Asset))
     {
-        Asset->ClearCache();
+        // Final cache cleanup is a per-asset barrier. It waits for this callback's native ticket
+        // instead of racing ClearCache against glTFRuntime's worker-owned parser state.
+        FglTFRuntimeSafety::RequestAssetRelease(Asset);
     }
 
     NodeMap.Empty();
@@ -125,7 +150,6 @@ void UStreamAsyncAction::AbortAndRelease(UStaticMesh* OrphanedMesh)
     Asset = nullptr;
     OwnerActor = nullptr;
     WorldContextObject = nullptr;
-    PendingComp = nullptr;
     DecalLight = nullptr;
     CurrentLoadingNode = NAME_None;
     CurrentLoadingMesh = NAME_None;
@@ -136,6 +160,11 @@ void UStreamAsyncAction::AbortAndRelease(UStaticMesh* OrphanedMesh)
 
 void UStreamAsyncAction::Activate()
 {
+    if (!EnsureStreamActionGameThread(TEXT("UStreamAsyncAction::Activate")))
+    {
+        return;
+    }
+
     bAbortRequested = false;
     bStaticMeshLoadInFlight = false;
     GlTFRuntimeOperationTicket = 0;
@@ -224,6 +253,11 @@ void UStreamAsyncAction::Activate()
 
 void UStreamAsyncAction::SanitizeRuntimeMaps()
 {
+    if (!EnsureStreamActionGameThread(TEXT("UStreamAsyncAction::SanitizeRuntimeMaps")))
+    {
+        return;
+    }
+
     for (auto It = NodeMap.CreateIterator(); It; ++It)
     {
         const FModelNodeData& Node = It.Value();
@@ -269,14 +303,9 @@ void UStreamAsyncAction::SanitizeRuntimeMaps()
                 if (IsValid(Component->Get()))
                 {
                     UInstancedStaticMeshComponent* ComponentToDestroy = Component->Get();
-                    UStaticMesh* MeshToRelease = ComponentToDestroy->GetStaticMesh();
                     ComponentToDestroy->ClearInstances();
                     ComponentToDestroy->SetStaticMesh(nullptr);
                     FActorHelper::DestroyComponent(OwnerActor, ComponentToDestroy);
-                    if (UAssetManageSubSystem* AssetManager = UAssetManageSubSystem::Get(OwnerActor))
-                    {
-                        AssetManager->ReleaseStaticMesh(OwnerActor, MeshToRelease);
-                    }
                 }
             }
             InstanceMap.Remove(It.Key());
@@ -302,6 +331,11 @@ void UStreamAsyncAction::SanitizeRuntimeMaps()
 
 void UStreamAsyncAction::ReleaseActionReferences()
 {
+    if (!EnsureStreamActionGameThread(TEXT("UStreamAsyncAction::ReleaseActionReferences")))
+    {
+        return;
+    }
+
     FglTFRuntimeSafety::CancelQueuedOperations(this);
     GlTFRuntimeOperationTicket = 0;
     UWorld* World = IsValid(OwnerActor) ? OwnerActor->GetWorld() : (IsValid(WorldContextObject) ? WorldContextObject->GetWorld() : nullptr);
@@ -313,7 +347,6 @@ void UStreamAsyncAction::ReleaseActionReferences()
     Asset = nullptr;
     OwnerActor = nullptr;
     WorldContextObject = nullptr;
-    PendingComp = nullptr;
     PendingLoadNodes.Empty();
     PendingUnloadNodes.Empty();
     PendingLoadWaterNodes.Empty();
@@ -338,6 +371,11 @@ void UStreamAsyncAction::ReleaseActionReferences()
 
 void UStreamAsyncAction::ProcessChunk()
 {
+    if (!EnsureStreamActionGameThread(TEXT("UStreamAsyncAction::ProcessChunk")))
+    {
+        return;
+    }
+
     if (bAbortRequested || !IsValid(OwnerActor))
     {
         AbortAndRelease();
@@ -435,6 +473,11 @@ float UStreamAsyncAction::GetWaterStreamRadiusSq(const FWaterStreamNodeData& Dat
 
 void UStreamAsyncAction::ProcessLoadWaterNode(const FName& Name)
 {
+    if (!EnsureStreamActionGameThread(TEXT("UStreamAsyncAction::ProcessLoadWaterNode")))
+    {
+        return;
+    }
+
     if (bAbortRequested || LoadedWaterNodes.Contains(Name) || !IsValid(OwnerActor.Get()))
     {
         return;
@@ -470,6 +513,11 @@ void UStreamAsyncAction::ProcessLoadWaterNode(const FName& Name)
 
 void UStreamAsyncAction::ProcessUnloadWaterNode(const FName& Name)
 {
+    if (!EnsureStreamActionGameThread(TEXT("UStreamAsyncAction::ProcessUnloadWaterNode")))
+    {
+        return;
+    }
+
     if (TObjectPtr<AWaterActor>* WaterPtr = WaterActorMap.Find(Name))
     {
         if (IsValid(WaterPtr->Get()))
@@ -484,6 +532,11 @@ void UStreamAsyncAction::ProcessUnloadWaterNode(const FName& Name)
 
 bool UStreamAsyncAction::ProcessLoadNode(const FName &Name)
 {
+    if (!EnsureStreamActionGameThread(TEXT("UStreamAsyncAction::ProcessLoadNode")))
+    {
+        return false;
+    }
+
     if (bAbortRequested)
     {
         return false;
@@ -522,6 +575,11 @@ bool UStreamAsyncAction::ProcessLoadNode(const FName &Name)
 
 void UStreamAsyncAction::ProcessUnloadNode(const FName &Name)
 {
+    if (!EnsureStreamActionGameThread(TEXT("UStreamAsyncAction::ProcessUnloadNode")))
+    {
+        return;
+    }
+
     if (bAbortRequested || !IsValid(OwnerActor.Get()))
     {
         return;
@@ -552,15 +610,12 @@ void UStreamAsyncAction::ProcessUnloadNode(const FName &Name)
         }
         else
         {
-            UStaticMesh* MeshToRelease = ISMC->GetStaticMesh();
+            // The glTFRuntimeAsset ReadWrite cache owns reusable mesh references. Detaching the
+            // component is sufficient; duplicating ownership in a second manager caused stale roots.
             ISMC->ClearInstances();
             ISMC->SetStaticMesh(nullptr);
             FActorHelper::DestroyComponent(OwnerActor, ISMC);
             InstanceMap.Remove(Info->MeshName);
-            if (UAssetManageSubSystem* AssetManager = UAssetManageSubSystem::Get(OwnerActor))
-            {
-                AssetManager->ReleaseStaticMesh(OwnerActor, MeshToRelease);
-            }
         }
         LoadedNodes.Remove(Name);
     }
@@ -585,10 +640,19 @@ void UStreamAsyncAction::ProcessUnloadNode(const FName &Name)
 
 void UStreamAsyncAction::SetStaticMesh(UStaticMesh *StaticMesh)
 {
+    if (!EnsureStreamActionGameThread(TEXT("UStreamAsyncAction::SetStaticMesh")))
+    {
+        return;
+    }
+
     const uint64 CompletedTicket = GlTFRuntimeOperationTicket;
     GlTFRuntimeOperationTicket = 0;
-    FglTFRuntimeSafety::CompleteOperation(CompletedTicket);
     bStaticMeshLoadInFlight = false;
+    ON_SCOPE_EXIT
+    {
+        // Keep the parser slot active until component creation/abort cleanup has finished.
+        FglTFRuntimeSafety::CompleteOperation(CompletedTicket);
+    };
     if (bAbortRequested || !IsValid(OwnerActor))
     {
         AbortAndRelease(StaticMesh);
@@ -610,11 +674,9 @@ void UStreamAsyncAction::SetStaticMesh(UStaticMesh *StaticMesh)
         return;
     }
 
+    // ReadWrite caching is owned by this UglTFRuntimeAsset. No second root-managed mesh registry
+    // is needed, and all components for this actor receive the exact cached mesh instance.
     UStaticMesh* MeshToUse = StaticMesh;
-    if (UAssetManageSubSystem* AssetManager = UAssetManageSubSystem::Get(OwnerActor))
-    {
-        MeshToUse = AssetManager->AcquireStaticMesh(OwnerActor, CurrentLoadingMesh, StaticMesh);
-    }
 
     UInstancedStaticMeshComponent *ISMC = InstanceMap.FindRef(CurrentLoadingMesh);
     if (!IsValid(ISMC))
@@ -646,13 +708,6 @@ void UStreamAsyncAction::SetStaticMesh(UStaticMesh *StaticMesh)
     }
     else
     {
-        if (MeshToUse != StaticMesh)
-        {
-            if (UAssetManageSubSystem* AssetManager = UAssetManageSubSystem::Get(OwnerActor))
-            {
-                AssetManager->ReleaseStaticMesh(OwnerActor, MeshToUse);
-            }
-        }
         ResetLoadState();
     }
 }
@@ -669,6 +724,11 @@ FORCEINLINE float CalculateLODScreenSize(int32 i, int32 N)
 
 void UStreamAsyncAction::LoadStaticMeshAsync(const FName &MeshName)
 {
+    if (!EnsureStreamActionGameThread(TEXT("UStreamAsyncAction::LoadStaticMeshAsync")))
+    {
+        return;
+    }
+
     if (bAbortRequested || !IsValid(Asset))
     {
         AbortAndRelease();
@@ -705,7 +765,6 @@ void UStreamAsyncAction::LoadStaticMeshAsync(const FName &MeshName)
         Config.bBuildComplexCollision = !bRenderOnly && Mesh->Data.bComplexCollision;
         Config.bBuildSimpleCollision = !bRenderOnly && Mesh->Data.bSimpleCollision;
         Config.bBuildNavCollision = !bRenderOnly && Config.bBuildNavCollision;
-        Config.bBuildLumenCards = Config.bBuildLumenCards;
         if (bRenderOnly)
         {
             Config.CollisionComplexity = ECollisionTraceFlag::CTF_UseDefault;
@@ -713,29 +772,32 @@ void UStreamAsyncAction::LoadStaticMeshAsync(const FName &MeshName)
         Config.LODScreenSize = LODScreenSize;
         Config.LODScreenSizeMultiplier = 1.0f;
 
-        // This is the exact crash-sensitive entry point from the supplied call stack. Queue it
-        // globally so only one allocation-heavy glTFRuntime mesh builder runs at a time.
+        // This is the crash-sensitive native entry point. The coordinator permits bounded
+        // cross-GLB parallelism but never overlaps two cache-mutating builds on this Asset.
         const TArray<int32> RequestedIndices = LocalIndices;
         const FglTFRuntimeStaticMeshConfig RequestedConfig = Config;
         const FName RequestedNode = CurrentLoadingNode;
         const FName RequestedMesh = CurrentLoadingMesh;
         TWeakObjectPtr<UStreamAsyncAction> WeakThis(this);
         bStaticMeshLoadInFlight = true;
-        GlTFRuntimeOperationTicket = FglTFRuntimeSafety::EnqueueOperation(
+        const uint64 SubmittedTicket = FglTFRuntimeSafety::EnqueueOperation(
             this,
+            Asset,
             FString::Printf(TEXT("Stream mesh %s for node %s"), *RequestedMesh.ToString(), *RequestedNode.ToString()),
             [WeakThis, RequestedIndices, RequestedConfig](const uint64 Ticket)
             {
                 UStreamAsyncAction* StrongThis = WeakThis.Get();
                 if (!IsValid(StrongThis) || StrongThis->bAbortRequested || !IsValid(StrongThis->Asset))
                 {
-                    FglTFRuntimeSafety::CompleteOperation(Ticket);
                     if (IsValid(StrongThis))
                     {
                         StrongThis->GlTFRuntimeOperationTicket = 0;
                         StrongThis->bStaticMeshLoadInFlight = false;
                         StrongThis->AbortAndRelease();
                     }
+                    // Request teardown while the active slot still protects this parser, then
+                    // return the ticket so the pending cache release becomes executable.
+                    FglTFRuntimeSafety::CompleteOperation(Ticket);
                     return;
                 }
 
@@ -756,6 +818,10 @@ void UStreamAsyncAction::LoadStaticMeshAsync(const FName &MeshName)
                 StrongThis->bStaticMeshLoadInFlight = false;
                 if (StrongThis->bAbortRequested)
                 {
+                    // A queued request can be cancelled before the native callback ever runs.
+                    // Finish the deferred release here; otherwise the action and parser asset
+                    // remain rooted by each other after world teardown.
+                    StrongThis->AbortAndRelease();
                     return;
                 }
 
@@ -767,6 +833,13 @@ void UStreamAsyncAction::LoadStaticMeshAsync(const FName &MeshName)
                 StrongThis->NodeMap.Remove(RequestedNode);
                 StrongThis->ResetLoadState();
             });
+
+        // A ReadWrite cache hit may invoke the plugin callback before EnqueueOperation returns.
+        // Preserve the callback's completed state instead of restoring a stale ticket afterwards.
+        if (bStaticMeshLoadInFlight && GlTFRuntimeOperationTicket == 0)
+        {
+            GlTFRuntimeOperationTicket = SubmittedTicket;
+        }
     }
     else
     {
@@ -776,6 +849,11 @@ void UStreamAsyncAction::LoadStaticMeshAsync(const FName &MeshName)
 
 void UStreamAsyncAction::AddTrasnform(const FName &Name, UInstancedStaticMeshComponent *ISMC)
 {
+    if (!EnsureStreamActionGameThread(TEXT("UStreamAsyncAction::AddTrasnform")))
+    {
+        return;
+    }
+
     if (bAbortRequested || !IsValid(OwnerActor.Get()))
     {
         ResetLoadState();
@@ -819,6 +897,11 @@ void UStreamAsyncAction::AddTrasnform(const FName &Name, UInstancedStaticMeshCom
 
 void UStreamAsyncAction::SpawnStreamComponents(const FName &NodeName, const FModelNodeData &NodeInfo, const FMeshData &Data)
 {
+    if (!EnsureStreamActionGameThread(TEXT("UStreamAsyncAction::SpawnStreamComponents")))
+    {
+        return;
+    }
+
     FComponentGroup *ExistingGroupPtr = DynamicComponentMap.Find(NodeName);
     if (ExistingGroupPtr && (ExistingGroupPtr->Colliders.Num() > 0 || ExistingGroupPtr->Lights.Num() > 0))
     {
@@ -906,6 +989,11 @@ void UStreamAsyncAction::SpawnStreamComponents(const FName &NodeName, const FMod
 
 void UStreamAsyncAction::DestroyStreamComponents(const FName &NodeName)
 {
+    if (!EnsureStreamActionGameThread(TEXT("UStreamAsyncAction::DestroyStreamComponents")))
+    {
+        return;
+    }
+
     FComponentGroup *GroupPtr = DynamicComponentMap.Find(NodeName);
     if (!GroupPtr)
         return;
@@ -934,17 +1022,26 @@ void UStreamAsyncAction::DestroyStreamComponents(const FName &NodeName)
 
 void UStreamAsyncAction::ResetLoadState()
 {
+    if (!EnsureStreamActionGameThread(TEXT("UStreamAsyncAction::ResetLoadState")))
+    {
+        return;
+    }
+
     bIsLoading = false;
     bStaticMeshLoadInFlight = false;
     GlTFRuntimeOperationTicket = 0;
     CurrentLoadingNode = NAME_None;
     CurrentLoadingMesh = NAME_None;
-    PendingComp = nullptr;
     BroadcastProgress();
 }
 
 void UStreamAsyncAction::BroadcastProgress()
 {
+    if (!EnsureStreamActionGameThread(TEXT("UStreamAsyncAction::BroadcastProgress")))
+    {
+        return;
+    }
+
     if (TotalOperationCount <= 0)
     {
         Progress.Broadcast(1.0f);

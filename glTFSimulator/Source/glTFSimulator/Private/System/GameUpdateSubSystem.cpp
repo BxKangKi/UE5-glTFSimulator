@@ -5,12 +5,26 @@
 #include "Engine/World.h"
 #include "Subsystems/SubsystemCollection.h"
 
+namespace
+{
+    /** The dispatcher owns UObject weak pointers and callback containers, so one thread must mutate it. */
+    bool EnsureGameUpdateThread(const TCHAR* Context)
+    {
+        return ensureMsgf(IsInGameThread(), TEXT("%s must run on the game thread"), Context);
+    }
+}
+
 UGameUpdateSubSystem::UGameUpdateSubSystem()
 {
 }
 
 UGameUpdateSubSystem* UGameUpdateSubSystem::Get(const UObject* WorldContextObject)
 {
+    if (!EnsureGameUpdateThread(TEXT("UGameUpdateSubSystem::Get")))
+    {
+        return nullptr;
+    }
+
     if (!IsValid(WorldContextObject))
     {
         return nullptr;
@@ -41,6 +55,7 @@ UGameUpdateSubSystem* UGameUpdateSubSystem::Get(const UObject* WorldContextObjec
 
 void UGameUpdateSubSystem::Initialize(FSubsystemCollectionBase& Collection)
 {
+    check(IsInGameThread());
     Super::Initialize(Collection);
     bInitialized = true;
     MarkDispatchOrderDirty();
@@ -48,6 +63,7 @@ void UGameUpdateSubSystem::Initialize(FSubsystemCollectionBase& Collection)
 
 void UGameUpdateSubSystem::Deinitialize()
 {
+    check(IsInGameThread());
     bInitialized = false;
     bIsDispatching = false;
     bSortedHandlesDirty = true;
@@ -65,6 +81,11 @@ UWorld* UGameUpdateSubSystem::GetTickableGameObjectWorld() const
 
 int32 UGameUpdateSubSystem::RegisterUpdate(UObject* Owner, TFunction<void(float)>&& UpdateFunction, int32 Priority)
 {
+    if (!EnsureGameUpdateThread(TEXT("UGameUpdateSubSystem::RegisterUpdate")))
+    {
+        return INDEX_NONE;
+    }
+
     if (!IsValid(Owner) || !UpdateFunction)
     {
         return INDEX_NONE;
@@ -83,6 +104,11 @@ int32 UGameUpdateSubSystem::RegisterUpdate(UObject* Owner, TFunction<void(float)
 
 void UGameUpdateSubSystem::UnregisterUpdate(int32 Handle)
 {
+    if (!EnsureGameUpdateThread(TEXT("UGameUpdateSubSystem::UnregisterUpdate")))
+    {
+        return;
+    }
+
     if (Handle == INDEX_NONE)
     {
         return;
@@ -102,6 +128,11 @@ void UGameUpdateSubSystem::UnregisterUpdate(int32 Handle)
 
 void UGameUpdateSubSystem::UnregisterOwner(const UObject* Owner)
 {
+    if (!EnsureGameUpdateThread(TEXT("UGameUpdateSubSystem::UnregisterOwner")))
+    {
+        return;
+    }
+
     if (!Owner)
     {
         return;
@@ -125,6 +156,11 @@ void UGameUpdateSubSystem::UnregisterOwner(const UObject* Owner)
 
 void UGameUpdateSubSystem::Tick(float DeltaTime)
 {
+    if (!EnsureGameUpdateThread(TEXT("UGameUpdateSubSystem::Tick")))
+    {
+        return;
+    }
+
     if (!bInitialized)
     {
         return;

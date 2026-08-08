@@ -28,7 +28,6 @@ class UglTFStreamSubSystem;
 class UGameSettings;
 class UPostProcessComponent;
 class AGameManagerActor;
-class UAssetManageSubSystem;
 class UWorld;
 class APlayerController;
 
@@ -790,7 +789,6 @@ private:
     void DestroyTrackedRuntimeActors();
     void ResetWorldRuntimeReferences();
     void RequestRuntimeGarbageCollection(const TCHAR* Reason) const;
-    UAssetManageSubSystem* GetAssetManagerSubsystem() const;
     void PrepareForMenuLevelTravelRequest();
     void FinalizeWorldSelectionTravelState();
     void RequestPostLoadRuntimeMemoryCleanup();

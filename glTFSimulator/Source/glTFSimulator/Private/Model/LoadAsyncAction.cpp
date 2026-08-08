@@ -4,25 +4,15 @@
 #include "Model/LoadAsyncAction.h"
 
 #include "Dom/JsonObject.h"
+#include "Dom/JsonValue.h"
 #include "Engine/StaticMesh.h"
-#include "Engine/Texture2D.h"
 #include "Engine/World.h"
-#include "HAL/FileManager.h"
-#include "IImageWrapper.h"
-#include "IImageWrapperModule.h"
-#include "Misc/CoreMisc.h"
-#include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
-#include "Modules/ModuleManager.h"
-#include "Serialization/JsonReader.h"
-#include "Serialization/JsonSerializer.h"
-#include "Serialization/JsonWriter.h"
-#include "Setting/GameSettings.h"
+#include "Misc/ScopeExit.h"
 #include "System/FileFunctionLibrary.h"
 #include "System/JsonHelper.h"
 #include "System/SafeFileIO.h"
 #include "System/glTFRuntimeSafety.h"
-#include "System/MacroLibrary.h"
 #include "System/StringHelper.h"
 #include "TimerManager.h"
 
@@ -66,34 +56,20 @@ namespace
         return FStringHelper::GetTextAfterChar(NodeName, ';').ToUpper().Contains(TEXT("WATER"));
     }
 
-    static void ResizeRGBA8Texture(const TArray<uint8>& SourcePixels, int32 SourceWidth, int32 SourceHeight, int32 TargetWidth, int32 TargetHeight, TArray<uint8>& OutPixels)
+    /** UObject, timer, delegate, and glTFRuntimeAsset access is confined to the game thread. */
+    static bool EnsureLoadActionGameThread(const TCHAR* FunctionName)
     {
-        OutPixels.Reset();
-        if (SourceWidth <= 0 || SourceHeight <= 0 || TargetWidth <= 0 || TargetHeight <= 0 || SourcePixels.Num() < SourceWidth * SourceHeight * 4)
-        {
-            return;
-        }
-
-        OutPixels.SetNumUninitialized(TargetWidth * TargetHeight * 4);
-        const float XScale = static_cast<float>(SourceWidth) / static_cast<float>(TargetWidth);
-        const float YScale = static_cast<float>(SourceHeight) / static_cast<float>(TargetHeight);
-
-        for (int32 Y = 0; Y < TargetHeight; ++Y)
-        {
-            const int32 SourceY = FMath::Clamp(FMath::FloorToInt((static_cast<float>(Y) + 0.5f) * YScale), 0, SourceHeight - 1);
-            for (int32 X = 0; X < TargetWidth; ++X)
-            {
-                const int32 SourceX = FMath::Clamp(FMath::FloorToInt((static_cast<float>(X) + 0.5f) * XScale), 0, SourceWidth - 1);
-                const int32 SourceIndex = (SourceY * SourceWidth + SourceX) * 4;
-                const int32 TargetIndex = (Y * TargetWidth + X) * 4;
-                OutPixels[TargetIndex + 0] = SourcePixels[SourceIndex + 0];
-                OutPixels[TargetIndex + 1] = SourcePixels[SourceIndex + 1];
-                OutPixels[TargetIndex + 2] = SourcePixels[SourceIndex + 2];
-                OutPixels[TargetIndex + 3] = SourcePixels[SourceIndex + 3];
-            }
-        }
+        return ensureMsgf(IsInGameThread(), TEXT("%s must run on the game thread"), FunctionName);
     }
+
+    /** Pure-data payload transferred from the JSON worker back to the game thread. */
+    struct FModelJsonWorkerResult
+    {
+        FModelData ModelData;
+        TArray<FString> Warnings;
+    };
 }
+
 
 ULoadAsyncAction *ULoadAsyncAction::LoadAsync(
     UObject *WorldContextObject,
@@ -102,12 +78,16 @@ ULoadAsyncAction *ULoadAsyncAction::LoadAsync(
     const int32 ChunkSize,
     const FString& InJsonFilePath)
 {
+    if (!EnsureLoadActionGameThread(TEXT("ULoadAsyncAction::LoadAsync")))
+    {
+        return nullptr;
+    }
+
     auto *Action = NewObject<ULoadAsyncAction>();
     Action->WorldContextObject = WorldContextObject;
     Action->Asset = Asset;
     Action->StaticMeshConfig = StaticMeshConfig;
     Action->ChunkSize = FMath::Max(1, ChunkSize);
-    Action->MaxTextureDimension = UGameSettings::ResolveMaxTextureResolution(WorldContextObject);
     Action->JsonFilePath = InJsonFilePath;
     Action->RegisterWithGameInstance(WorldContextObject);
     return Action;
@@ -115,6 +95,11 @@ ULoadAsyncAction *ULoadAsyncAction::LoadAsync(
 
 void ULoadAsyncAction::Activate()
 {
+    if (!EnsureLoadActionGameThread(TEXT("ULoadAsyncAction::Activate")))
+    {
+        return;
+    }
+
     bCancelled = false;
     bStaticMeshLoadInFlight = false;
     GlTFRuntimeOperationTicket = 0;
@@ -172,88 +157,90 @@ void ULoadAsyncAction::Activate()
 
 void ULoadAsyncAction::LoadJsonAsync()
 {
+    if (!EnsureLoadActionGameThread(TEXT("ULoadAsyncAction::LoadJsonAsync")))
+    {
+        return;
+    }
+
     const FString LocalJsonPath = JsonFilePath;
     TWeakObjectPtr<ULoadAsyncAction> WeakThis(this);
 
     const bool bWorkerQueued = FSafeFileIO::RunTrackedWorker([WeakThis, LocalJsonPath]()
     {
-        auto WriteLoadLog = [](const FString& Message)
-        {
-            UFileFunctionLibrary::WriteSimulatorLogAsync(TEXT("LoadAsyncAction"), Message);
-        };
-
-        auto CreateDefaultJson = [](const FString& Path) -> bool
-        {
-            UFileFunctionLibrary::GenerateDirectory(Path);
-
-            FModelData EmptyData;
-            TSharedRef<FJsonObject> RootObject = EmptyData.Serialization();
-
-            FString OutputString;
-            TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutputString);
-            if (FJsonSerializer::Serialize(RootObject, Writer))
-            {
-                return FFileHelper::SaveStringToFile(OutputString, *Path, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
-            }
-
-            return false;
-        };
+        // Worker code is intentionally limited to POD/container data and the non-UObject file
+        // service. Calling a UBlueprintFunctionLibrary from this thread would make its future
+        // implementation changes an accidental game-thread violation.
+        FModelJsonWorkerResult WorkerResult;
 
         if (!FPaths::FileExists(LocalJsonPath))
         {
-            WriteLoadLog(FString::Printf(TEXT("JSON file not found. Creating default JSON: %s"), *LocalJsonPath));
-            if (!CreateDefaultJson(LocalJsonPath))
+            WorkerResult.Warnings.Add(FString::Printf(
+                TEXT("JSON file not found. Creating default JSON: %s"),
+                *LocalJsonPath));
+
+            FModelData EmptyData;
+            const FSafeFileWriteResult SaveResult = FSafeFileIO::SaveJsonBlocking(
+                EmptyData.Serialization(),
+                LocalJsonPath,
+                MAX_MODEL_JSON_BYTES);
+            if (!SaveResult.IsSuccess())
             {
-                WriteLoadLog(FString::Printf(TEXT("Failed to create default JSON: %s"), *LocalJsonPath));
+                WorkerResult.Warnings.Add(FString::Printf(
+                    TEXT("Failed to create default JSON. Path=%s Reason=%s"),
+                    *LocalJsonPath,
+                    *SaveResult.Error));
             }
         }
 
-        FString JsonString;
-        FModelData TemporaryModelData;
-        const int64 JsonFileSize = IFileManager::Get().FileSize(*LocalJsonPath);
-
-        if (JsonFileSize >= 0 && JsonFileSize <= MAX_MODEL_JSON_BYTES &&
-            FFileHelper::LoadFileToString(JsonString, *LocalJsonPath))
+        FSafeJsonLimits JsonLimits;
+        JsonLimits.MaxFileBytes = MAX_MODEL_JSON_BYTES;
+        JsonLimits.MaxContainerEntries = MAX_MODEL_NODE_COUNT;
+        JsonLimits.bAllowBackupRecovery = true;
+        const FSafeJsonLoadResult LoadResult = FSafeFileIO::LoadJsonBlocking(LocalJsonPath, JsonLimits);
+        if (LoadResult.IsSuccess())
         {
-            TSharedPtr<FJsonObject> JsonObject;
-            TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonString);
+            const TSharedPtr<FJsonObject>& JsonObject = LoadResult.JsonObject;
+            WorkerResult.ModelData.Deserialization(JsonObject);
 
-            if (FJsonSerializer::Deserialize(Reader, JsonObject) && JsonObject.IsValid())
+            if (WorkerResult.ModelData.MeshData.Num() == 0)
             {
-                TemporaryModelData.Deserialization(JsonObject);
-
-                if (TemporaryModelData.MeshData.Num() == 0)
+                // Backward compatibility: also read the old MeshData array format. This remains
+                // bounded by FSafeFileIO's depth/value/container limits before this loop is entered.
+                const TArray<TSharedPtr<FJsonValue>>* JsonArrayPtr = nullptr;
+                if (JsonObject->TryGetArrayField(TEXT("MeshData"), JsonArrayPtr) && JsonArrayPtr)
                 {
-                    // Backward compatibility: also read the old MeshData array format.
-                    const TArray<TSharedPtr<FJsonValue>>* JsonArrayPtr = nullptr;
-                    if (JsonObject->TryGetArrayField(TEXT("MeshData"), JsonArrayPtr) && JsonArrayPtr)
+                    for (const TSharedPtr<FJsonValue>& Value : *JsonArrayPtr)
                     {
-                        for (const TSharedPtr<FJsonValue>& Value : *JsonArrayPtr)
+                        if (Value.IsValid() && Value->Type == EJson::Object)
                         {
-                            if (Value.IsValid() && Value->Type == EJson::Object)
+                            const TSharedPtr<FJsonObject> MeshObj = Value->AsObject();
+                            FMeshData MeshData;
+                            if (MeshData.Deserialization(MeshObj))
                             {
-                                TSharedPtr<FJsonObject> MeshObj = Value->AsObject();
-                                FMeshData MeshData;
-                                if (MeshData.Deserialization(MeshObj))
-                                {
-                                    TemporaryModelData.MeshData.Add(NAME_None, MeshData);
-                                }
+                                WorkerResult.ModelData.MeshData.Add(NAME_None, MeshData);
                             }
                         }
                     }
                 }
             }
-            else
+
+            if (LoadResult.bRecoveredFromBackup)
             {
-                WriteLoadLog(FString::Printf(TEXT("JSON is damaged or unreadable: %s"), *LocalJsonPath));
+                WorkerResult.Warnings.Add(FString::Printf(
+                    TEXT("Recovered model metadata from the backup copy: %s"),
+                    *LocalJsonPath));
             }
         }
         else
         {
-            WriteLoadLog(FString::Printf(TEXT("Failed to read JSON or file exceeds %lld bytes: %s"), MAX_MODEL_JSON_BYTES, *LocalJsonPath));
+            WorkerResult.Warnings.Add(FString::Printf(
+                TEXT("Failed to read bounded model JSON. Path=%s Reason=%s"),
+                *LocalJsonPath,
+                *LoadResult.Error));
         }
 
-        if (!FSafeFileIO::DispatchTrackedGameThread([WeakThis, TemporaryModelData]()
+        if (!FSafeFileIO::DispatchTrackedGameThread(
+            [WeakThis, WorkerResult = MoveTemp(WorkerResult)]() mutable
         {
             ULoadAsyncAction* StrongThis = WeakThis.Get();
             if (!StrongThis)
@@ -268,7 +255,12 @@ void ULoadAsyncAction::LoadJsonAsync()
                 return;
             }
 
-            StrongThis->LoadedJsonModelData = TemporaryModelData;
+            for (const FString& Warning : WorkerResult.Warnings)
+            {
+                StrongThis->WriteLogAsync(Warning);
+            }
+
+            StrongThis->LoadedJsonModelData = MoveTemp(WorkerResult.ModelData);
             StrongThis->ProcessChunk();
         }))
         {
@@ -286,25 +278,13 @@ void ULoadAsyncAction::LoadJsonAsync()
     }
 }
 
-bool ULoadAsyncAction::CreateDefaultJsonFile(const FString& Path)
-{
-    UFileFunctionLibrary::GenerateDirectory(Path);
-
-    FModelData EmptyData;
-    TSharedRef<FJsonObject> RootObject = EmptyData.Serialization();
-
-    FString OutputString;
-    TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutputString);
-    if (FJsonSerializer::Serialize(RootObject, Writer))
-    {
-        return FFileHelper::SaveStringToFile(OutputString, *Path, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
-    }
-
-    return false;
-}
-
 void ULoadAsyncAction::ProcessChunk()
 {
+    if (!EnsureLoadActionGameThread(TEXT("ULoadAsyncAction::ProcessChunk")))
+    {
+        return;
+    }
+
     if (bCancelled)
     {
         ReleaseActionReferences();
@@ -346,11 +326,16 @@ void ULoadAsyncAction::ProcessChunk()
 
 void ULoadAsyncAction::CancelAndRelease()
 {
+    if (!EnsureLoadActionGameThread(TEXT("ULoadAsyncAction::CancelAndRelease")))
+    {
+        return;
+    }
+
     bCancelled = true;
     Completed.Clear();
     Progress.Clear();
 
-    // Remove a request that is waiting in the process-wide queue. Native work already running is
+    // Remove a request that is waiting in the per-asset queue. Native work already running is
     // allowed to finish and will release its ticket from the plugin's terminal callback.
     FglTFRuntimeSafety::CancelQueuedOperations(this);
 
@@ -370,6 +355,11 @@ void ULoadAsyncAction::CancelAndRelease()
 
 void ULoadAsyncAction::ReleaseActionReferences()
 {
+    if (!EnsureLoadActionGameThread(TEXT("ULoadAsyncAction::ReleaseActionReferences")))
+    {
+        return;
+    }
+
     bCancelled = true;
 
     // Never clear an active ticket or parser while glTFRuntime still owns native work. The terminal
@@ -391,12 +381,9 @@ void ULoadAsyncAction::ReleaseActionReferences()
 
     if (IsValid(Asset))
     {
-        Asset->ClearCache();
-        if (Asset->IsRooted())
-        {
-            Asset->RemoveFromRoot();
-        }
-        Asset->ClearFlags(RF_Public | RF_Standalone);
+        // The coordinator keeps Asset alive and waits for this parser's native work to finish
+        // before clearing mutable glTFRuntime caches. Direct ClearCache here could race a worker.
+        FglTFRuntimeSafety::RequestAssetRelease(Asset);
     }
 
     Completed.Clear();
@@ -417,6 +404,11 @@ void ULoadAsyncAction::ReleaseActionReferences()
 
 void ULoadAsyncAction::SanitizeParsedData()
 {
+    if (!EnsureLoadActionGameThread(TEXT("ULoadAsyncAction::SanitizeParsedData")))
+    {
+        return;
+    }
+
     for (auto It = MeshMap.CreateIterator(); It; ++It)
     {
         FModelMeshData& RuntimeMeshData = It.Value();
@@ -468,6 +460,11 @@ void ULoadAsyncAction::SanitizeParsedData()
 
 void ULoadAsyncAction::RefreshGeneratedModelData()
 {
+    if (!EnsureLoadActionGameThread(TEXT("ULoadAsyncAction::RefreshGeneratedModelData")))
+    {
+        return;
+    }
+
     GeneratedModelData = LoadedJsonModelData;
     // Mesh customization is optional user-authored data. Never auto-generate one entry per glTF node/mesh.
     GeneratedModelData.MeshData.Empty();
@@ -522,6 +519,11 @@ void ULoadAsyncAction::SaveGeneratedJsonAsync() const
 
 void ULoadAsyncAction::CalculateSize()
 {
+    if (!EnsureLoadActionGameThread(TEXT("ULoadAsyncAction::CalculateSize")))
+    {
+        return;
+    }
+
     if (bCancelled || !IsValid(Asset))
     {
         ReleaseActionReferences();
@@ -588,21 +590,21 @@ void ULoadAsyncAction::CalculateSize()
     }
     else
     {
-        // Serialize allocation-heavy plugin builders. This prevents world metadata, streamed
-        // meshes, prefabs, vehicles, weapons, and characters from building concurrently.
+        // The coordinator serializes this parser's mutable cache, while allowing other GLB
+        // assets to calculate bounds concurrently under the global memory cap.
         const int32 RequestedMeshIndex = CurrentNode.MeshIndex;
         const FglTFRuntimeStaticMeshConfig RequestedConfig = StaticMeshConfig;
         TWeakObjectPtr<ULoadAsyncAction> WeakThis(this);
         bStaticMeshLoadInFlight = true;
-        GlTFRuntimeOperationTicket = FglTFRuntimeSafety::EnqueueOperation(
+        const uint64 SubmittedTicket = FglTFRuntimeSafety::EnqueueOperation(
             this,
+            Asset,
             FString::Printf(TEXT("Model metadata mesh %d"), RequestedMeshIndex),
             [WeakThis, RequestedMeshIndex, RequestedConfig](const uint64 Ticket)
             {
                 ULoadAsyncAction* StrongThis = WeakThis.Get();
                 if (!IsValid(StrongThis) || StrongThis->bCancelled || !IsValid(StrongThis->Asset))
                 {
-                    FglTFRuntimeSafety::CompleteOperation(Ticket);
                     if (IsValid(StrongThis))
                     {
                         StrongThis->GlTFRuntimeOperationTicket = 0;
@@ -610,6 +612,9 @@ void ULoadAsyncAction::CalculateSize()
                         StrongThis->ReleaseActionReferences();
                         StrongThis->SetReadyToDestroy();
                     }
+                    // Keep the ticket active until release has been requested. Completing first
+                    // could allow another queued operation to reuse this parser before teardown.
+                    FglTFRuntimeSafety::CompleteOperation(Ticket);
                     return;
                 }
 
@@ -641,12 +646,24 @@ void ULoadAsyncAction::CalculateSize()
                 StrongThis->MeshMap.Remove(StrongThis->CurrentMeshName);
                 StrongThis->UpdateNext();
             });
+
+        // EnqueueOperation may start immediately. Do not overwrite state after a synchronous cache-hit
+        // callback has already completed and reset the action.
+        if (bStaticMeshLoadInFlight && GlTFRuntimeOperationTicket == 0)
+        {
+            GlTFRuntimeOperationTicket = SubmittedTicket;
+        }
     }
 }
 
 
 void ULoadAsyncAction::UpdateWaterNodeData()
 {
+    if (!EnsureLoadActionGameThread(TEXT("ULoadAsyncAction::UpdateWaterNodeData")))
+    {
+        return;
+    }
+
     const FName NodeName(*CurrentNode.Name.TrimStartAndEnd());
     if (NodeName.IsNone() || !IsFiniteTransform(CurrentNode.Transform))
     {
@@ -668,6 +685,11 @@ void ULoadAsyncAction::UpdateWaterNodeData()
 
 void ULoadAsyncAction::UpdateModelNodeData()
 {
+    if (!EnsureLoadActionGameThread(TEXT("ULoadAsyncAction::UpdateModelNodeData")))
+    {
+        return;
+    }
+
     const FName NodeName(*CurrentNode.Name.TrimStartAndEnd());
     if (NodeName.IsNone() || CurrentMeshName.IsNone() || !MeshMap.Contains(CurrentMeshName) ||
         !IsFiniteTransform(CurrentNode.Transform))
@@ -687,11 +709,20 @@ void ULoadAsyncAction::UpdateModelNodeData()
 
 void ULoadAsyncAction::GetStaticMesh(UStaticMesh *StaticMesh)
 {
-    // The plugin callback is the only safe point to release an active native-operation ticket.
+    if (!EnsureLoadActionGameThread(TEXT("ULoadAsyncAction::GetStaticMesh")))
+    {
+        return;
+    }
+
+    // Keep the coordinator ticket active until all callback-side UObject work is complete. If
+    // cancellation requested cache release, the cache barrier is finalized by this scope exit.
     const uint64 CompletedTicket = GlTFRuntimeOperationTicket;
     GlTFRuntimeOperationTicket = 0;
-    FglTFRuntimeSafety::CompleteOperation(CompletedTicket);
     bStaticMeshLoadInFlight = false;
+    ON_SCOPE_EXIT
+    {
+        FglTFRuntimeSafety::CompleteOperation(CompletedTicket);
+    };
     if (bCancelled)
     {
         if (IsValid(StaticMesh) && !StaticMesh->IsAsset())
@@ -736,6 +767,11 @@ void ULoadAsyncAction::GetStaticMesh(UStaticMesh *StaticMesh)
 
 void ULoadAsyncAction::UpdateNext()
 {
+    if (!EnsureLoadActionGameThread(TEXT("ULoadAsyncAction::UpdateNext")))
+    {
+        return;
+    }
+
     if (bCancelled || !IsValid(WorldContextObject.Get()))
     {
         ReleaseActionReferences();
@@ -768,81 +804,6 @@ void ULoadAsyncAction::UpdateNext()
     else
     {
         ProcessChunk();
-    }
-}
-
-void ULoadAsyncAction::LoadTextureAsync(FString ImagePath)
-{
-    TWeakObjectPtr<ULoadAsyncAction> WeakThis(this);
-    const int32 TextureDimensionLimit = FMath::Clamp(MaxTextureDimension, 64, 8192);
-    const bool bWorkerQueued = FSafeFileIO::RunTrackedWorker(
-        [ImagePath, WeakThis, TextureDimensionLimit]()
-    {
-        TArray<uint8> RawFileData;
-        if (!FFileHelper::LoadFileToArray(RawFileData, *ImagePath))
-        {
-            return;
-        }
-
-        IImageWrapperModule& ImageWrapperModule = FModuleManager::LoadModuleChecked<IImageWrapperModule>(FName("ImageWrapper"));
-        EImageFormat Format = ImageWrapperModule.DetectImageFormat(RawFileData.GetData(), RawFileData.Num());
-        TSharedPtr<IImageWrapper> ImageWrapper = ImageWrapperModule.CreateImageWrapper(Format);
-
-        if (ImageWrapper.IsValid() && ImageWrapper->SetCompressed(RawFileData.GetData(), RawFileData.Num()))
-        {
-            TArray<uint8> UncompressedRGBA;
-            if (ImageWrapper->GetRaw(ERGBFormat::RGBA, 8, UncompressedRGBA))
-            {
-                int32 Width = ImageWrapper->GetWidth();
-                int32 Height = ImageWrapper->GetHeight();
-
-                const int32 LargestDimension = FMath::Max(Width, Height);
-                if (LargestDimension > TextureDimensionLimit)
-                {
-                    const float ResizeScale = static_cast<float>(TextureDimensionLimit) / static_cast<float>(LargestDimension);
-                    const int32 TargetWidth = FMath::Max(1, FMath::RoundToInt(static_cast<float>(Width) * ResizeScale));
-                    const int32 TargetHeight = FMath::Max(1, FMath::RoundToInt(static_cast<float>(Height) * ResizeScale));
-
-                    TArray<uint8> ResizedRGBA;
-                    ResizeRGBA8Texture(UncompressedRGBA, Width, Height, TargetWidth, TargetHeight, ResizedRGBA);
-                    if (ResizedRGBA.Num() == TargetWidth * TargetHeight * 4)
-                    {
-                        UncompressedRGBA = MoveTemp(ResizedRGBA);
-                        Width = TargetWidth;
-                        Height = TargetHeight;
-                    }
-                }
-
-                if (!FSafeFileIO::DispatchTrackedGameThread(
-                    [WeakThis, Width, Height, PixelData = MoveTemp(UncompressedRGBA)]() mutable
-                {
-                    ULoadAsyncAction* StrongThis = WeakThis.Get();
-                    if (!IsValid(StrongThis) || StrongThis->bCancelled)
-                    {
-                        return;
-                    }
-
-                    UTexture2D* NewTexture = UTexture2D::CreateTransient(Width, Height, PF_R8G8B8A8);
-                    if (NewTexture && PixelData.Num() == Width * Height * 4)
-                    {
-                        void* TextureData = NewTexture->GetPlatformData()->Mips[0].BulkData.Lock(LOCK_READ_WRITE);
-                        FMemory::Memcpy(TextureData, PixelData.GetData(), PixelData.Num());
-                        NewTexture->GetPlatformData()->Mips[0].BulkData.Unlock();
-                        NewTexture->UpdateResource();
-                    }
-                }))
-                {
-                    // Pixel data is released with the rejected continuation during shutdown.
-                    return;
-                }
-            }
-        }
-    });
-
-    if (!bWorkerQueued)
-    {
-        // Texture loading is optional; shutdown rejection requires no UObject-side completion.
-        return;
     }
 }
 

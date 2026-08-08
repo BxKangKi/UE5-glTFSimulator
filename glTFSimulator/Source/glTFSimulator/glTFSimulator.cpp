@@ -17,14 +17,10 @@ void FglTFSimulatorModule::ShutdownModule()
     // reduces the chance of leaving only an incomplete temporary file during a normal application exit.
     FSafeFileIO::BeginShutdown();
 
-    if (!FglTFRuntimeSafety::FlushPendingOperations(30.0))
-    {
-        UE_LOG(LogTemp, Error, TEXT("Timed out while draining an active glTFRuntime operation during shutdown."));
-    }
-    if (!FSafeFileIO::FlushPendingOperations(30.0))
-    {
-        UE_LOG(LogTemp, Error, TEXT("Timed out while draining asynchronous file transactions during shutdown."));
-    }
+    // A timeout followed by DLL unload is more dangerous than a slow shutdown: a native parser or
+    // queued lambda could still return into unloaded module code. Drain both lifetime trackers fully.
+    FglTFRuntimeSafety::FlushPendingOperations(-1.0);
+    FSafeFileIO::FlushPendingOperations(-1.0);
 
     FDefaultGameModuleImpl::ShutdownModule();
 }

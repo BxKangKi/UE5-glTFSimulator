@@ -8,48 +8,59 @@
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Components/LightComponent.h"
 #include "Components/ShapeComponent.h"
-#include "Engine/Texture2D.h"
-#include "Engine/Texture.h"
-#include "glTFRuntimeFunctionLibrary.h"
 #include "glTFRuntimeAsset.h"
 #include "glTFRuntimeParser.h"
-#include "HAL/FileManager.h"
-#include "IImageWrapper.h"
-#include "IImageWrapperModule.h"
-#include "Materials/MaterialInstance.h"
-#include "Materials/MaterialInstanceDynamic.h"
 #include "Materials/MaterialInterface.h"
 #include "Misc/CoreMisc.h"
-#include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Model/LoadAsyncAction.h"
 #include "Model/glTFMaterialOverrideUtils.h"
 #include "Model/StreamAsyncAction.h"
-#include "System/AssetManageSubSystem.h"
-#include "Modules/ModuleManager.h"
 #include "System/FileFunctionLibrary.h"
 #include "System/GameManagerSubSystem.h"
 #include "System/GameUpdateSubSystem.h"
 #include "System/GlbValidation.h"
 #include "System/SafeFileIO.h"
 #include "System/glTFRuntimeSafety.h"
-#include "System/MacroLibrary.h"
 #include "TimerManager.h"
 #include "World/WaterActor.h"
 
+namespace
+{
+    /** Actor state, UObject creation, delegates, timers, and component teardown are game-thread-only. */
+    bool EnsureStreamActorGameThread(const TCHAR* FunctionName)
+    {
+        return ensureMsgf(IsInGameThread(), TEXT("%s must run on the game thread"), FunctionName);
+    }
+}
 
 void AglTFStreamActor::Init(const FString& Path)
 {
+    if (!EnsureStreamActorGameThread(TEXT("AglTFStreamActor::Init")))
+    {
+        return;
+    }
+
     FilePath = Path;
 }
 
 void AglTFStreamActor::SetRenderOnlyStreaming(bool bRenderOnly)
 {
+    if (!EnsureStreamActorGameThread(TEXT("AglTFStreamActor::SetRenderOnlyStreaming")))
+    {
+        return;
+    }
+
     bRenderOnlyStreaming = bRenderOnly;
 }
 
 void AglTFStreamActor::BeginPlay()
 {
+    if (!EnsureStreamActorGameThread(TEXT("AglTFStreamActor::BeginPlay")))
+    {
+        return;
+    }
+
     Super::BeginPlay();
 
     bIsLoaded = false;
@@ -83,18 +94,33 @@ void AglTFStreamActor::BeginPlay()
 
 void AglTFStreamActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+    if (!EnsureStreamActorGameThread(TEXT("AglTFStreamActor::EndPlay")))
+    {
+        return;
+    }
+
     ReleaseRuntimeResourcesForWorldExit();
     Super::EndPlay(EndPlayReason);
 }
 
 void AglTFStreamActor::Destroyed()
 {
+    if (!EnsureStreamActorGameThread(TEXT("AglTFStreamActor::Destroyed")))
+    {
+        return;
+    }
+
     ReleaseRuntimeResourcesForWorldExit();
     Super::Destroyed();
 }
 
 void AglTFStreamActor::ReleaseRuntimeResourcesForWorldExit()
 {
+    if (!EnsureStreamActorGameThread(TEXT("AglTFStreamActor::ReleaseRuntimeResourcesForWorldExit")))
+    {
+        return;
+    }
+
     if (UWorld* World = GetWorld())
     {
         World->GetTimerManager().ClearAllTimersForObject(this);
@@ -133,6 +159,11 @@ void AglTFStreamActor::ReleaseRuntimeResourcesForWorldExit()
 
 void AglTFStreamActor::LoadAssetAsync(EGLTFStreamAssetPhase Phase)
 {
+    if (!EnsureStreamActorGameThread(TEXT("AglTFStreamActor::LoadAssetAsync")))
+    {
+        return;
+    }
+
     CancelActiveAssetLoad();
     AssetLoadPhase = Phase;
 
@@ -145,9 +176,10 @@ void AglTFStreamActor::LoadAssetAsync(EGLTFStreamAssetPhase Phase)
     // Keep glTF parsing asynchronous while avoiding glTFRuntime's built-in filename async
     // helper. The plugin helper creates an internal unreferenced UglTFRuntimeAsset before
     // parsing completes, then calls SetParser() later on the game thread. During world
-    // teardown that raw UObject can be collected. This path parses on a background thread and
-    // creates/touches UObjects only after the actor, request serial, path, phase and cancel
-    // token are still current on the game thread.
+    // teardown that raw UObject can be collected. Project code parses on a background thread, then
+    // creates/touches UObjects only after the actor, request serial, path, phase and cancel token
+    // are still current on the game thread. glTFRuntime itself may marshal internal engine-object
+    // setup to the game thread while its parser constructor runs.
     const int32 RequestId = AssetLoadRequestSerial;
     const FString RequestedFilePath = FilePath;
 
@@ -179,10 +211,9 @@ void AglTFStreamActor::LoadAssetAsync(EGLTFStreamAssetPhase Phase)
         }
         else
         {
-            // Parser construction is serialized across all runtime actors. glTFRuntime owns shared
-            // parser/cache state and overlapping third-party decoder initialization increases race
-            // and peak-memory risk in packaged builds.
-            Parser = FglTFRuntimeSafety::CreateParserSerialized(RequestedFilePath, Config);
+            // Each GLB receives an independent parser. Construction is bounded rather than globally
+            // serialized, allowing several files to preflight/parse concurrently without unbounded peaks.
+            Parser = FglTFRuntimeSafety::CreateParserSafely(RequestedFilePath, Config);
             if (!Parser.IsValid())
             {
                 FailureReason = TEXT("glTFRuntime parser creation was rejected or failed");
@@ -243,8 +274,7 @@ void AglTFStreamActor::LoadAssetAsync(EGLTFStreamAssetPhase Phase)
                     }
                     else
                     {
-                        LoadedAsset->ClearCache();
-                        LoadedAsset->ClearFlags(RF_Public | RF_Standalone);
+                        FglTFRuntimeSafety::RequestAssetRelease(LoadedAsset);
                     }
                 }
                 return;
@@ -284,6 +314,11 @@ void AglTFStreamActor::LoadAssetAsync(EGLTFStreamAssetPhase Phase)
 
 void AglTFStreamActor::OnAssetLoaded(UglTFRuntimeAsset* Asset)
 {
+    if (!EnsureStreamActorGameThread(TEXT("AglTFStreamActor::OnAssetLoaded")))
+    {
+        return;
+    }
+
     if (bIsDestroyed)
     {
         ReleaseAsset(Asset);
@@ -319,8 +354,15 @@ void AglTFStreamActor::OnAssetLoaded(UglTFRuntimeAsset* Asset)
 
 void AglTFStreamActor::StartSizeScan(UglTFRuntimeAsset* Asset)
 {
+    if (!EnsureStreamActorGameThread(TEXT("AglTFStreamActor::StartSizeScan")))
+    {
+        return;
+    }
+
     FglTFRuntimeStaticMeshConfig Config;
     Config.Outer = this;
+    // The probe deliberately uses None: it skips materials/normals/tangents and must not poison
+    // the later full-quality ReadWrite cache with a differently configured temporary mesh.
     Config.CacheMode = EglTFRuntimeCacheMode::None;
     Config.MaterialsConfig.CacheMode = EglTFRuntimeCacheMode::None;
     Config.MaterialsConfig.bSkipLoad = true;
@@ -362,6 +404,11 @@ int32 AglTFStreamActor::GetSizeScanChunkSize(int32 TotalNodeCount) const
 
 void AglTFStreamActor::OnChunksLoaded(const FLoadAsyncWrapper& MapWrapper)
 {
+    if (!EnsureStreamActorGameThread(TEXT("AglTFStreamActor::OnChunksLoaded")))
+    {
+        return;
+    }
+
     ActiveSizeScanAction = nullptr;
 
     if (bIsDestroyed)
@@ -402,6 +449,11 @@ void AglTFStreamActor::OnChunksLoaded(const FLoadAsyncWrapper& MapWrapper)
 
 void AglTFStreamActor::CancelActiveAssetLoad()
 {
+    if (!EnsureStreamActorGameThread(TEXT("AglTFStreamActor::CancelActiveAssetLoad")))
+    {
+        return;
+    }
+
     if (ActiveAssetLoadCancelToken.IsValid())
     {
         ActiveAssetLoadCancelToken->Set(1);
@@ -413,6 +465,11 @@ void AglTFStreamActor::CancelActiveAssetLoad()
 
 void AglTFStreamActor::CancelActiveAsyncActions()
 {
+    if (!EnsureStreamActorGameThread(TEXT("AglTFStreamActor::CancelActiveAsyncActions")))
+    {
+        return;
+    }
+
     if (IsValid(ActiveSizeScanAction.Get()))
     {
         ActiveSizeScanAction->CancelAndRelease();
@@ -428,20 +485,27 @@ void AglTFStreamActor::CancelActiveAsyncActions()
 
 void AglTFStreamActor::ReleaseAsset(UglTFRuntimeAsset* Asset)
 {
+    if (!EnsureStreamActorGameThread(TEXT("AglTFStreamActor::ReleaseAsset")))
+    {
+        return;
+    }
+
     if (IsValid(Asset))
     {
-        Asset->ClearCache();
-        if (Asset->IsRooted())
-        {
-            Asset->RemoveFromRoot();
-        }
-        Asset->ClearFlags(RF_Public | RF_Standalone);
+        // A final release is deferred while this parser still has native work in flight. The
+        // coordinator holds a strong reference, clears ReadWrite caches on the game thread, then
+        // removes any legacy root/standalone flags exactly once.
+        FglTFRuntimeSafety::RequestAssetRelease(Asset);
     }
 }
 
 void AglTFStreamActor::ReleaseStreamingResources()
 {
-    UAssetManageSubSystem* AssetManager = UAssetManageSubSystem::Get(this);
+    if (!EnsureStreamActorGameThread(TEXT("AglTFStreamActor::ReleaseStreamingResources")))
+    {
+        return;
+    }
+
     for (TPair<FName, TObjectPtr<UInstancedStaticMeshComponent>>& Pair : InstanceMap)
     {
         UInstancedStaticMeshComponent* ISMC = Pair.Value.Get();
@@ -450,7 +514,8 @@ void AglTFStreamActor::ReleaseStreamingResources()
             continue;
         }
 
-        UStaticMesh* MeshToRelease = ISMC->GetStaticMesh();
+        // Components release their references; reusable meshes remain owned solely by the
+        // glTFRuntimeAsset ReadWrite cache until ReleaseAsset reaches its cache barrier.
         ISMC->ClearInstances();
         const int32 MaterialCount = ISMC->GetNumMaterials();
         for (int32 MaterialIndex = 0; MaterialIndex < MaterialCount; ++MaterialIndex)
@@ -460,10 +525,6 @@ void AglTFStreamActor::ReleaseStreamingResources()
         ISMC->SetStaticMesh(nullptr);
         ISMC->UnregisterComponent();
         ISMC->DestroyComponent();
-        if (AssetManager)
-        {
-            AssetManager->ReleaseStaticMesh(this, MeshToRelease);
-        }
     }
     InstanceMap.Empty();
     LoadedNodes.Empty();
@@ -510,16 +571,31 @@ void AglTFStreamActor::ReleaseStreamingResources()
 
 void AglTFStreamActor::OnSizeScanProgress(float Progress)
 {
+    if (!EnsureStreamActorGameThread(TEXT("AglTFStreamActor::OnSizeScanProgress")))
+    {
+        return;
+    }
+
     LoadingStatus = FMath::Clamp(Progress * 0.5f, 0.0f, 0.5f);
 }
 
 void AglTFStreamActor::OnStreamAsyncProgress(float Progress)
 {
+    if (!EnsureStreamActorGameThread(TEXT("AglTFStreamActor::OnStreamAsyncProgress")))
+    {
+        return;
+    }
+
     LoadingStatus = FMath::Clamp(0.5f + Progress * 0.5f, 0.5f, 1.0f);
 }
 
 bool AglTFStreamActor::IsPlayerInsideModelRange() const
 {
+    if (!EnsureStreamActorGameThread(TEXT("AglTFStreamActor::IsPlayerInsideModelRange")))
+    {
+        return false;
+    }
+
     if (!bHasModelMetadata || ModelMetadata.Size.IsNearlyZero(0.001f))
     {
         return true;
@@ -543,6 +619,11 @@ void AglTFStreamActor::WriteLogAsync(const FString& Message) const
 
 void AglTFStreamActor::StartStreaming()
 {
+    if (!EnsureStreamActorGameThread(TEXT("AglTFStreamActor::StartStreaming")))
+    {
+        return;
+    }
+
     if (AllNodeMap.Num() == 0 && WaterNodeMap.Num() == 0)
     {
         bIsLoaded = true;
@@ -557,6 +638,11 @@ void AglTFStreamActor::StartStreaming()
 
 void AglTFStreamActor::RegisterGameUpdate()
 {
+    if (!EnsureStreamActorGameThread(TEXT("AglTFStreamActor::RegisterGameUpdate")))
+    {
+        return;
+    }
+
     if (GameUpdateTickHandle != INDEX_NONE)
     {
         return;
@@ -576,6 +662,11 @@ void AglTFStreamActor::RegisterGameUpdate()
 
 void AglTFStreamActor::UnregisterGameUpdate()
 {
+    if (!EnsureStreamActorGameThread(TEXT("AglTFStreamActor::UnregisterGameUpdate")))
+    {
+        return;
+    }
+
     if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
     {
         GameUpdate->UnregisterUpdate(GameUpdateTickHandle);
@@ -585,12 +676,23 @@ void AglTFStreamActor::UnregisterGameUpdate()
 
 void AglTFStreamActor::UpdateStreamingFromGameUpdate(float DeltaSeconds)
 {
+    if (!EnsureStreamActorGameThread(TEXT("AglTFStreamActor::UpdateStreamingFromGameUpdate")))
+    {
+        return;
+    }
+
     StartStreamingStep();
 }
 
 FglTFRuntimeStaticMeshConfig AglTFStreamActor::BuildStreamingStaticMeshConfig()
 {
+    if (!EnsureStreamActorGameThread(TEXT("AglTFStreamActor::BuildStreamingStaticMeshConfig")))
+    {
+        return FglTFRuntimeStaticMeshConfig();
+    }
+
     FglTFRuntimeStaticMeshConfig Config;
+    // One UglTFRuntimeAsset now owns the authoritative mesh/material cache for this GLB.
     Config.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
     Config.CollisionComplexity = ECollisionTraceFlag::CTF_UseComplexAsSimple;
 
@@ -635,6 +737,11 @@ FglTFRuntimeStaticMeshConfig AglTFStreamActor::BuildStreamingStaticMeshConfig()
 
 void AglTFStreamActor::StartStreamingStep()
 {
+    if (!EnsureStreamActorGameThread(TEXT("AglTFStreamActor::StartStreamingStep")))
+    {
+        return;
+    }
+
     if (bIsDestroyed)
     {
         bAsyncLoading = false;
@@ -696,6 +803,11 @@ void AglTFStreamActor::StartStreamingStep()
 
 void AglTFStreamActor::UpdateProperties(const FStreamAsyncWrapper& Collection)
 {
+    if (!EnsureStreamActorGameThread(TEXT("AglTFStreamActor::UpdateProperties")))
+    {
+        return;
+    }
+
     AllNodeMap = Collection.NodeMap;
     WaterNodeMap = Collection.WaterNodeMap;
     LoadedNodes = Collection.LoadedNodes;
@@ -708,6 +820,11 @@ void AglTFStreamActor::UpdateProperties(const FStreamAsyncWrapper& Collection)
 
 void AglTFStreamActor::OnStreamAsyncCompleted(const FStreamAsyncWrapper& MapWrapper)
 {
+    if (!EnsureStreamActorGameThread(TEXT("AglTFStreamActor::OnStreamAsyncCompleted")))
+    {
+        return;
+    }
+
     ActiveStreamAction = nullptr;
 
     if (bIsDestroyed)

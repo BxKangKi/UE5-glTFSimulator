@@ -14,6 +14,7 @@
 #include "System/MultiplayerWorldSubSystem.h"
 #include "System/GlbValidation.h"
 #include "System/MacroLibrary.h"
+#include "System/glTFRuntimeSafety.h"
 #include "Net/UnrealNetwork.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
@@ -147,11 +148,17 @@ void APrefabActor::OnRep_PrefabReplicationData()
 
 void APrefabActor::ReleaseRuntimeResources()
 {
+    if (!ensureMsgf(IsInGameThread(), TEXT("APrefabActor runtime release must run on the game thread")))
+    {
+        return;
+    }
+
     ClearLoadedComponents();
     if (IsValid(GltfAsset))
     {
-        GltfAsset->ClearCache();
-        GltfAsset->ClearFlags(RF_Public | RF_Standalone);
+        // Centralized release makes this path safe if prefab loading becomes asynchronous later.
+        // It also keeps parser-cache teardown consistent with streamed world assets.
+        FglTFRuntimeSafety::RequestAssetRelease(GltfAsset);
         GltfAsset = nullptr;
     }
 }
@@ -309,6 +316,11 @@ UStaticMesh* APrefabActor::LoadMeshByIndex(int32 MeshIndex)
 
 bool APrefabActor::LoadPrefab(const FString& InFilePath, const FString& InObjectName)
 {
+    if (!ensureMsgf(IsInGameThread(), TEXT("APrefabActor::LoadPrefab must run on the game thread")))
+    {
+        return false;
+    }
+
     ClearLoadedComponents();
 
     SourceFilePath = GlbValidation::NormalizePath(InFilePath);

@@ -11,8 +11,8 @@
 #include "Engine/World.h"
 #include "glTFRuntimeAsset.h"
 #include "glTFRuntimeParser.h"
-#include "HAL/FileManager.h"
 #include "Materials/MaterialInterface.h"
+#include "Misc/ScopeExit.h"
 #include "PhysicsEngine/PhysicsAsset.h"
 #include "Setting/GameSettings.h"
 #include "System/FileFunctionLibrary.h"
@@ -160,7 +160,8 @@ void UCharacterLoadAsyncAction::LoadAssetAsync()
         [WeakThis, RequestedFilePath, RequestId, Config, CancelToken]()
         {
             // BACKGROUND THREAD ONLY: filesystem access, GLB validation, and parser construction.
-            // This lambda deliberately performs no UObject creation or component mutation.
+            // Project code performs no direct UObject creation/access or component mutation here;
+            // glTFRuntime internally marshals any engine-object setup it requires to the game thread.
             FString ValidationReason;
             bool bCharacterFileValid = false;
             TSharedPtr<FglTFRuntimeParser> Parser;
@@ -172,9 +173,10 @@ void UCharacterLoadAsyncAction::LoadAssetAsync()
 
                 if (bCharacterFileValid && CancelToken->GetValue() == 0)
                 {
-                    // Parser creation touches third-party decoder/cache state. Route it through the
-                    // process-wide worker lock so character and world parsers cannot initialize at once.
-                    Parser = FglTFRuntimeSafety::CreateParserSerialized(RequestedFilePath, Config);
+                    // Parser creation is bounded across the process, but independent GLB files are
+                    // intentionally allowed to parse in parallel. This project does not directly
+                    // dereference a UObject in this worker stage.
+                    Parser = FglTFRuntimeSafety::CreateParserSafely(RequestedFilePath, Config);
                     if (!Parser.IsValid() && ValidationReason.IsEmpty())
                     {
                         ValidationReason = TEXT("glTFRuntime parser creation was rejected or failed");
@@ -235,8 +237,9 @@ void UCharacterLoadAsyncAction::LoadAssetAsync()
                             LoadedAsset->RuntimeContextString = Config.RuntimeContextString;
                             if (!LoadedAsset->SetParser(Parser.ToSharedRef()))
                             {
-                                LoadedAsset->ClearCache();
-                                ReleaseTransientRuntimeObject(LoadedAsset);
+                                // Central release owns cache teardown and keeps the asset alive until
+                                // no native operation can still reference its parser.
+                                FglTFRuntimeSafety::RequestAssetRelease(LoadedAsset);
                                 LoadedAsset = nullptr;
                             }
                         }
@@ -251,8 +254,7 @@ void UCharacterLoadAsyncAction::LoadAssetAsync()
                     {
                         if (IsValid(LoadedAsset))
                         {
-                            LoadedAsset->ClearCache();
-                            ReleaseTransientRuntimeObject(LoadedAsset);
+                            FglTFRuntimeSafety::RequestAssetRelease(LoadedAsset);
                         }
                         if (IsValid(StrongThis))
                         {
@@ -294,8 +296,7 @@ void UCharacterLoadAsyncAction::OnglTFAssetLoaded(UglTFRuntimeAsset* Asset)
     {
         if (IsValid(Asset))
         {
-            Asset->ClearCache();
-            ReleaseTransientRuntimeObject(Asset);
+            FglTFRuntimeSafety::RequestAssetRelease(Asset);
         }
         FinishAndRelease();
         return;
@@ -337,19 +338,20 @@ void UCharacterLoadAsyncAction::LoadBoneMapAsync()
     }
 
     TWeakObjectPtr<UCharacterLoadAsyncAction> WeakThis(this);
-    const FString JsonPath = UFileFunctionLibrary::GetPathWithoutExtension(FilePath) + TEXT(".json");
+    const FString JsonPath = FPaths::ChangeExtension(FilePath, TEXT("json"));
     bBoneMapLoadInFlight = true;
 
     const bool bWorkerQueued = FSafeFileIO::RunTrackedWorker([WeakThis, JsonPath]()
     {
         // BACKGROUND THREAD ONLY: bounded file I/O and plain JSON/string processing.
         TMap<FString, FString> LocalBoneMap;
-        const int64 JsonFileSize = IFileManager::Get().FileSize(*JsonPath);
-        TSharedPtr<FJsonObject> Json;
-        if (JsonFileSize >= 0 && JsonFileSize <= MaxBoneMapJsonBytes)
-        {
-            Json = UFileFunctionLibrary::FromJson(JsonPath);
-        }
+        FSafeJsonLimits Limits;
+        Limits.MaxFileBytes = MaxBoneMapJsonBytes;
+        Limits.MaxContainerEntries = 65536;
+        Limits.MaxValues = 131072;
+        Limits.bAllowBackupRecovery = false;
+        const FSafeJsonLoadResult JsonResult = FSafeFileIO::LoadJsonBlocking(JsonPath, Limits);
+        const TSharedPtr<FJsonObject>& Json = JsonResult.JsonObject;
 
         if (Json.IsValid())
         {
@@ -451,13 +453,15 @@ void UCharacterLoadAsyncAction::BeginSkeletalMeshLoad_GameThread()
     }
 
     FglTFRuntimeSkeletalMeshConfig Config;
-    Config.CacheMode = EglTFRuntimeCacheMode::None;
+    // The parser-owned ReadWrite cache is the single authoritative cache. It is cleared only by
+    // RequestAssetRelease after the final native callback has returned its safety ticket.
+    Config.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
     Config.Skeleton = CurrentRuntimeSkeleton;
     Config.bOverwriteRefSkeleton = false;
     Config.bMergeAllBonesToBoneTree = true;
     Config.bIgnoreSkin = false;
     Config.OverrideSkinIndex = DetectedSkinIndex;
-    Config.SkeletonConfig.CacheMode = EglTFRuntimeCacheMode::None;
+    Config.SkeletonConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
     Config.SkeletonConfig.bAddRootBone = CheckRootBoneName(CurrentLoadedAsset);
     Config.SkeletonConfig.RootBoneName = TEXT("Root");
     Config.SkeletonConfig.BonesNameMap = PendingBoneMap;
@@ -466,7 +470,7 @@ void UCharacterLoadAsyncAction::BeginSkeletalMeshLoad_GameThread()
     Config.SkeletonConfig.CopyRotationsFrom = DefaultSkeleton;
     Config.SkeletonConfig.MaxNodesTreeDepth = -1;
     Config.SkeletonConfig.bAddRootNodeIfMissing = true;
-    Config.MaterialsConfig.CacheMode = EglTFRuntimeCacheMode::None;
+    Config.MaterialsConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
 
     TMap<EglTFRuntimeMaterialType, UMaterialInterface*> MaterialMap;
     MaterialMap.Add(EglTFRuntimeMaterialType::Opaque, Material);
@@ -498,12 +502,13 @@ void UCharacterLoadAsyncAction::BeginSkeletalMeshLoad_GameThread()
     OnProgress.Broadcast(0.55f);
     bMeshLoadInFlight = true;
 
-    // Skeletal generation shares the same parser, material, render, and allocation pressure as
-    // static meshes. Serialize it with every other glTFRuntime mesh build.
+    // Skeletal generation is serialized only against work using this same parser. Independent
+    // character/world GLBs may use the other bounded slots concurrently.
     const FglTFRuntimeSkeletalMeshConfig RequestedConfig = Config;
     TWeakObjectPtr<UCharacterLoadAsyncAction> WeakThis(this);
-    GlTFRuntimeOperationTicket = FglTFRuntimeSafety::EnqueueOperation(
+    const uint64 SubmittedTicket = FglTFRuntimeSafety::EnqueueOperation(
         this,
+        CurrentLoadedAsset,
         FString::Printf(TEXT("Character mesh %s"), *FPaths::GetCleanFilename(FilePath)),
         [WeakThis, RequestedConfig](const uint64 Ticket)
         {
@@ -511,13 +516,15 @@ void UCharacterLoadAsyncAction::BeginSkeletalMeshLoad_GameThread()
             if (!IsValid(StrongThis) || StrongThis->bCancelled || StrongThis->bFinished ||
                 !IsValid(StrongThis->CurrentLoadedAsset))
             {
-                FglTFRuntimeSafety::CompleteOperation(Ticket);
                 if (IsValid(StrongThis))
                 {
                     StrongThis->GlTFRuntimeOperationTicket = 0;
                     StrongThis->bMeshLoadInFlight = false;
                     StrongThis->TryFinishCancelledRequest();
                 }
+                // Finalize action/asset ownership before releasing the parser slot. The active
+                // ticket is the lifetime barrier that keeps ClearCache from racing this branch.
+                FglTFRuntimeSafety::CompleteOperation(Ticket);
                 return;
             }
 
@@ -553,6 +560,13 @@ void UCharacterLoadAsyncAction::BeginSkeletalMeshLoad_GameThread()
                 TEXT("Character mesh request was rejected by the glTFRuntime safety queue: %s"),
                 *Reason));
         });
+
+    // A ReadWrite cache hit may complete synchronously from inside EnqueueOperation. Preserve the
+    // callback's terminal state instead of restoring a stale ticket after the call returns.
+    if (bMeshLoadInFlight && GlTFRuntimeOperationTicket == 0)
+    {
+        GlTFRuntimeOperationTicket = SubmittedTicket;
+    }
 }
 
 void UCharacterLoadAsyncAction::OnMeshLoaded(USkeletalMesh* SkeletalMesh)
@@ -564,8 +578,16 @@ void UCharacterLoadAsyncAction::OnMeshLoaded(USkeletalMesh* SkeletalMesh)
 
     const uint64 CompletedTicket = GlTFRuntimeOperationTicket;
     GlTFRuntimeOperationTicket = 0;
-    FglTFRuntimeSafety::CompleteOperation(CompletedTicket);
     bMeshLoadInFlight = false;
+
+    // Keep this parser's slot active through every callback-side UObject/reference mutation.
+    // A cancellation/failure below may request cache release; it becomes executable only after
+    // this scope returns the ticket and therefore cannot race this callback.
+    ON_SCOPE_EXIT
+    {
+        FglTFRuntimeSafety::CompleteOperation(CompletedTicket);
+    };
+
     if (bCancelled || bFinished)
     {
         ReleaseTransientRuntimeObject(SkeletalMesh);
@@ -926,8 +948,7 @@ void UCharacterLoadAsyncAction::ReleaseCurrentAsset()
 
     if (IsValid(CurrentLoadedAsset))
     {
-        CurrentLoadedAsset->ClearCache();
-        ReleaseTransientRuntimeObject(CurrentLoadedAsset);
+        FglTFRuntimeSafety::RequestAssetRelease(CurrentLoadedAsset);
     }
     CurrentLoadedAsset = nullptr;
 

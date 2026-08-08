@@ -31,7 +31,6 @@
 #include "Components/PostProcessComponent.h"
 #include "Model/glTFSaveLibrary.h"
 #include "Model/glTFStreamSubSystem.h"
-#include "System/AssetManageSubSystem.h"
 #include "World/WorldData.h"
 #include "Character/CharacterController.h"
 #include "Character/CharacterComponent.h"
@@ -854,11 +853,6 @@ void UGameManagerSubSystem::ReleaseMainWorldRuntimeMemory(bool bForceGarbageColl
         PlacementGridComponent = nullptr;
     }
 
-    if (UAssetManageSubSystem* AssetManager = GetAssetManagerSubsystem())
-    {
-        AssetManager->DeactivateAndRelease();
-    }
-
     Root = nullptr;
     ConfigActor = nullptr;
     ClearTransientRuntimeReferences();
@@ -965,15 +959,6 @@ void UGameManagerSubSystem::RequestRuntimeGarbageCollection(const TCHAR* Reason)
     UE_LOG(LogTemp, Display, TEXT("[Gameplay] Runtime memory cleanup completed: %s"), Reason ? Reason : TEXT("Unknown"));
 }
 
-UAssetManageSubSystem* UGameManagerSubSystem::GetAssetManagerSubsystem() const
-{
-    if (UGameInstance* GameInstance = GetGameInstance())
-    {
-        return GameInstance->GetSubsystem<UAssetManageSubSystem>();
-    }
-    return nullptr;
-}
-
 void UGameManagerSubSystem::RequestPostLoadRuntimeMemoryCleanup()
 {
     bPendingMainWorldRuntimePurge = true;
@@ -1015,11 +1000,6 @@ void UGameManagerSubSystem::RunPostLoadRuntimeMemoryCleanup()
     if (GlobalStreamSubSystem)
     {
         GlobalStreamSubSystem->StopMainWorldStreaming();
-    }
-
-    if (UAssetManageSubSystem* AssetManager = GetAssetManagerSubsystem())
-    {
-        AssetManager->DeactivateAndRelease();
     }
 
     HideLoadingWidget();
@@ -1078,11 +1058,6 @@ void UGameManagerSubSystem::StopWorldSystems()
             WorldManagerActor->Destroy();
         }
         WorldManagerActor = nullptr;
-    }
-
-    if (UAssetManageSubSystem* AssetManager = GetAssetManagerSubsystem())
-    {
-        AssetManager->DeactivateAndRelease();
     }
 
     bSpawnedWorldManager = false;

@@ -35,6 +35,7 @@
 #include "System/MacroLibrary.h"
 #include "System/PhysicsHelper.h"
 #include "System/MultiplayerWorldSubSystem.h"
+#include "System/glTFRuntimeSafety.h"
 #include "Net/UnrealNetwork.h"
 #include "Vehicle/VehicleSubSystem.h"
 #include "World/BuoyancyComponent.h"
@@ -896,6 +897,11 @@ void AVehiclePawn::Destroyed()
 
 void AVehiclePawn::ReleaseRuntimeResources()
 {
+    if (!ensureMsgf(IsInGameThread(), TEXT("AVehiclePawn runtime release must run on the game thread")))
+    {
+        return;
+    }
+
     ClearDriveInput();
     if (IsOccupied())
     {
@@ -965,8 +971,7 @@ void AVehiclePawn::ClearLoadedVehicleModel()
 
     if (IsValid(GltfAsset))
     {
-        GltfAsset->ClearCache();
-        GltfAsset->ClearFlags(RF_Public | RF_Standalone);
+        FglTFRuntimeSafety::RequestAssetRelease(GltfAsset);
         GltfAsset = nullptr;
     }
 
@@ -1308,6 +1313,11 @@ UStaticMesh* AVehiclePawn::LoadMeshByIndex(int32 MeshIndex)
 
 bool AVehiclePawn::LoadVehicleModel(const FString& InFilePath, const FString& InObjectName)
 {
+    if (!ensureMsgf(IsInGameThread(), TEXT("AVehiclePawn::LoadVehicleModel must run on the game thread")))
+    {
+        return false;
+    }
+
     ClearLoadedVehicleModel();
     LoadedBodyVisualBounds.Init();
     LoadedWheelVisualRestBounds.Init();
@@ -1359,8 +1369,7 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InFilePath, const FString& In
     {
         UE_LOG(LogTemp, Warning, TEXT("VehiclePawn: GLB node count exceeds the runtime safety limit. Path=%s Nodes=%d"),
             *SourceFilePath, Nodes.Num());
-        GltfAsset->ClearCache();
-        GltfAsset->ClearFlags(RF_Public | RF_Standalone);
+        FglTFRuntimeSafety::RequestAssetRelease(GltfAsset);
         GltfAsset = nullptr;
         return false;
     }

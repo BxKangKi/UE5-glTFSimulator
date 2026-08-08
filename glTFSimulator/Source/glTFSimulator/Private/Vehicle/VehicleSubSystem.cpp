@@ -8,12 +8,26 @@
 #include "System/GameUpdateSubSystem.h"
 #include "Vehicle/VehiclePawn.h"
 
+namespace
+{
+    /** Vehicle registration and every UObject/physics read or write are game-thread-owned. */
+    bool EnsureVehicleSubsystemGameThread(const TCHAR* Context)
+    {
+        return ensureMsgf(IsInGameThread(), TEXT("%s must run on the game thread"), Context);
+    }
+}
+
 UVehicleSubSystem::UVehicleSubSystem()
 {
 }
 
 UVehicleSubSystem* UVehicleSubSystem::Get(const UObject* WorldContextObject)
 {
+    if (!EnsureVehicleSubsystemGameThread(TEXT("UVehicleSubSystem::Get")))
+    {
+        return nullptr;
+    }
+
     if (!IsValid(WorldContextObject))
     {
         return nullptr;
@@ -30,6 +44,7 @@ UVehicleSubSystem* UVehicleSubSystem::Get(const UObject* WorldContextObject)
 
 void UVehicleSubSystem::Initialize(FSubsystemCollectionBase& Collection)
 {
+    check(IsInGameThread());
     Super::Initialize(Collection);
     if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
     {
@@ -45,6 +60,7 @@ void UVehicleSubSystem::Initialize(FSubsystemCollectionBase& Collection)
 
 void UVehicleSubSystem::Deinitialize()
 {
+    check(IsInGameThread());
     if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
     {
         GameUpdate->UnregisterUpdate(GameUpdateHandle);
@@ -57,6 +73,11 @@ void UVehicleSubSystem::Deinitialize()
 
 void UVehicleSubSystem::RegisterVehicle(AVehiclePawn* VehiclePawn)
 {
+    if (!EnsureVehicleSubsystemGameThread(TEXT("UVehicleSubSystem::RegisterVehicle")))
+    {
+        return;
+    }
+
     if (!IsValid(VehiclePawn))
     {
         return;
@@ -90,6 +111,11 @@ void UVehicleSubSystem::RegisterVehicle(AVehiclePawn* VehiclePawn)
 
 void UVehicleSubSystem::UnregisterVehicle(AVehiclePawn* VehiclePawn)
 {
+    if (!EnsureVehicleSubsystemGameThread(TEXT("UVehicleSubSystem::UnregisterVehicle")))
+    {
+        return;
+    }
+
     if (!VehiclePawn)
     {
         return;
@@ -103,6 +129,11 @@ void UVehicleSubSystem::UnregisterVehicle(AVehiclePawn* VehiclePawn)
 
 void UVehicleSubSystem::UpdateVehiclesFromGameUpdate(float DeltaSeconds)
 {
+    if (!EnsureVehicleSubsystemGameThread(TEXT("UVehicleSubSystem::UpdateVehiclesFromGameUpdate")))
+    {
+        return;
+    }
+
     const float SafeDeltaSeconds = FMath::Clamp(DeltaSeconds, 0.0f, 1.0f);
     if (SafeDeltaSeconds <= 0.0f)
     {
@@ -144,6 +175,8 @@ void UVehicleSubSystem::UpdateVehiclesFromGameUpdate(float DeltaSeconds)
     constexpr int32 ParallelVehicleThreshold = 32;
     if (ValidVehicleCount >= ParallelVehicleThreshold)
     {
+        // Worker tasks receive immutable value snapshots and write to disjoint array elements.
+        // No actor, component, physics body, or other UObject is dereferenced inside ParallelFor.
         ParallelFor(ValidVehicleCount, [&Inputs, &Outputs](const int32 Index)
         {
             Outputs[Index] = AVehiclePawn::CalculateParallelControlOutput(Inputs[Index]);
@@ -172,6 +205,7 @@ void UVehicleSubSystem::UpdateVehiclesFromGameUpdate(float DeltaSeconds)
 
 void UVehicleSubSystem::CompactVehicles()
 {
+    check(IsInGameThread());
     Vehicles.RemoveAllSwap([](const TWeakObjectPtr<AVehiclePawn>& Vehicle)
     {
         return !Vehicle.IsValid();
