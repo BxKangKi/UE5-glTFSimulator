@@ -7,7 +7,6 @@
 #include "Kismet/BlueprintAsyncActionBase.h"
 #include "Model/ModelData.h"
 #include "glTFRuntimeAsset.h"
-#include "Dom/JsonObject.h" // Required for FJsonObject handling.
 #include "LoadAsyncAction.generated.h"
 
 class UglTFRuntimeAsset;
@@ -74,11 +73,10 @@ private:
     int32 MaxCount = 0;
     FName CurrentMeshName;
     int32 ChunkSize;
-    int32 MaxTextureDimension = 768;
     bool bCancelled = false;
     bool bStaticMeshLoadInFlight = false;
 
-    /** Ticket held while this action owns or waits for the process-wide glTFRuntime mesh slot. */
+    /** Ticket held while this action owns or waits for its per-asset glTFRuntime slot. */
     uint64 GlTFRuntimeOperationTicket = 0;
 
     FModelData GeneratedModelData;
@@ -97,7 +95,6 @@ private:
     void CalculateSize();
     void ProcessChunk();
     void UpdateNext();
-    void LoadTextureAsync(FString ImagePath);
 
     // Functions that control JSON loading and merging.
     void LoadJsonAsync();
@@ -107,6 +104,4 @@ private:
     void WriteLogAsync(const FString& Message) const;
     void ReleaseActionReferences();
     
-    // Internal helper that creates a default file when the source file is missing.
-    bool CreateDefaultJsonFile(const FString& Path);
 };

@@ -978,6 +978,12 @@ bool UBuoyancyComponent::ApplySkeletalMeshBuoyancy(USkeletalMeshComponent* Skele
 
 void UBuoyancyComponent::UpdateBuoyancyFromGameUpdate(float DeltaTime)
 {
+    if (!ensureMsgf(IsInGameThread(),
+        TEXT("UBuoyancyComponent::UpdateBuoyancyFromGameUpdate must run on the game thread")))
+    {
+        return;
+    }
+
     if (!bInWater || DeltaTime <= SMALL_NUMBER)
     {
         return;
@@ -1084,6 +1090,8 @@ void UBuoyancyComponent::UpdateBuoyancyFromGameUpdate(float DeltaTime)
     constexpr int32 ParallelBuoyancySampleThreshold = 64;
     if (LocalSamplePoints.Num() >= ParallelBuoyancySampleThreshold)
     {
+        // Only immutable numeric snapshots and disjoint result slots cross the thread boundary.
+        // Physics components are queried before this call and receive impulses afterwards on GT.
         ParallelFor(LocalSamplePoints.Num(), CalculatePrimitiveSample);
     }
     else

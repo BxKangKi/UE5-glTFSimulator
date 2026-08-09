@@ -33,6 +33,8 @@ public class glTFSimulator : ModuleRules
                 "ProceduralMeshComponent",
                 "PhysicsCore",
                 "ImageWrapper",
+                // MoviePlayer renders a pure-Slate loading screen while blocking map loads run.
+                "MoviePlayer",
                 "RenderCore"
             });
 

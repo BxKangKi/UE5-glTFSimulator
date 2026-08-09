@@ -57,7 +57,7 @@ struct GLTFSIMULATOR_API FSafeJsonLimits
     int32 MaxPrimitiveCharacters = 1024;
 
     /** When true, a valid .bak copy is used if the primary file is missing or corrupt. */
-    bool bAllowBackupRecovery = true;
+    bool bAllowBackupRecovery = false;
 };
 
 /** Immutable result returned by a bounded JSON load. */

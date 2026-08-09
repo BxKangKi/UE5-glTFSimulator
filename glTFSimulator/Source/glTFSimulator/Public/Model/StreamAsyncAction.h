@@ -68,8 +68,10 @@ private:
     TSet<FName> LoadedWaterNodes;
     UPROPERTY()
     TMap<FName, TObjectPtr<UInstancedStaticMeshComponent>> InstanceMap;
+    UPROPERTY()
+    TSubclassOf<AWaterActor> WaterClass;
 
-    // Excluded from UPROPERTY to avoid UHT nested-container build errors.
+    // Reflected so dynamically spawned component groups remain reachable for the action lifetime.
     UPROPERTY()
     TMap<FName, FComponentGroup> DynamicComponentMap;
 
@@ -94,15 +96,12 @@ private:
     TObjectPtr<UglTFRuntimeAsset> Asset;
     UPROPERTY()
     TObjectPtr<AActor> OwnerActor;
-    UPROPERTY()
-    TObjectPtr<UStaticMeshComponent> PendingComp = nullptr;
-
     FVector CurrentSize;
     bool bIsLoading = false;
     bool bAbortRequested = false;
     bool bStaticMeshLoadInFlight = false;
 
-    /** Ticket held while this action owns or waits for the global glTFRuntime mesh slot. */
+    /** Ticket held while this action owns or waits for its per-asset glTFRuntime slot. */
     uint64 GlTFRuntimeOperationTicket = 0;
 
     bool bRenderOnly = false;

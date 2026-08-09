@@ -12,7 +12,6 @@
 
 class AActor;
 class AglTFStreamActor;
-class UAssetManageSubSystem;
 class ACharacterController;
 
 /** File identity captured when a character load fails, so a replaced file can be retried. */
@@ -43,8 +42,11 @@ public:
     UFUNCTION(BlueprintCallable, Category="glTF Streaming|Player")
     bool CycleNextPlayerCharacter();
 
-    void SetRenderOnlyStreaming(bool bInRenderOnlyStreaming) { bRenderOnlyStreaming = bInRenderOnlyStreaming; }
-    bool IsRenderOnlyStreaming() const { return bRenderOnlyStreaming; }
+    /** Mutates GT-owned streaming state. Calls from worker threads are rejected. */
+    void SetRenderOnlyStreaming(bool bInRenderOnlyStreaming);
+
+    /** Reads GT-owned streaming state. Calls from worker threads return false. */
+    bool IsRenderOnlyStreaming() const;
 
 private:
     UPROPERTY()
@@ -81,12 +83,16 @@ private:
     bool bPlayerActivated = false;
     bool bPendingPlayerIsInitialLoad = false;
     bool bRenderOnlyStreaming = false;
-    FString WaitingPath;
+    /** Invalidates worker completions from a stopped/restarted streaming session. */
+    int32 InitialScanGeneration = 0;
+    /** Pure-data GLB/JSON preflight jobs currently running on the worker pool. */
+    int32 ActiveInitialPreflightCount = 0;
+    /** Metadata-less GLBs currently calculating bounds through their own stream actor. */
+    TMap<FString, double> ActiveInitialActorScans;
     /** The single gameplay pawn. Runtime character meshes are swapped on demand on this pawn. */
     TWeakObjectPtr<ACharacterController> ActivePlayerCharacter;
     double PlayerActorWaitStartedAt = 0.0;
     double PlayerLoadStartedAt = 0.0;
-    double ModelWaitStartedAt = 0.0;
     double NextModelFileAuditTime = 0.0;
 
     FTimerHandle TimerHandle_ProcessPath;
@@ -95,6 +101,7 @@ private:
     FTimerHandle TimerHandle_WaitPlayer;
 
     void ProcessNextPathAsync();
+    void StartInitialPathPreflight(const FString& GlbPath, int32 ScanGeneration);
     void WaitForCurrentActorAsync();
     void UpdateStreamingAsync();
     void BeginInitialPlayerStreamingIfNeeded();
@@ -115,7 +122,6 @@ private:
     void DiscoverPlayerPaths();
     void PersistCurrentPlayerSelection();
 
-    bool TryLoadValidModelMetadata(const FString& GlbPath, FModelData& OutModelData, bool& bOutJsonExists) const;
     bool IsValidModelMetadata(const FModelData& ModelData) const;
     bool IsPlayerInsideModelRange(const FModelData& ModelData, float RadiusMultiplier = 1.0f) const;
     FVector GetPlayerLocation() const;
@@ -125,6 +131,8 @@ private:
     void CacheActorMetadata(const FString& GlbPath, const AglTFStreamActor* Actor);
 
     void ScheduleProcessNextPath();
+    void ScheduleWaitForInitialActors();
+    void FinalizeInitialPathScanIfReady();
     void ScheduleUpdateStreaming();
     void ScheduleWaitForPlayerActor();
     void ScheduleWaitForPlayerLoad();

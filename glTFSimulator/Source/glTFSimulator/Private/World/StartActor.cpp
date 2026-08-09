@@ -58,7 +58,7 @@ AStartActor::AStartActor()
 void AStartActor::BeginPlay()
 {
     // Arm before Super::BeginPlay so a legacy Blueprint ReceiveBeginPlay cannot consume the
-    // carried-over Exit click and reopen gameplay before the native next-tick menu rebuild.
+    // carried-over Exit click before the native menu is rebuilt later in this same BeginPlay call.
     if (UGameManagerSubSystem* GameManager = UGameManagerSubSystem::GetSubSystem(this))
     {
         // Remember the loaded menu world as a soft object reference. Gameplay pause Exit can use
@@ -79,13 +79,11 @@ void AStartActor::BeginPlay()
     // Rebuild the level list before any UI asks for it.
     BuildLevelFolderNameMap();
 
-    // Legacy derived Blueprint graphs may still create widgets after calling the parent BeginPlay.
-    // Running on the next tick lets this native flow own the final visible menu and clean up legacy widgets.
-    GetWorldTimerManager().SetTimerForNextTick(
-        FTimerDelegate::CreateWeakLambda(this, [this]()
-        {
-            InitializeStartScreenAfterBlueprintBeginPlay();
-        }));
+    // AActor::BeginPlay dispatches the Blueprint ReceiveBeginPlay event before Super::BeginPlay()
+    // returns. The native menu can therefore be created immediately here instead of waiting one
+    // frame. Removing that next-tick delay prevents the viewport from presenting a blank frame at
+    // startup while preserving the existing cleanup of any legacy Blueprint-created widgets.
+    InitializeStartScreenAfterBlueprintBeginPlay();
 }
 
 void AStartActor::Destroyed()

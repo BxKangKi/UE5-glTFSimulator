@@ -74,7 +74,7 @@ private:
     /** glTFRuntime worker/finalizer is active. Written on the game thread only. */
     bool bMeshLoadInFlight = false;
 
-    /** Ticket held while this request owns or waits for the global glTFRuntime mesh slot. */
+    /** Ticket held while this request owns or waits for its parser's bounded glTFRuntime slot. */
     uint64 GlTFRuntimeOperationTicket = 0;
 
     /** Mesh/skin pair selected from a validated skinned node in the external GLB. */

@@ -3,29 +3,75 @@
 
 /**
  * @file glTFRuntimeSafety.cpp
- * @brief Implements global serialization and session quarantine around glTFRuntime entry points.
+ * @brief Bounded per-asset scheduling, cache lifetime barriers, and session quarantine.
  */
 #include "System/glTFRuntimeSafety.h"
 
+#include "Async/Async.h"
 #include "Async/TaskGraphInterfaces.h"
 #include "Containers/Ticker.h"
 #include "HAL/PlatformProcess.h"
 #include "HAL/PlatformTime.h"
 #include "HAL/ThreadSafeCounter.h"
-#include "glTFRuntimeParser.h"
+#include "Misc/ScopeExit.h"
 #include "Misc/ScopeLock.h"
 #include "System/GlbValidation.h"
 #include "System/SafeFileIO.h"
+#include "UObject/StrongObjectPtr.h"
+#include "glTFRuntimeAsset.h"
+#include "glTFRuntimeParser.h"
 
 namespace glTFRuntimeSafetyPrivate
 {
+    /** One native operation waiting for a slot. Queue state is game-thread-only. */
     struct FQueuedOperation
     {
         uint64 Ticket = 0;
         TWeakObjectPtr<UObject> Owner;
+        TWeakObjectPtr<UglTFRuntimeAsset> Asset;
         FString Label;
         FglTFRuntimeSafety::FQueuedStart Start;
         FglTFRuntimeSafety::FRejected Rejected;
+    };
+
+    /** Metadata retained while one native operation owns a slot. */
+    struct FActiveOperation
+    {
+        FActiveOperation(
+            const uint64 InTicket,
+            UObject* InOwner,
+            UglTFRuntimeAsset* InAsset,
+            FString InLabel,
+            const double InStartedAtSeconds)
+            : Ticket(InTicket)
+            , Owner(InOwner)
+            , Asset(InAsset)
+            , Label(MoveTemp(InLabel))
+            , StartedAtSeconds(InStartedAtSeconds)
+        {
+        }
+
+        uint64 Ticket = 0;
+        // Once native work starts, both UObjects must outlive every plugin callback. Queued jobs
+        // remain weak so cancellation can discard them, but active jobs deliberately become strong.
+        TStrongObjectPtr<UObject> Owner;
+        TStrongObjectPtr<UglTFRuntimeAsset> Asset;
+        FString Label;
+        double StartedAtSeconds = 0.0;
+    };
+
+    /**
+     * A strong reference is required while the original actor/action is dropping its UPROPERTY.
+     * The reference is released only after ClearCache has run on the game thread.
+     */
+    struct FPendingAssetRelease
+    {
+        explicit FPendingAssetRelease(UglTFRuntimeAsset* InAsset)
+            : Asset(InAsset)
+        {
+        }
+
+        TStrongObjectPtr<UglTFRuntimeAsset> Asset;
     };
 
     struct FFailureRecord
@@ -36,8 +82,12 @@ namespace glTFRuntimeSafetyPrivate
 
     struct FState
     {
-        // Parser and failure maps are accessed from worker threads, so each has a dedicated lock.
-        FCriticalSection ParserLock;
+        // Parser construction is worker-thread-only. This small gate permits useful GLB parallelism
+        // while preventing dozens of large parser allocations from starting at the same instant.
+        FCriticalSection ParserGateLock;
+        int32 ActiveParserCreations = 0;
+
+        // Failure records are queried by both game and worker threads.
         FCriticalSection FailureLock;
         TMap<FString, FFailureRecord> Failures;
 
@@ -47,12 +97,13 @@ namespace glTFRuntimeSafetyPrivate
         FCriticalSection ControlLock;
         FString CircuitReason;
 
-        // Queue and active-operation fields are game-thread-only by design.
+        // Everything below is game-thread-only. Keeping a single owning thread avoids a second
+        // synchronization layer around UObject weak/strong pointer transitions and callbacks.
         TArray<FQueuedOperation> Queue;
+        TMap<uint64, FActiveOperation> ActiveOperations;
+        TArray<FPendingAssetRelease> PendingAssetReleases;
         uint64 NextTicket = 1;
-        uint64 ActiveTicket = 0;
-        double ActiveStartedAtSeconds = 0.0;
-        FString ActiveLabel;
+        bool bPumpingQueue = false;
         FTSTicker::FDelegateHandle WatchdogHandle;
     };
 
@@ -62,15 +113,9 @@ namespace glTFRuntimeSafetyPrivate
         return State;
     }
 
-    void RejectOperation(FQueuedOperation& Operation, const FString& Reason)
-    {
-        if (Operation.Rejected)
-        {
-            Operation.Rejected(Reason);
-        }
-    }
-
     constexpr int32 MaximumQueuedOperations = 4096;
+    constexpr int32 MaximumConcurrentNativeOperations = 3;
+    constexpr int32 MaximumConcurrentParserCreations = 3;
 
     bool IsShuttingDown()
     {
@@ -101,9 +146,129 @@ namespace glTFRuntimeSafetyPrivate
             State.CircuitOpenFlag.Increment();
         }
     }
+
+    void RejectOperation(FQueuedOperation& Operation, const FString& Reason)
+    {
+        if (Operation.Rejected)
+        {
+            Operation.Rejected(Reason);
+        }
+    }
+
+    bool IsAssetActive(const FState& State, const UglTFRuntimeAsset* Asset)
+    {
+        if (!Asset)
+        {
+            return false;
+        }
+
+        for (const TPair<uint64, FActiveOperation>& Pair : State.ActiveOperations)
+        {
+            if (Pair.Value.Asset.Get() == Asset)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool IsAssetPendingRelease(const FState& State, const UglTFRuntimeAsset* Asset)
+    {
+        if (!Asset)
+        {
+            return false;
+        }
+
+        for (const FPendingAssetRelease& Pending : State.PendingAssetReleases)
+        {
+            if (Pending.Asset.Get() == Asset)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Moves matching queue entries out before invoking rejection callbacks, avoiding re-entrant mutation. */
+    TArray<FQueuedOperation> RemoveQueuedOperationsForOwner(FState& State, const UObject* Owner)
+    {
+        TArray<FQueuedOperation> Removed;
+        if (!Owner)
+        {
+            return Removed;
+        }
+
+        for (int32 Index = State.Queue.Num() - 1; Index >= 0; --Index)
+        {
+            if (State.Queue[Index].Owner.Get() == Owner)
+            {
+                Removed.Add(MoveTemp(State.Queue[Index]));
+                State.Queue.RemoveAtSwap(Index, 1, EAllowShrinking::No);
+            }
+        }
+        return Removed;
+    }
+
+    /** Moves every queued operation for one asset out before callbacks are invoked. */
+    TArray<FQueuedOperation> RemoveQueuedOperationsForAsset(FState& State, const UglTFRuntimeAsset* Asset)
+    {
+        TArray<FQueuedOperation> Removed;
+        if (!Asset)
+        {
+            return Removed;
+        }
+
+        for (int32 Index = State.Queue.Num() - 1; Index >= 0; --Index)
+        {
+            if (State.Queue[Index].Asset.Get() == Asset)
+            {
+                Removed.Add(MoveTemp(State.Queue[Index]));
+                State.Queue.RemoveAtSwap(Index, 1, EAllowShrinking::No);
+            }
+        }
+        return Removed;
+    }
+
+    /** Worker-thread RAII token for the bounded parser-construction gate. */
+    class FParserCreationSlot
+    {
+    public:
+        bool Acquire()
+        {
+            while (!IsShuttingDown() && !IsCircuitOpen())
+            {
+                {
+                    FScopeLock Lock(&GetState().ParserGateLock);
+                    if (GetState().ActiveParserCreations < MaximumConcurrentParserCreations)
+                    {
+                        ++GetState().ActiveParserCreations;
+                        bHeld = true;
+                        return true;
+                    }
+                }
+
+                // Parser creation is already performed on the shared worker pool. A short sleep
+                // avoids a hot spin while preserving cancellation/shutdown responsiveness.
+                FPlatformProcess::SleepNoStats(0.001f);
+            }
+            return false;
+        }
+
+        ~FParserCreationSlot()
+        {
+            if (bHeld)
+            {
+                FScopeLock Lock(&GetState().ParserGateLock);
+                GetState().ActiveParserCreations = FMath::Max(0, GetState().ActiveParserCreations - 1);
+            }
+        }
+
+    private:
+        bool bHeld = false;
+    };
 }
 
-TSharedPtr<FglTFRuntimeParser> FglTFRuntimeSafety::CreateParserSerialized(
+TSharedPtr<FglTFRuntimeParser> FglTFRuntimeSafety::CreateParserSafely(
     const FString& FilePath,
     const FglTFRuntimeConfig& Config)
 {
@@ -121,28 +286,31 @@ TSharedPtr<FglTFRuntimeParser> FglTFRuntimeSafety::CreateParserSerialized(
     }
     if (glTFRuntimeSafetyPrivate::IsCircuitOpen(&CoordinatorReason))
     {
-        UE_LOG(LogTemp, Error, TEXT("Refused glTFRuntime parser because the safety circuit is open. Path=%s Reason=%s"),
-            *FilePath, *CoordinatorReason);
+        UE_LOG(LogTemp, Error,
+            TEXT("Refused glTFRuntime parser because the safety circuit is open. Path=%s Reason=%s"),
+            *FilePath,
+            *CoordinatorReason);
         return nullptr;
     }
 
     FString QuarantineReason;
     if (IsPathQuarantined(FilePath, &QuarantineReason))
     {
-        UE_LOG(
-            LogTemp,
-            Error,
-            TEXT("Refused quarantined glTF file. Path=%s Reason=%s"),
+        UE_LOG(LogTemp, Error, TEXT("Refused quarantined glTF file. Path=%s Reason=%s"),
             *FilePath,
             *QuarantineReason);
         return nullptr;
     }
 
-    // The plugin has mutable parser/cache state. A single construction lock avoids concurrent
-    // parser allocation and third-party decoder initialization across character/world actors.
-    FScopeLock ParserScope(&glTFRuntimeSafetyPrivate::GetState().ParserLock);
+    glTFRuntimeSafetyPrivate::FParserCreationSlot ParserSlot;
+    if (!ParserSlot.Acquire())
+    {
+        return nullptr;
+    }
 
-    // Recheck after waiting for the parser lock; shutdown or the circuit breaker may have opened.
+    // Each request creates a distinct parser and therefore a distinct mutable cache. The bounded
+    // slot above replaces the old process-wide lock: independent GLBs can parse concurrently, but
+    // parser construction remains capped to protect peak memory in large worlds.
     if (glTFRuntimeSafetyPrivate::IsShuttingDown() ||
         glTFRuntimeSafetyPrivate::IsCircuitOpen(&CoordinatorReason))
     {
@@ -153,22 +321,16 @@ TSharedPtr<FglTFRuntimeParser> FglTFRuntimeSafety::CreateParserSerialized(
 
 uint64 FglTFRuntimeSafety::EnqueueOperation(
     UObject* Owner,
+    UglTFRuntimeAsset* Asset,
     const FString& Label,
     FQueuedStart Start,
     FRejected Rejected)
 {
-    if (!IsInGameThread())
+    // EnqueueOperation returns a ticket synchronously. Silently redispatching from a worker would
+    // return 0 to the caller while a real request starts later, leaving its in-flight/ticket state
+    // unsynchronized. All project call sites are GT-guarded, so reject misuse instead.
+    if (!ensureMsgf(IsInGameThread(), TEXT("FglTFRuntimeSafety::EnqueueOperation must run on the game thread")))
     {
-        TWeakObjectPtr<UObject> WeakOwner(Owner);
-        FSafeFileIO::DispatchTrackedGameThread(
-            [WeakOwner, Label, Start = MoveTemp(Start), Rejected = MoveTemp(Rejected)]() mutable
-            {
-                FglTFRuntimeSafety::EnqueueOperation(
-                    WeakOwner.Get(),
-                    Label,
-                    MoveTemp(Start),
-                    MoveTemp(Rejected));
-            });
         return 0;
     }
 
@@ -181,9 +343,11 @@ uint64 FglTFRuntimeSafety::EnqueueOperation(
     }
 
     FString CoordinatorReason;
+    const bool bPendingRelease = glTFRuntimeSafetyPrivate::IsAssetPendingRelease(State, Asset);
     if (glTFRuntimeSafetyPrivate::IsShuttingDown() ||
         glTFRuntimeSafetyPrivate::IsCircuitOpen(&CoordinatorReason) ||
-        !IsValid(Owner) || !Start || State.Queue.Num() >= glTFRuntimeSafetyPrivate::MaximumQueuedOperations)
+        !IsValid(Owner) || !IsValid(Asset) || !Start || bPendingRelease ||
+        State.Queue.Num() >= glTFRuntimeSafetyPrivate::MaximumQueuedOperations)
     {
         if (Rejected)
         {
@@ -195,13 +359,17 @@ uint64 FglTFRuntimeSafety::EnqueueOperation(
             {
                 Rejected(CoordinatorReason);
             }
-            else if (!IsValid(Owner) || !Start)
+            else if (bPendingRelease)
             {
-                Rejected(TEXT("Operation owner or start callback is invalid"));
+                Rejected(TEXT("The glTFRuntime asset is already pending safe release"));
+            }
+            else if (!IsValid(Owner) || !IsValid(Asset) || !Start)
+            {
+                Rejected(TEXT("Operation owner, runtime asset, or start callback is invalid"));
             }
             else
             {
-                Rejected(TEXT("The serialized glTFRuntime queue reached its safety limit"));
+                Rejected(TEXT("The glTFRuntime queue reached its safety limit"));
             }
         }
         return 0;
@@ -210,6 +378,7 @@ uint64 FglTFRuntimeSafety::EnqueueOperation(
     glTFRuntimeSafetyPrivate::FQueuedOperation Operation;
     Operation.Ticket = State.NextTicket++;
     Operation.Owner = Owner;
+    Operation.Asset = Asset;
     Operation.Label = Label.Left(512);
     Operation.Start = MoveTemp(Start);
     Operation.Rejected = MoveTemp(Rejected);
@@ -223,7 +392,10 @@ void FglTFRuntimeSafety::CompleteOperation(const uint64 Ticket)
 {
     if (!IsInGameThread())
     {
-        FSafeFileIO::DispatchTrackedGameThread([Ticket]()
+        // Do not route this through FSafeFileIO: its shutdown gate intentionally rejects new
+        // dispatches. The active-ticket map itself keeps this module and both UObjects logically
+        // alive until this game-thread completion removes the ticket during the shutdown drain.
+        AsyncTask(ENamedThreads::GameThread, [Ticket]()
         {
             FglTFRuntimeSafety::CompleteOperation(Ticket);
         });
@@ -231,26 +403,24 @@ void FglTFRuntimeSafety::CompleteOperation(const uint64 Ticket)
     }
 
     glTFRuntimeSafetyPrivate::FState& State = glTFRuntimeSafetyPrivate::GetState();
-    if (Ticket == 0 || State.ActiveTicket != Ticket)
+    if (Ticket == 0 || !State.ActiveOperations.Contains(Ticket))
     {
         return;
     }
 
-    State.ActiveTicket = 0;
-    State.ActiveStartedAtSeconds = 0.0;
-    State.ActiveLabel.Reset();
+    State.ActiveOperations.Remove(Ticket);
+
+    // A release requested during the callback is finalized before another job can reuse that parser.
+    ProcessPendingAssetReleases_GameThread();
     PumpQueue_GameThread();
 }
 
 void FglTFRuntimeSafety::CancelQueuedOperations(UObject* Owner)
 {
-    if (!IsInGameThread())
+    // Constructing/reading weak UObject pointers and mutating the queue are deliberately kept on
+    // one owning thread. Every project caller is a UObject lifecycle or callback path on the GT.
+    if (!ensureMsgf(IsInGameThread(), TEXT("FglTFRuntimeSafety::CancelQueuedOperations must run on the game thread")))
     {
-        TWeakObjectPtr<UObject> WeakOwner(Owner);
-        FSafeFileIO::DispatchTrackedGameThread([WeakOwner]()
-        {
-            FglTFRuntimeSafety::CancelQueuedOperations(WeakOwner.Get());
-        });
         return;
     }
 
@@ -260,14 +430,82 @@ void FglTFRuntimeSafety::CancelQueuedOperations(UObject* Owner)
     }
 
     glTFRuntimeSafetyPrivate::FState& State = glTFRuntimeSafetyPrivate::GetState();
-    for (int32 Index = State.Queue.Num() - 1; Index >= 0; --Index)
+    TArray<glTFRuntimeSafetyPrivate::FQueuedOperation> Removed =
+        glTFRuntimeSafetyPrivate::RemoveQueuedOperationsForOwner(State, Owner);
+    for (glTFRuntimeSafetyPrivate::FQueuedOperation& Operation : Removed)
     {
-        if (State.Queue[Index].Owner.Get() == Owner)
+        glTFRuntimeSafetyPrivate::RejectOperation(Operation, TEXT("Operation was cancelled before it started"));
+    }
+
+    ProcessPendingAssetReleases_GameThread();
+    PumpQueue_GameThread();
+}
+
+void FglTFRuntimeSafety::RequestAssetRelease(UglTFRuntimeAsset* Asset)
+{
+    // The caller must transfer the last strong reference on the game thread. Silently posting a
+    // weak pointer from a worker would leave a GC window before the deferred release can own it.
+    if (!ensureMsgf(IsInGameThread(), TEXT("FglTFRuntimeSafety::RequestAssetRelease must run on the game thread")))
+    {
+        return;
+    }
+
+    if (!IsValid(Asset))
+    {
+        return;
+    }
+
+    glTFRuntimeSafetyPrivate::FState& State = glTFRuntimeSafetyPrivate::GetState();
+    if (glTFRuntimeSafetyPrivate::IsAssetPendingRelease(State, Asset))
+    {
+        return;
+    }
+
+    // Acquire the strong reference before callers null their UPROPERTY. This closes the GC window
+    // between actor teardown and a terminal native callback.
+    State.PendingAssetReleases.Emplace(Asset);
+
+    TArray<glTFRuntimeSafetyPrivate::FQueuedOperation> Removed =
+        glTFRuntimeSafetyPrivate::RemoveQueuedOperationsForAsset(State, Asset);
+    for (glTFRuntimeSafetyPrivate::FQueuedOperation& Operation : Removed)
+    {
+        glTFRuntimeSafetyPrivate::RejectOperation(
+            Operation,
+            TEXT("Operation was cancelled because its glTFRuntime asset is being released"));
+    }
+
+    ProcessPendingAssetReleases_GameThread();
+    PumpQueue_GameThread();
+}
+
+void FglTFRuntimeSafety::ProcessPendingAssetReleases_GameThread()
+{
+    check(IsInGameThread());
+    glTFRuntimeSafetyPrivate::FState& State = glTFRuntimeSafetyPrivate::GetState();
+
+    for (int32 Index = State.PendingAssetReleases.Num() - 1; Index >= 0; --Index)
+    {
+        UglTFRuntimeAsset* Asset = State.PendingAssetReleases[Index].Asset.Get();
+        if (!IsValid(Asset))
         {
-            glTFRuntimeSafetyPrivate::FQueuedOperation Removed = MoveTemp(State.Queue[Index]);
-            State.Queue.RemoveAtSwap(Index, 1, EAllowShrinking::No);
-            glTFRuntimeSafetyPrivate::RejectOperation(Removed, TEXT("Operation was cancelled before it started"));
+            State.PendingAssetReleases.RemoveAtSwap(Index, 1, EAllowShrinking::No);
+            continue;
         }
+
+        if (glTFRuntimeSafetyPrivate::IsAssetActive(State, Asset))
+        {
+            continue;
+        }
+
+        // ClearCache touches the parser's mutable cache and must never overlap native work for the
+        // same asset. Removing legacy root/standalone flags here also centralizes every final release.
+        Asset->ClearCache();
+        if (Asset->IsRooted())
+        {
+            Asset->RemoveFromRoot();
+        }
+        Asset->ClearFlags(RF_Public | RF_Standalone);
+        State.PendingAssetReleases.RemoveAtSwap(Index, 1, EAllowShrinking::No);
     }
 }
 
@@ -289,9 +527,7 @@ void FglTFRuntimeSafety::ReportRecoverableFailure(
 
     if (Record.Count >= 2)
     {
-        UE_LOG(
-            LogTemp,
-            Error,
+        UE_LOG(LogTemp, Error,
             TEXT("Quarantined glTF file after %d recoverable failures. Path=%s Reason=%s"),
             Record.Count,
             *NormalizedPath,
@@ -340,11 +576,14 @@ void FglTFRuntimeSafety::BeginShutdown()
         return;
     }
 
-    for (glTFRuntimeSafetyPrivate::FQueuedOperation& Operation : State.Queue)
+    TArray<glTFRuntimeSafetyPrivate::FQueuedOperation> Removed = MoveTemp(State.Queue);
+    State.Queue.Reset();
+    for (glTFRuntimeSafetyPrivate::FQueuedOperation& Operation : Removed)
     {
         glTFRuntimeSafetyPrivate::RejectOperation(Operation, TEXT("glTFRuntime coordinator is shutting down"));
     }
-    State.Queue.Reset();
+
+    ProcessPendingAssetReleases_GameThread();
     if (State.WatchdogHandle.IsValid())
     {
         FTSTicker::GetCoreTicker().RemoveTicker(State.WatchdogHandle);
@@ -352,9 +591,13 @@ void FglTFRuntimeSafety::BeginShutdown()
     }
 }
 
-
 bool FglTFRuntimeSafety::FlushPendingOperations(const double TimeoutSeconds)
 {
+    if (!ensureMsgf(IsInGameThread(), TEXT("FglTFRuntimeSafety::FlushPendingOperations must run on the game thread")))
+    {
+        return false;
+    }
+
     const double StartSeconds = FPlatformTime::Seconds();
     while (GetPendingOperationCount() > 0)
     {
@@ -363,12 +606,10 @@ bool FglTFRuntimeSafety::FlushPendingOperations(const double TimeoutSeconds)
             return false;
         }
 
-        // Native plugin callbacks are marshalled to the game thread. During module shutdown, pump
-        // that queue so a completed worker can release its active ticket before this DLL unloads.
-        if (IsInGameThread())
-        {
-            FTaskGraphInterface::Get().ProcessThreadUntilIdle(ENamedThreads::GameThread);
-        }
+        // Plugin callbacks are marshalled to the game thread. Pump them so terminal callbacks can
+        // return their tickets and finalize deferred cache releases before this module unloads.
+        FTaskGraphInterface::Get().ProcessThreadUntilIdle(ENamedThreads::GameThread);
+        ProcessPendingAssetReleases_GameThread();
         FPlatformProcess::SleepNoStats(0.005f);
     }
     return true;
@@ -376,8 +617,13 @@ bool FglTFRuntimeSafety::FlushPendingOperations(const double TimeoutSeconds)
 
 int32 FglTFRuntimeSafety::GetPendingOperationCount()
 {
+    if (!ensureMsgf(IsInGameThread(), TEXT("glTFRuntime queue state must be read on the game thread")))
+    {
+        return 0;
+    }
+
     const glTFRuntimeSafetyPrivate::FState& State = glTFRuntimeSafetyPrivate::GetState();
-    return State.Queue.Num() + (State.ActiveTicket != 0 ? 1 : 0);
+    return State.Queue.Num() + State.ActiveOperations.Num() + State.PendingAssetReleases.Num();
 }
 
 bool FglTFRuntimeSafety::TickWatchdog(const float DeltaSeconds)
@@ -391,30 +637,42 @@ bool FglTFRuntimeSafety::TickWatchdog(const float DeltaSeconds)
     {
         return false;
     }
-    if (glTFRuntimeSafetyPrivate::IsCircuitOpen() || State.ActiveTicket == 0 || State.ActiveStartedAtSeconds <= 0.0)
+    if (glTFRuntimeSafetyPrivate::IsCircuitOpen() || State.ActiveOperations.IsEmpty())
     {
         return true;
     }
 
-    const double ElapsedSeconds = FPlatformTime::Seconds() - State.ActiveStartedAtSeconds;
-    if (ElapsedSeconds < NativeOperationTimeoutSeconds)
+    const double NowSeconds = FPlatformTime::Seconds();
+    const glTFRuntimeSafetyPrivate::FActiveOperation* TimedOut = nullptr;
+    for (const TPair<uint64, glTFRuntimeSafetyPrivate::FActiveOperation>& Pair : State.ActiveOperations)
+    {
+        if (Pair.Value.StartedAtSeconds > 0.0 &&
+            NowSeconds - Pair.Value.StartedAtSeconds >= NativeOperationTimeoutSeconds)
+        {
+            TimedOut = &Pair.Value;
+            break;
+        }
+    }
+
+    if (!TimedOut)
     {
         return true;
     }
 
     const FString CircuitReason = FString::Printf(
         TEXT("glTFRuntime circuit breaker opened after operation [%llu] '%s' exceeded %.0f seconds"),
-        State.ActiveTicket,
-        *State.ActiveLabel,
+        TimedOut->Ticket,
+        *TimedOut->Label,
         NativeOperationTimeoutSeconds);
     glTFRuntimeSafetyPrivate::OpenCircuit(CircuitReason);
     UE_LOG(LogTemp, Error, TEXT("%s. No additional glTFRuntime jobs will start this session."), *CircuitReason);
 
-    for (glTFRuntimeSafetyPrivate::FQueuedOperation& Operation : State.Queue)
+    TArray<glTFRuntimeSafetyPrivate::FQueuedOperation> Removed = MoveTemp(State.Queue);
+    State.Queue.Reset();
+    for (glTFRuntimeSafetyPrivate::FQueuedOperation& Operation : Removed)
     {
         glTFRuntimeSafetyPrivate::RejectOperation(Operation, CircuitReason);
     }
-    State.Queue.Reset();
     return true;
 }
 
@@ -422,29 +680,105 @@ void FglTFRuntimeSafety::PumpQueue_GameThread()
 {
     check(IsInGameThread());
     glTFRuntimeSafetyPrivate::FState& State = glTFRuntimeSafetyPrivate::GetState();
-    if (glTFRuntimeSafetyPrivate::IsShuttingDown() ||
-        glTFRuntimeSafetyPrivate::IsCircuitOpen() ||
-        State.ActiveTicket != 0)
+    if (State.bPumpingQueue || glTFRuntimeSafetyPrivate::IsShuttingDown() ||
+        glTFRuntimeSafetyPrivate::IsCircuitOpen())
     {
         return;
     }
 
-    while (!State.Queue.IsEmpty())
+    State.bPumpingQueue = true;
+    ON_SCOPE_EXIT
     {
-        glTFRuntimeSafetyPrivate::FQueuedOperation Operation = MoveTemp(State.Queue[0]);
-        State.Queue.RemoveAt(0, 1, EAllowShrinking::No);
+        State.bPumpingQueue = false;
+    };
 
-        if (!Operation.Owner.IsValid() || !Operation.Start)
+    while (State.ActiveOperations.Num() < glTFRuntimeSafetyPrivate::MaximumConcurrentNativeOperations)
+    {
+        int32 SelectedIndex = INDEX_NONE;
+        TArray<glTFRuntimeSafetyPrivate::FQueuedOperation> RejectedBeforeStart;
+        glTFRuntimeSafetyPrivate::FQueuedOperation Operation;
+        bool bHasSelectedOperation = false;
+
+        // Preserve queue order where possible, but skip entries whose asset already owns a slot.
+        // This avoids head-of-line blocking: another GLB can proceed while one parser is busy.
+        for (int32 Index = 0; Index < State.Queue.Num(); ++Index)
         {
-            glTFRuntimeSafetyPrivate::RejectOperation(Operation, TEXT("Operation owner expired before execution"));
-            continue;
+            glTFRuntimeSafetyPrivate::FQueuedOperation& Candidate = State.Queue[Index];
+            UObject* Owner = Candidate.Owner.Get();
+            UglTFRuntimeAsset* Asset = Candidate.Asset.Get();
+
+            if (!IsValid(Owner) || !IsValid(Asset) || !Candidate.Start ||
+                glTFRuntimeSafetyPrivate::IsAssetPendingRelease(State, Asset))
+            {
+                RejectedBeforeStart.Add(MoveTemp(Candidate));
+                State.Queue.RemoveAt(Index, 1, EAllowShrinking::No);
+                --Index;
+                continue;
+            }
+
+            if (!glTFRuntimeSafetyPrivate::IsAssetActive(State, Asset))
+            {
+                SelectedIndex = Index;
+                break;
+            }
         }
 
-        State.ActiveTicket = Operation.Ticket;
-        State.ActiveStartedAtSeconds = FPlatformTime::Seconds();
-        State.ActiveLabel = Operation.Label;
-        UE_LOG(LogTemp, Verbose, TEXT("Starting serialized glTFRuntime operation [%llu] %s"), Operation.Ticket, *Operation.Label);
+        if (SelectedIndex != INDEX_NONE)
+        {
+            // Remove and register the selected entry before invoking any rejection callback.
+            // Callbacks are user code and may otherwise mutate Queue and invalidate SelectedIndex.
+            Operation = MoveTemp(State.Queue[SelectedIndex]);
+            State.Queue.RemoveAt(SelectedIndex, 1, EAllowShrinking::No);
+
+            glTFRuntimeSafetyPrivate::FActiveOperation Active(
+                Operation.Ticket,
+                Operation.Owner.Get(),
+                Operation.Asset.Get(),
+                Operation.Label,
+                FPlatformTime::Seconds());
+            State.ActiveOperations.Add(Active.Ticket, MoveTemp(Active));
+            bHasSelectedOperation = true;
+        }
+
+        if (!bHasSelectedOperation)
+        {
+            // Rejection callbacks are user code and may enqueue/cancel more work. Invoke them only
+            // after the queue scan has finished so callback re-entry cannot invalidate Queue indices.
+            for (glTFRuntimeSafetyPrivate::FQueuedOperation& Rejected : RejectedBeforeStart)
+            {
+                glTFRuntimeSafetyPrivate::RejectOperation(
+                    Rejected,
+                    TEXT("Operation owner/asset expired or the asset entered safe release before execution"));
+            }
+
+            // A rejection callback may have appended a newly runnable operation. Re-scan once the
+            // callbacks are complete; otherwise there is no runnable asset until an active job ends.
+            if (!RejectedBeforeStart.IsEmpty())
+            {
+                continue;
+            }
+            return;
+        }
+
+        UE_LOG(LogTemp, Verbose,
+            TEXT("Starting bounded glTFRuntime operation [%llu] %s (active=%d/%d)"),
+            Operation.Ticket,
+            *Operation.Label,
+            State.ActiveOperations.Num(),
+            glTFRuntimeSafetyPrivate::MaximumConcurrentNativeOperations);
+
+        // Start may synchronously fail and call CompleteOperation. The bPumpingQueue guard prevents
+        // recursive pumping while this outer loop safely observes the updated active map.
         Operation.Start(Operation.Ticket);
-        return;
+
+        // Start the selected operation before invoking unrelated rejection callbacks. Otherwise a
+        // rejection callback could request release of the just-selected asset after it was marked
+        // active but before native work actually began.
+        for (glTFRuntimeSafetyPrivate::FQueuedOperation& Rejected : RejectedBeforeStart)
+        {
+            glTFRuntimeSafetyPrivate::RejectOperation(
+                Rejected,
+                TEXT("Operation owner/asset expired or the asset entered safe release before execution"));
+        }
     }
 }

@@ -3,7 +3,7 @@
 
 /**
  * @file glTFRuntimeSafety.h
- * @brief Serializes high-risk glTFRuntime work and centralizes session quarantine decisions.
+ * @brief Coordinates bounded parallel glTFRuntime work and safe runtime-asset cache teardown.
  */
 #pragma once
 
@@ -11,14 +11,20 @@
 #include "Templates/Function.h"
 
 class FglTFRuntimeParser;
+class UglTFRuntimeAsset;
 struct FglTFRuntimeConfig;
 
 /**
  * Process-local safety coordinator for third-party glTF parser and mesh-build calls.
  *
- * Native access violations and memory corruption cannot be safely recovered by a C++ try/catch.
- * This service therefore reduces exposure by validating first, preventing overlapping parser/mesh
- * jobs, and quarantining repeatedly failing external files for the remainder of the session.
+ * glTFRuntime keeps mutable caches inside each parser. Operations that share one
+ * UglTFRuntimeAsset therefore remain strictly serialized, while operations belonging to
+ * different assets may run in parallel under a conservative global memory-pressure cap.
+ *
+ * Native access violations and memory corruption cannot be recovered with C++ exceptions.
+ * This coordinator instead validates external files before entry, keeps UObject work on the
+ * game thread, delays cache destruction until native callbacks have finished, and quarantines
+ * repeatedly failing files for the remainder of the process.
  */
 class GLTFSIMULATOR_API FglTFRuntimeSafety
 {
@@ -26,26 +32,44 @@ public:
     using FQueuedStart = TFunction<void(uint64)>;
     using FRejected = TFunction<void(const FString&)>;
 
-    /** Creates a parser under a process-wide worker lock. Never call this from the game thread. */
-    static TSharedPtr<FglTFRuntimeParser> CreateParserSerialized(
+    /**
+     * Creates an independent parser on a worker thread.
+     *
+     * Parser creation is bounded but no longer globally serialized, so different GLB files can
+     * parse concurrently without allowing an unbounded peak-memory spike.
+     */
+    static TSharedPtr<FglTFRuntimeParser> CreateParserSafely(
         const FString& FilePath,
         const FglTFRuntimeConfig& Config);
 
     /**
-     * Enqueues one game-thread glTFRuntime mesh operation. Start receives a ticket that the caller
-     * must release through CompleteOperation from every success, failure, and cancellation callback.
+     * Enqueues one game-thread glTFRuntime operation for Asset.
+     *
+     * Start receives a ticket that the caller must return through CompleteOperation from every
+     * terminal success/failure/cancellation callback. The same Asset never has two active native
+     * operations, but different assets can use separate slots concurrently.
      */
     static uint64 EnqueueOperation(
         UObject* Owner,
+        UglTFRuntimeAsset* Asset,
         const FString& Label,
         FQueuedStart Start,
         FRejected Rejected = FRejected());
 
-    /** Releases the active ticket and starts the next valid queued operation. */
+    /** Releases an active ticket, performs any now-safe cache teardown, and pumps queued work. */
     static void CompleteOperation(uint64 Ticket);
 
-    /** Removes queued work owned by Owner. Active native work is allowed to finish safely. */
+    /** Removes queued work owned by Owner. Game-thread only; active native work is allowed to finish. */
     static void CancelQueuedOperations(UObject* Owner);
+
+    /**
+     * Requests final release of a runtime asset and its parser cache.
+     *
+     * This function is idempotent and game-thread only. It rejects not-yet-started work for the
+     * asset, keeps the UObject strongly referenced, and calls ClearCache only after the asset has
+     * no active native operation. Callers may drop their own UPROPERTY immediately afterwards.
+     */
+    static void RequestAssetRelease(UglTFRuntimeAsset* Asset);
 
     /** Records a recoverable failure and quarantines a path after repeated failures. */
     static void ReportRecoverableFailure(const FString& FilePath, const FString& Reason);
@@ -53,19 +77,20 @@ public:
     /** Returns true when a path has been quarantined for the current process. */
     static bool IsPathQuarantined(const FString& FilePath, FString* OutReason = nullptr);
 
-    /** Returns true after a native operation timeout opens the session circuit breaker. */
+    /** Returns true after a native-operation timeout opens the session circuit breaker. */
     static bool IsCircuitOpen(FString* OutReason = nullptr);
 
-    /** Clears queued state and rejects new operations during module shutdown. */
+    /** Stops new work, rejects queued operations, and begins draining active callbacks. */
     static void BeginShutdown();
 
-    /** Waits for an active native operation to return its terminal callback before module unload. */
+    /** Waits for active native operations and deferred cache releases before module unload. */
     static bool FlushPendingOperations(double TimeoutSeconds);
 
-    /** Returns one for an active operation plus the number of operations waiting in the queue. */
+    /** Returns queued + active operations + deferred asset releases. Game-thread only. */
     static int32 GetPendingOperationCount();
 
 private:
     static void PumpQueue_GameThread();
+    static void ProcessPendingAssetReleases_GameThread();
     static bool TickWatchdog(float DeltaSeconds);
 };

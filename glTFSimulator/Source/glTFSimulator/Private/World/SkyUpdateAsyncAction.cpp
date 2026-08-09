@@ -7,6 +7,12 @@
 
 USkyUpdateAsyncAction *USkyUpdateAsyncAction::SkyUpdateAsync(UObject *WorldContextObject, UWorldData *Data)
 {
+    if (!ensureMsgf(IsInGameThread(),
+        TEXT("USkyUpdateAsyncAction::SkyUpdateAsync must create its UObject on the game thread")))
+    {
+        return nullptr;
+    }
+
     USkyUpdateAsyncAction *Action = NewObject<USkyUpdateAsyncAction>();
     Action->WorldContextObject = WorldContextObject;
     Action->Data = Data;
@@ -16,6 +22,12 @@ USkyUpdateAsyncAction *USkyUpdateAsyncAction::SkyUpdateAsync(UObject *WorldConte
 
 FRotator USkyUpdateAsyncAction::CalculateSunRotation(const UWorldData* World)
 {
+    if (!ensureMsgf(IsInGameThread(),
+        TEXT("USkyUpdateAsyncAction::CalculateSunRotation reads UObject state and must run on the game thread")))
+    {
+        return FRotator::ZeroRotator;
+    }
+
     FRotator Result = FRotator::ZeroRotator;
     if (IsValid(World) &&
         FMath::IsFinite(World->WorldTime) &&
@@ -83,6 +95,11 @@ FLightRotation USkyUpdateAsyncAction::CalculateLightRotation(const UWorldData* W
 
 void USkyUpdateAsyncAction::Activate()
 {
+    if (!ensureMsgf(IsInGameThread(), TEXT("USkyUpdateAsyncAction::Activate must run on the game thread")))
+    {
+        return;
+    }
+
     if (!IsValid(Data))
     {
         // Complete immediately with an empty vector when there is no data.

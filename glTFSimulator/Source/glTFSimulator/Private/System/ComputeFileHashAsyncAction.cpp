@@ -8,6 +8,12 @@
 
 UComputeFileHashAsyncAction *UComputeFileHashAsyncAction::ComputeFileHashAsync(UObject *WorldContextObject, const FString &FilePath)
 {
+    if (!ensureMsgf(IsInGameThread(),
+        TEXT("UComputeFileHashAsyncAction::ComputeFileHashAsync must create its UObject on the game thread")))
+    {
+        return nullptr;
+    }
+
     UComputeFileHashAsyncAction *Action = NewObject<UComputeFileHashAsyncAction>();
     Action->WorldContextObject = WorldContextObject;
     Action->TargetFilePath = FilePath;
@@ -16,6 +22,11 @@ UComputeFileHashAsyncAction *UComputeFileHashAsyncAction::ComputeFileHashAsync(U
 
 void UComputeFileHashAsyncAction::Activate()
 {
+    if (!ensureMsgf(IsInGameThread(), TEXT("UComputeFileHashAsyncAction::Activate must run on the game thread")))
+    {
+        return;
+    }
+
     RegisterWithGameInstance(WorldContextObject);
     const FString FilePath = TargetFilePath;
     TWeakObjectPtr<UComputeFileHashAsyncAction> WeakThis(this);

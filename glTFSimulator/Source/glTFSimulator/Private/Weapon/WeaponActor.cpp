@@ -21,6 +21,7 @@
 #include "Serialization/JsonWriter.h"
 #include "Setting/GameSettings.h"
 #include "System/GlbValidation.h"
+#include "System/glTFRuntimeSafety.h"
 #include "System/MacroLibrary.h"
 #include "Weapon/WeaponProjectileActor.h"
 #include "glTFRuntimeAsset.h"
@@ -169,6 +170,11 @@ void AWeaponActor::Destroyed()
 
 bool AWeaponActor::EquipFromFile(const FString& InFilePath, USceneComponent* AttachTarget)
 {
+    if (!ensureMsgf(IsInGameThread(), TEXT("AWeaponActor::EquipFromFile must run on the game thread")))
+    {
+        return false;
+    }
+
     Config = FWeaponConfig();
     SourceFilePath = InFilePath.IsEmpty() ? FString() : FPaths::ConvertRelativePathToFull(InFilePath);
 
@@ -190,6 +196,11 @@ bool AWeaponActor::EquipFromFile(const FString& InFilePath, USceneComponent* Att
 
 bool AWeaponActor::EquipDefault(USceneComponent* AttachTarget)
 {
+    if (!ensureMsgf(IsInGameThread(), TEXT("AWeaponActor::EquipDefault must run on the game thread")))
+    {
+        return false;
+    }
+
     Config = FWeaponConfig();
     SourceFilePath.Reset();
     if (!CreateDefaultBoxMesh())
@@ -295,11 +306,15 @@ bool AWeaponActor::SaveDefaultConfigJson(const FString& JsonPath) const
 
 void AWeaponActor::ReleaseRuntimeResources()
 {
+    if (!ensureMsgf(IsInGameThread(), TEXT("AWeaponActor runtime release must run on the game thread")))
+    {
+        return;
+    }
+
     ClearLoadedComponents();
     if (IsValid(GltfAsset))
     {
-        GltfAsset->ClearCache();
-        GltfAsset->ClearFlags(RF_Public | RF_Standalone);
+        FglTFRuntimeSafety::RequestAssetRelease(GltfAsset);
         GltfAsset = nullptr;
     }
 }
