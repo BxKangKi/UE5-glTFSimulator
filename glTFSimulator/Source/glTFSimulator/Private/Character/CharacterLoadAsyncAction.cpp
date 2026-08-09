@@ -28,14 +28,16 @@ namespace
     constexpr int64 MaxBoneMapJsonBytes = 16ll * 1024ll * 1024ll;
     constexpr int32 MaxSkeletonBonesForGeneratedSecondaryPhysics = 512;
 
-    bool IsFiniteVector(const FVector& Vector)
+    // Unity builds concatenate multiple .cpp files into one translation unit. The file-specific
+    // prefix prevents this helper from colliding with similarly named model-loading validators.
+    bool IsFiniteCharacterLoadVector(const FVector& Vector)
     {
         return FMath::IsFinite(Vector.X) &&
             FMath::IsFinite(Vector.Y) &&
             FMath::IsFinite(Vector.Z);
     }
 
-    bool IsFiniteQuat(const FQuat& Rotation)
+    bool IsFiniteCharacterLoadQuat(const FQuat& Rotation)
     {
         return FMath::IsFinite(Rotation.X) &&
             FMath::IsFinite(Rotation.Y) &&
@@ -43,13 +45,13 @@ namespace
             FMath::IsFinite(Rotation.W);
     }
 
-    bool IsFiniteTransform(const FTransform& Transform)
+    bool IsFiniteCharacterLoadTransform(const FTransform& Transform)
     {
         const FQuat Rotation = Transform.GetRotation();
         return !Transform.ContainsNaN() &&
-            IsFiniteVector(Transform.GetLocation()) &&
-            IsFiniteVector(Transform.GetScale3D()) &&
-            IsFiniteQuat(Rotation) &&
+            IsFiniteCharacterLoadVector(Transform.GetLocation()) &&
+            IsFiniteCharacterLoadVector(Transform.GetScale3D()) &&
+            IsFiniteCharacterLoadQuat(Rotation) &&
             Rotation.IsNormalized();
     }
 
@@ -900,7 +902,7 @@ bool UCharacterLoadAsyncAction::ResolveCharacterSkin(UglTFRuntimeAsset* Asset)
     {
         if (Node.Index >= 0 && Node.Index < Nodes.Num() &&
             Node.MeshIndex >= 0 && Node.MeshIndex < MeshCount &&
-            Node.SkinIndex >= 0 && IsFiniteTransform(Node.Transform))
+            Node.SkinIndex >= 0 && IsFiniteCharacterLoadTransform(Node.Transform))
         {
             DetectedMeshIndex = Node.MeshIndex;
             DetectedSkinIndex = Node.SkinIndex;

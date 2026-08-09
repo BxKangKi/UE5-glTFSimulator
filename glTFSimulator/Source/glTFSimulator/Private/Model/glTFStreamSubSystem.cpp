@@ -42,15 +42,17 @@ namespace
         FModelData Metadata;
     };
 
-    bool IsFiniteVector(const FVector& Value)
+    // The file-specific name avoids anonymous-namespace redefinition when Unreal Unity Build
+    // combines this source file with another loader that performs a similar finite-vector check.
+    bool IsFiniteStreamMetadataVector(const FVector& Value)
     {
         return FMath::IsFinite(Value.X) && FMath::IsFinite(Value.Y) && FMath::IsFinite(Value.Z);
     }
 
     bool IsUsableModelMetadata(const FModelData& ModelData)
     {
-        return IsFiniteVector(ModelData.Center) &&
-            IsFiniteVector(ModelData.Size) &&
+        return IsFiniteStreamMetadataVector(ModelData.Center) &&
+            IsFiniteStreamMetadataVector(ModelData.Size) &&
             !ModelData.Size.IsNearlyZero(0.001f);
     }
 

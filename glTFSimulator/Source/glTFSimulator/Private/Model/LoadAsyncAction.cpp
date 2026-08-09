@@ -26,14 +26,16 @@ namespace
     constexpr int64 MAX_MODEL_JSON_BYTES = 64ll * 1024ll * 1024ll;
     constexpr int32 MAX_MODEL_NODE_COUNT = 500000;
 
-    static bool IsFiniteVector(const FVector& Vector)
+    // Keep file-local helper names unique even under Unreal Unity Build, where anonymous
+    // namespaces from several .cpp files are merged into the same translation unit.
+    static bool IsFiniteModelLoadVector(const FVector& Vector)
     {
         return FMath::IsFinite(Vector.X) &&
             FMath::IsFinite(Vector.Y) &&
             FMath::IsFinite(Vector.Z);
     }
 
-    static bool IsFiniteQuat(const FQuat& Rotation)
+    static bool IsFiniteModelLoadQuat(const FQuat& Rotation)
     {
         return FMath::IsFinite(Rotation.X) &&
             FMath::IsFinite(Rotation.Y) &&
@@ -41,13 +43,13 @@ namespace
             FMath::IsFinite(Rotation.W);
     }
 
-    static bool IsFiniteTransform(const FTransform& Transform)
+    static bool IsFiniteModelLoadTransform(const FTransform& Transform)
     {
         const FQuat Rotation = Transform.GetRotation();
         return !Transform.ContainsNaN() &&
-            IsFiniteVector(Transform.GetLocation()) &&
-            IsFiniteVector(Transform.GetScale3D()) &&
-            IsFiniteQuat(Rotation) &&
+            IsFiniteModelLoadVector(Transform.GetLocation()) &&
+            IsFiniteModelLoadVector(Transform.GetScale3D()) &&
+            IsFiniteModelLoadQuat(Rotation) &&
             Rotation.IsNormalized();
     }
 
@@ -134,7 +136,7 @@ void ULoadAsyncAction::Activate()
         const FName NodeName(*TrimmedName);
         const bool bWaterNode = IsWaterNodeName(TrimmedName);
         const bool bHasValidMesh = Node.MeshIndex >= 0 && Node.MeshIndex < MeshCount;
-        if (TrimmedName.IsEmpty() || NodeName.IsNone() || !IsFiniteTransform(Node.Transform) ||
+        if (TrimmedName.IsEmpty() || NodeName.IsNone() || !IsFiniteModelLoadTransform(Node.Transform) ||
             (!bWaterNode && !bHasValidMesh) || SeenNodeNames.Contains(NodeName))
         {
             continue;
@@ -428,7 +430,7 @@ void ULoadAsyncAction::SanitizeParsedData()
     {
         const FModelNodeData& NodeData = It.Value();
         if (It.Key().IsNone() || NodeData.MeshName.IsNone() ||
-            !IsFiniteTransform(NodeData.Transform) || !MeshMap.Contains(NodeData.MeshName))
+            !IsFiniteModelLoadTransform(NodeData.Transform) || !MeshMap.Contains(NodeData.MeshName))
         {
             It.RemoveCurrent();
         }
@@ -436,7 +438,7 @@ void ULoadAsyncAction::SanitizeParsedData()
 
     for (auto It = WaterNodeMap.CreateIterator(); It; ++It)
     {
-        if (It.Key().IsNone() || !IsFiniteTransform(It.Value().Transform) ||
+        if (It.Key().IsNone() || !IsFiniteModelLoadTransform(It.Value().Transform) ||
             !FMath::IsFinite(It.Value().StreamRadius) || It.Value().StreamRadius <= 0.0f)
         {
             It.RemoveCurrent();
@@ -531,7 +533,7 @@ void ULoadAsyncAction::CalculateSize()
         return;
     }
 
-    if (CurrentNode.Name.TrimStartAndEnd().IsEmpty() || !IsFiniteTransform(CurrentNode.Transform))
+    if (CurrentNode.Name.TrimStartAndEnd().IsEmpty() || !IsFiniteModelLoadTransform(CurrentNode.Transform))
     {
         UpdateNext();
         return;
@@ -665,7 +667,7 @@ void ULoadAsyncAction::UpdateWaterNodeData()
     }
 
     const FName NodeName(*CurrentNode.Name.TrimStartAndEnd());
-    if (NodeName.IsNone() || !IsFiniteTransform(CurrentNode.Transform))
+    if (NodeName.IsNone() || !IsFiniteModelLoadTransform(CurrentNode.Transform))
     {
         UpdateNext();
         return;
@@ -692,7 +694,7 @@ void ULoadAsyncAction::UpdateModelNodeData()
 
     const FName NodeName(*CurrentNode.Name.TrimStartAndEnd());
     if (NodeName.IsNone() || CurrentMeshName.IsNone() || !MeshMap.Contains(CurrentMeshName) ||
-        !IsFiniteTransform(CurrentNode.Transform))
+        !IsFiniteModelLoadTransform(CurrentNode.Transform))
     {
         UpdateNext();
         return;
