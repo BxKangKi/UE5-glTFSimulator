@@ -113,7 +113,12 @@ private:
     int32 CurrentLoadWaterIndex = 0;
     int32 CurrentUnloadWaterIndex = 0;
     int32 ChunkSize;
+    /** All model/water nodes evaluated this pass, including no-op and sanitized nodes. */
     int32 TotalOperationCount = 0;
+    /** Nodes that require no UObject work still advance as progress-only work over several ticks. */
+    int32 TotalSkippedOperationCount = 0;
+    int32 CurrentSkippedOperationIndex = 0;
+    int32 SkippedProgressChunkSize = 1;
 
     FTimerHandle ProcessTimerHandle;
     FglTFRuntimeStaticMeshConfig StaticMeshConfig;

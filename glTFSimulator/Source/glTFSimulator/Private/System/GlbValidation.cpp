@@ -37,6 +37,10 @@ namespace
     constexpr int64 MAX_RUNTIME_MESH_INDICES = 12000000;
     constexpr int32 MAX_RUNTIME_VALIDATION_CACHE_ENTRIES = 2048;
     constexpr int32 RUNTIME_VALIDATION_SCHEMA_VERSION = 2;
+    constexpr int64 MAX_RUNTIME_GLTF_JSON_BYTES = 64ll * 1024ll * 1024ll;
+    constexpr int32 MAX_RUNTIME_GLTF_BUFFER_COUNT = 1024;
+    constexpr int64 MAX_RUNTIME_EXTERNAL_RESOURCE_BYTES = static_cast<int64>(MAX_int32);
+    constexpr int32 MAX_RUNTIME_EXTERNAL_RESOURCE_COUNT = 100000;
 
     /** Cached preflight results avoid reopening and reparsing an unchanged GLB during size-scan and streaming passes. */
     struct FRuntimeMeshValidationCacheEntry
@@ -544,6 +548,221 @@ namespace
         }
 
         OutParsed.Root = MoveTemp(JsonResult.JsonObject);
+        return true;
+    }
+
+    bool IsContainedLocalResourcePath(const FString& ModelDirectory, const FString& CandidatePath)
+    {
+        FString NormalizedDirectory = FPaths::ConvertRelativePathToFull(ModelDirectory);
+        FString NormalizedCandidate = FPaths::ConvertRelativePathToFull(CandidatePath);
+        FPaths::NormalizeDirectoryName(NormalizedDirectory);
+        FPaths::NormalizeFilename(NormalizedCandidate);
+        FPaths::CollapseRelativeDirectories(NormalizedDirectory);
+        FPaths::CollapseRelativeDirectories(NormalizedCandidate);
+#if PLATFORM_WINDOWS
+        NormalizedDirectory.ToLowerInline();
+        NormalizedCandidate.ToLowerInline();
+#endif
+        if (NormalizedCandidate == NormalizedDirectory)
+        {
+            return true;
+        }
+
+        if (!NormalizedDirectory.EndsWith(TEXT("/")))
+        {
+            NormalizedDirectory.AppendChar(TEXT('/'));
+        }
+        return NormalizedCandidate.StartsWith(NormalizedDirectory, ESearchCase::CaseSensitive);
+    }
+
+    bool ValidateGltfExternalUri(
+        const FString& NormalizedModelPath,
+        const FString& Uri,
+        const int64 DeclaredMinimumBytes,
+        FString& OutReason)
+    {
+        if (Uri.IsEmpty())
+        {
+            OutReason = TEXT("an external resource URI is empty");
+            return false;
+        }
+
+        // Embedded data URIs are bounded by the .gltf JSON file-size limit and require no disk I/O.
+        if (Uri.StartsWith(TEXT("data:"), ESearchCase::IgnoreCase))
+        {
+            return true;
+        }
+
+        // Runtime entity files may only reference files beside/below the model. Remote URLs and
+        // absolute paths would bypass the selected world's asset root and are deliberately rejected.
+        if (!FPaths::IsRelative(Uri)
+            || Uri.Contains(TEXT("://"), ESearchCase::IgnoreCase)
+            || Uri.StartsWith(TEXT("file:"), ESearchCase::IgnoreCase))
+        {
+            OutReason = FString::Printf(TEXT("external URI is not a local relative path: %s"), *Uri);
+            return false;
+        }
+
+        const FString ModelDirectory = FPaths::GetPath(NormalizedModelPath);
+        FString CandidatePath = FPaths::Combine(ModelDirectory, Uri);
+        CandidatePath = FPaths::ConvertRelativePathToFull(CandidatePath);
+        FPaths::NormalizeFilename(CandidatePath);
+        FPaths::CollapseRelativeDirectories(CandidatePath);
+        if (!IsContainedLocalResourcePath(ModelDirectory, CandidatePath))
+        {
+            OutReason = FString::Printf(TEXT("external URI escapes the model directory: %s"), *Uri);
+            return false;
+        }
+
+        const int64 ResourceSize = IFileManager::Get().FileSize(*CandidatePath);
+        if (ResourceSize == INDEX_NONE)
+        {
+            OutReason = FString::Printf(TEXT("external resource does not exist: %s"), *CandidatePath);
+            return false;
+        }
+        if (ResourceSize < DeclaredMinimumBytes)
+        {
+            OutReason = FString::Printf(
+                TEXT("external resource is smaller than its declared byteLength: %s"),
+                *CandidatePath);
+            return false;
+        }
+        if (ResourceSize > MAX_RUNTIME_EXTERNAL_RESOURCE_BYTES)
+        {
+            OutReason = FString::Printf(TEXT("external resource exceeds the runtime size limit: %s"), *CandidatePath);
+            return false;
+        }
+        return true;
+    }
+
+    bool ValidateGltfExternalBuffers(
+        const FString& NormalizedModelPath,
+        const TSharedPtr<FJsonObject>& Root,
+        TArray<FBufferInfo>& OutBuffers,
+        FString& OutReason)
+    {
+        OutBuffers.Reset();
+        if (!Root.IsValid())
+        {
+            OutReason = TEXT("gltf root JSON object is invalid");
+            return false;
+        }
+
+        const TSharedPtr<FJsonObject>* AssetObject = nullptr;
+        FString AssetVersion;
+        if (!Root->TryGetObjectField(TEXT("asset"), AssetObject)
+            || !AssetObject || !AssetObject->IsValid()
+            || !(*AssetObject)->TryGetStringField(TEXT("version"), AssetVersion)
+            || (AssetVersion != TEXT("2") && !AssetVersion.StartsWith(TEXT("2."))))
+        {
+            OutReason = TEXT("gltf asset.version is missing or is not version 2");
+            return false;
+        }
+
+        const TArray<TSharedPtr<FJsonValue>>* Buffers = nullptr;
+        if (!TryGetRequiredArray(Root, TEXT("buffers"), Buffers)
+            || !Buffers
+            || Buffers->Num() > MAX_RUNTIME_GLTF_BUFFER_COUNT)
+        {
+            OutReason = TEXT("gltf buffers field is missing, empty, malformed, or exceeds the safety limit");
+            return false;
+        }
+
+        OutBuffers.Reserve(Buffers->Num());
+        for (int32 BufferIndex = 0; BufferIndex < Buffers->Num(); ++BufferIndex)
+        {
+            TSharedPtr<FJsonObject> BufferObject;
+            if (!TryGetJsonObjectValue((*Buffers)[BufferIndex], BufferObject))
+            {
+                OutReason = FString::Printf(TEXT("buffer %d is not a JSON object"), BufferIndex);
+                return false;
+            }
+
+            int64 ByteLength = 0;
+            FString Uri;
+            if (!TryGetIntegerField(BufferObject, TEXT("byteLength"), true, 0, 1, MAX_int32, ByteLength)
+                || !BufferObject->TryGetStringField(TEXT("uri"), Uri))
+            {
+                OutReason = FString::Printf(TEXT("buffer %d has no valid uri/byteLength"), BufferIndex);
+                return false;
+            }
+            if (!ValidateGltfExternalUri(NormalizedModelPath, Uri, ByteLength, OutReason))
+            {
+                return false;
+            }
+
+            FBufferInfo& BufferInfo = OutBuffers.AddDefaulted_GetRef();
+            BufferInfo.ByteLength = ByteLength;
+        }
+        return true;
+    }
+
+    bool ValidateGltfImageResources(
+        const FString& NormalizedModelPath,
+        const TSharedPtr<FJsonObject>& Root,
+        const int32 BufferViewCount,
+        const int32 BufferCount,
+        FString& OutReason)
+    {
+        if (!Root.IsValid())
+        {
+            OutReason = TEXT("gltf root JSON object is invalid");
+            return false;
+        }
+
+        const TArray<TSharedPtr<FJsonValue>>* Images = nullptr;
+        if (Root->HasField(TEXT("images")))
+        {
+            if (!Root->TryGetArrayField(TEXT("images"), Images) || !Images)
+            {
+                OutReason = TEXT("gltf images field is not an array");
+                return false;
+            }
+            if (Images->Num() > MAX_RUNTIME_EXTERNAL_RESOURCE_COUNT - FMath::Min(BufferCount, MAX_RUNTIME_EXTERNAL_RESOURCE_COUNT))
+            {
+                OutReason = TEXT("gltf contains too many external resources");
+                return false;
+            }
+
+            for (int32 ImageIndex = 0; ImageIndex < Images->Num(); ++ImageIndex)
+            {
+                TSharedPtr<FJsonObject> ImageObject;
+                if (!TryGetJsonObjectValue((*Images)[ImageIndex], ImageObject))
+                {
+                    OutReason = FString::Printf(TEXT("image %d is not a JSON object"), ImageIndex);
+                    return false;
+                }
+
+                FString Uri;
+                if (!ImageObject->TryGetStringField(TEXT("uri"), Uri))
+                {
+                    // Images embedded through bufferView are covered by the validated buffer file.
+                    int64 BufferViewIndex = 0;
+                    if (!TryGetIntegerField(
+                            ImageObject,
+                            TEXT("bufferView"),
+                            true,
+                            0,
+                            0,
+                            MAX_int32,
+                            BufferViewIndex))
+                    {
+                        OutReason = FString::Printf(TEXT("image %d has neither a valid uri nor bufferView"), ImageIndex);
+                        return false;
+                    }
+                    if (BufferViewIndex >= BufferViewCount)
+                    {
+                        OutReason = FString::Printf(TEXT("image %d references an invalid bufferView"), ImageIndex);
+                        return false;
+                    }
+                    continue;
+                }
+                if (!ValidateGltfExternalUri(NormalizedModelPath, Uri, 0, OutReason))
+                {
+                    return false;
+                }
+            }
+        }
         return true;
     }
 
@@ -1143,7 +1362,13 @@ namespace
 
 FString GlbValidation::NormalizePath(const FString& FilePath)
 {
-    FString Normalized = FPaths::ConvertRelativePathToFull(FilePath);
+    FString Normalized = FilePath.TrimStartAndEnd();
+    if (Normalized.IsEmpty())
+    {
+        return FString();
+    }
+
+    Normalized = FPaths::ConvertRelativePathToFull(Normalized);
     FPaths::NormalizeFilename(Normalized);
     FPaths::CollapseRelativeDirectories(Normalized);
     return Normalized;
@@ -1289,7 +1514,13 @@ bool GlbValidation::ValidateRuntimeMeshFile(const FString& FilePath, FString& Ou
     if (!ParseAndValidateBuffers(Parsed.Root, Parsed.BinaryChunkSize, Buffers, OutReason) ||
         !ParseAndValidateBufferViews(Parsed.Root, Buffers, BufferViews, OutReason) ||
         !ParseAndValidateAccessors(Parsed.Root, BufferViews, Accessors, OutReason) ||
-        !ValidateMeshPrimitives(Parsed.Root, Accessors, OutReason))
+        !ValidateMeshPrimitives(Parsed.Root, Accessors, OutReason) ||
+        !ValidateGltfImageResources(
+            NormalizedPath,
+            Parsed.Root,
+            BufferViews.Num(),
+            Buffers.Num(),
+            OutReason))
     {
         CacheRuntimeValidation(ValidationCacheKey, FileSize, Timestamp, false, OutReason);
         return false;
@@ -1297,6 +1528,77 @@ bool GlbValidation::ValidateRuntimeMeshFile(const FString& FilePath, FString& Ou
 
     OutReason.Reset();
     CacheRuntimeValidation(ValidationCacheKey, FileSize, Timestamp, true, OutReason);
+    return true;
+}
+
+bool GlbValidation::ValidateRuntimeModelFile(const FString& FilePath, FString& OutReason)
+{
+    const FString NormalizedPath = NormalizePath(FilePath);
+    if (NormalizedPath.IsEmpty())
+    {
+        OutReason = TEXT("model path is empty");
+        return false;
+    }
+
+    const FString Extension = FPaths::GetExtension(NormalizedPath).ToLower();
+    if (Extension == TEXT("glb"))
+    {
+        return ValidateRuntimeMeshFile(NormalizedPath, OutReason);
+    }
+    if (Extension != TEXT("gltf"))
+    {
+        OutReason = TEXT("runtime entity model extension must be .glb or .gltf");
+        return false;
+    }
+
+    const int64 FileSize = IFileManager::Get().FileSize(*NormalizedPath);
+    if (FileSize == INDEX_NONE)
+    {
+        OutReason = TEXT("file does not exist or cannot be opened");
+        return false;
+    }
+    if (FileSize <= 0 || FileSize > MAX_RUNTIME_GLTF_JSON_BYTES)
+    {
+        OutReason = FString::Printf(
+            TEXT("gltf JSON file is empty or exceeds the runtime size limit (%lld bytes)"),
+            FileSize);
+        return false;
+    }
+
+    FSafeJsonLimits JsonLimits;
+    JsonLimits.MaxFileBytes = MAX_RUNTIME_GLTF_JSON_BYTES;
+    JsonLimits.MaxDepth = 96;
+    JsonLimits.MaxValues = 4000000;
+    JsonLimits.MaxContainerEntries = 1000000;
+    JsonLimits.MaxStringCharacters = 8 * 1024 * 1024;
+    JsonLimits.bAllowBackupRecovery = false;
+    const FSafeJsonLoadResult JsonResult = FSafeFileIO::LoadJsonBlocking(NormalizedPath, JsonLimits);
+    if (!JsonResult.IsSuccess() || !JsonResult.JsonObject.IsValid())
+    {
+        OutReason = JsonResult.Error.IsEmpty()
+            ? TEXT("gltf JSON could not be parsed safely")
+            : FString::Printf(TEXT("gltf JSON validation failed: %s"), *JsonResult.Error);
+        return false;
+    }
+
+    TArray<FBufferInfo> Buffers;
+    TArray<FBufferViewInfo> BufferViews;
+    TArray<FAccessorInfo> Accessors;
+    if (!ValidateGltfExternalBuffers(NormalizedPath, JsonResult.JsonObject, Buffers, OutReason)
+        || !ParseAndValidateBufferViews(JsonResult.JsonObject, Buffers, BufferViews, OutReason)
+        || !ParseAndValidateAccessors(JsonResult.JsonObject, BufferViews, Accessors, OutReason)
+        || !ValidateMeshPrimitives(JsonResult.JsonObject, Accessors, OutReason)
+        || !ValidateGltfImageResources(
+            NormalizedPath,
+            JsonResult.JsonObject,
+            BufferViews.Num(),
+            Buffers.Num(),
+            OutReason))
+    {
+        return false;
+    }
+
+    OutReason.Reset();
     return true;
 }
 

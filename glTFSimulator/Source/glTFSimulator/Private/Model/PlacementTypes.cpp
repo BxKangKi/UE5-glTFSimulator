@@ -6,8 +6,8 @@
 
 namespace PlacementTypesInternal
 {
-    // Generated-mesh JSON is user-controlled save data. These limits are intentionally below
-    // int32/TArray limits so malformed manifests cannot request multi-gigabyte allocations.
+    // Legacy placement JSON remains readable for one-way migration only. These limits stay below
+    // int32/TArray limits so malformed legacy manifests cannot request huge allocations.
     constexpr int32 MaxRecordNameCharacters = 1024;
     constexpr int32 MaxSourcePathCharacters = 32768;
 
@@ -155,58 +155,10 @@ namespace PlacementTypesInternal
             OutValue.Len() <= MaxCharacters;
     }
 
-    static bool IsGeneratedMeshTopologyValid(
-        const TArray<FVector>& Vertices,
-        const TArray<int32>& TriangleIndices)
-    {
-        if (Vertices.Num() < 3 ||
-            Vertices.Num() > PlacementSafetyLimits::MaxGeneratedMeshVertices ||
-            TriangleIndices.Num() < 3 ||
-            TriangleIndices.Num() > PlacementSafetyLimits::MaxGeneratedMeshTriangleIndices ||
-            (TriangleIndices.Num() % 3) != 0)
-        {
-            return false;
-        }
-
-        for (const FVector& Vertex : Vertices)
-        {
-            if (!IsFiniteBoundedVector(Vertex))
-            {
-                return false;
-            }
-        }
-
-        for (int32 TriangleOffset = 0;
-            TriangleOffset < TriangleIndices.Num();
-            TriangleOffset += 3)
-        {
-            const int32 A = TriangleIndices[TriangleOffset];
-            const int32 B = TriangleIndices[TriangleOffset + 1];
-            const int32 C = TriangleIndices[TriangleOffset + 2];
-            if (!Vertices.IsValidIndex(A) ||
-                !Vertices.IsValidIndex(B) ||
-                !Vertices.IsValidIndex(C) ||
-                A == B || B == C || C == A)
-            {
-                return false;
-            }
-
-            const FVector Cross = FVector::CrossProduct(Vertices[B] - Vertices[A], Vertices[C] - Vertices[A]);
-            const double CrossSizeSquared = Cross.SizeSquared();
-            if (!FMath::IsFinite(CrossSizeSquared) || CrossSizeSquared <= 1.0)
-            {
-                return false;
-            }
-        }
-        return true;
-    }
-
     static FString KindToString(EPlacedObjectKind Kind)
     {
         switch (Kind)
         {
-        case EPlacedObjectKind::GeneratedMesh:
-            return TEXT("GeneratedMesh");
         case EPlacedObjectKind::Vehicle:
             return TEXT("Vehicle");
         case EPlacedObjectKind::Prefab:
@@ -217,10 +169,6 @@ namespace PlacementTypesInternal
 
     static EPlacedObjectKind StringToKind(const FString& Value)
     {
-        if (Value.Equals(TEXT("GeneratedMesh"), ESearchCase::IgnoreCase))
-        {
-            return EPlacedObjectKind::GeneratedMesh;
-        }
         if (Value.Equals(TEXT("Vehicle"), ESearchCase::IgnoreCase))
         {
             return EPlacedObjectKind::Vehicle;
@@ -359,136 +307,5 @@ bool FPlacedObjectRecord::FromJson(const TSharedPtr<FJsonObject>& Json)
     SourceFile = MoveTemp(ParsedSourceFile);
     Kind = ParsedKind;
     Transform = ParsedTransform;
-    return true;
-}
-
-TSharedRef<FJsonObject> FGeneratedMeshRecord::ToJson() const
-{
-    TSharedRef<FJsonObject> Json = MakeShared<FJsonObject>();
-    Json->SetStringField(TEXT("ObjectName"), ObjectName);
-    Json->SetStringField(TEXT("BaseName"), BaseName);
-    FPlacementJson::SetTransform(Json, Transform);
-
-    TArray<TSharedPtr<FJsonValue>> VertexValues;
-    VertexValues.Reserve(Vertices.Num());
-    for (const FVector& Vertex : Vertices)
-    {
-        TSharedRef<FJsonObject> VertexJson = MakeShared<FJsonObject>();
-        FPlacementJson::SetVector(VertexJson, TEXT(""), Vertex);
-        VertexValues.Add(MakeShared<FJsonValueObject>(VertexJson));
-    }
-    Json->SetArrayField(TEXT("Vertices"), VertexValues);
-
-    TArray<TSharedPtr<FJsonValue>> TriangleValues;
-    TriangleValues.Reserve(Triangles.Num());
-    for (const int32 Index : Triangles)
-    {
-        TriangleValues.Add(MakeShared<FJsonValueNumber>(Index));
-    }
-    Json->SetArrayField(TEXT("Triangles"), TriangleValues);
-    return Json;
-}
-
-bool FGeneratedMeshRecord::FromJson(const TSharedPtr<FJsonObject>& Json)
-{
-    if (!Json.IsValid())
-    {
-        return false;
-    }
-
-    FString ParsedObjectName;
-    FString ParsedBaseName;
-    if (!PlacementTypesInternal::TryReadOptionalString(
-            Json, TEXT("ObjectName"), PlacementTypesInternal::MaxRecordNameCharacters, ParsedObjectName) ||
-        ParsedObjectName.IsEmpty() ||
-        !PlacementTypesInternal::TryReadOptionalString(
-            Json, TEXT("BaseName"), PlacementTypesInternal::MaxRecordNameCharacters, ParsedBaseName))
-    {
-        return false;
-    }
-
-    FTransform ParsedTransform = FTransform::Identity;
-    if (Json->HasField(TEXT("Transform")) &&
-        !FPlacementJson::TryGetTransform(Json, ParsedTransform))
-    {
-        return false;
-    }
-
-    const TArray<TSharedPtr<FJsonValue>>* VertexValues = nullptr;
-    if (!Json->TryGetArrayField(TEXT("Vertices"), VertexValues) ||
-        !VertexValues ||
-        VertexValues->Num() < 3 ||
-        VertexValues->Num() > PlacementSafetyLimits::MaxGeneratedMeshVertices)
-    {
-        return false;
-    }
-
-    TArray<FVector> ParsedVertices;
-    ParsedVertices.Reserve(VertexValues->Num());
-    for (const TSharedPtr<FJsonValue>& Value : *VertexValues)
-    {
-        if (!Value.IsValid() || Value->Type != EJson::Object)
-        {
-            return false;
-        }
-
-        FVector Vertex = FVector::ZeroVector;
-        bool bFoundVertex = false;
-        if (!PlacementTypesInternal::TryReadFiniteVector(
-                Value->AsObject(), TEXT(""), Vertex, bFoundVertex, true) ||
-            !bFoundVertex)
-        {
-            return false;
-        }
-        ParsedVertices.Add(Vertex);
-    }
-
-    const TArray<TSharedPtr<FJsonValue>>* TriangleValues = nullptr;
-    if (!Json->TryGetArrayField(TEXT("Triangles"), TriangleValues) ||
-        !TriangleValues ||
-        TriangleValues->Num() < 3 ||
-        TriangleValues->Num() > PlacementSafetyLimits::MaxGeneratedMeshTriangleIndices ||
-        (TriangleValues->Num() % 3) != 0)
-    {
-        return false;
-    }
-
-    TArray<int32> ParsedTriangles;
-    ParsedTriangles.Reserve(TriangleValues->Num());
-    for (const TSharedPtr<FJsonValue>& Value : *TriangleValues)
-    {
-        if (!Value.IsValid() || Value->Type != EJson::Number)
-        {
-            return false;
-        }
-
-        const double NumericIndex = Value->AsNumber();
-        if (!FMath::IsFinite(NumericIndex) ||
-            NumericIndex < 0.0 ||
-            NumericIndex >= static_cast<double>(ParsedVertices.Num()))
-        {
-            return false;
-        }
-
-        // The range check above makes this cast safe; comparing it back rejects fractional values.
-        const int32 IntegralIndex = static_cast<int32>(NumericIndex);
-        if (static_cast<double>(IntegralIndex) != NumericIndex)
-        {
-            return false;
-        }
-        ParsedTriangles.Add(IntegralIndex);
-    }
-
-    if (!PlacementTypesInternal::IsGeneratedMeshTopologyValid(
-            ParsedVertices, ParsedTriangles))
-    {
-        return false;
-    }
-
-    ObjectName = MoveTemp(ParsedObjectName);
-    BaseName = MoveTemp(ParsedBaseName);
-    Transform = ParsedTransform;
-    Vertices = MoveTemp(ParsedVertices);
-    Triangles = MoveTemp(ParsedTriangles);
     return true;
 }

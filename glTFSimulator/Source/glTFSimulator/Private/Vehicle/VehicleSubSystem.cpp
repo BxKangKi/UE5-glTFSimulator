@@ -157,6 +157,10 @@ void UVehicleSubSystem::UpdateVehiclesFromGameUpdate(float DeltaSeconds)
     {
         if (AVehiclePawn* VehiclePawn = Vehicle.Get())
         {
+            if (!VehiclePawn->ShouldUpdateVehicleSimulation())
+            {
+                continue;
+            }
             VehiclePtrs.Add(VehiclePawn);
             Inputs.Add(VehiclePawn->BuildParallelControlInput(SafeDeltaSeconds));
         }

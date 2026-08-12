@@ -4,7 +4,6 @@
 #include "System/ActorHelper.h"
 #include "GameFramework/Actor.h"
 #include "Components/InstancedStaticMeshComponent.h"
-#include "Components/HierarchicalInstancedStaticMeshComponent.h"
 #include "Components/BoxComponent.h"
 
 void FActorHelper::DestroyComponent(AActor *Actor, UActorComponent *Comp)

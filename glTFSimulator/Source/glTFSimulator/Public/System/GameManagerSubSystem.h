@@ -11,7 +11,6 @@
 #include "GameManagerSubSystem.generated.h"
 
 class APrefabActor;
-class AEditableMeshActor;
 class AVehiclePawn;
 class AWeaponActor;
 class UCameraComponent;
@@ -34,12 +33,11 @@ class APlayerController;
 UENUM(BlueprintType)
 enum class EToolMode : uint8
 {
-    None UMETA(DisplayName="None"),
-    PlacePrefab UMETA(DisplayName="Place Prefab"),
-    PlaceEmptyObject UMETA(DisplayName="Place Empty Object"),
-    EditVertices UMETA(DisplayName="Edit Vertices"),
-    PlaceVehicle UMETA(DisplayName="Place Vehicle"),
-    Weapon UMETA(DisplayName="Weapon")
+    None = 0 UMETA(DisplayName="None"),
+    PlacePrefab = 1 UMETA(DisplayName="Place Prefab"),
+    // Values 2 and 3 are reserved for the removed object/vertex authoring tools.
+    PlaceVehicle = 4 UMETA(DisplayName="Place Vehicle"),
+    Weapon = 5 UMETA(DisplayName="Weapon")
 };
 
 UENUM(BlueprintType)
@@ -52,11 +50,11 @@ enum class EPlayMode : uint8
 UENUM(BlueprintType)
 enum class EToolbarItemKind : uint8
 {
-    None UMETA(DisplayName="None"),
-    CreateObject UMETA(DisplayName="Create Object"),
-    Prefab UMETA(DisplayName="Prefab"),
-    Weapon UMETA(DisplayName="Weapon"),
-    Vehicle UMETA(DisplayName="Vehicle")
+    None = 0 UMETA(DisplayName="None"),
+    // Value 1 is reserved for the removed object-creation item.
+    Prefab = 2 UMETA(DisplayName="Prefab"),
+    Weapon = 3 UMETA(DisplayName="Weapon"),
+    Vehicle = 4 UMETA(DisplayName="Vehicle")
 };
 
 USTRUCT(BlueprintType)
@@ -84,6 +82,8 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE(FGameStateChanged);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FToolbarChanged);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FGameMessageChanged, const FString&, Message);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FItemListWindowChanged, bool, bOpen);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FWorldBakeProgress, float, Progress);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FWorldBakeCompleted, bool, bSuccess, const FString&, Message);
 
 UCLASS(Blueprintable, BlueprintType)
 class GLTFSIMULATOR_API UGameManagerSubSystem : public UGameInstanceSubsystem
@@ -130,7 +130,10 @@ public:
     UFUNCTION(BlueprintCallable, Category="Game|Lifecycle")
     void StartGameManager(class AGameManagerActor* InConfigActor);
 
-    void StopGameManager(const EEndPlayReason::Type EndPlayReason);
+    /** Stops the active session. A non-null requester may stop only the session it owns. */
+    void StopGameManager(
+        const EEndPlayReason::Type EndPlayReason,
+        const class AGameManagerActor* RequestingActor = nullptr);
     void UpdateGameManager(float DeltaSeconds);
     void ApplyEditorConfig(const class AGameManagerActor* InConfigActor);
 
@@ -178,9 +181,9 @@ public:
     bool AreCheatsEnabledForCurrentLevel() const { return bCurrentLevelCheatsEnabled; }
     FString GetCurrentWorldName() const { return CurrentWorldName; }
     static void ToggleFullscreen();
-    void SetLoadingStatus(float InValue) { LoadingStatus = (int32)(InValue * 100); }
+    void SetLoadingStatus(float InValue) { LoadingStatus = FMath::Clamp(InValue, 0.0f, 1.0f); }
     UFUNCTION(BlueprintCallable, Category="Game|Loading")
-    float GetLoadingStatus() const { return (float)(LoadingStatus / 100.0f); }
+    float GetLoadingStatus() const { return LoadingStatus; }
     UFUNCTION(BlueprintPure, Category="Game|Debug")
     FString GetDebugText();
 
@@ -192,12 +195,6 @@ public:
 
     UFUNCTION(BlueprintCallable, Category="Game|UI Actions")
     void SelectPrefabPlacementTool();
-
-    UFUNCTION(BlueprintCallable, Category="Game|UI Actions")
-    void SelectEmptyObjectTool();
-
-    UFUNCTION(BlueprintCallable, Category="Game|UI Actions")
-    void SelectVertexTool();
 
     UFUNCTION(BlueprintCallable, Category="Game|UI Actions")
     void SelectVehicleTool();
@@ -224,16 +221,27 @@ public:
     void ToggleFirstPerson();
 
     UFUNCTION(BlueprintCallable, Category="Game|UI Actions")
-    bool FinishCurrentEditableMesh();
-
-    UFUNCTION(BlueprintCallable, Category="Game|UI Actions")
-    void CancelCurrentEditableMesh(bool bDestroyActor = true);
-
-    UFUNCTION(BlueprintCallable, Category="Game|UI Actions")
     bool SaveScene();
 
     UFUNCTION(BlueprintCallable, Category="Game|UI Actions")
     bool LoadSavedScene();
+
+    /**
+     * Writes data/entities.dat, data/players.dat, data/world.dat and validates/builds every sibling
+     * model .scz under the selected world. Designed to be mapped directly to a world-list UI button.
+     */
+    UFUNCTION(BlueprintCallable, Category="Game|Bake")
+    void BakeWorldData();
+
+    UFUNCTION(BlueprintPure, Category="Game|Bake")
+    bool IsWorldBakeInProgress() const { return bWorldBakeInProgress; }
+
+    UFUNCTION(BlueprintPure, Category="Game|Bake")
+    float GetWorldBakeProgress() const { return WorldBakeProgressValue; }
+
+    /** Updates the selected player runtime record and persists it to data/world.dat. */
+    UFUNCTION(BlueprintCallable, Category="Game|World Data")
+    void SetSelectedPlayerForRuntime(const FString& PlayerFileName);
 
     UFUNCTION(BlueprintCallable, Category="Game|UI Actions")
     void RefreshAssetLists();
@@ -247,19 +255,19 @@ public:
     UFUNCTION(BlueprintCallable, Category="Game|UI Actions")
     bool SetCurrentWeaponIndex(int32 NewIndex);
 
-    /** Compatibility short-click action. Prefer InputPrimaryPressed/Released for click-vs-hold vertex editing. */
+    /** Compatibility short-click action for the currently selected placement/equipment item. */
     UFUNCTION(BlueprintCallable, Category="Game|Input")
     void InputPrimaryAction();
 
-    /** Left mouse pressed. In vertex edit mode, pressing an existing vertex starts click/hold classification. */
+    /** Left mouse pressed. Executes the selected placement/equipment action once. */
     UFUNCTION(BlueprintCallable, Category="Game|Input")
     void InputPrimaryPressed();
 
-    /** Left mouse released. Short click selects a linked-vertex source; hold+move commits vertex movement. */
+    /** Left mouse released. Retained as a stable input-mapping endpoint. */
     UFUNCTION(BlueprintCallable, Category="Game|Input")
     void InputPrimaryReleased();
 
-    /** Right mouse / secondary action. Ends current vertex editing; invalid/no-face objects are canceled. */
+    /** Secondary action endpoint retained for project input mappings. */
     UFUNCTION(BlueprintCallable, Category="Game|Input")
     void InputSecondaryAction();
 
@@ -288,7 +296,7 @@ public:
     UFUNCTION(BlueprintCallable, Category="Game|Input")
     void InputVehicleSteeringAction(float Steering);
 
-    /** Useful for BP widgets that want explicit Select/Confirm buttons as well as LMB/RMB. */
+    /** Blueprint aliases for the currently selected placement action. */
     UFUNCTION(BlueprintCallable, Category="Game|Placement")
     void SelectCurrentTraceLocation();
 
@@ -327,9 +335,6 @@ public:
 
     UFUNCTION(BlueprintCallable, Category="Game|Toolbar")
     bool SelectAvailableItemForCurrentToolbarSlot(int32 AvailableItemIndex, bool bCloseItemList = true);
-
-    UFUNCTION(BlueprintPure, Category="Game|Toolbar")
-    bool IsSelectedToolbarItemObjectCreation() const;
 
     UFUNCTION(BlueprintPure, Category="Game|Inventory")
     int32 GetAvailableItemCount() const { return AvailableItems.Num(); }
@@ -409,45 +414,6 @@ public:
     UFUNCTION(BlueprintPure, Category="Game|Placement")
     AActor* GetCrosshairHitActor() const;
 
-    UFUNCTION(BlueprintPure, Category="Game|Placement")
-    bool HasPendingPlacementSelection() const { return bHasPendingEmptyObjectLocation || bHasPendingVertexLocation; }
-
-    UFUNCTION(BlueprintPure, Category="Game|Placement")
-    FVector GetPendingPlacementSelection() const;
-
-    UFUNCTION(BlueprintCallable, Category="Game|Placement")
-    void ClearPendingPlacementSelection();
-
-    UFUNCTION(BlueprintPure, Category="Game|Generated Mesh")
-    bool IsEditingGeneratedMesh() const;
-
-    UFUNCTION(BlueprintPure, Category="Game|Generated Mesh")
-    AEditableMeshActor* GetCurrentEditableMeshActor() const { return CurrentEditableActor.Get(); }
-
-    UFUNCTION(BlueprintPure, Category="Game|Generated Mesh")
-    int32 GetCurrentEditableMeshVertexCount() const;
-
-    UFUNCTION(BlueprintPure, Category="Game|Generated Mesh")
-    int32 GetCurrentEditableMeshTriangleCount() const;
-
-    UFUNCTION(BlueprintPure, Category="Game|Generated Mesh")
-    bool IsCurrentEditableMeshTopologyValid() const;
-
-    UFUNCTION(BlueprintPure, Category="Game|Generated Mesh")
-    int32 GetHighlightedEditableVertexIndex() const { return HighlightedEditableVertexIndex; }
-
-    UFUNCTION(BlueprintPure, Category="Game|Generated Mesh")
-    bool IsMovingEditableVertex() const { return bMovingHighlightedEditableVertex; }
-
-    UFUNCTION(BlueprintPure, Category="Game|Generated Mesh")
-    bool IsVertexPrimaryPressActive() const { return bPrimaryVertexPressActive; }
-
-    UFUNCTION(BlueprintPure, Category="Game|Generated Mesh")
-    int32 GetConnectedEditableVertexSourceIndex() const { return ConnectedEditableVertexSourceIndex; }
-
-    UFUNCTION(BlueprintCallable, Category="Game|Generated Mesh")
-    void GetSpawnedGeneratedMeshActors(TArray<AEditableMeshActor*>& OutActors) const;
-
     /** Starts gameplay-owned model streaming and optional ocean actor creation. */
     UFUNCTION(BlueprintCallable, Category="Game|World")
     void InitializeWorldSystems(UWorldData* InWorldData, const FString& InModelDirectory, const FString& InPlayerDirectory, const FString& InInitialPlayerName);
@@ -522,6 +488,12 @@ public:
     UPROPERTY(BlueprintAssignable, Category="Game|Events")
     FItemListWindowChanged OnItemListWindowChanged;
 
+    UPROPERTY(BlueprintAssignable, Category="Game|Bake")
+    FWorldBakeProgress OnWorldBakeProgress;
+
+    UPROPERTY(BlueprintAssignable, Category="Game|Bake")
+    FWorldBakeCompleted OnWorldBakeCompleted;
+
 protected:
 
 private:
@@ -539,7 +511,7 @@ private:
     bool bIsWorldLoading = false;
     FString CurrentWorldName;
     FVector PlayerLocation = FVector::ZeroVector;
-    int32 LoadingStatus = 0;
+    float LoadingStatus = 0.0f;
     int32 TotalSumFPS = 0;
     int32 TotalCountFPS = 0;
     FString GetHardwareInfoText(FString InString);
@@ -580,9 +552,6 @@ private:
 
     UPROPERTY(Transient)
     TSubclassOf<APrefabActor> PrefabActorClass;
-
-    UPROPERTY(Transient)
-    TSubclassOf<AEditableMeshActor> EditableMeshActorClass;
 
     UPROPERTY(Transient)
     TSubclassOf<AVehiclePawn> VehiclePawnClass;
@@ -693,22 +662,9 @@ private:
     float SurfacePlacementOffset = 2.0f;
 
     UPROPERTY(Transient)
-    float VertexSelectionRayDistance = 28.0f;
-
-    UPROPERTY(Transient)
-    float VertexDragHoldSeconds = 0.18f;
-
-    UPROPERTY(Transient)
-    float VertexDragStartDistance = 18.0f;
-
-    UPROPERTY(Transient)
     float VehicleEnterDistance = 450.0f;
 
-    /** Temporary kill-switch: hides and blocks the hand-built vertex/object creation tool without removing the code. */
-    UPROPERTY(Transient)
-    bool bEnableObjectVertexCreation = false;
-
-    /** Periodically saves runtime placed prefabs/vehicles/generated entities. */
+    /** Periodically saves runtime placed prefabs and vehicles. */
     UPROPERTY(Transient)
     bool bAutoSaveScene = true;
 
@@ -723,19 +679,10 @@ private:
     EPlayMode PlayMode = EPlayMode::Creator;
 
     UPROPERTY()
-    TObjectPtr<AEditableMeshActor> CurrentEditableActor;
-
-    UPROPERTY()
-    TObjectPtr<AEditableMeshActor> PendingEmptyObjectPreviewActor;
-
-    UPROPERTY()
     TObjectPtr<AWeaponActor> EquippedWeapon;
 
     UPROPERTY()
     TArray<TObjectPtr<APrefabActor>> SpawnedPrefabs;
-
-    UPROPERTY()
-    TArray<TObjectPtr<AEditableMeshActor>> SpawnedGeneratedMeshes;
 
     UPROPERTY()
     TArray<TObjectPtr<AVehiclePawn>> SpawnedVehicles;
@@ -754,36 +701,42 @@ private:
     bool bItemListWindowOpen = false;
     bool bToolbarInitialized = false;
     FVector LastPreviewLocation = FVector::ZeroVector;
-    FVector PendingEmptyObjectLocation = FVector::ZeroVector;
-    FVector PendingVertexLocation = FVector::ZeroVector;
-    bool bHasPendingEmptyObjectLocation = false;
-    bool bHasPendingVertexLocation = false;
-    float LastVertexDistance = 0.0f;
     FString LastSaveMessage;
+    /** True only after entities.dat was validated and its records were applied (or confirmed absent). */
     bool bSavedSceneLoaded = false;
+    bool bSavedSceneLoadInProgress = false;
+    /** Protects an unreadable entities.dat from being overwritten by an empty autosave. */
+    bool bSavedSceneLoadFailed = false;
+    int32 SavedSceneReadinessAttemptCount = 0;
+    int32 SavedSceneDataAttemptCount = 0;
     FVector LastTraceStart = FVector::ZeroVector;
     FVector LastTraceDirection = FVector::ForwardVector;
     FHitResult LastTraceHit;
     bool bLastTraceBlockingHit = false; // True only when the short collision trace actually hit a blocking object.
     bool bLastTraceHasPlacementLocation = false; // True when the crosshair resolved either to a hit surface or to a free-space point.
     bool bLastTraceUsedFreeSpace = false; // True when the last cursor point came from the 10m air fallback instead of collision.
-    int32 HighlightedEditableVertexIndex = INDEX_NONE; // Vertex currently selected by the center-crosshair ray.
-    bool bMovingHighlightedEditableVertex = false; // True while a held click is dragging a vertex.
-    bool bPrimaryVertexPressActive = false; // True between left-button press and release while deciding click vs hold.
-    bool bPrimaryVertexDragActive = false; // True after hold-time and movement thresholds convert a press into a drag.
-    int32 PressedEditableVertexIndex = INDEX_NONE; // Vertex that was under the crosshair when the current left press began.
-    int32 ConnectedEditableVertexSourceIndex = INDEX_NONE; // Vertex that the next new or merged segment should continue from.
-    double PrimaryVertexPressStartTime = 0.0; // World time when the current vertex press started.
-    FVector PrimaryVertexPressStartLocation = FVector::ZeroVector; // World location used to measure drag distance from the press start.
-    bool bCurrentEditableActorWasExisting = false;
-    bool bHasOriginalEditableMeshRecord = false;
-    FGeneratedMeshRecord OriginalEditableMeshRecord;
     FVector CachedPlacementGridCenter = FVector::ZeroVector;
     float CachedPlacementGridRadius = 0.0f;
     bool bPlacementGridBuilt = false;
     bool bIsSavingScene = false;
+
+    bool bWorldBakeInProgress = false;
+    bool bWorldBakeStateFilesSaved = false;
+    float WorldBakeProgressValue = 0.0f;
+    int32 WorldBakeTotalModels = 0;
+    int32 WorldBakeCompletedModels = 0;
+    int32 WorldBakeFailedModels = 0;
+    int32 WorldBakeNextModelIndex = 0;
+    TArray<FString> PendingWorldBakeModels;
+
+    UPROPERTY(Transient)
+    TObjectPtr<AglTFStreamActor> ActiveWorldBakeActor;
+
     FTimerHandle SceneAutoSaveTimerHandle;
     FTimerHandle WorldDataSaveTimerHandle;
+    FTimerHandle SavedSceneLoadRetryTimerHandle;
+    /** Polls the active metadata actor so one-model Bake jobs also expose size-scan progress. */
+    FTimerHandle WorldBakeProgressTimerHandle;
 
     void ClearTransientRuntimeReferences();
     void DestroyTrackedRuntimeActors();
@@ -799,9 +752,13 @@ private:
     FString GetWorldRootPath() const;
     FString GetPrefabDirectory() const;
     FString GetItemsDirectory() const;
+    FString GetDataDirectory() const;
     FString GetManifestPath() const;
-    FString GetLegacyManifestPath() const;
-    FString GetLegacyGltfScenePath() const;
+    FString GetPlayersDatPath() const;
+    FString GetWorldDatPath() const;
+    FString MakePlacementSourcePathForSave(const FString& SourcePath) const;
+    FString ResolvePlacementSourcePath(const FString& SavedPath, EPlacedObjectKind Kind) const;
+    void ScheduleSavedSceneLoadRetry(const FString& Reason, bool bWaitingForWorldReadiness);
     bool TracePlacementLocation(FVector& OutLocation, FHitResult& OutHit);
     FVector ApplyGridSnap(const FVector& Location) const;
     bool ShouldShowPlacementGrid() const;
@@ -813,35 +770,21 @@ private:
     void ClearPlacementGridMesh();
     FString MakeObjectName(const FString& BaseName, EPlacedObjectKind Kind) const;
     int32 CountExistingBaseName(const FString& BaseName, EPlacedObjectKind Kind) const;
-    bool TryUseObjectCreationItemAtCrosshair();
-    bool CloseCurrentEditableMeshForToolChange();
     void PlaceCurrentPrefab(const FVector& Location);
-    void PlaceEmptyObject(const FVector& Location, AEditableMeshActor* ExistingPreviewActor = nullptr);
-    void BeginEditingExistingMesh(AEditableMeshActor* MeshActor);
-    void AddVertexToEditableObject(const FVector& Location);
-    bool AddExistingVertexToEditableObject(int32 ExistingVertexIndex);
-    bool FinishOrCancelCurrentVertexEditing();
-    void PlaceVehicle(const FVector& Location, const FString& SourceFile = FString());
+    void PlaceVehicle(const FVector& Location, const FString& SourceFile);
     void TryEnterOrExitVehicle();
-    void CollectSceneRecords(TArray<FPlacedObjectRecord>& OutPlaced, TArray<FGeneratedMeshRecord>& OutMeshes) const;
-    void UpdatePendingEmptyObjectPreview(const FVector& Location);
-    void DestroyPendingEmptyObjectPreview();
-    void UpdateObjectCreationPreview();
-    void UpdateEditableVertexPreviewAndSelection();
-    void BeginEditableVertexPrimaryPress(int32 VertexIndex);
-    void UpdateEditableVertexPrimaryPressDrag();
-    void EndEditableVertexPrimaryPress();
-    void BeginConnectedVertexCreationFromIndex(int32 VertexIndex);
-    void ClearConnectedVertexCreationState();
-    void ClearEditableVertexMoveState();
-    AEditableMeshActor* GetEditableMeshFromHit(const FHitResult& Hit) const;
+    void CollectSceneRecords(TArray<FPlacedObjectRecord>& OutPlaced) const;
+    void StartNextWorldBakeModel();
+    void RefreshWorldBakeProgress();
+    void HandleWorldBakeModelFinished(AglTFStreamActor* BakeActor, bool bSuccess);
+    void FinishWorldBake();
+    void CancelWorldBake();
     void BuildAvailableItems();
     void InitializeToolbarSlotsIfNeeded();
     void ReconcileToolbarSlotsWithAvailableItems();
     void ApplySelectedToolbarItem(bool bBroadcastChange = true);
     FToolbarItem MakeToolbarItem(EToolbarItemKind Kind, const FString& DisplayName, const FString& SourcePath = FString(), int32 SourceIndex = INDEX_NONE) const;
     int32 FindAvailableItemIndexMatching(const FToolbarItem& Item) const;
-    bool IsObjectCreationItem(const FToolbarItem& Item) const;
     bool ShouldSpawnOcean() const;
     void SpawnOcean();
     void MainWorldStreaming(const FString& InModelDirectory, const FString& InPlayerDirectory, const FString& InInitialPlayerName);

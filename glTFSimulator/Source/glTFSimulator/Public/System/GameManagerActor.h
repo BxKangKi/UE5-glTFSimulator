@@ -8,7 +8,6 @@
 #include "GameManagerActor.generated.h"
 
 class APrefabActor;
-class AEditableMeshActor;
 class AVehiclePawn;
 class AWeaponActor;
 class AWorldManager;
@@ -57,9 +56,6 @@ public:
     TSubclassOf<APrefabActor> PrefabActorClass;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|Classes")
-    TSubclassOf<AEditableMeshActor> EditableMeshActorClass;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|Classes")
     TSubclassOf<AVehiclePawn> VehiclePawnClass;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|Classes")
@@ -101,20 +97,8 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|Placement")
     float SurfacePlacementOffset = 2.0f;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|Placement")
-    float VertexSelectionRayDistance = 28.0f;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|Placement")
-    float VertexDragHoldSeconds = 0.18f;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|Placement")
-    float VertexDragStartDistance = 18.0f;
-
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|Vehicle")
     float VehicleEnterDistance = 450.0f;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|Object Creation")
-    bool bEnableObjectVertexCreation = false;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|Save")
     bool bAutoSaveScene = true;

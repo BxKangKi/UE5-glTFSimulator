@@ -146,6 +146,10 @@ void UStreamAsyncAction::AbortAndRelease(UStaticMesh* OrphanedMesh)
     PendingUnloadNodes.Empty();
     PendingLoadWaterNodes.Empty();
     PendingUnloadWaterNodes.Empty();
+    TotalOperationCount = 0;
+    TotalSkippedOperationCount = 0;
+    CurrentSkippedOperationIndex = 0;
+    SkippedProgressChunkSize = 1;
 
     Asset = nullptr;
     OwnerActor = nullptr;
@@ -175,6 +179,9 @@ void UStreamAsyncAction::Activate()
         return;
     }
 
+    // Preserve the original node count before sanitization. Invalid, already-correct, and
+    // distance-skipped nodes are still completed loading work and remain in the denominator.
+    const int32 OriginalNodeWorkCount = NodeMap.Num() + WaterNodeMap.Num();
     SanitizeRuntimeMaps();
     ChunkSize = FMath::Max(1, FMath::Min(FMath::Max(1, NodeMap.Num() + WaterNodeMap.Num()), ChunkSize));
 
@@ -244,7 +251,21 @@ void UStreamAsyncAction::Activate()
     CurrentUnloadIndex = 0;
     CurrentLoadWaterIndex = 0;
     CurrentUnloadWaterIndex = 0;
-    TotalOperationCount = PendingLoadNodes.Num() + PendingUnloadNodes.Num() + PendingLoadWaterNodes.Num() + PendingUnloadWaterNodes.Num();
+    const int32 PendingOperationCount = PendingLoadNodes.Num() + PendingUnloadNodes.Num() +
+        PendingLoadWaterNodes.Num() + PendingUnloadWaterNodes.Num();
+    TotalOperationCount = OriginalNodeWorkCount;
+    TotalSkippedOperationCount = FMath::Max(0, TotalOperationCount - PendingOperationCount);
+    CurrentSkippedOperationIndex = 0;
+
+    // No-op, invalid, already-correct, and distance-skipped nodes remain visible loading work.
+    // Advancing them in a bounded number of next-tick steps lets the UI actually render progress
+    // instead of receiving a single jump from the initial value to 100 percent.
+    constexpr int32 DesiredSkippedProgressUpdates = 16;
+    const int32 SkippedNodesPerUpdate = TotalSkippedOperationCount > 0
+        ? (TotalSkippedOperationCount + DesiredSkippedProgressUpdates - 1) / DesiredSkippedProgressUpdates
+        : 1;
+    SkippedProgressChunkSize = FMath::Max(1, SkippedNodesPerUpdate);
+
     bIsLoading = false;
     BroadcastProgress();
 
@@ -351,6 +372,10 @@ void UStreamAsyncAction::ReleaseActionReferences()
     PendingUnloadNodes.Empty();
     PendingLoadWaterNodes.Empty();
     PendingUnloadWaterNodes.Empty();
+    TotalOperationCount = 0;
+    TotalSkippedOperationCount = 0;
+    CurrentSkippedOperationIndex = 0;
+    SkippedProgressChunkSize = 1;
     NodeMap.Empty();
     WaterNodeMap.Empty();
     MeshMap.Empty();
@@ -382,52 +407,62 @@ void UStreamAsyncAction::ProcessChunk()
         return;
     }
 
+    if (CurrentSkippedOperationIndex < TotalSkippedOperationCount)
+    {
+        CurrentSkippedOperationIndex = FMath::Min(
+            CurrentSkippedOperationIndex + SkippedProgressChunkSize,
+            TotalSkippedOperationCount);
+        BroadcastProgress();
+    }
+
     const int32 WaterUnloadEnd = FMath::Min(CurrentUnloadWaterIndex + ChunkSize, PendingUnloadWaterNodes.Num());
     for (int32 i = CurrentUnloadWaterIndex; i < WaterUnloadEnd; ++i)
     {
         ProcessUnloadWaterNode(PendingUnloadWaterNodes[i]);
+        CurrentUnloadWaterIndex = i + 1;
         BroadcastProgress();
     }
-    CurrentUnloadWaterIndex = WaterUnloadEnd;
 
-    int32 UnloadEnd = FMath::Min(CurrentUnloadIndex + ChunkSize, PendingUnloadNodes.Num());
+    const int32 UnloadEnd = FMath::Min(CurrentUnloadIndex + ChunkSize, PendingUnloadNodes.Num());
     for (int32 i = CurrentUnloadIndex; i < UnloadEnd; ++i)
     {
         ProcessUnloadNode(PendingUnloadNodes[i]);
+        CurrentUnloadIndex = i + 1;
         BroadcastProgress();
     }
-    CurrentUnloadIndex = UnloadEnd;
 
     const int32 WaterLoadEnd = FMath::Min(CurrentLoadWaterIndex + ChunkSize, PendingLoadWaterNodes.Num());
     for (int32 i = CurrentLoadWaterIndex; i < WaterLoadEnd; ++i)
     {
         ProcessLoadWaterNode(PendingLoadWaterNodes[i]);
+        CurrentLoadWaterIndex = i + 1;
         BroadcastProgress();
     }
-    CurrentLoadWaterIndex = WaterLoadEnd;
-
-    BroadcastProgress();
 
     if (!bIsLoading && CurrentLoadIndex < PendingLoadNodes.Num())
     {
-        int32 EndIndex = FMath::Min(CurrentLoadIndex + ChunkSize, PendingLoadNodes.Num());
+        const int32 EndIndex = FMath::Min(CurrentLoadIndex + ChunkSize, PendingLoadNodes.Num());
         for (int32 i = CurrentLoadIndex; i < EndIndex; ++i)
         {
-            FName TargetNode = PendingLoadNodes[i];
+            const FName TargetNode = PendingLoadNodes[i];
+            CurrentLoadIndex = i + 1;
             if (LoadedNodes.Contains(TargetNode))
             {
-                CurrentLoadIndex++;
+                BroadcastProgress();
                 continue;
             }
             if (ProcessLoadNode(TargetNode))
             {
+                // The active node is subtracted by BroadcastProgress until its terminal callback.
+                BroadcastProgress();
                 break;
             }
-            CurrentLoadIndex++;
+            BroadcastProgress();
         }
     }
 
-    if (CurrentLoadIndex >= PendingLoadNodes.Num() &&
+    if (CurrentSkippedOperationIndex >= TotalSkippedOperationCount &&
+        CurrentLoadIndex >= PendingLoadNodes.Num() &&
         CurrentUnloadIndex >= PendingUnloadNodes.Num() &&
         CurrentLoadWaterIndex >= PendingLoadWaterNodes.Num() &&
         CurrentUnloadWaterIndex >= PendingUnloadWaterNodes.Num() &&
@@ -1048,6 +1083,17 @@ void UStreamAsyncAction::BroadcastProgress()
         return;
     }
 
-    const int32 CompletedOperations = FMath::Clamp(CurrentUnloadIndex + CurrentLoadIndex + CurrentUnloadWaterIndex + CurrentLoadWaterIndex, 0, TotalOperationCount);
-    Progress.Broadcast(FMath::Clamp(static_cast<float>(CompletedOperations) / static_cast<float>(TotalOperationCount), 0.0f, 1.0f));
+    const int32 CompletedLoadNodes = FMath::Max(0, CurrentLoadIndex - (bIsLoading ? 1 : 0));
+    const int32 CompletedOperations = FMath::Clamp(
+        CurrentSkippedOperationIndex +
+        CurrentUnloadIndex +
+        CompletedLoadNodes +
+        CurrentUnloadWaterIndex +
+        CurrentLoadWaterIndex,
+        0,
+        TotalOperationCount);
+    Progress.Broadcast(FMath::Clamp(
+        static_cast<float>(CompletedOperations) / static_cast<float>(TotalOperationCount),
+        0.0f,
+        1.0f));
 }

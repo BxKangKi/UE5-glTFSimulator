@@ -31,28 +31,41 @@ AWorldManager::AWorldManager()
     Sun->SetEnableLightShaftOcclusion(true);
     Sun->SetEnableLightShaftBloom(true);
     Sun->SetBloomScale(0.0001f);
+    Sun->SetIntensity(20.0f);
+    Sun->SetLightSourceAngle(0.53f);
+    Sun->SetTemperature(5700.0f);
+    Sun->SetVolumetricScatteringIntensity(2.5f);
     Sun->bCastShadowsOnClouds = true;
     Sun->bCastShadowsOnAtmosphere = true;
 
     Moon = CreateDefaultSubobject<UDirectionalLightComponent>(TEXT("Moon"));
     Moon->SetupAttachment(RootComponent);
-    Moon->SetIntensity(0.005f);
-    Moon->bUseTemperature = true;
+    Moon->SetIntensity(0.01f);
+    Moon->SetUseTemperature(true);
     Moon->SetEnableLightShaftOcclusion(true);
     Moon->SetEnableLightShaftBloom(true);
     Moon->SetBloomScale(0.0001f);
+    Moon->bCastShadowsOnClouds = true;
     Moon->bCastShadowsOnAtmosphere = true;
-    Moon->ForwardShadingPriority = 1;
+    Moon->SetForwardShadingPriority(1);
 
     PostProcess = CreateDefaultSubobject<UPostProcessComponent>(TEXT("PostProcess"));
     PostProcess->SetupAttachment(RootComponent);
 
     SkyAtmosphere = CreateDefaultSubobject<USkyAtmosphereComponent>(TEXT("SkyAtmosphere"));
     SkyAtmosphere->SetupAttachment(RootComponent);
-    SkyAtmosphere->RayleighScatteringScale = 0.003996f;
-    SkyAtmosphere->GroundAlbedo = FColor(255.0f, 255.0f, 255.0f);
-    SkyAtmosphere->AtmosphereHeight = 200.0f;
-    SkyAtmosphere->MultiScatteringFactor = 2.0f;
+    SkyAtmosphere->SetRayleighScatteringScale(0.003996f);
+    SkyAtmosphere->SetGroundAlbedo(FColor(255.0f, 255.0f, 255.0f));
+    SkyAtmosphere->SetAtmosphereHeight(200.0f);
+    SkyAtmosphere->SetMultiScatteringFactor(1.0f);
+    SkyAtmosphere->SetRayleighScattering(FLinearColor(0.0058f, 0.0180f, 0.0331f));
+    SkyAtmosphere->SetRayleighScatteringScale(0.35f);
+    SkyAtmosphere->SetRayleighExponentialDistribution (8.0f);
+    SkyAtmosphere->SetMieScatteringScale(0.012f);
+    SkyAtmosphere->SetMieAbsorption(FLinearColor(0.00044f, 0.00044f, 0.00044f));
+    SkyAtmosphere->SetMieAbsorptionScale(0.0004f);
+    SkyAtmosphere->SetMieAnisotropy(0.85f);
+    SkyAtmosphere->SetSkyLuminanceFactor(FLinearColor(1.0f, 1.0f, 1.0f));
 
     Skybox = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("Skybox"));
     Skybox->SetupAttachment(RootComponent);
@@ -61,9 +74,9 @@ AWorldManager::AWorldManager()
 
     SkyLight = CreateDefaultSubobject<USkyLightComponent>(TEXT("SkyLight"));
     SkyLight->SetupAttachment(RootComponent);
-    SkyLight->bRealTimeCapture = true;
+    SkyLight->SetRealTimeCapture(true);
     SkyLight->SetIntensity(0.5f);
-    SkyLight->bCastDeepShadow = true;
+    SkyLight->SetCastDeepShadow(true);
     SkyLight->bTransmission = true;
     SkyLight->bAffectTranslucentLighting = true;
 }
@@ -127,9 +140,15 @@ void AWorldManager::ConfigureRenderingSettings()
         {
             Fog = NewObject<UExponentialHeightFogComponent>(this);
             AddInstanceComponent(Fog);
+            Fog->SetVolumetricFog(true);
+            Fog->SetVolumetricFogScatteringDistribution(0.25f);
+            Fog->SetVolumetricFogExtinctionScale(1.2f);
             Fog->SetupAttachment(GetRootComponent());
-            Fog->RegisterComponent();
             Fog->SetFogDensity(0.02f);
+            Fog->SetFogHeightFalloff(0.2f);
+            Fog->SetSecondFogDensity(0.0f);
+            Fog->RegisterComponent();
+
         }
 
         const bool bLevelAllowsCloud = !IsValid(Data) || Data->Cloud.bEnabled;

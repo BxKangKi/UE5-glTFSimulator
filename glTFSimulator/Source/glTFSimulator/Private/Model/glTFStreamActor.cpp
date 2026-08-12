@@ -42,6 +42,21 @@ void AglTFStreamActor::Init(const FString& Path)
     }
 
     FilePath = Path;
+    bMetadataBakeOnly = false;
+    bMetadataBakeCompletionSent = false;
+}
+
+void AglTFStreamActor::InitMetadataBake(const FString& Path)
+{
+    if (!EnsureStreamActorGameThread(TEXT("AglTFStreamActor::InitMetadataBake")))
+    {
+        return;
+    }
+
+    FilePath = Path;
+    bMetadataBakeOnly = true;
+    bMetadataBakeCompletionSent = false;
+    bRenderOnlyStreaming = true;
 }
 
 void AglTFStreamActor::SetRenderOnlyStreaming(bool bRenderOnly)
@@ -67,6 +82,7 @@ void AglTFStreamActor::BeginPlay()
     bIsDestroyed = false;
     bAsyncLoading = false;
     LoadingStatus = 0.0f;
+    LoadingNodeCount = 0;
     GameUpdateTickHandle = INDEX_NONE;
     AssetLoadPhase = EGLTFStreamAssetPhase::None;
     ActiveSizeScanAction = nullptr;
@@ -134,6 +150,7 @@ void AglTFStreamActor::ReleaseRuntimeResourcesForWorldExit()
     bAsyncLoading = false;
     bIsLoaded = false;
     LoadingStatus = 1.0f;
+    LoadingNodeCount = 0;
 
     ReleaseStreamingResources();
     ReleaseAsset(glTFAsset.Get());
@@ -151,6 +168,9 @@ void AglTFStreamActor::ReleaseRuntimeResourcesForWorldExit()
     ModelMetadata = FModelData();
     bHasModelMetadata = false;
     FilePath.Reset();
+    bMetadataBakeOnly = false;
+    bMetadataBakeCompletionSent = false;
+    OnModelSizeCacheBakeFinished.Clear();
     ActiveSizeScanAction = nullptr;
     ActiveStreamAction = nullptr;
     GameUpdateTickHandle = INDEX_NONE;
@@ -166,10 +186,25 @@ void AglTFStreamActor::LoadAssetAsync(EGLTFStreamAssetPhase Phase)
 
     CancelActiveAssetLoad();
     AssetLoadPhase = Phase;
+    if (Phase == EGLTFStreamAssetPhase::SizeScan)
+    {
+        LoadingStatus = FMath::Max(LoadingStatus, 0.01f);
+    }
+    else if (Phase == EGLTFStreamAssetPhase::Streaming)
+    {
+        LoadingStatus = FMath::Max(LoadingStatus, 0.50f);
+    }
 
     if (bIsDestroyed || FilePath.IsEmpty())
     {
         bAsyncLoading = false;
+        if (!bIsDestroyed)
+        {
+            bIsLoaded = true;
+            LoadingStatus = 1.0f;
+            WriteLogAsync(TEXT("Model load skipped because the source path is empty"));
+            FinishMetadataBake(false);
+        }
         return;
     }
 
@@ -301,7 +336,8 @@ void AglTFStreamActor::LoadAssetAsync(EGLTFStreamAssetPhase Phase)
 
     if (!bWorkerQueued)
     {
-        // The request never left the game thread, so its local actor state can be unwound safely.
+        // The request never left the game thread. Treat the external file as a completed isolated
+        // path instead of leaving the world bootstrap polling this actor until its timeout.
         CancelToken->Set(1);
         if (ActiveAssetLoadCancelToken == CancelToken)
         {
@@ -309,6 +345,12 @@ void AglTFStreamActor::LoadAssetAsync(EGLTFStreamAssetPhase Phase)
         }
         bAsyncLoading = false;
         AssetLoadPhase = EGLTFStreamAssetPhase::None;
+        bIsLoaded = true;
+        LoadingStatus = 1.0f;
+        WriteLogAsync(FString::Printf(
+            TEXT("Model load worker could not be queued; file isolated without stalling world entry: %s"),
+            *RequestedFilePath));
+        FinishMetadataBake(false);
     }
 }
 
@@ -332,12 +374,14 @@ void AglTFStreamActor::OnAssetLoaded(UglTFRuntimeAsset* Asset)
         bAsyncLoading = false;
         LoadingStatus = 1.0f;
         WriteLogAsync(FString::Printf(TEXT("Model GLB parser failed; the file was isolated: %s"), *FilePath));
+        FinishMetadataBake(false);
         return;
     }
 
     switch (AssetLoadPhase)
     {
         case EGLTFStreamAssetPhase::SizeScan:
+            LoadingNodeCount = Asset->GetNodes().Num();
             StartSizeScan(Asset);
             return;
         case EGLTFStreamAssetPhase::Streaming:
@@ -350,6 +394,13 @@ void AglTFStreamActor::OnAssetLoaded(UglTFRuntimeAsset* Asset)
     }
 
     ReleaseAsset(Asset);
+    bAsyncLoading = false;
+    bIsLoaded = true;
+    LoadingStatus = 1.0f;
+    WriteLogAsync(FString::Printf(
+        TEXT("Model load reached an invalid phase and was isolated without stalling world entry: %s"),
+        *FilePath));
+    FinishMetadataBake(false);
 }
 
 void AglTFStreamActor::StartSizeScan(UglTFRuntimeAsset* Asset)
@@ -377,8 +428,17 @@ void AglTFStreamActor::StartSizeScan(UglTFRuntimeAsset* Asset)
 
     const int32 SizeScanChunkSize = GetSizeScanChunkSize(Asset->GetNodes().Num());
     const FString JsonPath = FPaths::ChangeExtension(FilePath, TEXT("json"));
+    const FString SizeCachePath = FPaths::ChangeExtension(FilePath, TEXT("scz"));
 
-    ULoadAsyncAction* AsyncAction = ULoadAsyncAction::LoadAsync(this, Asset, Config, SizeScanChunkSize, JsonPath);
+    ULoadAsyncAction* AsyncAction = ULoadAsyncAction::LoadAsync(
+        this,
+        Asset,
+        Config,
+        SizeScanChunkSize,
+        FilePath,
+        JsonPath,
+        SizeCachePath,
+        !bMetadataBakeOnly);
     ActiveSizeScanAction = AsyncAction;
     if (AsyncAction)
     {
@@ -390,6 +450,13 @@ void AglTFStreamActor::StartSizeScan(UglTFRuntimeAsset* Asset)
     {
         ActiveSizeScanAction = nullptr;
         ReleaseAsset(Asset);
+        bAsyncLoading = false;
+        bIsLoaded = true;
+        LoadingStatus = 1.0f;
+        WriteLogAsync(FString::Printf(
+            TEXT("Model size-scan action could not be created; file isolated without stalling world entry: %s"),
+            *FilePath));
+        FinishMetadataBake(false);
     }
 }
 
@@ -399,7 +466,14 @@ int32 AglTFStreamActor::GetSizeScanChunkSize(int32 TotalNodeCount) const
     {
         return 1;
     }
-    return FMath::Max(1, ChunkSize);
+
+    // Cached and skipped nodes are inexpensive, but processing all of them in one frame prevents
+    // the UI from ever drawing intermediate progress. Target several visible updates while still
+    // respecting the actor's configured upper bound.
+    constexpr int32 DesiredProgressUpdates = 16;
+    const int32 NodesPerUpdate =
+        (TotalNodeCount + DesiredProgressUpdates - 1) / DesiredProgressUpdates;
+    return FMath::Clamp(NodesPerUpdate, 1, FMath::Max(1, ChunkSize));
 }
 
 void AglTFStreamActor::OnChunksLoaded(const FLoadAsyncWrapper& MapWrapper)
@@ -432,6 +506,18 @@ void AglTFStreamActor::OnChunksLoaded(const FLoadAsyncWrapper& MapWrapper)
         *ModelMetadata.Center.ToCompactString(),
         *ModelMetadata.Size.ToCompactString()));
 
+    // In metadata-only mode ULoadAsyncAction does not report completion until a newly generated SCZ
+    // has finished its verified temp/primary/.bak transaction. A cache hit is also already durable.
+    if (bMetadataBakeOnly)
+    {
+        bIsLoaded = true;
+        bAsyncLoading = false;
+        LoadingStatus = 1.0f;
+        const FString SizeCachePath = FPaths::ChangeExtension(FilePath, TEXT("scz"));
+        FinishMetadataBake(bHasModelMetadata && FPaths::FileExists(SizeCachePath));
+        return;
+    }
+
     // The size-scan asset and its temporary meshes are no longer needed here.
     // ULoadAsyncAction already clears its local asset pointer after calculating bounds.
     if (IsPlayerInsideModelRange())
@@ -445,6 +531,23 @@ void AglTFStreamActor::OnChunksLoaded(const FLoadAsyncWrapper& MapWrapper)
         LoadingStatus = 1.0f;
         WriteLogAsync(FString::Printf(TEXT("Streaming GLB load skipped because player is outside model range: %s"), *FilePath));
     }
+}
+
+
+void AglTFStreamActor::FinishMetadataBake(bool bSuccess)
+{
+    if (!EnsureStreamActorGameThread(TEXT("AglTFStreamActor::FinishMetadataBake")))
+    {
+        return;
+    }
+
+    if (!bMetadataBakeOnly || bMetadataBakeCompletionSent)
+    {
+        return;
+    }
+
+    bMetadataBakeCompletionSent = true;
+    OnModelSizeCacheBakeFinished.Broadcast(this, bSuccess);
 }
 
 void AglTFStreamActor::CancelActiveAssetLoad()
@@ -576,7 +679,12 @@ void AglTFStreamActor::OnSizeScanProgress(float Progress)
         return;
     }
 
-    LoadingStatus = FMath::Clamp(Progress * 0.5f, 0.0f, 0.5f);
+    // A metadata-only Bake consists entirely of this scan, so expose its full 0..1 progress.
+    // Runtime world loading reserves the second half for render/collider streaming.
+    const float MappedProgress = bMetadataBakeOnly
+        ? FMath::Clamp(Progress, 0.0f, 1.0f)
+        : FMath::Clamp(Progress * 0.5f, 0.0f, 0.5f);
+    LoadingStatus = FMath::Max(LoadingStatus, MappedProgress);
 }
 
 void AglTFStreamActor::OnStreamAsyncProgress(float Progress)
@@ -586,7 +694,9 @@ void AglTFStreamActor::OnStreamAsyncProgress(float Progress)
         return;
     }
 
-    LoadingStatus = FMath::Clamp(0.5f + Progress * 0.5f, 0.5f, 1.0f);
+    LoadingStatus = FMath::Max(
+        LoadingStatus,
+        FMath::Clamp(0.5f + Progress * 0.5f, 0.5f, 1.0f));
 }
 
 bool AglTFStreamActor::IsPlayerInsideModelRange() const
@@ -752,7 +862,12 @@ void AglTFStreamActor::StartStreamingStep()
     if (!IsValid(glTFAsset))
     {
         bAsyncLoading = false;
+        bIsLoaded = true;
+        LoadingStatus = 1.0f;
         UnregisterGameUpdate();
+        WriteLogAsync(FString::Printf(
+            TEXT("Streaming asset became invalid; model isolated without stalling world entry: %s"),
+            *FilePath));
         return;
     }
 
@@ -798,6 +913,11 @@ void AglTFStreamActor::StartStreamingStep()
     {
         ActiveStreamAction = nullptr;
         bAsyncLoading = false;
+        bIsLoaded = true;
+        LoadingStatus = 1.0f;
+        WriteLogAsync(FString::Printf(
+            TEXT("Streaming action could not be created; model isolated without stalling world entry: %s"),
+            *FilePath));
     }
 }
 

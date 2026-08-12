@@ -19,6 +19,10 @@ class UStreamAsyncAction;
 class UTexture;
 class UGameUpdateSubSystem;
 class AWaterActor;
+class AglTFStreamActor;
+
+/** Native completion signal used by the world-level SCZ bake queue. */
+DECLARE_MULTICAST_DELEGATE_TwoParams(FModelSizeCacheBakeFinished, AglTFStreamActor*, bool);
 struct FLoadAsyncWrapper;
 struct FStreamAsyncWrapper;
 
@@ -37,6 +41,11 @@ class GLTFSIMULATOR_API AglTFStreamActor : public AActor
 public:
     UFUNCTION(BlueprintCallable)
     void Init(const FString& Path);
+
+    /** Initializes a metadata-only model load that creates/validates the sibling .scz and never streams rendering. */
+    void InitMetadataBake(const FString& Path);
+
+    FModelSizeCacheBakeFinished OnModelSizeCacheBakeFinished;
 
     UFUNCTION(BlueprintCallable)
     bool GetIsLoaded() const { return bIsLoaded; }
@@ -78,6 +87,9 @@ public:
 
     UFUNCTION(BlueprintCallable)
     float GetLoadingStatus() const { return LoadingStatus; }
+
+    /** Number of parsed glTF nodes represented by this actor's initial loading work. */
+    int32 GetLoadingNodeCount() const { return FMath::Max(1, LoadingNodeCount); }
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite)
     int32 ChunkSize = 256;
@@ -163,14 +175,18 @@ private:
     FString FilePath;
     bool bHasModelMetadata = false;
     bool bRenderOnlyStreaming = false;
+    bool bMetadataBakeOnly = false;
+    bool bMetadataBakeCompletionSent = false;
     bool bIsDestroyed = false;
     float LoadingStatus = 0.0f;
+    int32 LoadingNodeCount = 0;
     int32 GameUpdateTickHandle = INDEX_NONE;
     EGLTFStreamAssetPhase AssetLoadPhase = EGLTFStreamAssetPhase::None;
     TSharedPtr<FThreadSafeCounter, ESPMode::ThreadSafe> ActiveAssetLoadCancelToken;
     int32 AssetLoadRequestSerial = 0;
 
     void LoadAssetAsync(EGLTFStreamAssetPhase Phase);
+    void FinishMetadataBake(bool bSuccess);
     void CancelActiveAssetLoad();
     void StartSizeScan(UglTFRuntimeAsset* Asset);
     void CancelActiveAsyncActions();

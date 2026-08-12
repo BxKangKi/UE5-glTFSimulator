@@ -2,12 +2,90 @@
 
 #include "System/PhysicsTransformInterpolationSubSystem.h"
 #include "System/GameUpdateSubSystem.h"
+#include "Async/ParallelFor.h"
 #include "Components/PrimitiveComponent.h"
 #include "Components/SceneComponent.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
 #include "Subsystems/SubsystemCollection.h"
+
+
+namespace
+{
+    constexpr int32 ParallelTransformInterpolationThreshold = 64;
+
+    struct FPhysicsInterpolationWorkItem
+    {
+        int32 EntryIndex = INDEX_NONE;
+        FTransform CurrentTransform = FTransform::Identity;
+        FTransform TargetTransform = FTransform::Identity;
+        FVector ResultLocation = FVector::ZeroVector;
+        FQuat ResultRotation = FQuat::Identity;
+        FVector ResultScale = FVector::OneVector;
+        float InterpSpeed = 0.0f;
+        float TeleportDistance = 0.0f;
+        float DeltaTime = 0.0f;
+        bool bApplyScale = false;
+        bool bShouldApply = false;
+        bool bAtTarget = false;
+    };
+
+    static void CalculatePhysicsInterpolation(FPhysicsInterpolationWorkItem& Work)
+    {
+        const FVector CurrentLocation = Work.CurrentTransform.GetLocation();
+        const FVector TargetLocation = Work.TargetTransform.GetLocation();
+        const FQuat CurrentRotation = Work.CurrentTransform.GetRotation().GetNormalized();
+        const FQuat TargetRotation = Work.TargetTransform.GetRotation().GetNormalized();
+        const FVector CurrentScale = Work.CurrentTransform.GetScale3D();
+        const FVector TargetScale = Work.TargetTransform.GetScale3D();
+        const bool bLocationAtTarget = CurrentLocation.Equals(TargetLocation, 0.01f);
+        const bool bRotationAtTarget = CurrentRotation.Equals(TargetRotation, 0.0001f);
+        const bool bScaleAtTarget = !Work.bApplyScale
+            || Work.CurrentTransform.GetScale3D().Equals(Work.TargetTransform.GetScale3D(), 0.001f);
+
+        if (bLocationAtTarget && bRotationAtTarget && bScaleAtTarget)
+        {
+            Work.ResultLocation = TargetLocation;
+            Work.ResultRotation = TargetRotation;
+            Work.ResultScale = TargetScale;
+            Work.bShouldApply = false;
+            Work.bAtTarget = true;
+            return;
+        }
+
+        Work.ResultLocation = TargetLocation;
+        Work.ResultRotation = TargetRotation;
+        Work.ResultScale = TargetScale;
+        const bool bTeleport = Work.TeleportDistance > 0.0f
+            && FVector::DistSquared(CurrentLocation, TargetLocation) > FMath::Square(Work.TeleportDistance);
+        if (!bTeleport && Work.InterpSpeed > KINDA_SMALL_NUMBER)
+        {
+            const float Alpha = FMath::Clamp(
+                1.0f - FMath::Exp(-Work.InterpSpeed * Work.DeltaTime),
+                0.0f,
+                1.0f);
+            Work.ResultLocation = FMath::Lerp(CurrentLocation, TargetLocation, Alpha);
+            Work.ResultRotation = FQuat::Slerp(CurrentRotation, TargetRotation, Alpha).GetNormalized();
+            if (Work.bApplyScale)
+            {
+                Work.ResultScale = FMath::Lerp(CurrentScale, TargetScale, Alpha);
+            }
+        }
+
+        const bool bReachedLocation = Work.ResultLocation.Equals(TargetLocation, 0.01f);
+        const bool bReachedRotation = Work.ResultRotation.Equals(TargetRotation, 0.0001f);
+        const bool bReachedScale = !Work.bApplyScale || Work.ResultScale.Equals(TargetScale, 0.001f);
+        if (bReachedLocation && bReachedRotation && bReachedScale)
+        {
+            Work.ResultLocation = TargetLocation;
+            Work.ResultRotation = TargetRotation;
+            Work.ResultScale = TargetScale;
+        }
+        Work.bShouldApply = true;
+        Work.bAtTarget = bReachedLocation && bReachedRotation && bReachedScale;
+    }
+}
 
 UPhysicsTransformInterpolationSubSystem* UPhysicsTransformInterpolationSubSystem::Get(const UObject* WorldContextObject)
 {
@@ -190,75 +268,91 @@ bool UPhysicsTransformInterpolationSubSystem::ShouldSkipComponent(const USceneCo
 
 void UPhysicsTransformInterpolationSubSystem::UpdateFromGameUpdate(float DeltaTime)
 {
-    if (DeltaTime <= 0.0f)
+    const float SafeDeltaTime = FMath::Clamp(DeltaTime, 0.0f, 1.0f);
+    if (SafeDeltaTime <= 0.0f)
     {
         return;
     }
 
-    for (int32 Index = Entries.Num() - 1; Index >= 0; --Index)
+    // Compact first so entry indices remain stable for the immutable worker snapshots below.
+    Entries.RemoveAllSwap([](const FInterpolatedTransformEntry& Entry)
     {
-        FInterpolatedTransformEntry& Entry = Entries[Index];
+        return !Entry.Component.IsValid();
+    }, EAllowShrinking::No);
+
+    TArray<FPhysicsInterpolationWorkItem> WorkItems;
+    WorkItems.Reserve(Entries.Num());
+    for (int32 EntryIndex = 0; EntryIndex < Entries.Num(); ++EntryIndex)
+    {
+        FInterpolatedTransformEntry& Entry = Entries[EntryIndex];
         USceneComponent* Component = Entry.Component.Get();
-        if (!IsValid(Component))
-        {
-            Entries.RemoveAtSwap(Index);
-            continue;
-        }
-
-        if (ShouldSkipComponent(Component, Entry.bCanMoveSimulatingPrimitive))
-        {
-            continue;
-        }
-
-        // Stable targets stay registered for future submissions but do not dirty scene transforms.
-        if (Entry.bAtTarget)
+        if (!IsValid(Component) || ShouldSkipComponent(Component, Entry.bCanMoveSimulatingPrimitive) || Entry.bAtTarget)
         {
             continue;
         }
 
         const FTransform CurrentTransform = Component->GetComponentTransform();
-        const FVector CurrentLocation = CurrentTransform.GetLocation();
-        const FVector TargetLocation = Entry.TargetTransform.GetLocation();
-        const FQuat CurrentRotation = CurrentTransform.GetRotation().GetNormalized();
-        const FQuat TargetRotation = Entry.TargetTransform.GetRotation().GetNormalized();
-        const bool bLocationAtTarget = CurrentLocation.Equals(TargetLocation, 0.01f);
-        const bool bRotationAtTarget = CurrentRotation.Equals(TargetRotation, 0.0001f);
-        const bool bScaleAtTarget =
-            !Entry.bApplyScale ||
-            CurrentTransform.GetScale3D().Equals(Entry.TargetTransform.GetScale3D(), 0.001f);
-        if (bLocationAtTarget && bRotationAtTarget && bScaleAtTarget)
+        if (CurrentTransform.ContainsNaN() || Entry.TargetTransform.ContainsNaN())
         {
-            Entry.bAtTarget = true;
             continue;
         }
 
-        const float DistanceSquared = FVector::DistSquared(CurrentLocation, TargetLocation);
-        const bool bTeleport = Entry.TeleportDistance > 0.0f && DistanceSquared > FMath::Square(Entry.TeleportDistance);
+        FPhysicsInterpolationWorkItem& Work = WorkItems.AddDefaulted_GetRef();
+        Work.EntryIndex = EntryIndex;
+        Work.CurrentTransform = CurrentTransform;
+        Work.TargetTransform = Entry.TargetTransform;
+        Work.InterpSpeed = Entry.InterpSpeed;
+        Work.TeleportDistance = Entry.TeleportDistance;
+        Work.DeltaTime = SafeDeltaTime;
+        Work.bApplyScale = Entry.bApplyScale;
+    }
 
-        FVector NewLocation = TargetLocation;
-        FQuat NewRotation = TargetRotation;
-
-        if (!bTeleport && Entry.InterpSpeed > KINDA_SMALL_NUMBER)
+    auto CalculateItem = [&WorkItems](const int32 Index)
+    {
+        CalculatePhysicsInterpolation(WorkItems[Index]);
+    };
+    if (WorkItems.Num() >= ParallelTransformInterpolationThreshold)
+    {
+        // Workers operate only on value snapshots and disjoint output elements. UObject access and
+        // scene-transform writes remain on the game thread.
+        ParallelFor(WorkItems.Num(), CalculateItem);
+    }
+    else
+    {
+        for (int32 Index = 0; Index < WorkItems.Num(); ++Index)
         {
-            const float Alpha = FMath::Clamp(1.0f - FMath::Exp(-Entry.InterpSpeed * DeltaTime), 0.0f, 1.0f);
-            NewLocation = FMath::Lerp(CurrentLocation, TargetLocation, Alpha);
-            NewRotation = FQuat::Slerp(CurrentRotation, NewRotation, Alpha).GetNormalized();
+            CalculateItem(Index);
+        }
+    }
+
+    for (const FPhysicsInterpolationWorkItem& Work : WorkItems)
+    {
+        if (!Entries.IsValidIndex(Work.EntryIndex))
+        {
+            continue;
         }
 
-        const bool bReachedLocation = NewLocation.Equals(TargetLocation, 0.01f);
-        const bool bReachedRotation = NewRotation.Equals(TargetRotation, 0.0001f);
-        if (bReachedLocation && bReachedRotation)
+        FInterpolatedTransformEntry& Entry = Entries[Work.EntryIndex];
+        USceneComponent* Component = Entry.Component.Get();
+        if (!IsValid(Component) || ShouldSkipComponent(Component, Entry.bCanMoveSimulatingPrimitive))
         {
-            // Snap once at convergence so later frames can skip the entry without residual drift.
-            NewLocation = TargetLocation;
-            NewRotation = TargetRotation;
+            continue;
         }
 
-        Component->SetWorldLocationAndRotation(NewLocation, NewRotation.Rotator(), false, nullptr, ETeleportType::TeleportPhysics);
-        if (Entry.bApplyScale)
+        if (Work.bShouldApply)
         {
-            Component->SetWorldScale3D(Entry.TargetTransform.GetScale3D());
+            Component->SetWorldLocationAndRotation(
+                Work.ResultLocation,
+                Work.ResultRotation.Rotator(),
+                false,
+                nullptr,
+                ETeleportType::TeleportPhysics);
+            if (Entry.bApplyScale)
+            {
+                Component->SetWorldScale3D(Work.ResultScale);
+            }
         }
-        Entry.bAtTarget = bReachedLocation && bReachedRotation;
+        Entry.bAtTarget = Work.bAtTarget;
     }
 }
+

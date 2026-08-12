@@ -9,8 +9,8 @@
 #include "Components/BoxComponent.h"
 #include "GameFramework/Character.h"
 #include "Components/CapsuleComponent.h"
-#include "Components/StaticMeshComponent.h"
 #include "Dom/JsonObject.h"
+#include "Dom/JsonValue.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "GameFramework/PlayerController.h"
 #include "Engine/StaticMesh.h"
@@ -18,7 +18,6 @@
 #include "GameFramework/SpringArmComponent.h"
 #include "Interface/WaterInteract.h"
 #include "PhysicalMaterials/PhysicalMaterial.h"
-#include "ProceduralMeshComponent.h"
 #include "glTFRuntimeAsset.h"
 #include "glTFRuntimeFunctionLibrary.h"
 #include "glTFRuntimeParser.h"
@@ -26,6 +25,7 @@
 #include "HAL/FileManager.h"
 #include "HAL/PlatformTime.h"
 #include "Misc/Paths.h"
+#include "Model/InstancedEntitySubsystem.h"
 #include "Model/glTFMaterialOverrideUtils.h"
 #include "Setting/GameSettings.h"
 #include "System/ActorHelper.h"
@@ -34,6 +34,7 @@
 #include "System/MathHelper.h"
 #include "System/MacroLibrary.h"
 #include "System/PhysicsHelper.h"
+#include "System/SafeFileIO.h"
 #include "System/MultiplayerWorldSubSystem.h"
 #include "System/glTFRuntimeSafety.h"
 #include "Net/UnrealNetwork.h"
@@ -42,60 +43,60 @@
 #include "World/WaterActor.h"
 
 static bool IsVehicleWheelTaggedName(const FString& Name)
+{
+    if (Name.EndsWith(TEXT(";WHEL"), ESearchCase::IgnoreCase)
+        || Name.EndsWith(TEXT(";WHEEL"), ESearchCase::IgnoreCase))
     {
-        if (Name.EndsWith(TEXT(";WHEL"), ESearchCase::IgnoreCase)
-            || Name.EndsWith(TEXT(";WHEEL"), ESearchCase::IgnoreCase))
-        {
-            return true;
-        }
-
-        const FString LowerName = Name.ToLower();
-        if (LowerName.Contains(TEXT("steering")))
-        {
-            return false;
-        }
-
-        return LowerName.Contains(TEXT(";wheel"))
-            || LowerName.StartsWith(TEXT("wheel_"))
-            || LowerName.Contains(TEXT("_wheel_"))
-            || LowerName.EndsWith(TEXT("_wheel"))
-            || LowerName.StartsWith(TEXT("tire_"))
-            || LowerName.Contains(TEXT("_tire"))
-            || LowerName.StartsWith(TEXT("tyre_"))
-            || LowerName.Contains(TEXT("_tyre"));
+        return true;
     }
+
+    const FString LowerName = Name.ToLower();
+    if (LowerName.Contains(TEXT("steering")))
+    {
+        return false;
+    }
+
+    return LowerName.Contains(TEXT(";wheel"))
+        || LowerName.StartsWith(TEXT("wheel_"))
+        || LowerName.Contains(TEXT("_wheel_"))
+        || LowerName.EndsWith(TEXT("_wheel"))
+        || LowerName.StartsWith(TEXT("tire_"))
+        || LowerName.Contains(TEXT("_tire"))
+        || LowerName.StartsWith(TEXT("tyre_"))
+        || LowerName.Contains(TEXT("_tyre"));
+}
 
 static FTransform GetVehicleNodeWorldTransform(const TMap<int32, FglTFRuntimeNode>& NodeMap, const FglTFRuntimeNode& Node)
+{
+    FTransform WorldTransform = Node.Transform;
+    int32 ParentIndex = Node.ParentIndex;
+    TSet<int32> VisitedParents;
+
+    while (const FglTFRuntimeNode* Parent = NodeMap.Find(ParentIndex))
     {
-        FTransform WorldTransform = Node.Transform;
-        int32 ParentIndex = Node.ParentIndex;
-        TSet<int32> VisitedParents;
-
-        while (const FglTFRuntimeNode* Parent = NodeMap.Find(ParentIndex))
+        if (VisitedParents.Contains(ParentIndex) || Parent->Transform.ContainsNaN())
         {
-            if (VisitedParents.Contains(ParentIndex) || Parent->Transform.ContainsNaN())
-            {
-                break;
-            }
-            VisitedParents.Add(ParentIndex);
-            WorldTransform = WorldTransform * Parent->Transform;
-            ParentIndex = Parent->ParentIndex;
+            break;
         }
-
-        return WorldTransform.ContainsNaN() ? FTransform::Identity : WorldTransform;
+        VisitedParents.Add(ParentIndex);
+        WorldTransform = WorldTransform * Parent->Transform;
+        ParentIndex = Parent->ParentIndex;
     }
 
+    return WorldTransform.ContainsNaN() ? FTransform::Identity : WorldTransform;
+}
+
 struct FVehicleWheelVisual
-    {
-        FglTFRuntimeNode Node;
-        FTransform Transform = FTransform::Identity;
+{
+    FglTFRuntimeNode Node;
+    FTransform Transform = FTransform::Identity;
 };
 
 namespace
 {
-    constexpr float LoadedWheelGroundContactBuffer = 1.0f;
-    constexpr float LoadedVisualBodyGroundClearance = 18.0f;
-    constexpr float LoadedPhysicsBodyGroundClearance = 20.0f;
+    constexpr float LoadedWheelGroundContactBuffer = 0.05f;
+    constexpr float LoadedVisualBodyGroundClearance = 1.0f;
+    constexpr float LoadedPhysicsBodyGroundClearance = 2.0f;
     constexpr float VehiclePhysicsMaxCatchUpSeconds = 1.0f;
     constexpr int32 VehiclePhysicsHardMaxSubsteps = 64;
     constexpr float VehicleTuningMaxForce = 5000000.0f;
@@ -103,6 +104,7 @@ namespace
     constexpr float VehicleTuningMaxTorque = 2000000.0f;
     constexpr float VehicleTuningMaxSpeed = 12000.0f;
     constexpr float VehicleTuningMaxGrip = 10.0f;
+    constexpr float VehicleWheelHeightOffsetLimit = 200.0f;
     constexpr float VehicleLowSpeedSlopeDampingMaxSpeed = 700.0f;
     constexpr float VehicleLowSpeedSlopeDampingRate = 1.65f;
     constexpr float VehicleLowSpeedSlopeDampingMaxAlpha = 0.22f;
@@ -199,8 +201,7 @@ static bool IsVehicleExitLocationInWater(const UObject* WorldContextObject, cons
 
 static FString ResolveReplicatedVehicleGltfPathForCurrentWorld(const UObject* WorldContextObject, const FString& InPath)
 {
-    FString NormalizedPath = InPath;
-    FPaths::NormalizeFilename(NormalizedPath);
+    const FString NormalizedPath = GlbValidation::NormalizePath(InPath);
     if (FPaths::FileExists(NormalizedPath))
     {
         return NormalizedPath;
@@ -218,16 +219,16 @@ static FString ResolveReplicatedVehicleGltfPathForCurrentWorld(const UObject* Wo
         const FString WorldFolderName = Multiplayer->GetSelectedWorldFolderName();
         if (!WorldFolderName.IsEmpty())
         {
-            const FString Candidate = FPaths::Combine(PATH_ROOT, WorldFolderName, TEXT("model"), RelativeModelPath);
+            const FString Candidate = GlbValidation::NormalizePath(
+                FPaths::Combine(PATH_ROOT, WorldFolderName, TEXT("model"), RelativeModelPath));
             if (FPaths::FileExists(Candidate))
             {
                 return Candidate;
             }
-            return Candidate;
         }
     }
 
-    return NormalizedPath;
+    return FString();
 }
 
 static void ApplyVehicleWaterExitState(APawn* RestoredPawn, float WaterLevel)
@@ -305,18 +306,6 @@ AVehiclePawn::AVehiclePawn()
         }
     }
 
-    BodyMesh = CreateDefaultSubobject<UProceduralMeshComponent>(TEXT("BodyMesh"));
-    BodyMesh->SetupAttachment(Body);
-    BodyMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-
-    for (int32 WheelIndex = 0; WheelIndex < 4; ++WheelIndex)
-    {
-        UProceduralMeshComponent* WheelMesh = CreateDefaultSubobject<UProceduralMeshComponent>(*FString::Printf(TEXT("WheelMesh_%d"), WheelIndex));
-        WheelMesh->SetupAttachment(Body);
-        WheelMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-        WheelMeshes.Add(WheelMesh);
-    }
-
     BuoyancyComponent = CreateDefaultSubobject<UBuoyancyComponent>(TEXT("Buoyancy"));
 
     bUseControllerRotationPitch = false;
@@ -340,11 +329,6 @@ AVehiclePawn::AVehiclePawn()
     Camera->SetupAttachment(SpringArm, USpringArmComponent::SocketName);
     Camera->bUsePawnControlRotation = false;
 
-    // Chassis-space suspension mount points. +X is front, +Y is right.
-    WheelOffsets.Add(FVector(112.0f, 66.0f, 10.0f));
-    WheelOffsets.Add(FVector(112.0f, -66.0f, 10.0f));
-    WheelOffsets.Add(FVector(-112.0f, 66.0f, 10.0f));
-    WheelOffsets.Add(FVector(-112.0f, -66.0f, 10.0f));
 }
 
 void AVehiclePawn::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
@@ -358,10 +342,19 @@ void AVehiclePawn::OnRep_VehicleModelReplicationData()
 {
     if (ReplicatedSourceFilePath.IsEmpty())
     {
+        ClearLoadedVehicleModel();
         return;
     }
 
-    LoadVehicleModel(ResolveReplicatedVehicleGltfPathForCurrentWorld(this, ReplicatedSourceFilePath), ReplicatedObjectName);
+    const FString ResolvedPath = ResolveReplicatedVehicleGltfPathForCurrentWorld(this, ReplicatedSourceFilePath);
+    if (ResolvedPath.IsEmpty())
+    {
+        UE_LOG(LogTemp, Warning, TEXT("VehiclePawn: replicated source file is missing; load skipped. Source=%s"), *ReplicatedSourceFilePath);
+        ClearLoadedVehicleModel();
+        return;
+    }
+
+    LoadVehicleModel(ResolvedPath, ReplicatedObjectName);
 }
 
 void AVehiclePawn::BeginPlay()
@@ -387,29 +380,20 @@ void AVehiclePawn::BeginPlay()
     {
         Body->SetPhysMaterialOverride(LowFrictionPhysicalMaterial);
     }
-    BuildBodyMesh();
-    BuildWheelMeshes();
-
     const bool bClientRenderOnlyVehicle = UMultiplayerWorldSubSystem::ShouldUseClientRenderOnlyStreaming(this) && !HasAuthority();
     if (bClientRenderOnlyVehicle)
     {
         Body->SetSimulatePhysics(false);
         Body->SetCollisionEnabled(ECollisionEnabled::NoCollision);
         Body->SetGenerateOverlapEvents(false);
-        BodyMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-        BodyMesh->SetGenerateOverlapEvents(false);
-        for (TObjectPtr<UProceduralMeshComponent>& WheelMesh : WheelMeshes)
-        {
-            if (IsValid(WheelMesh.Get()))
-            {
-                WheelMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-                WheelMesh->SetGenerateOverlapEvents(false);
-            }
-        }
+    }
+    else if (bVehicleModelLoaded)
+    {
+        ResetVehiclePoseAboveGround();
     }
     else
     {
-        ResetVehiclePoseAboveGround();
+        DeactivateVehicleUntilModelLoaded();
     }
 
     WheelSpinDegrees.Init(0.0f, WheelOffsets.Num());
@@ -428,7 +412,7 @@ void AVehiclePawn::BeginPlay()
     WheelLateralForces.Init(0.0f, WheelOffsets.Num());
     WheelGrounded.Init(false, WheelOffsets.Num());
 
-    if (!bClientRenderOnlyVehicle)
+    if (!bClientRenderOnlyVehicle && bVehicleModelLoaded)
     {
         if (UVehicleSubSystem* VehicleSubSystem = UVehicleSubSystem::Get(this))
         {
@@ -447,8 +431,17 @@ float AVehiclePawn::GetVehicleMassScale() const
     return FMath::Max(1.0f, VehicleMassKg) / 1000.0f;
 }
 
-float AVehiclePawn::GetEffectiveWheelRadius() const
+float AVehiclePawn::GetEffectiveWheelRadius(int32 WheelIndex) const
 {
+    if (LoadedWheelGroundRadii.IsValidIndex(WheelIndex))
+    {
+        const float PerWheelRadius = LoadedWheelGroundRadii[WheelIndex];
+        if (FMath::IsFinite(PerWheelRadius) && PerWheelRadius > 0.0f)
+        {
+            return FMath::Max(1.0f, PerWheelRadius);
+        }
+    }
+
     return FMath::Max(1.0f, RuntimeWheelRadius > 0.0f ? RuntimeWheelRadius : WheelRadius);
 }
 
@@ -462,12 +455,12 @@ float AVehiclePawn::GetPhysicsBodyGroundClearance() const
     // Do not let old serialized defaults keep the body a full wheel-height above the road.
     // Use the smaller of the legacy configured clearance and the desired wheel-relative clearance,
     // but keep a small skid-plate gap for uneven ground.
-    return FMath::Max(8.0f, FMath::Min(FMath::Max(0.0f, ConfiguredClearance), HalfWheelClearance));
+    return FMath::Max(1.0f, FMath::Min(FMath::Max(0.0f, ConfiguredClearance), HalfWheelClearance));
 }
 
 float AVehiclePawn::GetMinimumWheelSpringLength(int32 WheelIndex) const
 {
-    const float SafeWheelRadius = GetEffectiveWheelRadius();
+    const float SafeWheelRadius = GetEffectiveWheelRadius(WheelIndex);
     const float CompressionTravel = FMath::Clamp(MaxWheelCompressionTravel, 2.0f, 30.0f);
     const float FallbackMinimum = FMath::Max(3.0f, SafeWheelRadius * 0.30f);
     const float SafeBodyHalfHeight = FMath::Max(0.0f, BodyExtent.Z);
@@ -489,16 +482,21 @@ float AVehiclePawn::GetMinimumWheelSpringLength(int32 WheelIndex) const
 
     if (WheelTargetSpringLengths.IsValidIndex(WheelIndex))
     {
-        return FMath::Max(GetBodyClearanceMinimum(WheelIndex), WheelTargetSpringLengths[WheelIndex] - CompressionTravel);
+        // Runtime glTF wheels already provide an authored ride pose. A single chassis box has no
+        // wheel wells, so forcing the tire crown outside that box pushes the rendered wheels down
+        // and creates an artificial gap below the body. Preserve the authored pose and reserve only
+        // the configured upward compression stroke.
+        const float AuthoredTargetLength = FMath::Max(FallbackMinimum + 1.0f, WheelTargetSpringLengths[WheelIndex]);
+        return FMath::Max(FallbackMinimum, AuthoredTargetLength - CompressionTravel);
     }
 
     if (WheelIndex == INDEX_NONE && WheelTargetSpringLengths.Num() > 0)
     {
         float MinimumLength = FallbackMinimum;
-        for (int32 Index = 0; Index < WheelTargetSpringLengths.Num(); ++Index)
+        for (const float TargetLength : WheelTargetSpringLengths)
         {
-            MinimumLength = FMath::Max(MinimumLength, WheelTargetSpringLengths[Index] - CompressionTravel);
-            MinimumLength = FMath::Max(MinimumLength, GetBodyClearanceMinimum(Index));
+            const float AuthoredTargetLength = FMath::Max(FallbackMinimum + 1.0f, TargetLength);
+            MinimumLength = FMath::Max(MinimumLength, AuthoredTargetLength - CompressionTravel);
         }
         return MinimumLength;
     }
@@ -527,9 +525,12 @@ float AVehiclePawn::GetEffectiveSuspensionRestLength(int32 WheelIndex) const
     const float CompressionTravel = FMath::Clamp(MaxWheelCompressionTravel, 2.0f, 30.0f);
     const float DroopTravel = FMath::Clamp(MaxWheelDroopTravel, 4.0f, 80.0f);
 
+    const float SafeRideHeightOffset = FMath::Clamp(RideHeightOffset, -30.0f, 30.0f);
     if (WheelTargetSpringLengths.IsValidIndex(WheelIndex))
     {
-        const float TargetLength = FMath::Max(MinimumLength + 1.0f, WheelTargetSpringLengths[WheelIndex]);
+        const float TargetLength = FMath::Max(
+            MinimumLength + 1.0f,
+            WheelTargetSpringLengths[WheelIndex] + SafeRideHeightOffset);
         return FMath::Max(TargetLength + DroopTravel, MinimumLength + CompressionTravel + DroopTravel);
     }
 
@@ -538,7 +539,7 @@ float AVehiclePawn::GetEffectiveSuspensionRestLength(int32 WheelIndex) const
         float MaxLength = FMath::Max(4.0f, SuspensionRestLength);
         for (float TargetLength : WheelTargetSpringLengths)
         {
-            MaxLength = FMath::Max(MaxLength, TargetLength + DroopTravel);
+            MaxLength = FMath::Max(MaxLength, TargetLength + SafeRideHeightOffset + DroopTravel);
         }
         return FMath::Max(MaxLength, MinimumLength + CompressionTravel + DroopTravel);
     }
@@ -552,9 +553,13 @@ float AVehiclePawn::GetTargetWheelSpringLength(int32 WheelIndex) const
     const float RestLength = GetEffectiveSuspensionRestLength(WheelIndex);
     const float CompressionTravel = FMath::Clamp(MaxWheelCompressionTravel, 2.0f, 30.0f);
 
+    const float SafeRideHeightOffset = FMath::Clamp(RideHeightOffset, -30.0f, 30.0f);
     if (WheelTargetSpringLengths.IsValidIndex(WheelIndex))
     {
-        return FMath::Clamp(WheelTargetSpringLengths[WheelIndex], MinimumLength + 1.0f, RestLength - 1.0f);
+        return FMath::Clamp(
+            WheelTargetSpringLengths[WheelIndex] + SafeRideHeightOffset,
+            MinimumLength + 1.0f,
+            RestLength - 1.0f);
     }
 
     if (WheelIndex == INDEX_NONE && WheelTargetSpringLengths.Num() > 0)
@@ -564,14 +569,18 @@ float AVehiclePawn::GetTargetWheelSpringLength(int32 WheelIndex) const
         {
             Sum += TargetLength;
         }
-        return FMath::Clamp(Sum / static_cast<float>(WheelTargetSpringLengths.Num()), MinimumLength + 1.0f, RestLength - 1.0f);
+        const float AverageTarget = Sum / static_cast<float>(WheelTargetSpringLengths.Num());
+        return FMath::Clamp(AverageTarget + SafeRideHeightOffset, MinimumLength + 1.0f, RestLength - 1.0f);
     }
 
-    // Fallback/default mesh: static ride point is one compression stroke above the safe
+    // Fallback/default geometry: static ride point is one compression stroke above the safe
     // minimum, with a separate droop stroke below it for slopes and uneven terrain.
     const float RatioTarget = RestLength * FMath::Clamp(LoadedWheelVisualRestLengthRatio, 0.55f, 0.90f);
     const float StrokeTarget = MinimumLength + CompressionTravel;
-    return FMath::Clamp(FMath::Max(RatioTarget, StrokeTarget), MinimumLength + 1.0f, RestLength - 1.0f);
+    return FMath::Clamp(
+        FMath::Max(RatioTarget, StrokeTarget) + SafeRideHeightOffset,
+        MinimumLength + 1.0f,
+        RestLength - 1.0f);
 }
 
 float AVehiclePawn::GetStableWheelVisualSpringLength() const
@@ -783,6 +792,11 @@ void AVehiclePawn::ApplyParallelControlOutput(const FVehicleParallelControlOutpu
 
 void AVehiclePawn::UpdateVehicleFromSubSystem(float DeltaSeconds)
 {
+    if (!ShouldUpdateVehicleSimulation())
+    {
+        return;
+    }
+
     if (UMultiplayerWorldSubSystem::ShouldUseClientRenderOnlyStreaming(this) && !HasAuthority())
     {
         return;
@@ -822,7 +836,6 @@ void AVehiclePawn::UpdateVehicleFromSubSystem(float DeltaSeconds)
 
     UpdateWheelVisuals(SafeFrameDeltaTime);
 }
-
 
 
 void AVehiclePawn::SetDriveInput(float Throttle, float Steering)
@@ -912,90 +925,78 @@ void AVehiclePawn::ReleaseRuntimeResources()
 
 void AVehiclePawn::ClearLoadedVehicleModel()
 {
-    TSet<UStaticMesh*> MeshesToRelease;
-
-    auto ReleaseComponentMesh = [this, &MeshesToRelease](UStaticMeshComponent* Component)
+    if (UVehicleSubSystem* VehicleSubSystem = UVehicleSubSystem::Get(this))
     {
-        if (IsValid(Component))
+        VehicleSubSystem->UnregisterVehicle(this);
+    }
+
+    if (InstancedRenderRegistrationId != INDEX_NONE)
+    {
+        if (UInstancedEntitySubsystem* InstancedEntities = UInstancedEntitySubsystem::Get(this))
         {
-            if (UStaticMesh* Mesh = Component->GetStaticMesh())
-            {
-                MeshesToRelease.Add(Mesh);
-            }
-            Component->SetStaticMesh(nullptr);
-            FActorHelper::DestroyComponent(this, Component);
+            InstancedEntities->UnregisterEntity(InstancedRenderRegistrationId);
         }
-    };
-
-    for (UStaticMeshComponent* Component : LoadedBodyMeshComponents)
-    {
-        ReleaseComponentMesh(Component);
-    }
-    for (UStaticMeshComponent* Component : LoadedWheelMeshComponents)
-    {
-        ReleaseComponentMesh(Component);
+        InstancedRenderRegistrationId = INDEX_NONE;
     }
 
-    for (const TPair<int32, TObjectPtr<UStaticMesh>>& Pair : MeshCache)
-    {
-        if (UStaticMesh* Mesh = Pair.Value.Get())
-        {
-            MeshesToRelease.Add(Mesh);
-        }
-    }
-
-    for (UStaticMesh* Mesh : MeshesToRelease)
-    {
-        if (IsValid(Mesh) && !Mesh->IsAsset())
-        {
-            Mesh->ClearFlags(RF_Public | RF_Standalone);
-        }
-    }
-
-    LoadedBodyMeshComponents.Empty();
-    LoadedWheelMeshComponents.Empty();
-    LoadedWheelBaseRotations.Empty();
-    LoadedWheelVisualCenterOffsets.Empty();
-    WheelTargetSpringLengths.Empty();
-    WheelVisualSpringLengths.Empty();
-    LoadedBodyVisualBounds.Init();
-    LoadedWheelVisualRestBounds.Init();
-    RuntimeWheelRadius = 0.0f;
-    StablePlanarVelocity = FVector::ZeroVector;
-    StableVerticalVelocity = 0.0f;
-    bStablePlanarVelocityInitialized = false;
-    StablePhysicsLinearVelocity = FVector::ZeroVector;
-    StablePhysicsAngularVelocity = FVector::ZeroVector;
-    bStablePhysicsStateInitialized = false;
+    // Generated meshes are retained by the shared ISM actor while at least one entity uses the
+    // source prefab. This actor owns only a temporary load cache and can release it immediately.
     MeshCache.Empty();
-
     if (IsValid(GltfAsset))
     {
         FglTFRuntimeSafety::RequestAssetRelease(GltfAsset);
         GltfAsset = nullptr;
     }
 
-    HideProceduralDefaultVisuals(false);
-}
+    LoadedWheelRenderPartIndices.Empty();
+    LoadedWheelBaseRotations.Empty();
+    LoadedWheelBaseScales.Empty();
+    LoadedWheelVisualCenterOffsets.Empty();
+    LoadedWheelGroundRadii.Empty();
+    WheelOffsets.Empty();
+    WheelTargetSpringLengths.Empty();
+    WheelSpinDegrees.Empty();
+    WheelSpringLengths.Empty();
+    WheelVisualSpringLengths.Empty();
+    WheelSuspensionForces.Empty();
+    WheelLateralForces.Empty();
+    WheelGrounded.Empty();
+    LoadedBodyVisualBounds.Init();
+    LoadedWheelVisualRestBounds.Init();
+    RuntimeWheelRadius = 0.0f;
 
-void AVehiclePawn::HideProceduralDefaultVisuals(bool bHide)
-{
-    if (IsValid(BodyMesh))
+    if (const UClass* VehicleClass = GetClass())
     {
-        BodyMesh->SetHiddenInGame(bHide);
-        BodyMesh->SetVisibility(!bHide, true);
-    }
-
-    const bool bHideDefaultWheels = bHide && LoadedWheelMeshComponents.Num() > 0;
-    for (UProceduralMeshComponent* WheelMesh : WheelMeshes)
-    {
-        if (IsValid(WheelMesh))
+        const AVehiclePawn* Defaults = VehicleClass->GetDefaultObject<AVehiclePawn>();
+        if (Defaults && Defaults != this)
         {
-            WheelMesh->SetHiddenInGame(bHideDefaultWheels);
-            WheelMesh->SetVisibility(!bHideDefaultWheels, true);
+            BodyExtent = Defaults->BodyExtent;
         }
     }
+    if (IsValid(Body))
+    {
+        Body->SetBoxExtent(BodyExtent, false);
+    }
+
+    StablePlanarVelocity = FVector::ZeroVector;
+    StableVerticalVelocity = 0.0f;
+    bStablePlanarVelocityInitialized = false;
+    StablePhysicsLinearVelocity = FVector::ZeroVector;
+    StablePhysicsAngularVelocity = FVector::ZeroVector;
+    bStablePhysicsStateInitialized = false;
+
+    SourceFilePath.Reset();
+    BaseName.Reset();
+    ObjectName.Reset();
+    bVehicleModelLoaded = false;
+    if (HasAuthority())
+    {
+        ReplicatedSourceFilePath.Reset();
+        ReplicatedObjectName.Reset();
+    }
+    DeactivateVehicleUntilModelLoaded();
 }
+
 
 FString AVehiclePawn::ResolveVehicleTuningJsonPath(const FString& ModelPath) const
 {
@@ -1021,6 +1022,52 @@ FString AVehiclePawn::GetVehicleTuningJsonPath() const
     return ResolveVehicleTuningJsonPath(SourceFilePath);
 }
 
+bool AVehiclePawn::IsWheelMeshName(const FString& Name) const
+{
+    const FString TrimmedName = Name.TrimStartAndEnd();
+    if (TrimmedName.IsEmpty())
+    {
+        return false;
+    }
+
+    if (IsVehicleWheelTaggedName(TrimmedName))
+    {
+        return true;
+    }
+
+    auto GetBaseNameBeforeTag = [](const FString& Value)
+    {
+        FString Result = Value.TrimStartAndEnd();
+        int32 SeparatorIndex = INDEX_NONE;
+        if (Result.FindChar(TEXT(';'), SeparatorIndex) && SeparatorIndex >= 0)
+        {
+            Result = Result.Left(SeparatorIndex).TrimStartAndEnd();
+        }
+        return Result;
+    };
+
+    const FString CandidateBaseName = GetBaseNameBeforeTag(TrimmedName);
+    for (const FString& ConfiguredName : WheelMeshNames)
+    {
+        const FString ConfiguredFullName = ConfiguredName.TrimStartAndEnd();
+        if (ConfiguredFullName.IsEmpty())
+        {
+            continue;
+        }
+
+        const FString ConfiguredBaseName = GetBaseNameBeforeTag(ConfiguredFullName);
+        if (TrimmedName.Equals(ConfiguredFullName, ESearchCase::IgnoreCase)
+            || (!CandidateBaseName.IsEmpty() && CandidateBaseName.Equals(ConfiguredFullName, ESearchCase::IgnoreCase))
+            || (!ConfiguredBaseName.IsEmpty() && TrimmedName.Equals(ConfiguredBaseName, ESearchCase::IgnoreCase))
+            || (!CandidateBaseName.IsEmpty() && !ConfiguredBaseName.IsEmpty()
+                && CandidateBaseName.Equals(ConfiguredBaseName, ESearchCase::IgnoreCase)))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 void AVehiclePawn::ResetVehicleTuningToClassDefaults()
 {
     const UClass* VehicleClass = GetClass();
@@ -1041,11 +1088,15 @@ void AVehiclePawn::ResetVehicleTuningToClassDefaults()
     MaxSteeringSpeedFactor = Defaults->MaxSteeringSpeedFactor;
     SteeringSpeedForFullAssist = Defaults->SteeringSpeedForFullAssist;
     SteeringYawRateAssist = Defaults->SteeringYawRateAssist;
+    HighSpeedYawAssistStrength = Defaults->HighSpeedYawAssistStrength;
+    HighSpeedYawAssistStartSpeed = Defaults->HighSpeedYawAssistStartSpeed;
     SteeringYawDamping = Defaults->SteeringYawDamping;
     MaxSteeringAssistTorque = Defaults->MaxSteeringAssistTorque;
     LowSpeedSteeringYawAssistSpeed = Defaults->LowSpeedSteeringYawAssistSpeed;
     FrontSteeringGripMultiplier = Defaults->FrontSteeringGripMultiplier;
     RearSteeringGripMultiplier = Defaults->RearSteeringGripMultiplier;
+    HighSpeedFrontGripBoost = Defaults->HighSpeedFrontGripBoost;
+    HighSpeedSteeringAuthorityScale = Defaults->HighSpeedSteeringAuthorityScale;
     LateralGrip = Defaults->LateralGrip;
     MaxLateralGripForce = Defaults->MaxLateralGripForce;
     RollingResistance = Defaults->RollingResistance;
@@ -1056,6 +1107,7 @@ void AVehiclePawn::ResetVehicleTuningToClassDefaults()
     TireSlipReferenceSpeed = Defaults->TireSlipReferenceSpeed;
     HighSpeedLateralGripScale = Defaults->HighSpeedLateralGripScale;
     HighSpeedLateralGripSpeed = Defaults->HighSpeedLateralGripSpeed;
+    SteeringLateralGripReserve = Defaults->SteeringLateralGripReserve;
     DrivenFrontTorqueShare = Defaults->DrivenFrontTorqueShare;
     EngineBrakingForce = Defaults->EngineBrakingForce;
     HighSpeedSteeringAngleDegrees = Defaults->HighSpeedSteeringAngleDegrees;
@@ -1064,6 +1116,7 @@ void AVehiclePawn::ResetVehicleTuningToClassDefaults()
     MaxAerodynamicDrag = Defaults->MaxAerodynamicDrag;
     GroundedDownforceCoefficient = Defaults->GroundedDownforceCoefficient;
     MaxGroundedDownforce = Defaults->MaxGroundedDownforce;
+    MinimumDownforceSpeed = Defaults->MinimumDownforceSpeed;
     FrontDownforceCoefficient = Defaults->FrontDownforceCoefficient;
     MaxFrontDownforce = Defaults->MaxFrontDownforce;
     ThrottleFrontDownforce = Defaults->ThrottleFrontDownforce;
@@ -1073,6 +1126,14 @@ void AVehiclePawn::ResetVehicleTuningToClassDefaults()
     SteeringInputReturnRate = Defaults->SteeringInputReturnRate;
     SteeringInputSpeedDamping = Defaults->SteeringInputSpeedDamping;
     SteeringInputCurveExponent = Defaults->SteeringInputCurveExponent;
+    RideHeightOffset = Defaults->RideHeightOffset;
+    WheelHeightOffset = Defaults->WheelHeightOffset;
+    FrontWheelHeightOffset = Defaults->FrontWheelHeightOffset;
+    RearWheelHeightOffset = Defaults->RearWheelHeightOffset;
+    WheelHeightOffsets = Defaults->WheelHeightOffsets;
+    WheelMeshNames = Defaults->WheelMeshNames;
+    StableRideHeightGroundBuffer = Defaults->StableRideHeightGroundBuffer;
+    WheelVisualGroundContactBuffer = Defaults->WheelVisualGroundContactBuffer;
 }
 
 bool AVehiclePawn::ApplyVehicleTuningJsonObject(const TSharedPtr<FJsonObject>& JsonObject)
@@ -1129,6 +1190,8 @@ bool AVehiclePawn::ApplyVehicleTuningJsonObject(const TSharedPtr<FJsonObject>& J
     ReadFloat(TEXT("SteeringAngle"), MaxSteeringAngleDegrees, 1.0f, 55.0f);
     ReadFloat(TEXT("HighSpeedSteeringAngleDegrees"), HighSpeedSteeringAngleDegrees, 1.0f, 45.0f);
     ReadFloat(TEXT("SteeringYawRateAssist"), SteeringYawRateAssist, 0.0f, VehicleTuningMaxTorque);
+    ReadFloat(TEXT("HighSpeedYawAssistStrength"), HighSpeedYawAssistStrength, 0.0f, VehicleTuningMaxTorque);
+    ReadFloat(TEXT("HighSpeedYawAssistStartSpeed"), HighSpeedYawAssistStartSpeed, 100.0f, VehicleTuningMaxSpeed);
     ReadFloat(TEXT("RotationForce"), SteeringYawRateAssist, 0.0f, VehicleTuningMaxTorque);
     ReadFloat(TEXT("TurnAssistTorque"), SteeringYawRateAssist, 0.0f, VehicleTuningMaxTorque);
     ReadFloat(TEXT("SteeringYawDamping"), SteeringYawDamping, 0.0f, VehicleTuningMaxTorque);
@@ -1140,6 +1203,8 @@ bool AVehiclePawn::ApplyVehicleTuningJsonObject(const TSharedPtr<FJsonObject>& J
     ReadFloat(TEXT("AckermannStrength"), AckermannStrength, 0.0f, 1.0f);
     ReadFloat(TEXT("FrontSteeringGripMultiplier"), FrontSteeringGripMultiplier, 0.1f, VehicleTuningMaxGrip);
     ReadFloat(TEXT("RearSteeringGripMultiplier"), RearSteeringGripMultiplier, 0.1f, VehicleTuningMaxGrip);
+    ReadFloat(TEXT("HighSpeedFrontGripBoost"), HighSpeedFrontGripBoost, 1.0f, 2.0f);
+    ReadFloat(TEXT("HighSpeedSteeringAuthorityScale"), HighSpeedSteeringAuthorityScale, 1.0f, 2.0f);
 
     ReadFloat(TEXT("LateralGrip"), LateralGrip, 0.1f, VehicleTuningMaxGrip);
     ReadFloat(TEXT("TireLateralForceScale"), TireLateralForceScale, 0.0f, 1.0f);
@@ -1150,12 +1215,14 @@ bool AVehiclePawn::ApplyVehicleTuningJsonObject(const TSharedPtr<FJsonObject>& J
     ReadFloat(TEXT("TireSlipReferenceSpeed"), TireSlipReferenceSpeed, 1.0f, VehicleTuningMaxSpeed);
     ReadFloat(TEXT("HighSpeedLateralGripScale"), HighSpeedLateralGripScale, 0.1f, 1.0f);
     ReadFloat(TEXT("HighSpeedLateralGripSpeed"), HighSpeedLateralGripSpeed, 100.0f, VehicleTuningMaxSpeed);
+    ReadFloat(TEXT("SteeringLateralGripReserve"), SteeringLateralGripReserve, 0.0f, 0.90f);
     ReadFloat(TEXT("DrivenFrontTorqueShare"), DrivenFrontTorqueShare, 0.0f, 1.0f);
 
     ReadFloat(TEXT("AerodynamicDragCoefficient"), AerodynamicDragCoefficient, 0.0f, 1.0f);
     ReadFloat(TEXT("MaxAerodynamicDrag"), MaxAerodynamicDrag, 0.0f, VehicleTuningMaxForce);
     ReadFloat(TEXT("GroundedDownforceCoefficient"), GroundedDownforceCoefficient, 0.0f, 1.0f);
     ReadFloat(TEXT("MaxGroundedDownforce"), MaxGroundedDownforce, 0.0f, VehicleTuningMaxForce);
+    ReadFloat(TEXT("MinimumDownforceSpeed"), MinimumDownforceSpeed, 0.0f, VehicleTuningMaxSpeed);
     ReadFloat(TEXT("FrontDownforceCoefficient"), FrontDownforceCoefficient, 0.0f, 1.0f);
     ReadFloat(TEXT("MaxFrontDownforce"), MaxFrontDownforce, 0.0f, VehicleTuningMaxForce);
     ReadFloat(TEXT("ThrottleFrontDownforce"), ThrottleFrontDownforce, 0.0f, VehicleTuningMaxForce);
@@ -1166,6 +1233,64 @@ bool AVehiclePawn::ApplyVehicleTuningJsonObject(const TSharedPtr<FJsonObject>& J
     ReadFloat(TEXT("SteeringInputReturnRate"), SteeringInputReturnRate, 0.1f, 60.0f);
     ReadFloat(TEXT("SteeringInputSpeedDamping"), SteeringInputSpeedDamping, 0.0f, 1.0f);
     ReadFloat(TEXT("SteeringInputCurveExponent"), SteeringInputCurveExponent, 1.0f, 3.0f);
+
+    ReadFloat(TEXT("RideHeightOffset"), RideHeightOffset, -30.0f, 30.0f);
+    ReadFloat(TEXT("GroundClearanceOffset"), RideHeightOffset, -30.0f, 30.0f);
+    ReadFloat(TEXT("WheelHeightOffset"), WheelHeightOffset, -VehicleWheelHeightOffsetLimit, VehicleWheelHeightOffsetLimit);
+    ReadFloat(TEXT("WheelZOffset"), WheelHeightOffset, -VehicleWheelHeightOffsetLimit, VehicleWheelHeightOffsetLimit);
+    ReadFloat(TEXT("WheelMountHeightOffset"), WheelHeightOffset, -VehicleWheelHeightOffsetLimit, VehicleWheelHeightOffsetLimit);
+    ReadFloat(TEXT("FrontWheelHeightOffset"), FrontWheelHeightOffset, -VehicleWheelHeightOffsetLimit, VehicleWheelHeightOffsetLimit);
+    ReadFloat(TEXT("RearWheelHeightOffset"), RearWheelHeightOffset, -VehicleWheelHeightOffsetLimit, VehicleWheelHeightOffsetLimit);
+    ReadFloat(TEXT("StableRideHeightGroundBuffer"), StableRideHeightGroundBuffer, 0.0f, 6.0f);
+    ReadFloat(TEXT("WheelVisualGroundContactBuffer"), WheelVisualGroundContactBuffer, 0.0f, 6.0f);
+
+    const TArray<TSharedPtr<FJsonValue>>* WheelHeightArray = nullptr;
+    if (TuningObject->TryGetArrayField(TEXT("WheelHeightOffsets"), WheelHeightArray) && WheelHeightArray)
+    {
+        TArray<float> ParsedOffsets;
+        ParsedOffsets.Reserve(FMath::Min(WheelHeightArray->Num(), 32));
+        for (int32 Index = 0; Index < WheelHeightArray->Num() && Index < 32; ++Index)
+        {
+            double NumberValue = 0.0;
+            if (!(*WheelHeightArray)[Index].IsValid() || !(*WheelHeightArray)[Index]->TryGetNumber(NumberValue))
+            {
+                UE_LOG(LogTemp, Warning, TEXT("VehiclePawn: WheelHeightOffsets[%d] is not numeric and was ignored."), Index);
+                ParsedOffsets.Add(0.0f);
+                continue;
+            }
+            ParsedOffsets.Add(FMath::Clamp(
+                static_cast<float>(NumberValue),
+                -VehicleWheelHeightOffsetLimit,
+                VehicleWheelHeightOffsetLimit));
+        }
+        WheelHeightOffsets = MoveTemp(ParsedOffsets);
+        bAppliedAnyField = true;
+    }
+
+    const TArray<TSharedPtr<FJsonValue>>* WheelNameArray = nullptr;
+    if (TuningObject->TryGetArrayField(TEXT("WheelMeshNames"), WheelNameArray) && WheelNameArray)
+    {
+        TArray<FString> ParsedNames;
+        ParsedNames.Reserve(FMath::Min(WheelNameArray->Num(), 32));
+        for (int32 Index = 0; Index < WheelNameArray->Num() && Index < 32; ++Index)
+        {
+            if (!(*WheelNameArray)[Index].IsValid() || (*WheelNameArray)[Index]->Type != EJson::String)
+            {
+                UE_LOG(LogTemp, Warning, TEXT("VehiclePawn: WheelMeshNames[%d] is not a string and was ignored."), Index);
+                continue;
+            }
+
+            FString Name = (*WheelNameArray)[Index]->AsString().TrimStartAndEnd();
+            if (Name.IsEmpty() || Name.Len() > 256)
+            {
+                UE_LOG(LogTemp, Warning, TEXT("VehiclePawn: WheelMeshNames[%d] is empty or too long and was ignored."), Index);
+                continue;
+            }
+            ParsedNames.AddUnique(MoveTemp(Name));
+        }
+        WheelMeshNames = MoveTemp(ParsedNames);
+        bAppliedAnyField = true;
+    }
 
     MaxSteeringSpeedFactor = FMath::Max(MaxSteeringSpeedFactor, MinSteeringSpeedFactor);
     HighSpeedSteeringAngleDegrees = FMath::Min(HighSpeedSteeringAngleDegrees, MaxSteeringAngleDegrees);
@@ -1216,9 +1341,10 @@ bool AVehiclePawn::SaveVehicleTuningJsonTemplate(const FString& JsonPath) const
     const FString FullJsonPath = FPaths::ConvertRelativePathToFull(JsonPath);
     TSharedRef<FJsonObject> RootObject = MakeShared<FJsonObject>();
     RootObject->SetStringField(JSON_VERSION_FIELD, JSON_SCHEMA_VERSION);
-    RootObject->SetStringField(TEXT("Schema"), TEXT("glTFSimulator.VehicleTuning.v1"));
+    RootObject->SetStringField(TEXT("Schema"), TEXT("glTFSimulator.VehicleTuning.v3"));
+    RootObject->SetStringField(TEXT("AssetType"), TEXT("Vehicle"));
     RootObject->SetStringField(TEXT("DisplayName"), ObjectName.IsEmpty() ? BaseName : ObjectName);
-    RootObject->SetStringField(TEXT("Notes"), TEXT("Gameplay driving tune values only. Do not put physical constants such as mass, suspension, gravity, or collision body sizes here."));
+    RootObject->SetStringField(TEXT("Notes"), TEXT("User-authored read-only vehicle settings. Runtime geometry/hash caches are stored in the sibling .scz file. Positive RideHeightOffset raises the chassis; negative lowers it."));
 
     RootObject->SetNumberField(TEXT("MaxSpeedForward"), MaxSpeedForward);
     RootObject->SetNumberField(TEXT("EngineForce"), EngineForce);
@@ -1227,9 +1353,38 @@ bool AVehiclePawn::SaveVehicleTuningJsonTemplate(const FString& JsonPath) const
     RootObject->SetNumberField(TEXT("EngineBrakingForce"), EngineBrakingForce);
     RootObject->SetNumberField(TEXT("RollingResistance"), RollingResistance);
 
+    RootObject->SetNumberField(TEXT("RideHeightOffset"), RideHeightOffset);
+    RootObject->SetNumberField(TEXT("WheelHeightOffset"), WheelHeightOffset);
+    RootObject->SetNumberField(TEXT("FrontWheelHeightOffset"), FrontWheelHeightOffset);
+    RootObject->SetNumberField(TEXT("RearWheelHeightOffset"), RearWheelHeightOffset);
+    TArray<TSharedPtr<FJsonValue>> WheelHeightArray;
+    const int32 TemplateWheelCount = FMath::Max(WheelOffsets.Num(), WheelHeightOffsets.Num());
+    WheelHeightArray.Reserve(TemplateWheelCount);
+    for (int32 WheelIndex = 0; WheelIndex < TemplateWheelCount; ++WheelIndex)
+    {
+        const float PerWheelOffset = WheelHeightOffsets.IsValidIndex(WheelIndex) ? WheelHeightOffsets[WheelIndex] : 0.0f;
+        WheelHeightArray.Add(MakeShared<FJsonValueNumber>(PerWheelOffset));
+    }
+    RootObject->SetArrayField(TEXT("WheelHeightOffsets"), WheelHeightArray);
+
+    TArray<TSharedPtr<FJsonValue>> WheelNameValues;
+    WheelNameValues.Reserve(WheelMeshNames.Num());
+    for (const FString& WheelMeshName : WheelMeshNames)
+    {
+        if (!WheelMeshName.IsEmpty())
+        {
+            WheelNameValues.Add(MakeShared<FJsonValueString>(WheelMeshName));
+        }
+    }
+    RootObject->SetArrayField(TEXT("WheelMeshNames"), WheelNameValues);
+    RootObject->SetNumberField(TEXT("StableRideHeightGroundBuffer"), StableRideHeightGroundBuffer);
+    RootObject->SetNumberField(TEXT("WheelVisualGroundContactBuffer"), WheelVisualGroundContactBuffer);
+
     RootObject->SetNumberField(TEXT("MaxSteeringAngleDegrees"), MaxSteeringAngleDegrees);
     RootObject->SetNumberField(TEXT("HighSpeedSteeringAngleDegrees"), HighSpeedSteeringAngleDegrees);
     RootObject->SetNumberField(TEXT("SteeringYawRateAssist"), SteeringYawRateAssist);
+    RootObject->SetNumberField(TEXT("HighSpeedYawAssistStrength"), HighSpeedYawAssistStrength);
+    RootObject->SetNumberField(TEXT("HighSpeedYawAssistStartSpeed"), HighSpeedYawAssistStartSpeed);
     RootObject->SetNumberField(TEXT("SteeringYawDamping"), SteeringYawDamping);
     RootObject->SetNumberField(TEXT("MaxSteeringAssistTorque"), MaxSteeringAssistTorque);
     RootObject->SetNumberField(TEXT("LowSpeedSteeringYawAssistSpeed"), LowSpeedSteeringYawAssistSpeed);
@@ -1237,6 +1392,8 @@ bool AVehiclePawn::SaveVehicleTuningJsonTemplate(const FString& JsonPath) const
     RootObject->SetNumberField(TEXT("AckermannStrength"), AckermannStrength);
     RootObject->SetNumberField(TEXT("FrontSteeringGripMultiplier"), FrontSteeringGripMultiplier);
     RootObject->SetNumberField(TEXT("RearSteeringGripMultiplier"), RearSteeringGripMultiplier);
+    RootObject->SetNumberField(TEXT("HighSpeedFrontGripBoost"), HighSpeedFrontGripBoost);
+    RootObject->SetNumberField(TEXT("HighSpeedSteeringAuthorityScale"), HighSpeedSteeringAuthorityScale);
 
     RootObject->SetNumberField(TEXT("LateralGrip"), LateralGrip);
     RootObject->SetNumberField(TEXT("TireLateralForceScale"), TireLateralForceScale);
@@ -1247,12 +1404,14 @@ bool AVehiclePawn::SaveVehicleTuningJsonTemplate(const FString& JsonPath) const
     RootObject->SetNumberField(TEXT("TireSlipReferenceSpeed"), TireSlipReferenceSpeed);
     RootObject->SetNumberField(TEXT("HighSpeedLateralGripScale"), HighSpeedLateralGripScale);
     RootObject->SetNumberField(TEXT("HighSpeedLateralGripSpeed"), HighSpeedLateralGripSpeed);
+    RootObject->SetNumberField(TEXT("SteeringLateralGripReserve"), SteeringLateralGripReserve);
     RootObject->SetNumberField(TEXT("DrivenFrontTorqueShare"), DrivenFrontTorqueShare);
 
     RootObject->SetNumberField(TEXT("AerodynamicDragCoefficient"), AerodynamicDragCoefficient);
     RootObject->SetNumberField(TEXT("MaxAerodynamicDrag"), MaxAerodynamicDrag);
     RootObject->SetNumberField(TEXT("GroundedDownforceCoefficient"), GroundedDownforceCoefficient);
     RootObject->SetNumberField(TEXT("MaxGroundedDownforce"), MaxGroundedDownforce);
+    RootObject->SetNumberField(TEXT("MinimumDownforceSpeed"), MinimumDownforceSpeed);
     RootObject->SetNumberField(TEXT("FrontDownforceCoefficient"), FrontDownforceCoefficient);
     RootObject->SetNumberField(TEXT("MaxFrontDownforce"), MaxFrontDownforce);
     RootObject->SetNumberField(TEXT("ThrottleFrontDownforce"), ThrottleFrontDownforce);
@@ -1264,12 +1423,22 @@ bool AVehiclePawn::SaveVehicleTuningJsonTemplate(const FString& JsonPath) const
     RootObject->SetNumberField(TEXT("SteeringInputSpeedDamping"), SteeringInputSpeedDamping);
     RootObject->SetNumberField(TEXT("SteeringInputCurveExponent"), SteeringInputCurveExponent);
 
-    return UFileFunctionLibrary::ToJson(RootObject, FullJsonPath);
+    const FSafeFileWriteResult Result = FSafeFileIO::CreateJsonIfMissingBlocking(
+        RootObject,
+        FullJsonPath,
+        64ll * 1024ll * 1024ll);
+    if (!Result.IsSuccess())
+    {
+        UE_LOG(LogTemp, Warning, TEXT("VehiclePawn: could not create missing read-only tuning template. Path=%s Reason=%s"),
+            *FullJsonPath,
+            *Result.Error);
+    }
+    return Result.IsSuccess();
 }
 
 UStaticMesh* AVehiclePawn::LoadMeshByIndex(int32 MeshIndex)
 {
-    if (!IsValid(GltfAsset) || MeshIndex < 0 || MeshIndex >= GltfAsset->GetNumMeshes())
+    if (MeshIndex < 0)
     {
         return nullptr;
     }
@@ -1279,8 +1448,23 @@ UStaticMesh* AVehiclePawn::LoadMeshByIndex(int32 MeshIndex)
         return Existing->Get();
     }
 
+    UInstancedEntitySubsystem* InstancedEntities = UInstancedEntitySubsystem::Get(this);
+    if (InstancedEntities)
+    {
+        if (UStaticMesh* SharedMesh = InstancedEntities->FindSharedMesh(SourceFilePath, MeshIndex))
+        {
+            MeshCache.Add(MeshIndex, SharedMesh);
+            return SharedMesh;
+        }
+    }
+
+    if (!IsValid(GltfAsset) || MeshIndex >= GltfAsset->GetNumMeshes())
+    {
+        return nullptr;
+    }
+
     FglTFRuntimeStaticMeshConfig MeshConfig;
-    MeshConfig.Outer = this;
+    MeshConfig.Outer = InstancedEntities ? InstancedEntities->GetRuntimeMeshOuter() : this;
     MeshConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
     MeshConfig.MaterialsConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
     MeshConfig.MaterialsConfig.bGeneratesMipMaps = false;
@@ -1298,10 +1482,12 @@ UStaticMesh* AVehiclePawn::LoadMeshByIndex(int32 MeshIndex)
         MeshConfig.MaterialsConfig.UnlitOverrideMap = LitOverrides;
     }
     glTFMaterialOverrideUtils::ApplyNamedOverrides(MaterialAssets, MeshConfig.MaterialsConfig);
-    MeshConfig.bAllowCPUAccess = true;
+    MeshConfig.bAllowCPUAccess = false;
     MeshConfig.bBuildLumenCards = true;
     MeshConfig.bBuildSimpleCollision = false;
     MeshConfig.bBuildComplexCollision = false;
+    MeshConfig.bBuildNavCollision = false;
+    MeshConfig.CollisionComplexity = ECollisionTraceFlag::CTF_UseDefault;
 
     UStaticMesh* Mesh = GltfAsset->LoadStaticMesh(MeshIndex, MeshConfig);
     if (IsValid(Mesh))
@@ -1311,6 +1497,7 @@ UStaticMesh* AVehiclePawn::LoadMeshByIndex(int32 MeshIndex)
     return Mesh;
 }
 
+
 bool AVehiclePawn::LoadVehicleModel(const FString& InFilePath, const FString& InObjectName)
 {
     if (!ensureMsgf(IsInGameThread(), TEXT("AVehiclePawn::LoadVehicleModel must run on the game thread")))
@@ -1318,25 +1505,173 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InFilePath, const FString& In
         return false;
     }
 
-    ClearLoadedVehicleModel();
-    LoadedBodyVisualBounds.Init();
-    LoadedWheelVisualRestBounds.Init();
-
-    SourceFilePath = GlbValidation::NormalizePath(InFilePath);
-    BaseName = FPaths::GetBaseFilename(SourceFilePath);
-    ObjectName = InObjectName.IsEmpty() ? BaseName : InObjectName;
-
-    FString ValidationReason;
-    if (!GlbValidation::ValidateRuntimeMeshFile(SourceFilePath, ValidationReason))
+    const FString NormalizedPath = GlbValidation::NormalizePath(InFilePath);
+    if (NormalizedPath.IsEmpty() || !IFileManager::Get().FileExists(*NormalizedPath))
     {
-        UE_LOG(LogTemp, Warning, TEXT("VehiclePawn: invalid GLB skipped. Path=%s Reason=%s"), *SourceFilePath, *ValidationReason);
-        SourceFilePath.Reset();
-        BaseName = TEXT("Vehicle");
-        ObjectName = TEXT("Vehicle");
+        UE_LOG(LogTemp, Warning, TEXT("VehiclePawn: source file is missing; load skipped. Path=%s"), *NormalizedPath);
         return false;
     }
 
+    FString ValidationReason;
+    if (!GlbValidation::ValidateRuntimeModelFile(NormalizedPath, ValidationReason))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("VehiclePawn: invalid glTF model skipped. Path=%s Reason=%s"), *NormalizedPath, *ValidationReason);
+        return false;
+    }
+
+    ClearLoadedVehicleModel();
+    SourceFilePath = NormalizedPath;
+    BaseName = FPaths::GetBaseFilename(SourceFilePath);
+    ObjectName = InObjectName.IsEmpty() ? BaseName : InObjectName;
     ResetVehicleTuningToClassDefaults();
+
+    const FString TuningJsonPath = GetVehicleTuningJsonPath();
+    const bool bHasTuningJson = !TuningJsonPath.IsEmpty() && IFileManager::Get().FileExists(*TuningJsonPath);
+    if (bHasTuningJson)
+    {
+        LoadVehicleTuningJson(TuningJsonPath);
+    }
+
+    UInstancedEntitySubsystem* InstancedEntities = UInstancedEntitySubsystem::Get(this);
+    if (!InstancedEntities)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("VehiclePawn: instanced entity subsystem is unavailable."));
+        ClearLoadedVehicleModel();
+        return false;
+    }
+
+    auto BuildRegistrationOptions = [this](const bool bStoreAsVehicleTemplate)
+    {
+        FInstancedEntityRegistrationOptions Options;
+        Options.bDynamic = !UMultiplayerWorldSubSystem::ShouldUseClientRenderOnlyStreaming(this) || HasAuthority();
+        Options.bAllowPhysicsDistanceDeactivation = Options.bDynamic;
+        Options.bAlwaysRelevant = IsOccupied();
+        Options.bStoreAsVehicleTemplate = bStoreAsVehicleTemplate;
+        Options.InterpolationSpeed = 32.0f;
+        Options.TeleportDistance = 2500.0f;
+        Options.MidDistance = 40000.0f;
+        Options.PhysicsSuspendDistance = 80000.0f;
+        Options.EndCullDistance = 150000.0f;
+        Options.MidUpdateInterval = 1.0f / 30.0f;
+        Options.FarUpdateInterval = 0.20f;
+        return Options;
+    };
+
+    auto PrepareLoadedVehicleState = [this]()
+    {
+        if (LoadedBodyVisualBounds.IsValid && IsValid(Body))
+        {
+            // LoadedBodyVisualBounds contains only meshes that were not classified as wheels. The
+            // model was rebased to this bounds center, so a centered box can use its true half extent
+            // rather than the old max(abs(min), abs(max)) approximation that could include the pivot gap.
+            const FVector VisualBodyExtent = LoadedBodyVisualBounds.GetExtent().GetAbs();
+            BodyExtent.X = FMath::Clamp(VisualBodyExtent.X * 0.96f, 20.0f, 1200.0f);
+            BodyExtent.Y = FMath::Clamp(VisualBodyExtent.Y * 0.94f, 20.0f, 800.0f);
+            float CollisionHalfHeight = FMath::Clamp(VisualBodyExtent.Z * 0.90f, 8.0f, 600.0f);
+
+            // Keep the chassis collider above every authored tire bottom. This is calculated from the
+            // per-wheel radius and configured wheel offsets, so an oversized wheel AABB cannot lift all
+            // other wheels and the box never reaches the road before the tires do.
+            float HighestWheelBottom = -TNumericLimits<float>::Max();
+            for (int32 WheelIndex = 0; WheelIndex < WheelOffsets.Num(); ++WheelIndex)
+            {
+                const float WheelBottom = WheelOffsets[WheelIndex].Z
+                    - GetTargetWheelSpringLength(WheelIndex)
+                    - GetEffectiveWheelRadius(WheelIndex);
+                if (FMath::IsFinite(WheelBottom))
+                {
+                    // The wheel bottom closest to the chassis is the strict limit. Using the lowest
+                    // tire bottom allowed the box to extend below a smaller/offset wheel and touch
+                    // the road before that wheel, making the rendered vehicle appear to float.
+                    HighestWheelBottom = FMath::Max(HighestWheelBottom, WheelBottom);
+                }
+            }
+            if (HighestWheelBottom > -TNumericLimits<float>::Max())
+            {
+                const float MaximumCollisionHalfHeight = FMath::Max(8.0f, -HighestWheelBottom - 1.0f);
+                CollisionHalfHeight = FMath::Min(CollisionHalfHeight, MaximumCollisionHalfHeight);
+            }
+
+            BodyExtent.Z = FMath::Clamp(CollisionHalfHeight, 8.0f, 600.0f);
+            Body->SetBoxExtent(BodyExtent, true);
+        }
+
+        WheelSpinDegrees.Init(0.0f, WheelOffsets.Num());
+        WheelSpringLengths.SetNum(WheelOffsets.Num());
+        WheelVisualSpringLengths.SetNum(WheelOffsets.Num());
+        for (int32 WheelIndex = 0; WheelIndex < WheelOffsets.Num(); ++WheelIndex)
+        {
+            const float TargetSpringLength = GetTargetWheelSpringLength(WheelIndex);
+            WheelSpringLengths[WheelIndex] = TargetSpringLength;
+            WheelVisualSpringLengths[WheelIndex] = TargetSpringLength;
+        }
+        WheelSuspensionForces.Init(0.0f, WheelOffsets.Num());
+        WheelLateralForces.Init(0.0f, WheelOffsets.Num());
+        WheelGrounded.Init(false, WheelOffsets.Num());
+
+        bVehicleModelLoaded = true;
+        ActivateVehicleAfterModelLoad();
+        if (!UMultiplayerWorldSubSystem::ShouldUseClientRenderOnlyStreaming(this) || HasAuthority())
+        {
+            ResetVehiclePoseAboveGround();
+        }
+    };
+
+    auto FinishSuccessfulModelLoad = [this, bHasTuningJson, TuningJsonPath]()
+    {
+        UpdateWheelVisuals(0.0f);
+
+        if (!bHasTuningJson && !TuningJsonPath.IsEmpty())
+        {
+            // Generate a documented v3 template only after the authored wheel count is known.
+            SaveVehicleTuningJsonTemplate(TuningJsonPath);
+        }
+
+        if (HasAuthority())
+        {
+            ReplicatedSourceFilePath = SourceFilePath;
+            ReplicatedObjectName = ObjectName;
+            ForceNetUpdate();
+        }
+    };
+
+    // Reuse the shared vehicle prefab while at least one instance still owns the resource. This
+    // avoids reopening and reparsing the glTF file for every vehicle while keeping JSON tuning per entity.
+    FInstancedVehicleTemplateData CachedVehicleTemplate;
+    if (InstancedEntities->GetVehicleTemplateData(SourceFilePath, CachedVehicleTemplate))
+    {
+        LoadedWheelRenderPartIndices = CachedVehicleTemplate.WheelPartIndices;
+        LoadedWheelBaseRotations = CachedVehicleTemplate.WheelBaseRotations;
+        LoadedWheelBaseScales = CachedVehicleTemplate.WheelBaseScales;
+        LoadedWheelVisualCenterOffsets = CachedVehicleTemplate.WheelVisualCenterOffsets;
+        WheelOffsets = CachedVehicleTemplate.AuthoredWheelOffsets;
+        WheelTargetSpringLengths = CachedVehicleTemplate.WheelTargetSpringLengths;
+        LoadedWheelGroundRadii = CachedVehicleTemplate.WheelGroundRadii;
+        LoadedBodyVisualBounds = CachedVehicleTemplate.BodyVisualBounds;
+        LoadedWheelVisualRestBounds = CachedVehicleTemplate.WheelVisualRestBounds;
+        RuntimeWheelRadius = CachedVehicleTemplate.RuntimeWheelRadius;
+
+        ApplyConfiguredWheelHeightOffsets();
+        PrepareLoadedVehicleState();
+
+        const FInstancedEntityRegistrationOptions RegistrationOptions = BuildRegistrationOptions(false);
+        InstancedRenderRegistrationId = InstancedEntities->RegisterVehicleEntityFromTemplate(
+            SourceFilePath,
+            this,
+            Body,
+            RegistrationOptions);
+        if (InstancedRenderRegistrationId == INDEX_NONE)
+        {
+            UE_LOG(LogTemp, Warning,
+                TEXT("VehiclePawn: failed to register cached vehicle prefab for %s"),
+                *SourceFilePath);
+            ClearLoadedVehicleModel();
+            return false;
+        }
+
+        FinishSuccessfulModelLoad();
+        return true;
+    }
 
     FglTFRuntimeConfig LoaderConfig;
     LoaderConfig.bAllowExternalFiles = true;
@@ -1344,35 +1679,19 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InFilePath, const FString& In
     if (!IsValid(GltfAsset))
     {
         UE_LOG(LogTemp, Warning, TEXT("VehiclePawn: failed to load vehicle model %s"), *SourceFilePath);
-        SourceFilePath.Reset();
-        BaseName = TEXT("Vehicle");
-        ObjectName = TEXT("Vehicle");
+        ClearLoadedVehicleModel();
         return false;
-    }
-
-    const FString TuningJsonPath = GetVehicleTuningJsonPath();
-    if (!TuningJsonPath.IsEmpty())
-    {
-        if (IFileManager::Get().FileExists(*TuningJsonPath))
-        {
-            LoadVehicleTuningJson(TuningJsonPath);
-        }
-        else
-        {
-            // Generate a per-prefab template next to the model so designers can tune this vehicle later.
-            SaveVehicleTuningJsonTemplate(TuningJsonPath);
-        }
     }
 
     const TArray<FglTFRuntimeNode> Nodes = GltfAsset->GetNodes();
     if (Nodes.Num() > MaxRuntimeVehicleNodeCount)
     {
-        UE_LOG(LogTemp, Warning, TEXT("VehiclePawn: GLB node count exceeds the runtime safety limit. Path=%s Nodes=%d"),
+        UE_LOG(LogTemp, Warning, TEXT("VehiclePawn: glTF node count exceeds the runtime safety limit. Path=%s Nodes=%d"),
             *SourceFilePath, Nodes.Num());
-        FglTFRuntimeSafety::RequestAssetRelease(GltfAsset);
-        GltfAsset = nullptr;
+        ClearLoadedVehicleModel();
         return false;
     }
+
     const int32 MeshCount = GltfAsset->GetNumMeshes();
     TMap<int32, FglTFRuntimeNode> NodeMap;
     for (const FglTFRuntimeNode& Node : Nodes)
@@ -1397,12 +1716,14 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InFilePath, const FString& In
         }
     }
 
+    TArray<FInstancedEntityMeshPart> RenderParts;
     TArray<FVehicleWheelVisual> WheelNodes;
-    int32 BodyComponentIndex = 0;
+    int32 BodyRenderPartCount = 0;
+
     for (const FglTFRuntimeNode& Node : Nodes)
     {
-        if (Node.Index < 0 || !NodeMap.Contains(Node.Index) ||
-            Node.MeshIndex < 0 || Node.MeshIndex >= MeshCount || Node.Transform.ContainsNaN())
+        if (Node.Index < 0 || !NodeMap.Contains(Node.Index)
+            || Node.MeshIndex < 0 || Node.MeshIndex >= MeshCount || Node.Transform.ContainsNaN())
         {
             continue;
         }
@@ -1414,36 +1735,54 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InFilePath, const FString& In
         }
 
         const FTransform NodeWorldTransform = GetVehicleNodeWorldTransform(NodeMap, Node);
-        const FString MeshName = MeshNamesByIndex.FindRef(Node.MeshIndex);
-        if (IsVehicleWheelTaggedName(Node.Name) || IsVehicleWheelTaggedName(MeshName))
+        if (NodeWorldTransform.ContainsNaN())
         {
-            FVehicleWheelVisual WheelVisual;
+            continue;
+        }
+
+        const FString MeshName = MeshNamesByIndex.FindRef(Node.MeshIndex);
+        if (IsWheelMeshName(Node.Name) || IsWheelMeshName(MeshName))
+        {
+            FVehicleWheelVisual& WheelVisual = WheelNodes.AddDefaulted_GetRef();
             WheelVisual.Node = Node;
             WheelVisual.Transform = NodeWorldTransform;
-            WheelNodes.Add(WheelVisual);
             continue;
         }
 
-        UStaticMeshComponent* MeshComponent = NewObject<UStaticMeshComponent>(this, *FString::Printf(TEXT("VehicleBodyMesh_%d"), BodyComponentIndex++));
-        if (!IsValid(MeshComponent))
-        {
-            continue;
-        }
-
-        AddInstanceComponent(MeshComponent);
-        MeshComponent->SetMobility(EComponentMobility::Movable);
-        MeshComponent->SetupAttachment(Body);
-        MeshComponent->SetStaticMesh(Mesh);
-        MeshComponent->SetRelativeTransform(NodeWorldTransform);
-        MeshComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-        MeshComponent->RegisterComponent();
-        LoadedBodyMeshComponents.Add(MeshComponent);
+        FInstancedEntityMeshPart& RenderPart = RenderParts.AddDefaulted_GetRef();
+        RenderPart.MeshKey = Node.MeshIndex;
+        RenderPart.Mesh = Mesh;
+        RenderPart.LocalTransform = NodeWorldTransform;
+        ++BodyRenderPartCount;
 
         const FBox BodyMeshBounds = TransformVehicleBounds(Mesh->GetBoundingBox(), NodeWorldTransform);
         if (BodyMeshBounds.IsValid)
         {
             LoadedBodyVisualBounds += BodyMeshBounds.Min;
             LoadedBodyVisualBounds += BodyMeshBounds.Max;
+        }
+    }
+
+    // glTF vehicle roots may use any scene pivot. Center the physics proxy on the body-only bounds
+    // in all three axes before deriving wheel mounts. Wheel meshes have already been separated, so
+    // they can never enlarge the chassis hitbox. Applying the same offset to body and wheels preserves
+    // the authored relationship while keeping the box collider aligned to the visible chassis.
+    if (LoadedBodyVisualBounds.IsValid)
+    {
+        const FVector AuthoredBodyCenter = LoadedBodyVisualBounds.GetCenter();
+        if (!AuthoredBodyCenter.ContainsNaN())
+        {
+            const FVector ModelToPhysicsOffset = -AuthoredBodyCenter;
+            for (FInstancedEntityMeshPart& RenderPart : RenderParts)
+            {
+                RenderPart.LocalTransform.AddToTranslation(ModelToPhysicsOffset);
+            }
+            for (FVehicleWheelVisual& WheelVisual : WheelNodes)
+            {
+                WheelVisual.Transform.AddToTranslation(ModelToPhysicsOffset);
+            }
+            LoadedBodyVisualBounds.Min += ModelToPhysicsOffset;
+            LoadedBodyVisualBounds.Max += ModelToPhysicsOffset;
         }
     }
 
@@ -1458,17 +1797,6 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InFilePath, const FString& In
         return AL.Y > BL.Y;
     });
 
-    if (WheelNodes.Num() > 0)
-    {
-        WheelOffsets.Empty();
-        LoadedWheelBaseRotations.Empty();
-        LoadedWheelVisualCenterOffsets.Empty();
-        WheelTargetSpringLengths.Empty();
-        LoadedWheelVisualRestBounds.Init();
-        RuntimeWheelRadius = 0.0f;
-    }
-
-    int32 WheelComponentIndex = 0;
     for (const FVehicleWheelVisual& WheelNode : WheelNodes)
     {
         UStaticMesh* Mesh = LoadMeshByIndex(WheelNode.Node.MeshIndex);
@@ -1477,97 +1805,222 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InFilePath, const FString& In
             continue;
         }
 
-        UStaticMeshComponent* MeshComponent = NewObject<UStaticMeshComponent>(this, *FString::Printf(TEXT("VehicleWheelMesh_%d"), WheelComponentIndex++));
-        if (!IsValid(MeshComponent))
-        {
-            continue;
-        }
-
-        AddInstanceComponent(MeshComponent);
-        MeshComponent->SetMobility(EComponentMobility::Movable);
-        MeshComponent->SetupAttachment(Body);
-        MeshComponent->SetStaticMesh(Mesh);
-        MeshComponent->SetRelativeTransform(WheelNode.Transform);
-        MeshComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-        MeshComponent->RegisterComponent();
-        LoadedWheelMeshComponents.Add(MeshComponent);
-        LoadedWheelBaseRotations.Add(WheelNode.Transform.GetRotation());
+        const int32 RenderPartIndex = RenderParts.Num();
+        FInstancedEntityMeshPart& RenderPart = RenderParts.AddDefaulted_GetRef();
+        RenderPart.MeshKey = WheelNode.Node.MeshIndex;
+        RenderPart.Mesh = Mesh;
+        RenderPart.LocalTransform = WheelNode.Transform;
+        LoadedWheelRenderPartIndices.Add(RenderPartIndex);
+        LoadedWheelBaseRotations.Add(WheelNode.Transform.GetRotation().GetNormalized());
+        LoadedWheelBaseScales.Add(WheelNode.Transform.GetScale3D());
 
         const FBox MeshBounds = Mesh->GetBoundingBox();
         const FVector MeshCenterOffset = MeshBounds.IsValid ? MeshBounds.GetCenter() : FVector::ZeroVector;
         LoadedWheelVisualCenterOffsets.Add(MeshCenterOffset);
 
+        const FVector AuthoredWheelCenter = WheelNode.Transform.TransformPosition(MeshCenterOffset);
         const FBox WheelBodyBounds = TransformVehicleBounds(MeshBounds, WheelNode.Transform);
+        float GroundRadius = FMath::Max(1.0f, WheelRadius);
         if (WheelBodyBounds.IsValid)
         {
             LoadedWheelVisualRestBounds += WheelBodyBounds.Min;
             LoadedWheelVisualRestBounds += WheelBodyBounds.Max;
-            RuntimeWheelRadius = FMath::Max(RuntimeWheelRadius, WheelBodyBounds.GetExtent().Z);
+            const float CenterToBottom = AuthoredWheelCenter.Z - WheelBodyBounds.Min.Z;
+            if (FMath::IsFinite(CenterToBottom) && CenterToBottom > 0.0f)
+            {
+                GroundRadius = FMath::Max(1.0f, CenterToBottom);
+            }
         }
-        else
-        {
-            RuntimeWheelRadius = FMath::Max(RuntimeWheelRadius, WheelRadius);
-        }
+        LoadedWheelGroundRadii.Add(GroundRadius);
+        RuntimeWheelRadius = FMath::Max(RuntimeWheelRadius, GroundRadius);
 
-        // glTF wheel nodes are usually authored at the wheel pivot, not always at the visual tire center.
-        // Use the mesh bounds center as the wheel center while preserving the authored rest pose.
-        const FVector AuthoredWheelCenter = WheelNode.Transform.TransformPosition(MeshCenterOffset);
         const float VisualRestLength = GetStableWheelVisualSpringLength();
         WheelOffsets.Add(AuthoredWheelCenter + FVector(0.0f, 0.0f, VisualRestLength));
         WheelTargetSpringLengths.Add(VisualRestLength);
     }
 
+    // No procedural/default vehicle is created. A valid vehicle needs authored body and wheel meshes.
+    if (BodyRenderPartCount == 0 || WheelOffsets.Num() == 0 || RenderParts.Num() == 0)
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("VehiclePawn: vehicle requires at least one body mesh and one wheel mesh (name tag or JSON WheelMeshNames). Load skipped: %s"),
+            *SourceFilePath);
+        ClearLoadedVehicleModel();
+        return false;
+    }
+
+    const TArray<FVector> AuthoredWheelOffsets = WheelOffsets;
+    ApplyConfiguredWheelHeightOffsets();
+    PrepareLoadedVehicleState();
+
+    FBox CombinedLocalBounds = LoadedBodyVisualBounds;
+    if (LoadedWheelVisualRestBounds.IsValid)
+    {
+        CombinedLocalBounds += LoadedWheelVisualRestBounds.Min;
+        CombinedLocalBounds += LoadedWheelVisualRestBounds.Max;
+    }
+
+    const FInstancedEntityRegistrationOptions RegistrationOptions = BuildRegistrationOptions(true);
+    InstancedRenderRegistrationId = InstancedEntities->RegisterEntity(
+        SourceFilePath,
+        this,
+        Body,
+        RenderParts,
+        RegistrationOptions,
+        CombinedLocalBounds);
+    if (InstancedRenderRegistrationId == INDEX_NONE)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("VehiclePawn: failed to register instanced renderer for %s"), *SourceFilePath);
+        ClearLoadedVehicleModel();
+        return false;
+    }
+
+    FInstancedVehicleTemplateData VehicleTemplateData;
+    VehicleTemplateData.WheelPartIndices = LoadedWheelRenderPartIndices;
+    VehicleTemplateData.WheelBaseRotations = LoadedWheelBaseRotations;
+    VehicleTemplateData.WheelBaseScales = LoadedWheelBaseScales;
+    VehicleTemplateData.WheelVisualCenterOffsets = LoadedWheelVisualCenterOffsets;
+    VehicleTemplateData.AuthoredWheelOffsets = AuthoredWheelOffsets;
+    VehicleTemplateData.WheelTargetSpringLengths = WheelTargetSpringLengths;
+    VehicleTemplateData.WheelGroundRadii = LoadedWheelGroundRadii;
+    VehicleTemplateData.BodyVisualBounds = LoadedBodyVisualBounds;
+    VehicleTemplateData.WheelVisualRestBounds = LoadedWheelVisualRestBounds;
+    VehicleTemplateData.CombinedLocalBounds = CombinedLocalBounds;
+    VehicleTemplateData.RuntimeWheelRadius = RuntimeWheelRadius;
+    if (!InstancedEntities->StoreVehicleTemplateData(SourceFilePath, VehicleTemplateData))
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("VehiclePawn: shared vehicle metadata could not be cached; this instance remains usable. Path=%s"),
+            *SourceFilePath);
+    }
+
+    // The shared ISM actor now retains the meshes. This vehicle no longer needs a parser/cache.
+    MeshCache.Empty();
+    if (IsValid(GltfAsset))
+    {
+        FglTFRuntimeSafety::RequestAssetRelease(GltfAsset);
+        GltfAsset = nullptr;
+    }
+
+    FinishSuccessfulModelLoad();
+    return true;
+}
+
+float AVehiclePawn::GetConfiguredWheelHeightOffset(int32 WheelIndex, float FrontRearSplitX) const
+{
+    const float AxleOffset = WheelOffsets.IsValidIndex(WheelIndex) && WheelOffsets[WheelIndex].X >= FrontRearSplitX
+        ? FrontWheelHeightOffset
+        : RearWheelHeightOffset;
+    const float PerWheelOffset = WheelHeightOffsets.IsValidIndex(WheelIndex)
+        ? WheelHeightOffsets[WheelIndex]
+        : 0.0f;
+    return WheelHeightOffset + AxleOffset + PerWheelOffset;
+}
+
+void AVehiclePawn::ApplyConfiguredWheelHeightOffsets()
+{
     if (WheelOffsets.Num() == 0)
     {
-        LoadedWheelVisualRestBounds.Init();
-        RuntimeWheelRadius = 0.0f;
-        WheelTargetSpringLengths.Empty();
-        WheelOffsets.Add(FVector(112.0f, 66.0f, 10.0f));
-        WheelOffsets.Add(FVector(112.0f, -66.0f, 10.0f));
-        WheelOffsets.Add(FVector(-112.0f, 66.0f, 10.0f));
-        WheelOffsets.Add(FVector(-112.0f, -66.0f, 10.0f));
+        return;
     }
 
-    if (LoadedBodyVisualBounds.IsValid && IsValid(Body))
+    float MinX = WheelOffsets[0].X;
+    float MaxX = WheelOffsets[0].X;
+    for (const FVector& Offset : WheelOffsets)
     {
-        const FVector VisualBodyExtent = LoadedBodyVisualBounds.GetExtent();
-        BodyExtent.X = FMath::Clamp(FMath::Max(BodyExtent.X, VisualBodyExtent.X * 0.92f), 60.0f, 1200.0f);
-        BodyExtent.Y = FMath::Clamp(FMath::Max(BodyExtent.Y, VisualBodyExtent.Y * 0.92f), 35.0f, 800.0f);
-        // Keep the chassis collision from hanging below the visual car on ramps. A tall centered box
-        // made the body scrape/dig into uphill terrain before the wheels could support it.
-        BodyExtent.Z = FMath::Clamp(FMath::Max(36.0f, VisualBodyExtent.Z * 0.72f), 25.0f, 600.0f);
-        Body->SetBoxExtent(BodyExtent, true);
-        ApplyVehicleBodyPhysicsSettings();
+        MinX = FMath::Min(MinX, Offset.X);
+        MaxX = FMath::Max(MaxX, Offset.X);
     }
+    const float FrontRearSplitX = (MinX + MaxX) * 0.5f;
 
-    WheelSpinDegrees.Init(0.0f, WheelOffsets.Num());
-    WheelSpringLengths.SetNum(WheelOffsets.Num());
-    WheelVisualSpringLengths.SetNum(WheelOffsets.Num());
     for (int32 WheelIndex = 0; WheelIndex < WheelOffsets.Num(); ++WheelIndex)
     {
-        const float TargetSpringLength = GetTargetWheelSpringLength(WheelIndex);
-        WheelSpringLengths[WheelIndex] = TargetSpringLength;
-        WheelVisualSpringLengths[WheelIndex] = TargetSpringLength;
+        WheelOffsets[WheelIndex].Z += GetConfiguredWheelHeightOffset(WheelIndex, FrontRearSplitX);
     }
-    WheelSuspensionForces.Init(0.0f, WheelOffsets.Num());
-    WheelLateralForces.Init(0.0f, WheelOffsets.Num());
-    WheelGrounded.Init(false, WheelOffsets.Num());
+}
 
-    const bool bLoadedAnyVisual = LoadedBodyMeshComponents.Num() > 0 || LoadedWheelMeshComponents.Num() > 0;
-    HideProceduralDefaultVisuals(bLoadedAnyVisual);
-
-    if (bLoadedAnyVisual && HasAuthority())
+void AVehiclePawn::DeactivateVehicleUntilModelLoaded()
+{
+    if (UVehicleSubSystem* VehicleSubSystem = UVehicleSubSystem::Get(this))
     {
-        ReplicatedSourceFilePath = SourceFilePath;
-        ReplicatedObjectName = ObjectName;
-        ForceNetUpdate();
+        VehicleSubSystem->UnregisterVehicle(this);
     }
 
-    if (!UMultiplayerWorldSubSystem::ShouldUseClientRenderOnlyStreaming(this) || HasAuthority())
+    if (IsValid(Body))
     {
-        ResetVehiclePoseAboveGround();
+        Body->SetSimulatePhysics(false);
+        Body->SetEnableGravity(false);
+        Body->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+        Body->SetGenerateOverlapEvents(false);
+        Body->SetPhysicsLinearVelocity(FVector::ZeroVector);
+        Body->SetPhysicsAngularVelocityInRadians(FVector::ZeroVector);
     }
-    return bLoadedAnyVisual;
+}
+
+void AVehiclePawn::ActivateVehicleAfterModelLoad()
+{
+    if (!bVehicleModelLoaded || !IsValid(Body))
+    {
+        DeactivateVehicleUntilModelLoaded();
+        return;
+    }
+
+    const bool bClientRenderOnlyVehicle =
+        UMultiplayerWorldSubSystem::ShouldUseClientRenderOnlyStreaming(this) && !HasAuthority();
+    if (bClientRenderOnlyVehicle)
+    {
+        Body->SetSimulatePhysics(false);
+        Body->SetEnableGravity(false);
+        Body->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+        Body->SetGenerateOverlapEvents(false);
+        if (UVehicleSubSystem* VehicleSubSystem = UVehicleSubSystem::Get(this))
+        {
+            VehicleSubSystem->UnregisterVehicle(this);
+        }
+        return;
+    }
+
+    Body->SetCollisionProfileName(TEXT("Vehicle"));
+    Body->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+    Body->SetCollisionResponseToChannel(ECC_WorldStatic, ECR_Block);
+    Body->SetCollisionResponseToChannel(ECC_WorldDynamic, ECR_Block);
+    Body->SetCollisionResponseToChannel(ECC_Visibility, ECR_Block);
+    Body->SetGenerateOverlapEvents(true);
+    ApplyVehicleBodyPhysicsSettings();
+    Body->SetUseCCD(true);
+    if (LowFrictionPhysicalMaterial)
+    {
+        Body->SetPhysMaterialOverride(LowFrictionPhysicalMaterial);
+    }
+
+    if (HasActorBegunPlay())
+    {
+        if (UVehicleSubSystem* VehicleSubSystem = UVehicleSubSystem::Get(this))
+        {
+            VehicleSubSystem->RegisterVehicle(this);
+        }
+    }
+}
+
+bool AVehiclePawn::ShouldUpdateVehicleSimulation() const
+{
+    if (!bVehicleModelLoaded || !IsValid(Body))
+    {
+        return false;
+    }
+
+    if (InstancedRenderRegistrationId != INDEX_NONE)
+    {
+        if (const UInstancedEntitySubsystem* InstancedEntities = UInstancedEntitySubsystem::Get(this))
+        {
+            if (!InstancedEntities->IsEntityPhysicsActive(InstancedRenderRegistrationId))
+            {
+                return false;
+            }
+        }
+    }
+
+    return bUseStableGroundRideHeight || Body->IsSimulatingPhysics();
 }
 
 void AVehiclePawn::ResetVehiclePoseAboveGround()
@@ -1663,15 +2116,12 @@ void AVehiclePawn::UpdateStableWheelVehicle(float DeltaSeconds)
 
     const float SafeMassKg = FMath::Max(1.0f, VehicleMassKg);
     const float MassScale = GetVehicleMassScale();
-    const float SafeWheelRadius = GetEffectiveWheelRadius();
     const float SuspensionTravel = GetEffectiveSuspensionRestLength(INDEX_NONE);
     const float GroundBuffer = FMath::Max(0.0f, StableRideHeightGroundBuffer);
     // Do not let wheel sphere sweeps treat curb sides or sharp edges as suspension ground.
     // Accept only surfaces that are actually drivable for the configured max slope.
     const float DrivableNormalZ = FMath::Cos(FMath::DegreesToRadians(FMath::Clamp(StableMaxSlopeDegrees, 1.0f, 60.0f)));
     const float RequiredNormalZ = FMath::Clamp(FMath::Max(MinSuspensionHitNormalDot, DrivableNormalZ), 0.0f, 1.0f);
-    const float TraceUp = FMath::Max(8.0f, SafeWheelRadius * 0.25f);
-    const float TraceDown = FMath::Max(80.0f, SuspensionTravel + SuspensionTraceExtra + SafeWheelRadius + GroundBuffer + 12.0f);
     const float GravityAcceleration = FMath::Max(1.0f, FMath::Abs(World->GetGravityZ()));
     const float RequiredSupportForcePerWheel = WheelOffsets.Num() > 0
         ? SafeMassKg * GravityAcceleration / static_cast<float>(WheelOffsets.Num())
@@ -1724,12 +2174,16 @@ void AVehiclePawn::UpdateStableWheelVehicle(float DeltaSeconds)
 
     auto TraceWheel = [&](const FTransform& ProbeTransform, int32 WheelIndex, FHitResult& OutHit, float& OutSpringLength) -> bool
     {
-        OutSpringLength = SuspensionTravel;
+        const float WheelSuspensionTravel = GetEffectiveSuspensionRestLength(WheelIndex);
+        OutSpringLength = WheelSuspensionTravel;
         if (!WheelOffsets.IsValidIndex(WheelIndex))
         {
             return false;
         }
 
+        const float SafeWheelRadius = GetEffectiveWheelRadius(WheelIndex);
+        const float TraceUp = FMath::Max(8.0f, SafeWheelRadius * 0.25f);
+        const float TraceDown = FMath::Max(80.0f, WheelSuspensionTravel + SuspensionTraceExtra + SafeWheelRadius + GroundBuffer + 12.0f);
         const FVector ProbeUp = ProbeTransform.GetUnitAxis(EAxis::Z).GetSafeNormal();
         const FVector MountWorld = ProbeTransform.TransformPosition(WheelOffsets[WheelIndex]);
         const FVector TraceStart = MountWorld + ProbeUp * TraceUp;
@@ -1764,7 +2218,7 @@ void AVehiclePawn::UpdateStableWheelVehicle(float DeltaSeconds)
         }
 
         const float MountToGround = FVector::DotProduct(MountWorld - OutHit.ImpactPoint, ProbeUp);
-        OutSpringLength = FMath::Clamp(MountToGround - SafeWheelRadius - GroundBuffer, 0.0f, SuspensionTravel);
+        OutSpringLength = FMath::Clamp(MountToGround - SafeWheelRadius - GroundBuffer, 0.0f, WheelSuspensionTravel);
         return true;
     };
 
@@ -1852,8 +2306,21 @@ void AVehiclePawn::UpdateStableWheelVehicle(float DeltaSeconds)
     const float AbsBodyForwardSpeed = FMath::Abs(BodyForwardSpeed);
     const float SteeringSpeedAlphaRaw = FMath::Clamp(AbsBodyForwardSpeed / FMath::Max(100.0f, SteeringSpeedForFullAssist), 0.0f, 1.0f);
     const float SteeringSpeedAlpha = SteeringSpeedAlphaRaw * SteeringSpeedAlphaRaw * (3.0f - 2.0f * SteeringSpeedAlphaRaw);
-    // Keyboard/gamepad steering still fades with speed, but not so early that the vehicle feels like a train.
-    const float EffectiveMaxSteeringDegrees = FMath::Lerp(MaxSteeringAngleDegrees, HighSpeedSteeringAngleDegrees, SteeringSpeedAlpha);
+    // Preserve deliberate steering authority at speed. Older JSON templates commonly contained a
+    // very small HighSpeedSteeringAngleDegrees value; the v3 authority scale upgrades those files
+    // without rewriting them and still caps the result at the low-speed steering lock.
+    const float HighSpeedSteeringAuthority = FMath::Clamp(
+        HighSpeedSteeringAuthorityScale * FMath::Lerp(1.0f, 1.15f, SteeringSpeedAlpha),
+        1.0f,
+        2.0f);
+    const float EffectiveHighSpeedSteeringDegrees = FMath::Clamp(
+        HighSpeedSteeringAngleDegrees * HighSpeedSteeringAuthority,
+        1.0f,
+        FMath::Max(1.0f, MaxSteeringAngleDegrees));
+    const float EffectiveMaxSteeringDegrees = FMath::Lerp(
+        MaxSteeringAngleDegrees,
+        EffectiveHighSpeedSteeringDegrees,
+        SteeringSpeedAlpha);
     const float BaseSteeringAngle = FMath::DegreesToRadians(EffectiveMaxSteeringDegrees * SmoothedSteeringInput);
     const float HighSpeedGripAlphaRaw = FMath::Clamp(AbsBodyForwardSpeed / FMath::Max(100.0f, HighSpeedLateralGripSpeed), 0.0f, 1.0f);
     const float HighSpeedGripAlpha = HighSpeedGripAlphaRaw * HighSpeedGripAlphaRaw * (3.0f - 2.0f * HighSpeedGripAlphaRaw);
@@ -1884,13 +2351,15 @@ void AVehiclePawn::UpdateStableWheelVehicle(float DeltaSeconds)
         WheelState.bRightSide = WheelState.LocalOffset.Y > 0.0f;
 
         const bool bWasGrounded = WheelGrounded.IsValidIndex(WheelIndex) && WheelGrounded[WheelIndex];
+        const float SafeWheelRadius = GetEffectiveWheelRadius(WheelIndex);
+        const float WheelSuspensionTravel = GetEffectiveSuspensionRestLength(WheelIndex);
         const float PreviousSpringLength = WheelSpringLengths.IsValidIndex(WheelIndex) ? WheelSpringLengths[WheelIndex] : GetTargetWheelSpringLength(WheelIndex);
         FHitResult Hit;
-        float SpringLength = SuspensionTravel;
+        float SpringLength = WheelSuspensionTravel;
         if (!TraceWheel(BodyTransform, WheelIndex, Hit, SpringLength))
         {
             WheelGrounded[WheelIndex] = false;
-            WheelSpringLengths[WheelIndex] = FMath::FInterpTo(PreviousSpringLength, SuspensionTravel, SafeDeltaSeconds, FMath::Max(0.1f, SuspensionContactSmoothingSpeed));
+            WheelSpringLengths[WheelIndex] = FMath::FInterpTo(PreviousSpringLength, WheelSuspensionTravel, SafeDeltaSeconds, FMath::Max(0.1f, SuspensionContactSmoothingSpeed));
             WheelSuspensionForces[WheelIndex] = FMath::FInterpTo(WheelSuspensionForces[WheelIndex], 0.0f, SafeDeltaSeconds, FMath::Max(0.1f, SuspensionForceInterpSpeed));
             WheelLateralForces[WheelIndex] = FMath::FInterpTo(WheelLateralForces[WheelIndex], 0.0f, SafeDeltaSeconds, FMath::Max(0.1f, TireForceInterpSpeed));
             continue;
@@ -1901,13 +2370,13 @@ void AVehiclePawn::UpdateStableWheelVehicle(float DeltaSeconds)
             : 0.0f;
         const float SuspensionVelocityLimit = FMath::Max(20.0f, MaxSuspensionVelocity);
         const float SuspensionVelocity = FMath::Clamp(RawSuspensionVelocity, -SuspensionVelocityLimit, SuspensionVelocityLimit);
-        const float Compression = FMath::Max(0.0f, SuspensionTravel - SpringLength);
+        const float Compression = FMath::Max(0.0f, WheelSuspensionTravel - SpringLength);
 
         // Conservative raycast-car suspension. The spring supports the chassis, but rebound energy is
         // deliberately bled off so a curb edge, trace jitter, or a wheel regaining contact cannot kick
         // the vehicle into a self-sustaining hop.
         const float NeutralSpringLength = FMath::Clamp(GetTargetWheelSpringLength(WheelIndex), GetMinimumWheelSpringLength(WheelIndex), GetEffectiveSuspensionRestLength(WheelIndex));
-        const float NeutralCompression = FMath::Max(1.0f, SuspensionTravel - NeutralSpringLength);
+        const float NeutralCompression = FMath::Max(1.0f, WheelSuspensionTravel - NeutralSpringLength);
         const float ContactAlpha = FMath::Clamp(Compression / NeutralCompression, 0.0f, 1.0f);
         const float RideHeightError = NeutralSpringLength - SpringLength;
         const float PositionCorrection = RideHeightError * SuspensionStrength * 0.34f * MassScale;
@@ -1920,7 +2389,7 @@ void AVehiclePawn::UpdateStableWheelVehicle(float DeltaSeconds)
             MaxSuspensionForcePerWheel * MassScale,
             RequiredSupportForcePerWheel * FMath::Clamp(StableSuspensionForceLimitMultiplier, 1.0f, 1.65f));
         float TargetSuspensionForce = FMath::Clamp(RawTargetSuspensionForce, 0.0f, SuspensionForceLimit);
-        const float StableBumpStopStartLength = FMath::Clamp(NeutralSpringLength * 0.52f, 5.0f, SuspensionTravel * 0.58f);
+        const float StableBumpStopStartLength = FMath::Clamp(NeutralSpringLength * 0.52f, 5.0f, WheelSuspensionTravel * 0.58f);
         if (SpringLength < StableBumpStopStartLength)
         {
             const float BumpStopAlpha = FMath::Clamp((StableBumpStopStartLength - SpringLength) / FMath::Max(1.0f, StableBumpStopStartLength), 0.0f, 1.0f);
@@ -1977,7 +2446,7 @@ void AVehiclePawn::UpdateStableWheelVehicle(float DeltaSeconds)
         WheelState.NormalForce = SuspensionForce;
 
         WheelGrounded[WheelIndex] = true;
-        WheelSpringLengths[WheelIndex] = FMath::Clamp(SpringLength, FMath::Max(3.0f, SafeWheelRadius * 0.28f), SuspensionTravel);
+        WheelSpringLengths[WheelIndex] = FMath::Clamp(SpringLength, FMath::Max(3.0f, SafeWheelRadius * 0.28f), WheelSuspensionTravel);
         WheelSuspensionForces[WheelIndex] = SuspensionForce;
         ++GroundedWheels;
         TotalCompressionForGroundedWheels += Compression;
@@ -2133,15 +2602,49 @@ void AVehiclePawn::UpdateStableWheelVehicle(float DeltaSeconds)
             WheelState.NormalForce * TireLongitudinalFriction * FMath::Lerp(1.0f, 1.22f, SlopeTractionAssist));
         float LongitudinalForce = FMath::Clamp(LongitudinalDemand, -LongitudinalLimit, LongitudinalLimit);
 
+        // Preserve a bounded part of the friction circle for cornering. Previously full drive force
+        // could produce LongitudinalUsage=1, reducing the lateral limit to zero exactly when a fast
+        // vehicle needed front-tire authority. The reservation is almost absent at parking speed,
+        // increases smoothly with speed/steering input, and is slightly stronger on the front axle.
+        const float SteeringReserveActivity = FMath::Clamp(FMath::Abs(SmoothedSteeringInput), 0.0f, 1.0f)
+            * FMath::Lerp(0.25f, 1.0f, HighSpeedGripAlpha);
+        const float AxleReserveScale = WheelState.bFront ? 1.0f : 0.72f;
+        const float LateralGripReserve = FMath::Clamp(
+            SteeringLateralGripReserve * FMath::Lerp(1.0f, HighSpeedSteeringAuthority, HighSpeedGripAlpha)
+                * SteeringReserveActivity * AxleReserveScale,
+            0.0f,
+            0.90f);
+        const float MaxLongitudinalUsageForSteering = FMath::Sqrt(FMath::Max(
+            0.0f,
+            1.0f - LateralGripReserve * LateralGripReserve));
+        const float SteeringLongitudinalLimit = LongitudinalLimit * MaxLongitudinalUsageForSteering;
+        LongitudinalForce = FMath::Clamp(
+            LongitudinalForce,
+            -SteeringLongitudinalLimit,
+            SteeringLongitudinalLimit);
+
         // Tire side force is generated from slip angle, not by directly rotating the chassis.
         // The small reference speed keeps low-speed steering responsive without creating a snap turn.
         const float SlipReferenceSpeed = FMath::Max(1.0f, TireSlipReferenceSpeed + FMath::Abs(WheelState.ForwardSpeed) * 0.05f);
         const float EffectiveLongitudinalSpeed = FMath::Max(SlipReferenceSpeed, FMath::Abs(WheelState.ForwardSpeed));
         const float SlipAngle = FMath::Atan2(WheelState.LateralSpeed, EffectiveLongitudinalSpeed);
         const float SteeringGripMultiplier = WheelState.bFront ? FMath::Max(0.1f, FrontSteeringGripMultiplier) : FMath::Max(0.1f, RearSteeringGripMultiplier);
-        const float CorneringStiffness = FMath::Max(0.1f, TireCorneringStiffness) * FMath::Max(0.1f, LateralGrip) * SteeringGripMultiplier * SpeedLateralGripScale;
+        const float SteeringActivity = FMath::Clamp(FMath::Abs(SmoothedSteeringInput), 0.0f, 1.0f);
+        const float EffectiveHighSpeedFrontGripBoost = FMath::Clamp(
+            1.0f + (FMath::Clamp(HighSpeedFrontGripBoost, 1.0f, 2.0f) - 1.0f) * HighSpeedSteeringAuthority,
+            1.0f,
+            2.0f);
+        const float FrontGripBoost = WheelState.bFront
+            ? FMath::Lerp(1.0f, EffectiveHighSpeedFrontGripBoost, HighSpeedGripAlpha * SteeringActivity)
+            : 1.0f;
+        // HighSpeedLateralGripScale limits capacity only once. Applying it to both stiffness and
+        // capacity compounded the loss and made fast vehicles ignore steering input.
+        const float CorneringStiffness = FMath::Max(0.1f, TireCorneringStiffness)
+            * FMath::Max(0.1f, LateralGrip) * SteeringGripMultiplier * FrontGripBoost;
         const float LateralDemand = -SlipAngle * CorneringStiffness * WheelState.NormalForce;
-        const float LateralLimitBase = FMath::Min(WheelState.NormalForce * TireLateralFriction, MaxLateralGripForce * MassScale) * SpeedLateralGripScale;
+        const float LateralCapacityBoost = WheelState.bFront ? FMath::Lerp(1.0f, FrontGripBoost, 0.35f) : 1.0f;
+        const float LateralLimitBase = FMath::Min(WheelState.NormalForce * TireLateralFriction, MaxLateralGripForce * MassScale)
+            * SpeedLateralGripScale * LateralCapacityBoost;
         const float LongitudinalUsage = FMath::Clamp(FMath::Abs(LongitudinalForce) / LongitudinalLimit, 0.0f, 1.0f);
         const float LateralLimit = LateralLimitBase * FMath::Sqrt(FMath::Max(0.0f, 1.0f - LongitudinalUsage * LongitudinalUsage));
         const float TargetLateralForce = FMath::Clamp(LateralDemand, -LateralLimit, LateralLimit) * FMath::Clamp(TireLateralForceScale, 0.0f, 1.0f);
@@ -2223,12 +2726,33 @@ void AVehiclePawn::UpdateStableWheelVehicle(float DeltaSeconds)
             0.0f,
             1.0f);
         const float SteeringAmount = FMath::Clamp(FMath::Abs(SmoothedSteeringInput), 0.0f, 1.0f);
-        const float YawAssistTorque = YawRateError * SteeringYawRateAssist * 0.26f * MassScale * GroundedRatio * ParkingSpeedAssistAlpha * SteeringAmount;
+        const float HighSpeedAssistStart = FMath::Max(100.0f, HighSpeedYawAssistStartSpeed);
+        const float HighSpeedAssistAlpha = FMath::Clamp(
+            (AbsBodyForwardSpeed - HighSpeedAssistStart) / FMath::Max(600.0f, FMath::Min(1800.0f, SteeringSpeedForFullAssist - HighSpeedAssistStart)),
+            0.0f,
+            1.0f);
+        const float DesiredYawAbs = FMath::Abs(DesiredYawRate);
+        const float DesiredYawDirection = FMath::Sign(DesiredYawRate);
+        const float DirectedCurrentYawRate = DesiredYawDirection == 0.0f ? 0.0f : CurrentYawRate * DesiredYawDirection;
+        const float UndersteerAlpha = SteeringAmount > 0.02f
+            ? FMath::Clamp((DesiredYawAbs - FMath::Max(0.0f, DirectedCurrentYawRate)) / FMath::Max(0.12f, DesiredYawAbs), 0.0f, 1.0f)
+            : 0.0f;
+        const float AssistStrength = FMath::Lerp(
+            SteeringYawRateAssist,
+            FMath::Max(SteeringYawRateAssist, HighSpeedYawAssistStrength) * HighSpeedSteeringAuthority,
+            HighSpeedAssistAlpha);
+        const float AssistActivity = FMath::Max(ParkingSpeedAssistAlpha * 0.26f, HighSpeedAssistAlpha * UndersteerAlpha);
+        const float YawAssistTorque = YawRateError * AssistStrength * MassScale * GroundedRatio * AssistActivity * SteeringAmount;
         const float YawDampingTorque = FMath::Lerp(
             -CurrentYawRate * SteeringYawDamping * 0.08f * MassScale * GroundedRatio,
             YawRateError * SteeringYawDamping * 0.060f * MassScale * GroundedRatio,
             SteeringAmount);
-        TotalTorque += Up * FMath::Clamp(YawAssistTorque + YawDampingTorque, -MaxSteeringAssistTorque * MassScale, MaxSteeringAssistTorque * MassScale);
+        const float EffectiveSteeringTorqueLimit = MaxSteeringAssistTorque * MassScale
+            * FMath::Lerp(1.0f, HighSpeedSteeringAuthority, HighSpeedAssistAlpha);
+        TotalTorque += Up * FMath::Clamp(
+            YawAssistTorque + YawDampingTorque,
+            -EffectiveSteeringTorqueLimit,
+            EffectiveSteeringTorqueLimit);
     }
     else
     {
@@ -2496,10 +3020,10 @@ void AVehiclePawn::ApplyStableVehicleGrounding(float DeltaSeconds)
         // With pitch/roll locked, local Z is stable. Place the actor so the wheel visual center
         // stays one radius above the floor at the fixed visual suspension length.
         AddTargetHeight(Hit.ImpactPoint.Z + GroundBuffer + StableSpringLength + SafeWheelRadius - LocalWheelOffset.Z);
-        AddTargetHeight(Hit.ImpactPoint.Z + GroundBuffer + BodyExtent.Z + FMath::Max(0.5f, GetPhysicsBodyGroundClearance()));
-        if (LoadedBodyVisualBounds.IsValid)
+        if (!LoadedWheelVisualRestBounds.IsValid)
         {
-            AddTargetHeight(Hit.ImpactPoint.Z + GroundBuffer - LoadedBodyVisualBounds.Min.Z + LoadedVisualBodyGroundClearance);
+            AddTargetHeight(Hit.ImpactPoint.Z + GroundBuffer + BodyExtent.Z
+                + FMath::Clamp(GetPhysicsBodyGroundClearance(), 1.0f, 8.0f));
         }
     }
 
@@ -2580,7 +3104,7 @@ FPlacedObjectRecord AVehiclePawn::ToPlacementRecord(int32 VehicleRecordIndex) co
 
 bool AVehiclePawn::EnterVehicle(APlayerController* PlayerController, APawn* PreviousPawn)
 {
-    if (!IsValid(PlayerController) || IsOccupied())
+    if (!bVehicleModelLoaded || !IsValid(PlayerController) || IsOccupied())
     {
         return false;
     }
@@ -2622,6 +3146,10 @@ bool AVehiclePawn::EnterVehicle(APlayerController* PlayerController, APawn* Prev
     if (bHasStoredControlRotation)
     {
         PlayerController->SetControlRotation(StoredControlRotation);
+    }
+    if (UInstancedEntitySubsystem* InstancedEntities = UInstancedEntitySubsystem::Get(this))
+    {
+        InstancedEntities->SetEntityAlwaysRelevant(InstancedRenderRegistrationId, true);
     }
     return true;
 }
@@ -2695,6 +3223,10 @@ void AVehiclePawn::ExitVehicle()
     StoredPawnTransformBeforeEnter = FTransform::Identity;
     bHasStoredControlRotation = false;
     bHasStoredPawnTransform = false;
+    if (UInstancedEntitySubsystem* InstancedEntities = UInstancedEntitySubsystem::Get(this))
+    {
+        InstancedEntities->SetEntityAlwaysRelevant(InstancedRenderRegistrationId, false);
+    }
 }
 
 FVector AVehiclePawn::GetExitLocation() const
@@ -2971,7 +3503,7 @@ void AVehiclePawn::ApplyChassisClearanceProtection(UWorld* World, const FTransfo
     const float MassScale = GetVehicleMassScale();
     // Bottom-out guard only. Use a small real clearance here instead of the full spawn ride-height
     // so this does not turn back into the old ground-snap / hover behavior.
-    const float DesiredClearance = FMath::Clamp(GetPhysicsBodyGroundClearance(), 16.0f, 32.0f);
+    const float DesiredClearance = FMath::Clamp(GetPhysicsBodyGroundClearance(), 1.0f, 8.0f);
     const float Strength = FMath::Max(0.0f, ChassisAntiGroundStickStrength) * MassScale;
     const float Damping = FMath::Max(0.0f, ChassisAntiGroundStickDamping) * MassScale;
     const float MaxForcePerPoint = FMath::Max(1.0f, MaxChassisAntiGroundStickForce * MassScale / 5.0f);
@@ -2987,7 +3519,7 @@ void AVehiclePawn::ApplyChassisClearanceProtection(UWorld* World, const FTransfo
     for (const FVector& LocalPoint : LocalBottomPoints)
     {
         const FVector BottomWorld = BodyTransform.TransformPosition(LocalPoint);
-        const FVector TraceStart = BottomWorld + FVector::UpVector * 30.0f;
+        const FVector TraceStart = BottomWorld + FVector::UpVector * 18.0f;
         const FVector TraceEnd = BottomWorld - FVector::UpVector * (DesiredClearance + 100.0f);
 
         FHitResult Hit;
@@ -3043,7 +3575,6 @@ void AVehiclePawn::ApplySuspensionAndDrive(float DeltaSeconds)
     const FVector AngularVelocity = Body->GetPhysicsAngularVelocityInRadians();
     const float BodyForwardSpeed = FVector::DotProduct(BodyVelocity, Forward);
     const float AbsBodyForwardSpeed = FMath::Abs(BodyForwardSpeed);
-    const float SafeWheelRadius = GetEffectiveWheelRadius();
     const float MassScale = GetVehicleMassScale();
     const float GravityAcceleration = FMath::Max(1.0f, FMath::Abs(World->GetGravityZ()));
     const float RequiredSupportForcePerWheel = (WheelOffsets.Num() > 0)
@@ -3068,7 +3599,11 @@ void AVehiclePawn::ApplySuspensionAndDrive(float DeltaSeconds)
     {
         const FVector BodyLocation = Body->GetComponentLocation();
         // The center guard is also a bottom-out bump-stop, not a ride-height controller.
-        const float DesiredCenterHeight = BodyExtent.Z + FMath::Clamp(GetPhysicsBodyGroundClearance(), 12.0f, 28.0f);
+        const float CollisionGuardHeight = BodyExtent.Z
+            + FMath::Clamp(GetPhysicsBodyGroundClearance(), 1.0f, 8.0f);
+        const float DesiredCenterHeight = LoadedWheelVisualRestBounds.IsValid
+            ? FMath::Min(CollisionGuardHeight, GetDesiredCenterHeightAboveGround())
+            : CollisionGuardHeight;
         const FVector ClearanceTraceStart = BodyLocation + FVector(0.0f, 0.0f, 64.0f);
         const FVector ClearanceTraceEnd = BodyLocation - FVector(0.0f, 0.0f, DesiredCenterHeight + 120.0f);
         FHitResult ClearanceHit;
@@ -3129,8 +3664,21 @@ void AVehiclePawn::ApplySuspensionAndDrive(float DeltaSeconds)
 
     const float SteeringSpeedAlphaRaw = FMath::Clamp(AbsBodyForwardSpeed / FMath::Max(100.0f, SteeringSpeedForFullAssist), 0.0f, 1.0f);
     const float SteeringSpeedAlpha = SteeringSpeedAlphaRaw * SteeringSpeedAlphaRaw * (3.0f - 2.0f * SteeringSpeedAlphaRaw);
-    // Keyboard/gamepad steering still fades with speed, but not so early that the vehicle feels like a train.
-    const float EffectiveMaxSteeringDegrees = FMath::Lerp(MaxSteeringAngleDegrees, HighSpeedSteeringAngleDegrees, SteeringSpeedAlpha);
+    // Preserve deliberate steering authority at speed. Older JSON templates commonly contained a
+    // very small HighSpeedSteeringAngleDegrees value; the v3 authority scale upgrades those files
+    // without rewriting them and still caps the result at the low-speed steering lock.
+    const float HighSpeedSteeringAuthority = FMath::Clamp(
+        HighSpeedSteeringAuthorityScale * FMath::Lerp(1.0f, 1.15f, SteeringSpeedAlpha),
+        1.0f,
+        2.0f);
+    const float EffectiveHighSpeedSteeringDegrees = FMath::Clamp(
+        HighSpeedSteeringAngleDegrees * HighSpeedSteeringAuthority,
+        1.0f,
+        FMath::Max(1.0f, MaxSteeringAngleDegrees));
+    const float EffectiveMaxSteeringDegrees = FMath::Lerp(
+        MaxSteeringAngleDegrees,
+        EffectiveHighSpeedSteeringDegrees,
+        SteeringSpeedAlpha);
     const float BaseSteeringAngle = FMath::DegreesToRadians(EffectiveMaxSteeringDegrees * SmoothedSteeringInput);
     const float HighSpeedGripAlphaRaw = FMath::Clamp(AbsBodyForwardSpeed / FMath::Max(100.0f, HighSpeedLateralGripSpeed), 0.0f, 1.0f);
     const float HighSpeedGripAlpha = HighSpeedGripAlphaRaw * HighSpeedGripAlphaRaw * (3.0f - 2.0f * HighSpeedGripAlphaRaw);
@@ -3148,6 +3696,7 @@ void AVehiclePawn::ApplySuspensionAndDrive(float DeltaSeconds)
         WheelState.LocalOffset = WheelOffsets[WheelIndex];
         WheelState.bFront = WheelState.LocalOffset.X >= AxleSplitX;
         WheelState.bRightSide = WheelState.LocalOffset.Y > 0.0f;
+        const float SafeWheelRadius = GetEffectiveWheelRadius(WheelIndex);
         const bool bWasGrounded = WheelGrounded.IsValidIndex(WheelIndex) && WheelGrounded[WheelIndex];
         const float MinSpringLength = GetMinimumWheelSpringLength(WheelIndex);
         const float MaxSpringLength = GetEffectiveSuspensionRestLength(WheelIndex);
@@ -3637,15 +4186,47 @@ void AVehiclePawn::ApplySuspensionAndDrive(float DeltaSeconds)
             WheelState.NormalForce * TireLongitudinalFriction * FMath::Lerp(1.0f, 1.22f, SlopeTractionAssist));
         float LongitudinalForce = FMath::Clamp(LongitudinalDemand, -LongitudinalLimit, LongitudinalLimit);
 
+        // Keep enough combined-slip budget for steering at speed instead of allowing throttle to
+        // consume the complete tire friction circle and collapse lateral grip to zero.
+        const float SteeringReserveActivity = FMath::Clamp(FMath::Abs(SmoothedSteeringInput), 0.0f, 1.0f)
+            * FMath::Lerp(0.25f, 1.0f, HighSpeedGripAlpha);
+        const float AxleReserveScale = WheelState.bFront ? 1.0f : 0.72f;
+        const float LateralGripReserve = FMath::Clamp(
+            SteeringLateralGripReserve * FMath::Lerp(1.0f, HighSpeedSteeringAuthority, HighSpeedGripAlpha)
+                * SteeringReserveActivity * AxleReserveScale,
+            0.0f,
+            0.90f);
+        const float MaxLongitudinalUsageForSteering = FMath::Sqrt(FMath::Max(
+            0.0f,
+            1.0f - LateralGripReserve * LateralGripReserve));
+        const float SteeringLongitudinalLimit = LongitudinalLimit * MaxLongitudinalUsageForSteering;
+        LongitudinalForce = FMath::Clamp(
+            LongitudinalForce,
+            -SteeringLongitudinalLimit,
+            SteeringLongitudinalLimit);
+
         // Tire side force is generated from slip angle, not by directly rotating the chassis.
         // The small reference speed keeps low-speed steering responsive without creating a snap turn.
         const float SlipReferenceSpeed = FMath::Max(1.0f, TireSlipReferenceSpeed + FMath::Abs(WheelState.ForwardSpeed) * 0.05f);
         const float EffectiveLongitudinalSpeed = FMath::Max(SlipReferenceSpeed, FMath::Abs(WheelState.ForwardSpeed));
         const float SlipAngle = FMath::Atan2(WheelState.LateralSpeed, EffectiveLongitudinalSpeed);
         const float SteeringGripMultiplier = WheelState.bFront ? FMath::Max(0.1f, FrontSteeringGripMultiplier) : FMath::Max(0.1f, RearSteeringGripMultiplier);
-        const float CorneringStiffness = FMath::Max(0.1f, TireCorneringStiffness) * FMath::Max(0.1f, LateralGrip) * SteeringGripMultiplier * SpeedLateralGripScale;
+        const float SteeringActivity = FMath::Clamp(FMath::Abs(SmoothedSteeringInput), 0.0f, 1.0f);
+        const float EffectiveHighSpeedFrontGripBoost = FMath::Clamp(
+            1.0f + (FMath::Clamp(HighSpeedFrontGripBoost, 1.0f, 2.0f) - 1.0f) * HighSpeedSteeringAuthority,
+            1.0f,
+            2.0f);
+        const float FrontGripBoost = WheelState.bFront
+            ? FMath::Lerp(1.0f, EffectiveHighSpeedFrontGripBoost, HighSpeedGripAlpha * SteeringActivity)
+            : 1.0f;
+        // HighSpeedLateralGripScale limits capacity only once. Applying it to both stiffness and
+        // capacity compounded the loss and made fast vehicles ignore steering input.
+        const float CorneringStiffness = FMath::Max(0.1f, TireCorneringStiffness)
+            * FMath::Max(0.1f, LateralGrip) * SteeringGripMultiplier * FrontGripBoost;
         const float LateralDemand = -SlipAngle * CorneringStiffness * WheelState.NormalForce;
-        const float LateralLimitBase = FMath::Min(WheelState.NormalForce * TireLateralFriction, MaxLateralGripForce * MassScale) * SpeedLateralGripScale;
+        const float LateralCapacityBoost = WheelState.bFront ? FMath::Lerp(1.0f, FrontGripBoost, 0.35f) : 1.0f;
+        const float LateralLimitBase = FMath::Min(WheelState.NormalForce * TireLateralFriction, MaxLateralGripForce * MassScale)
+            * SpeedLateralGripScale * LateralCapacityBoost;
         const float LongitudinalUsage = FMath::Clamp(FMath::Abs(LongitudinalForce) / LongitudinalLimit, 0.0f, 1.0f);
         const float LateralLimit = LateralLimitBase * FMath::Sqrt(FMath::Max(0.0f, 1.0f - LongitudinalUsage * LongitudinalUsage));
         const float TargetLateralForce = FMath::Clamp(LateralDemand, -LateralLimit, LateralLimit) * FMath::Clamp(TireLateralForceScale, 0.0f, 1.0f);
@@ -4025,15 +4606,41 @@ void AVehiclePawn::ApplySuspensionAndDrive(float DeltaSeconds)
             const float YawRateAbs = FMath::Abs(YawRate);
             const float YawRateError = DesiredYawRate - YawRate;
 
-            // Let the vehicle rotate primarily from tire forces at the steered front wheels. A direct
-            // yaw-rate torque is used only as a small low-speed anti-understeer helper, because a strong
-            // yaw controller makes the chassis pivot unnaturally instead of following the front tires.
+            // Tire forces remain the primary steering mechanism. The direct yaw controller is limited to
+            // measured understeer, uses front-wheel contact as authority, and blends from the existing
+            // low-speed helper into a bounded high-speed helper instead of disappearing at speed.
+            int32 FrontWheelCount = 0;
+            for (const FVehicleWheelState& WheelState : WheelStates)
+            {
+                FrontWheelCount += WheelState.bFront ? 1 : 0;
+            }
+            const float FrontGroundedRatio = static_cast<float>(GroundedFrontWheels)
+                / static_cast<float>(FMath::Max(1, FrontWheelCount));
             const float LowSpeedAssistAlpha = FMath::Clamp(1.0f - AbsBodyForwardSpeed / 1450.0f, 0.0f, 1.0f);
+            const float HighSpeedAssistStart = FMath::Max(100.0f, HighSpeedYawAssistStartSpeed);
+            const float HighSpeedAssistFullSpeed = FMath::Max(
+                HighSpeedAssistStart + 600.0f,
+                FMath::Min(FMath::Max(HighSpeedAssistStart + 1.0f, SteeringSpeedForFullAssist), HighSpeedAssistStart + 1800.0f));
+            const float HighSpeedAssistRange = FMath::Max(300.0f, HighSpeedAssistFullSpeed - HighSpeedAssistStart);
+            const float HighSpeedAssistAlpha = FMath::Clamp(
+                (AbsBodyForwardSpeed - HighSpeedAssistStart) / HighSpeedAssistRange,
+                0.0f,
+                1.0f);
+            const float DesiredYawDirection = FMath::Sign(DesiredYawRate);
+            const float DirectedCurrentYawRate = DesiredYawDirection == 0.0f
+                ? 0.0f
+                : YawRate * DesiredYawDirection;
             const float UndersteerAlpha = SteeringAmount > 0.02f
-                ? FMath::Clamp((DesiredYawAbs - YawRateAbs) / FMath::Max(0.12f, DesiredYawAbs), 0.0f, 1.0f)
+                ? FMath::Clamp((DesiredYawAbs - FMath::Max(0.0f, DirectedCurrentYawRate)) / FMath::Max(0.12f, DesiredYawAbs), 0.0f, 1.0f)
                 : 0.0f;
-            const float YawAssistAlpha = SteeringAmount * LowSpeedAssistAlpha * UndersteerAlpha * 1.10f;
-            const float YawAssistTorque = YawRateError * SteeringYawRateAssist * MassScale * GroundedRatio * YawAssistAlpha;
+            const float AssistBlend = FMath::Max(LowSpeedAssistAlpha * 1.10f, HighSpeedAssistAlpha);
+            const float AssistStrength = FMath::Lerp(
+                SteeringYawRateAssist,
+                FMath::Max(SteeringYawRateAssist, HighSpeedYawAssistStrength) * HighSpeedSteeringAuthority,
+                HighSpeedAssistAlpha);
+            const float YawAssistAlpha = SteeringAmount * UndersteerAlpha * AssistBlend
+                * FMath::Clamp(FrontGroundedRatio, 0.0f, 1.0f);
+            const float YawAssistTorque = YawRateError * AssistStrength * MassScale * GroundedRatio * YawAssistAlpha;
 
             // Stability damping is deliberately conditional. It catches excessive spin or idle yaw, but
             // does not fight the tire-generated turn while the car is following a reasonable bicycle-model yaw rate.
@@ -4045,10 +4652,12 @@ void AVehiclePawn::ApplySuspensionAndDrive(float DeltaSeconds)
             const float YawDampingTorque = DampingError * SteeringYawDamping * MassScale * GroundedRatio
                 * FMath::Max(IdleYawDampingAlpha * 0.30f, OvershootAlpha * 0.48f);
 
+            const float EffectiveSteeringTorqueLimit = MaxSteeringAssistTorque * MassScale
+                * FMath::Lerp(1.0f, HighSpeedSteeringAuthority, HighSpeedAssistAlpha);
             const float SteeringTotalTorque = FMath::Clamp(
                 YawAssistTorque + YawDampingTorque,
-                -MaxSteeringAssistTorque * MassScale,
-                MaxSteeringAssistTorque * MassScale);
+                -EffectiveSteeringTorqueLimit,
+                EffectiveSteeringTorqueLimit);
             if (!FMath::IsNearlyZero(SteeringTotalTorque, 1.0f))
             {
                 AddVehicleTorqueInRadians(Up * SteeringTotalTorque);
@@ -4263,36 +4872,45 @@ void AVehiclePawn::ApplyGroundedPitchRollDamping(int32 GroundedWheels, float Del
 
 float AVehiclePawn::GetDesiredCenterHeightAboveGround() const
 {
-    if (LoadedWheelVisualRestBounds.IsValid)
-    {
-        // Loaded vehicle models can have an origin/body box that does not match the visual chassis.
-        // Place the actor from the real visual wheel bounds so the tires, not the chassis, touch the floor.
-        float DesiredHeight = -LoadedWheelVisualRestBounds.Min.Z + LoadedWheelGroundContactBuffer;
+    const float SafeRideHeightOffset = FMath::Clamp(RideHeightOffset, -30.0f, 30.0f);
 
-        if (LoadedBodyVisualBounds.IsValid)
-        {
-            DesiredHeight = FMath::Max(DesiredHeight, -LoadedBodyVisualBounds.Min.Z + LoadedVisualBodyGroundClearance);
-        }
-
-        for (int32 WheelIndex = 0; WheelIndex < WheelOffsets.Num(); ++WheelIndex)
-        {
-            const float LocalWheelBottomZ = WheelOffsets[WheelIndex].Z - GetTargetWheelSpringLength(WheelIndex) - GetEffectiveWheelRadius();
-            DesiredHeight = FMath::Max(DesiredHeight, -LocalWheelBottomZ + LoadedWheelGroundContactBuffer);
-        }
-
-        DesiredHeight = FMath::Max(DesiredHeight, BodyExtent.Z + GetPhysicsBodyGroundClearance());
-        return FMath::Max(1.0f, DesiredHeight);
-    }
-
-    float WheelRideHeight = 0.0f;
+    // The tire bottoms are the ride-height authority. Use a robust median rather than the maximum:
+    // one wheel mesh with an oversized AABB/pivot must not raise the entire chassis and leave the
+    // other tires in the air. Each rendered wheel is subsequently aligned to its own traced contact.
+    TArray<float, TInlineAllocator<16>> RequiredCenterHeights;
+    RequiredCenterHeights.Reserve(WheelOffsets.Num());
     for (int32 WheelIndex = 0; WheelIndex < WheelOffsets.Num(); ++WheelIndex)
     {
-        const float LocalWheelBottomZ = WheelOffsets[WheelIndex].Z - GetTargetWheelSpringLength(WheelIndex) - GetEffectiveWheelRadius();
-        WheelRideHeight = FMath::Max(WheelRideHeight, -LocalWheelBottomZ);
+        const float LocalWheelBottomZ = WheelOffsets[WheelIndex].Z
+            - GetTargetWheelSpringLength(WheelIndex)
+            - GetEffectiveWheelRadius(WheelIndex);
+        const float RequiredHeight = -LocalWheelBottomZ
+            + LoadedWheelGroundContactBuffer
+            + SafeRideHeightOffset;
+        if (FMath::IsFinite(RequiredHeight) && RequiredHeight > 0.0f)
+        {
+            RequiredCenterHeights.Add(RequiredHeight);
+        }
     }
 
-    const float ChassisRideHeight = BodyExtent.Z + GetPhysicsBodyGroundClearance();
-    return FMath::Max(ChassisRideHeight, WheelRideHeight);
+    if (RequiredCenterHeights.Num() > 0)
+    {
+        RequiredCenterHeights.Sort();
+        const int32 UpperMiddleIndex = RequiredCenterHeights.Num() / 2;
+        const int32 LowerMiddleIndex = (RequiredCenterHeights.Num() - 1) / 2;
+        const float DesiredHeight = 0.5f * (
+            RequiredCenterHeights[LowerMiddleIndex] + RequiredCenterHeights[UpperMiddleIndex]);
+        if (FMath::IsFinite(DesiredHeight))
+        {
+            return FMath::Max(1.0f, DesiredHeight);
+        }
+    }
+
+    // Malformed/no-wheel fallback only. It is never combined with a valid authored tire pose.
+    const float FallbackHeight = (LoadedBodyVisualBounds.IsValid
+        ? -LoadedBodyVisualBounds.Min.Z + LoadedVisualBodyGroundClearance
+        : BodyExtent.Z + GetPhysicsBodyGroundClearance()) + SafeRideHeightOffset;
+    return FMath::Max(1.0f, FallbackHeight);
 }
 
 float AVehiclePawn::GetDownforceClearanceScale() const
@@ -4351,7 +4969,6 @@ void AVehiclePawn::UpdateWheelVisuals(float DeltaSeconds)
 {
     const FTransform BodyTransform = Body ? Body->GetComponentTransform() : GetActorTransform();
     const FVector Forward = Body ? Body->GetForwardVector() : GetActorForwardVector();
-    const float SafeWheelRadius = GetEffectiveWheelRadius();
     const FVector VisualLinearVelocity = bUseStableGroundRideHeight
         ? StablePhysicsLinearVelocity
         : (Body ? Body->GetPhysicsLinearVelocity() : FVector::ZeroVector);
@@ -4361,7 +4978,18 @@ void AVehiclePawn::UpdateWheelVisuals(float DeltaSeconds)
     const float AbsForwardSpeed = FMath::Abs(FVector::DotProduct(VisualLinearVelocity, Forward));
     const float SteerAlphaRaw = FMath::Clamp(AbsForwardSpeed / FMath::Max(1.0f, SteeringSpeedForFullAssist), 0.0f, 1.0f);
     const float SteerAlpha = FMath::Pow(SteerAlphaRaw, 1.65f);
-    const float SteeringDegrees = SmoothedSteeringInput * FMath::Lerp(MaxSteeringAngleDegrees, HighSpeedSteeringAngleDegrees, SteerAlpha);
+    const float VisualHighSpeedAuthority = FMath::Clamp(
+        HighSpeedSteeringAuthorityScale * FMath::Lerp(1.0f, 1.15f, SteerAlpha),
+        1.0f,
+        2.0f);
+    const float VisualHighSpeedSteeringDegrees = FMath::Clamp(
+        HighSpeedSteeringAngleDegrees * VisualHighSpeedAuthority,
+        1.0f,
+        FMath::Max(1.0f, MaxSteeringAngleDegrees));
+    const float SteeringDegrees = SmoothedSteeringInput * FMath::Lerp(
+        MaxSteeringAngleDegrees,
+        VisualHighSpeedSteeringDegrees,
+        SteerAlpha);
     WheelSpinDegrees.SetNum(WheelOffsets.Num());
     WheelVisualSpringLengths.SetNum(WheelOffsets.Num());
 
@@ -4371,6 +4999,7 @@ void AVehiclePawn::UpdateWheelVisuals(float DeltaSeconds)
 
     auto CalculateWheelVisual = [&](int32 WheelIndex, FVector& OutLocalCenter, FRotator& OutRelativeRotation)
     {
+        const float SafeWheelRadius = GetEffectiveWheelRadius(WheelIndex);
         const FVector MountWorld = BodyTransform.TransformPosition(WheelOffsets[WheelIndex]);
         const float MinSpringLength = GetMinimumWheelSpringLength(WheelIndex);
         const float MaxSpringLength = GetEffectiveSuspensionRestLength(WheelIndex);
@@ -4421,10 +5050,17 @@ void AVehiclePawn::UpdateWheelVisuals(float DeltaSeconds)
                     FVector::DotProduct(VisualHit.ImpactNormal.GetSafeNormal(), FVector::UpVector)) >= FMath::Clamp(MinSuspensionHitNormalDot, 0.0f, 1.0f))
             {
                 const float MountToGround = FVector::DotProduct(MountWorld - VisualHit.ImpactPoint, WheelUp);
-                const float MaxNonPenetratingSpringLength = FMath::Max(
+                const float GroundContactSpringLength = FMath::Clamp(
+                    MountToGround - SafeWheelRadius - FMath::Max(0.0f, WheelVisualGroundContactBuffer),
                     0.0f,
-                    MountToGround - SafeWheelRadius - FMath::Max(0.0f, WheelVisualGroundContactBuffer));
-                TargetVisualSpringLength = FMath::Min(TargetVisualSpringLength, MaxNonPenetratingSpringLength);
+                    MaxSpringLength);
+                if (FMath::IsFinite(GroundContactSpringLength))
+                {
+                    // Align the tire bottom to the traced surface in both directions. The previous
+                    // code only shortened the spring to prevent penetration; it never extended a
+                    // hovering wheel down to the road, so a valid contact could still render a gap.
+                    TargetVisualSpringLength = GroundContactSpringLength;
+                }
             }
         }
 
@@ -4454,143 +5090,38 @@ void AVehiclePawn::UpdateWheelVisuals(float DeltaSeconds)
         OutRelativeRotation = FRotator(WheelSpinDegrees[WheelIndex], bFrontWheel ? SteeringDegrees : 0.0f, 0.0f);
     };
 
-    for (int32 WheelIndex = 0; WheelIndex < WheelMeshes.Num() && WheelIndex < WheelOffsets.Num(); ++WheelIndex)
-    {
-        UProceduralMeshComponent* WheelMesh = WheelMeshes[WheelIndex];
-        if (!IsValid(WheelMesh))
-        {
-            continue;
-        }
-
-        FVector LocalWheelCenter;
-        FRotator RelativeRotation;
-        CalculateWheelVisual(WheelIndex, LocalWheelCenter, RelativeRotation);
-        WheelMesh->SetRelativeLocation(LocalWheelCenter);
-        WheelMesh->SetRelativeRotation(RelativeRotation);
-    }
-
-    for (int32 WheelIndex = 0; WheelIndex < LoadedWheelMeshComponents.Num() && WheelIndex < WheelOffsets.Num(); ++WheelIndex)
-    {
-        UStaticMeshComponent* WheelMeshComponent = LoadedWheelMeshComponents[WheelIndex];
-        if (!IsValid(WheelMeshComponent))
-        {
-            continue;
-        }
-
-        FVector LocalWheelCenter;
-        FRotator RelativeRotation;
-        CalculateWheelVisual(WheelIndex, LocalWheelCenter, RelativeRotation);
-        const FQuat BaseRotation = LoadedWheelBaseRotations.IsValidIndex(WheelIndex) ? LoadedWheelBaseRotations[WheelIndex] : FQuat::Identity;
-        const FQuat VisualRotation = RelativeRotation.Quaternion() * BaseRotation;
-        const FVector MeshCenterOffset = LoadedWheelVisualCenterOffsets.IsValidIndex(WheelIndex) ? LoadedWheelVisualCenterOffsets[WheelIndex] : FVector::ZeroVector;
-        const FVector ScaledCenterOffset = MeshCenterOffset * WheelMeshComponent->GetRelativeScale3D();
-        WheelMeshComponent->SetRelativeLocation(LocalWheelCenter - VisualRotation.RotateVector(ScaledCenterOffset));
-        WheelMeshComponent->SetRelativeRotation(VisualRotation.Rotator());
-    }
-}
-
-void AVehiclePawn::BuildBodyMesh()
-{
-    if (!IsValid(BodyMesh))
+    UInstancedEntitySubsystem* InstancedEntities = UInstancedEntitySubsystem::Get(this);
+    if (!InstancedEntities || InstancedRenderRegistrationId == INDEX_NONE)
     {
         return;
     }
 
-    const FVector E = BodyExtent;
-    TArray<FVector> Vertices = {
-        FVector(E.X, E.Y, E.Z), FVector(E.X, -E.Y, E.Z), FVector(-E.X, -E.Y, E.Z), FVector(-E.X, E.Y, E.Z),
-        FVector(E.X, E.Y, -E.Z), FVector(E.X, -E.Y, -E.Z), FVector(-E.X, -E.Y, -E.Z), FVector(-E.X, E.Y, -E.Z)
-    };
-    TArray<int32> Triangles = {
-        0, 1, 2, 0, 2, 3,
-        4, 6, 5, 4, 7, 6,
-        0, 4, 5, 0, 5, 1,
-        1, 5, 6, 1, 6, 2,
-        2, 6, 7, 2, 7, 3,
-        3, 7, 4, 3, 4, 0
-    };
-    TArray<FVector> Normals;
-    Normals.Init(FVector::UpVector, Vertices.Num());
-    TArray<FVector2D> UV0;
-    UV0.Init(FVector2D::ZeroVector, Vertices.Num());
-    TArray<FColor> Colors;
-    Colors.Init(FColor(80, 80, 85), Vertices.Num());
-    TArray<FProcMeshTangent> Tangents;
-    Tangents.Init(FProcMeshTangent(1.0f, 0.0f, 0.0f), Vertices.Num());
-    BodyMesh->CreateMeshSection(0, Vertices, Triangles, Normals, UV0, Colors, Tangents, false);
-}
-
-void AVehiclePawn::BuildWheelMeshes()
-{
-    for (UProceduralMeshComponent* WheelMesh : WheelMeshes)
+    for (int32 WheelIndex = 0;
+         WheelIndex < LoadedWheelRenderPartIndices.Num() && WheelIndex < WheelOffsets.Num();
+         ++WheelIndex)
     {
-        BuildWheelMesh(WheelMesh);
+        FVector LocalWheelCenter;
+        FRotator RelativeRotation;
+        CalculateWheelVisual(WheelIndex, LocalWheelCenter, RelativeRotation);
+
+        const FQuat BaseRotation = LoadedWheelBaseRotations.IsValidIndex(WheelIndex)
+            ? LoadedWheelBaseRotations[WheelIndex]
+            : FQuat::Identity;
+        const FVector BaseScale = LoadedWheelBaseScales.IsValidIndex(WheelIndex)
+            ? LoadedWheelBaseScales[WheelIndex]
+            : FVector::OneVector;
+        const FVector MeshCenterOffset = LoadedWheelVisualCenterOffsets.IsValidIndex(WheelIndex)
+            ? LoadedWheelVisualCenterOffsets[WheelIndex]
+            : FVector::ZeroVector;
+        const FQuat VisualRotation = (RelativeRotation.Quaternion() * BaseRotation).GetNormalized();
+        const FVector RelativeLocation = LocalWheelCenter - VisualRotation.RotateVector(MeshCenterOffset * BaseScale);
+        const FTransform WheelLocalTransform(VisualRotation, RelativeLocation, BaseScale);
+
+        InstancedEntities->UpdateEntityPartLocalTransform(
+            InstancedRenderRegistrationId,
+            LoadedWheelRenderPartIndices[WheelIndex],
+            WheelLocalTransform);
     }
 }
 
-void AVehiclePawn::BuildWheelMesh(UProceduralMeshComponent* MeshComponent) const
-{
-    if (!IsValid(MeshComponent))
-    {
-        return;
-    }
 
-    constexpr int32 Segments = 20;
-    const float Radius = FMath::Max(4.0f, GetEffectiveWheelRadius());
-    const float HalfWidth = FMath::Max(2.0f, WheelWidth * 0.5f);
-    TArray<FVector> Vertices;
-    TArray<int32> Triangles;
-    TArray<FVector> Normals;
-    TArray<FVector2D> UV0;
-    TArray<FColor> Colors;
-
-    for (int32 Index = 0; Index < Segments; ++Index)
-    {
-        const float Angle = 2.0f * PI * static_cast<float>(Index) / static_cast<float>(Segments);
-        const float X = FMath::Cos(Angle) * Radius;
-        const float Z = FMath::Sin(Angle) * Radius;
-        Vertices.Add(FVector(X, -HalfWidth, Z));
-        Vertices.Add(FVector(X, HalfWidth, Z));
-        Normals.Add(FVector(X, 0.0f, Z).GetSafeNormal());
-        Normals.Add(FVector(X, 0.0f, Z).GetSafeNormal());
-        UV0.Add(FVector2D(static_cast<float>(Index) / Segments, 0.0f));
-        UV0.Add(FVector2D(static_cast<float>(Index) / Segments, 1.0f));
-        Colors.Add(FColor(18, 18, 18));
-        Colors.Add(FColor(18, 18, 18));
-    }
-
-    const int32 LeftCenter = Vertices.Add(FVector(0.0f, -HalfWidth, 0.0f));
-    const int32 RightCenter = Vertices.Add(FVector(0.0f, HalfWidth, 0.0f));
-    Normals.Add(FVector(0.0f, -1.0f, 0.0f));
-    Normals.Add(FVector(0.0f, 1.0f, 0.0f));
-    UV0.Add(FVector2D(0.5f, 0.5f));
-    UV0.Add(FVector2D(0.5f, 0.5f));
-    Colors.Add(FColor(12, 12, 12));
-    Colors.Add(FColor(12, 12, 12));
-
-    for (int32 Index = 0; Index < Segments; ++Index)
-    {
-        const int32 Next = (Index + 1) % Segments;
-        const int32 L0 = Index * 2;
-        const int32 R0 = L0 + 1;
-        const int32 L1 = Next * 2;
-        const int32 R1 = L1 + 1;
-
-        Triangles.Add(L0);
-        Triangles.Add(R0);
-        Triangles.Add(R1);
-        Triangles.Add(L0);
-        Triangles.Add(R1);
-        Triangles.Add(L1);
-        Triangles.Add(LeftCenter);
-        Triangles.Add(L1);
-        Triangles.Add(L0);
-        Triangles.Add(RightCenter);
-        Triangles.Add(R0);
-        Triangles.Add(R1);
-    }
-
-    TArray<FProcMeshTangent> Tangents;
-    Tangents.Init(FProcMeshTangent(1.0f, 0.0f, 0.0f), Vertices.Num());
-    MeshComponent->CreateMeshSection(0, Vertices, Triangles, Normals, UV0, Colors, Tangents, false);
-}

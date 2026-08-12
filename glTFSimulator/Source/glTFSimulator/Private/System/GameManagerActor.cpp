@@ -3,7 +3,6 @@
 #include "System/GameManagerActor.h"
 #include "System/GameManagerSubSystem.h"
 #include "System/GameUpdateSubSystem.h"
-#include "Model/EditableMeshActor.h"
 #include "World/PrefabActor.h"
 #include "Vehicle/VehiclePawn.h"
 #include "Weapon/WeaponActor.h"
@@ -23,7 +22,6 @@ AGameManagerActor::AGameManagerActor()
     // PlacementGridMaterial is assigned directly in the owning Blueprint/class defaults.
 
     PrefabActorClass = APrefabActor::StaticClass();
-    EditableMeshActorClass = AEditableMeshActor::StaticClass();
     VehiclePawnClass = AVehiclePawn::StaticClass();
     WeaponActorClass = AWeaponActor::StaticClass();
     WorldManagerClass = AWorldManager::StaticClass();
@@ -62,7 +60,7 @@ void AGameManagerActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
 
     if (UGameManagerSubSystem* GameManager = UGameManagerSubSystem::GetSubSystem(this))
     {
-        GameManager->StopGameManager(EndPlayReason);
+        GameManager->StopGameManager(EndPlayReason, this);
     }
 
     Super::EndPlay(EndPlayReason);

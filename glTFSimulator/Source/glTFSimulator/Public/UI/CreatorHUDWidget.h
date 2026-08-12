@@ -77,17 +77,13 @@ public:
     UFUNCTION(BlueprintCallable, Category="Creator HUD|Inventory")
     void ToggleItemListFromUI();
 
-    /** Called by UI buttons to finish the currently edited mesh. */
-    UFUNCTION(BlueprintCallable, Category="Creator HUD|Editing")
-    void FinishEditFromUI();
-
-    /** Called by UI buttons to cancel the currently edited mesh. */
-    UFUNCTION(BlueprintCallable, Category="Creator HUD|Editing")
-    void CancelEditFromUI();
-
     /** Called by UI buttons to save the current scene. */
     UFUNCTION(BlueprintCallable, Category="Creator HUD|Save")
     void SaveSceneFromUI();
+
+    /** Starts the DAT-only world bake and can be mapped directly to a world-list UI button. */
+    UFUNCTION(BlueprintCallable, Category="Creator HUD|Bake")
+    void BakeWorldDataFromUI();
 
     /** Called by UI buttons to toggle grid snapping. */
     UFUNCTION(BlueprintCallable, Category="Creator HUD|Placement")
