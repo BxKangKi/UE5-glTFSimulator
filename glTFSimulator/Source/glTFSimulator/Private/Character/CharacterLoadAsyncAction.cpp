@@ -175,9 +175,8 @@ void UCharacterLoadAsyncAction::LoadAssetAsync()
 
                 if (bCharacterFileValid && CancelToken->GetValue() == 0)
                 {
-                    // Parser creation is bounded across the process, but independent GLB files are
-                    // intentionally allowed to parse in parallel. This project does not directly
-                    // dereference a UObject in this worker stage.
+                    // Parser creation is serialized across the process. This project does not
+                    // directly dereference a UObject in this worker stage.
                     Parser = FglTFRuntimeSafety::CreateParserSafely(RequestedFilePath, Config);
                     if (!Parser.IsValid() && ValidationReason.IsEmpty())
                     {
@@ -445,6 +444,12 @@ void UCharacterLoadAsyncAction::BeginSkeletalMeshLoad_GameThread()
         return;
     }
 
+    // FglTFRuntimeSkeletalMeshConfig stores raw UObject pointers. The owner is deliberately weak and
+    // may be destroyed during travel, so keep the source skeleton/material GC-safe on this action
+    // until the native terminal callback has acknowledged completion or cancellation.
+    SourceSkeletonReferenceGuard = DefaultSkeleton;
+    SourceMaterialReferenceGuard = Material;
+
     // Creating/duplicating UObjects must remain on the game thread. The expensive glTF primitive,
     // skin-weight, render-buffer, material, and texture work is performed by glTFRuntime's async API.
     CurrentRuntimeSkeleton = UCharacterFunctionLibrary::DuplicateSkeleton(DefaultSkeleton);
@@ -504,8 +509,7 @@ void UCharacterLoadAsyncAction::BeginSkeletalMeshLoad_GameThread()
     OnProgress.Broadcast(0.55f);
     bMeshLoadInFlight = true;
 
-    // Skeletal generation is serialized only against work using this same parser. Independent
-    // character/world GLBs may use the other bounded slots concurrently.
+    // Skeletal generation shares the same process-wide native slot as static mesh generation.
     const FglTFRuntimeSkeletalMeshConfig RequestedConfig = Config;
     TWeakObjectPtr<UCharacterLoadAsyncAction> WeakThis(this);
     const uint64 SubmittedTicket = FglTFRuntimeSafety::EnqueueOperation(
@@ -587,7 +591,7 @@ void UCharacterLoadAsyncAction::OnMeshLoaded(USkeletalMesh* SkeletalMesh)
     // this scope returns the ticket and therefore cannot race this callback.
     ON_SCOPE_EXIT
     {
-        FglTFRuntimeSafety::CompleteOperation(CompletedTicket);
+        FglTFRuntimeSafety::CompleteOperationAfterCallback(CompletedTicket);
     };
 
     if (bCancelled || bFinished)
@@ -960,6 +964,8 @@ void UCharacterLoadAsyncAction::ReleaseCurrentAsset()
     PendingRuntimePhysicsAsset = nullptr;
     PendingSkeletalMesh = nullptr;
     CurrentRuntimeSkeleton = nullptr;
+    SourceSkeletonReferenceGuard = nullptr;
+    SourceMaterialReferenceGuard = nullptr;
     PendingBoneMap.Empty();
 }
 

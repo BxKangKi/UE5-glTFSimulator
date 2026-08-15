@@ -15,7 +15,8 @@
 #include "Vehicle/VehiclePawn.h"
 #include "Weapon/WeaponActor.h"
 #include "Model/glTFStreamActor.h"
-#include "World/WorldManager.h"
+#include "Model/MaterialDefaultAsset.h"
+#include "World/WorldEnvManager.h"
 #include "World/WeatherActor.h"
 #include "World/PlayerData.h"
 #include "ProceduralMeshComponent.h"
@@ -56,6 +57,7 @@
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "RenderingThread.h"
+#include "Templates/UnrealTemplate.h"
 #include "UObject/UObjectGlobals.h"
 #include "UObject/GarbageCollection.h"
 #include "Engine/GameInstance.h"
@@ -67,7 +69,7 @@ static constexpr int32 ToolbarSlotCount = 7;
 namespace
 {
     constexpr int32 MaxSavedSceneReadinessAttempts = 120; // 30 seconds at 0.25 s intervals.
-    constexpr int32 MaxSavedSceneDataAttempts = 4;
+    constexpr int32 MaxSavedSceneDataAttempts = 20; // Allow transient model-registration failures to settle for up to five seconds.
     constexpr float SavedSceneLoadRetryDelaySeconds = 0.25f;
 
     FString NormalizeFullPathForWorldData(const FString& Path)
@@ -103,6 +105,31 @@ namespace
         const FString Prefix = Directory + TEXT("/");
         return Candidate.Equals(Directory, ESearchCase::IgnoreCase) ||
             Candidate.StartsWith(Prefix, ESearchCase::IgnoreCase);
+    }
+
+    bool ArePlacedObjectRecordsEquivalent(
+        const TArray<FPlacedObjectRecord>& A,
+        const TArray<FPlacedObjectRecord>& B)
+    {
+        if (A.Num() != B.Num())
+        {
+            return false;
+        }
+
+        for (int32 Index = 0; Index < A.Num(); ++Index)
+        {
+            const FPlacedObjectRecord& Left = A[Index];
+            const FPlacedObjectRecord& Right = B[Index];
+            if (Left.Kind != Right.Kind
+                || !Left.ObjectName.Equals(Right.ObjectName, ESearchCase::CaseSensitive)
+                || !Left.BaseName.Equals(Right.BaseName, ESearchCase::CaseSensitive)
+                || !Left.SourceFile.Equals(Right.SourceFile, ESearchCase::CaseSensitive)
+                || !Left.Transform.Equals(Right.Transform, 0.001f))
+            {
+                return false;
+            }
+        }
+        return true;
     }
 
     enum class EAuthoredAssetType : uint8
@@ -347,7 +374,7 @@ UGameManagerSubSystem::UGameManagerSubSystem()
     VehiclePawnClass = AVehiclePawn::StaticClass();
     WeaponActorClass = AWeaponActor::StaticClass();
     WeatherActorClass = AWeatherActor::StaticClass();
-    WorldManagerClass = AWorldManager::StaticClass();
+    WorldEnvManagerClass = AWorldEnvManager::StaticClass();
     SpawnActorClass = AglTFStreamActor::StaticClass();
 }
 
@@ -384,6 +411,7 @@ void UGameManagerSubSystem::Deinitialize()
         PostLoadMapCleanupHandle.Reset();
     }
 
+    ReleaseMaterialDefaultAsset();
     RegisteredWorldSelectionWorld.Reset();
     WorldSelectionTravelSourceWorld.Reset();
     WorldNameBeforeMenuTravel.Reset();
@@ -391,6 +419,145 @@ void UGameManagerSubSystem::Deinitialize()
     bMenuTravelSaveCompleted = false;
 
     Super::Deinitialize();
+}
+
+const FglTFMaterialAssetReferences& UGameManagerSubSystem::GetMaterialDefaultReferences()
+{
+    if (UMaterialDefaultRuntimeCache* Guard = AcquireMaterialDefaultReferenceGuard())
+    {
+        return Guard->References;
+    }
+
+    static const FglTFMaterialAssetReferences EmptyReferences;
+    return EmptyReferences;
+}
+
+UMaterialDefaultRuntimeCache* UGameManagerSubSystem::AcquireMaterialDefaultReferenceGuard()
+{
+    // UObject loads and mutation of the shared table are game-thread-owned. Returning null
+    // off-thread prevents a data race and prevents an accidental synchronous asset load.
+    if (!ensureMsgf(IsInGameThread(), TEXT("AcquireMaterialDefaultReferenceGuard must run on the game thread")))
+    {
+        return nullptr;
+    }
+
+    if (!bMaterialDefaultAssetResolved && !bMaterialDefaultAssetResolving)
+    {
+        ResolveMaterialDefaultAsset();
+    }
+
+    return IsValid(MaterialDefaultRuntimeCache) ? MaterialDefaultRuntimeCache.Get() : nullptr;
+}
+
+bool UGameManagerSubSystem::ResolveMaterialDefaultAsset()
+{
+    if (!ensureMsgf(IsInGameThread(), TEXT("MaterialDefaultAsset must be resolved on the game thread")))
+    {
+        return false;
+    }
+
+    if (bMaterialDefaultAssetResolving)
+    {
+        return IsValid(MaterialDefaultRuntimeCache);
+    }
+    TGuardValue<bool> ResolvingGuard(bMaterialDefaultAssetResolving, true);
+
+    bMaterialDefaultAssetResolved = false;
+
+    // Never mutate an old guard: a cancelled native glTFRuntime callback may still hold it.
+    // Installing fresh objects makes world replacement atomic from the request's perspective.
+    MaterialDefaultRuntimeCache = nullptr;
+    MaterialDefaultAssetInstance = nullptr;
+
+    UMaterialDefaultAsset* ConfigInstance = nullptr;
+    FString ConfigSource;
+
+    if (UClass* ConfigClass = MaterialDefaultAssetClass.Get())
+    {
+        const bool bUsableClass =
+            ConfigClass->IsChildOf(UMaterialDefaultAsset::StaticClass()) &&
+            !ConfigClass->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists);
+        if (!bUsableClass)
+        {
+            bMaterialDefaultAssetResolved = true;
+            UE_LOG(LogTemp, Error,
+                TEXT("MaterialDefaultAssetClass is not instantiable. Runtime glTF actors will use plugin defaults. Class=%s"),
+                *GetPathNameSafe(ConfigClass));
+            return false;
+        }
+
+        // StartGameManager is entered from AGameManagerActor::BeginPlay. Creating the object here
+        // keeps UObject allocation and all subsequent soft-material loads on the game thread.
+        ConfigInstance = NewObject<UMaterialDefaultAsset>(
+            this,
+            ConfigClass,
+            NAME_None,
+            RF_Transient);
+        if (!IsValid(ConfigInstance))
+        {
+            bMaterialDefaultAssetResolved = true;
+            UE_LOG(LogTemp, Error,
+                TEXT("MaterialDefaultAssetClass instance could not be created. Runtime glTF actors will use plugin defaults. Class=%s"),
+                *GetPathNameSafe(ConfigClass));
+            return false;
+        }
+
+        // Root the instance before resolving. ResolveMaterials may synchronously load packages, and
+        // a nested game-thread call must never observe an unreferenced configuration object.
+        MaterialDefaultAssetInstance = ConfigInstance;
+        ConfigSource = ConfigClass->GetPathName();
+    }
+    else
+    {
+        bMaterialDefaultAssetResolved = true;
+        UE_LOG(LogTemp, Display,
+            TEXT("No MaterialDefaultAssetClass is configured; glTFRuntime material defaults will be used."));
+        return true;
+    }
+
+    UMaterialDefaultRuntimeCache* NewCache = NewObject<UMaterialDefaultRuntimeCache>(this);
+    if (!IsValid(NewCache))
+    {
+        MaterialDefaultAssetInstance = nullptr;
+        bMaterialDefaultAssetResolved = true;
+        UE_LOG(LogTemp, Error, TEXT("MaterialDefaultAsset runtime reference guard could not be allocated."));
+        return false;
+    }
+
+    // Assign before resolving so any re-entrant game-thread lookup sees a GC-rooted object.
+    MaterialDefaultRuntimeCache = NewCache;
+
+    TArray<FString> Failures;
+    const bool bResolveCallSucceeded = ConfigInstance->ResolveMaterials(
+        NewCache->References,
+        Failures);
+    bMaterialDefaultAssetResolved = true;
+
+    for (const FString& Failure : Failures)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("MaterialDefaultAsset reference skipped: %s"), *Failure);
+    }
+
+    UE_LOG(LogTemp, Display,
+        TEXT("MaterialDefaultAsset runtime instance resolved for the active world. Configured=%d Named=%d Failures=%d Source=%s Instance=%s"),
+        ConfigInstance->Materials.NumConfiguredReferences(),
+        NewCache->References.ByMaterialName.Num(),
+        Failures.Num(),
+        *ConfigSource,
+        *GetNameSafe(ConfigInstance));
+
+    return bResolveCallSucceeded;
+}
+
+void UGameManagerSubSystem::ReleaseMaterialDefaultAsset()
+{
+    // Drop only the subsystem's pointer. Never Reset() the cache object itself: an async action may
+    // still be holding the same guard until a native glTFRuntime callback reaches its terminal path.
+    MaterialDefaultRuntimeCache = nullptr;
+    MaterialDefaultAssetInstance = nullptr;
+    MaterialDefaultAssetClass = nullptr;
+    bMaterialDefaultAssetResolved = false;
+    bMaterialDefaultAssetResolving = false;
 }
 
 void UGameManagerSubSystem::SaveSettings()
@@ -689,7 +856,29 @@ void UGameManagerSubSystem::ApplyEditorConfig(const AGameManagerActor* InConfigA
     VehiclePawnClass = InConfigActor->VehiclePawnClass;
     WeaponActorClass = InConfigActor->WeaponActorClass;
     WeatherActorClass = InConfigActor->WeatherActorClass;
-    WorldManagerClass = InConfigActor->WorldManagerClass;
+
+    // Use the editor-authored world environment class, with the native class as a safe fallback.
+    if (InConfigActor->WorldEnvManagerClass)
+    {
+        WorldEnvManagerClass = InConfigActor->WorldEnvManagerClass;
+    }
+    else
+    {
+        WorldEnvManagerClass = AWorldEnvManager::StaticClass();
+    }
+
+    // Player/input code may call StartGameManager repeatedly. Rebuild this immutable runtime
+    // configuration only when its effective editor-authored source changes.
+    const UClass* RequestedMaterialClass = InConfigActor->MaterialDefaultAssetClass.Get();
+    const bool bMaterialConfigurationChanged =
+        MaterialDefaultAssetClass.Get() != RequestedMaterialClass;
+    if (!bMaterialDefaultAssetResolved || bMaterialConfigurationChanged)
+    {
+        ReleaseMaterialDefaultAsset();
+        MaterialDefaultAssetClass = InConfigActor->MaterialDefaultAssetClass;
+        ResolveMaterialDefaultAsset();
+    }
+
     SpawnActorClass = InConfigActor->SpawnActorClass;
     WaterClass = InConfigActor->WaterClass;
     OceanTransform = InConfigActor->OceanTransform;
@@ -720,21 +909,23 @@ FVector UGameManagerSubSystem::GetManagerActorLocation() const
 
 void UGameManagerSubSystem::EnsureRuntimeComponents()
 {
-    if (!ConfigActor.IsValid())
+    AGameManagerActor* OwnerActor = ConfigActor.Get();
+    if (!IsValid(OwnerActor))
     {
         return;
     }
 
-    Root = ConfigActor->GetRootComponent();
+    Root = OwnerActor->GetRootComponent();
     if (IsValid(PlacementGridComponent))
     {
         return;
     }
 
     // The grid mesh is runtime state, so it is created by the subsystem on the config actor instead of being an editor property.
-    PlacementGridComponent = NewObject<UProceduralMeshComponent>(ConfigActor.Get(), TEXT("PlacementGrid_Runtime"));
+    PlacementGridComponent = NewObject<UProceduralMeshComponent>(OwnerActor, TEXT("PlacementGrid_Runtime"));
     if (IsValid(PlacementGridComponent))
     {
+        OwnerActor->AddInstanceComponent(PlacementGridComponent);
         PlacementGridComponent->SetupAttachment(Root);
         PlacementGridComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
         PlacementGridComponent->SetGenerateOverlapEvents(false);
@@ -776,11 +967,17 @@ void UGameManagerSubSystem::StartGameManager(AGameManagerActor* InConfigActor)
         {
             CurrentWorldName = FString(WorldOption);
         }
-        else if (CurrentWorldName.IsEmpty() && IsValid(Multiplayer))
+        else if (IsValid(Multiplayer))
         {
-            // Single-player OpenLevel historically omitted the World URL option. Recover from the
-            // GameInstance subsystem so the selected folder survives MainWorld -> SingleWorld travel.
-            CurrentWorldName = Multiplayer->GetSelectedWorldFolderName();
+            // Single-player OpenLevel historically omitted the World URL option. Always prefer the
+            // current world-selection value over a name retained by this persistent subsystem from
+            // an earlier map; otherwise entities.dat can be read from the previous world's folder.
+            FString SelectedWorldName = Multiplayer->GetSelectedWorldFolderName();
+            SelectedWorldName.TrimStartAndEndInline();
+            if (!SelectedWorldName.IsEmpty())
+            {
+                CurrentWorldName = MoveTemp(SelectedWorldName);
+            }
         }
 
         CurrentWorldName.TrimStartAndEndInline();
@@ -788,6 +985,11 @@ void UGameManagerSubSystem::StartGameManager(AGameManagerActor* InConfigActor)
         {
             Multiplayer->SetSelectedWorldFolderName(CurrentWorldName);
         }
+        UE_LOG(LogTemp, Display,
+            TEXT("Resolved runtime world data root. SelectedWorld=%s Root=%s EntityDat=%s"),
+            CurrentWorldName.IsEmpty() ? TEXT("<empty>") : *CurrentWorldName,
+            *GetWorldRootPath(),
+            *GetManifestPath());
 
         if (World->GetNetMode() != NM_Standalone && World->GetNetMode() != NM_Client)
         {
@@ -856,15 +1058,17 @@ void UGameManagerSubSystem::StopGameManager(
     }
 
     CancelWorldBake();
+    CompactTrackedEntityReferences();
 
     const bool bHadActiveMainWorld = bManagerStarted
         || bWorldBootstrapStarted
         || IsValid(StreamSubSystem)
-        || IsValid(WorldManagerActor)
+        || IsValid(WorldEnvManagerActor)
         || IsValid(OceanActor)
         || IsValid(LoadingWidgetInstance)
         || SpawnedPrefabs.Num() > 0
         || SpawnedVehicles.Num() > 0
+        || LastKnownSceneRecords.Num() > 0
         || IsValid(EquippedWeapon);
 
     if (UWorld* World = GetWorld())
@@ -877,8 +1081,8 @@ void UGameManagerSubSystem::StopGameManager(
     if (bHadActiveMainWorld && bSaveSceneOnEndPlay && !bMenuTravelSaveCompleted
         && EndPlayReason != EEndPlayReason::Destroyed)
     {
-        // Saving is intentionally performed from EndPlay rather than the pause-menu OnClicked
-        // handler. This keeps Exit responsive even when the streamed glTF scene is large.
+        // Fallback for editor shutdown or travel paths that did not run the pre-travel commit.
+        // CollectSceneRecords retains the last validated snapshot if entity EndPlay ran first.
         SaveScene();
         SaveWorldData();
         SavePlayerData();
@@ -887,8 +1091,7 @@ void UGameManagerSubSystem::StopGameManager(
 
     if (bMenuTravelStatePrepared)
     {
-        // The source folder must remain valid until the EndPlay save above finishes. Clear it only
-        // after level teardown has committed the gameplay state.
+        // The source folder remains valid through the pre-travel commit and teardown fallback.
         CurrentWorldName.Reset();
         if (UMultiplayerWorldSubSystem* Multiplayer = UMultiplayerWorldSubSystem::Get(this))
         {
@@ -907,11 +1110,22 @@ void UGameManagerSubSystem::PrepareForMenuLevelTravelRequest()
         return;
     }
 
-    // The button callback only records intent and unpauses travel. Saving, actor destruction,
-    // asset release, and the expensive purge all occur during level teardown/PostLoadMap.
+    // Commit while every tracked actor is still alive. EndPlay ordering is not deterministic: a
+    // prefab or vehicle can be destroyed before the manager receives its own EndPlay callback,
+    // which previously allowed an empty entity snapshot to replace a populated entities.dat.
     WorldNameBeforeMenuTravel = CurrentWorldName;
+    const bool bEntitySaveCompleted = SaveScene();
+    SaveWorldData();
+    SavePlayerData();
+
     bMenuTravelStatePrepared = true;
-    bMenuTravelSaveCompleted = false;
+    // A failed/blocked save intentionally leaves the last committed DAT untouched. Do not retry
+    // from actor teardown, where the snapshot is less trustworthy than it is at this point.
+    bMenuTravelSaveCompleted = true;
+    UE_LOG(LogTemp, Display,
+        TEXT("Pre-travel runtime save finished. World=%s EntitySave=%s"),
+        *WorldNameBeforeMenuTravel,
+        bEntitySaveCompleted ? TEXT("success") : TEXT("preserved-previous-generation"));
     RequestPostLoadRuntimeMemoryCleanup();
     SetGamePaused(false);
 }
@@ -929,21 +1143,9 @@ void UGameManagerSubSystem::PrepareForReturnToMainWorld()
     PrepareForReturnToMenuLevel();
 }
 
-void UGameManagerSubSystem::PrepareForReturnToStartWorld()
-{
-    // Backward-compatible Blueprint/C++ entry point for projects that have not refreshed renamed nodes yet.
-    PrepareForReturnToMainWorld();
-}
-
 void UGameManagerSubSystem::RequestWorldSelectionMenuOnNextMainWorld()
 {
     bOpenWorldSelectionMenuOnNextMainWorld = true;
-}
-
-void UGameManagerSubSystem::RequestWorldSelectionMenuOnNextStartWorld()
-{
-    // Backward-compatible Blueprint/C++ entry point for projects that have not refreshed renamed nodes yet.
-    RequestWorldSelectionMenuOnNextMainWorld();
 }
 
 bool UGameManagerSubSystem::ConsumeWorldSelectionMenuRequest()
@@ -975,10 +1177,17 @@ void UGameManagerSubSystem::ReleaseMainWorldRuntimeMemory(bool bForceGarbageColl
 
     StopWorldSystems();
     DestroyTrackedRuntimeActors();
+    ReleaseMaterialDefaultAsset();
 
     ClearPlacementGridMesh();
     if (IsValid(PlacementGridComponent))
     {
+        PlacementGridComponent->SetMaterial(0, nullptr);
+        if (AActor* OwnerActor = PlacementGridComponent->GetOwner(); IsValid(OwnerActor))
+        {
+            OwnerActor->RemoveInstanceComponent(PlacementGridComponent);
+        }
+        PlacementGridComponent->UnregisterComponent();
         PlacementGridComponent->DestroyComponent();
         PlacementGridComponent = nullptr;
     }
@@ -991,7 +1200,7 @@ void UGameManagerSubSystem::ReleaseMainWorldRuntimeMemory(bool bForceGarbageColl
     bManagerStarted = false;
     bWorldBootstrapStarted = false;
     bWorldLoadCompleted = false;
-    bSpawnedWorldManager = false;
+    bSpawnedWorldEnvManager = false;
     bIsWorldLoading = false;
     bIsGamePaused = false;
     LoadingStatus = 0.0f;
@@ -1017,12 +1226,13 @@ void UGameManagerSubSystem::DestroyTrackedRuntimeActors()
 
     DestroyActorIfValid(EquippedWeapon.Get());
 
-    for (APrefabActor* Prefab : SpawnedPrefabs)
+    for (const TWeakObjectPtr<APrefabActor>& PrefabReference : SpawnedPrefabs)
     {
-        DestroyActorIfValid(Prefab);
+        DestroyActorIfValid(PrefabReference.Get());
     }
-    for (AVehiclePawn* Vehicle : SpawnedVehicles)
+    for (const TWeakObjectPtr<AVehiclePawn>& VehicleReference : SpawnedVehicles)
     {
+        AVehiclePawn* Vehicle = VehicleReference.Get();
         if (IsValid(Vehicle))
         {
             if (Vehicle->IsOccupied())
@@ -1039,18 +1249,48 @@ void UGameManagerSubSystem::DestroyTrackedRuntimeActors()
     }
 
     EquippedWeapon = nullptr;
-    SpawnedPrefabs.Reset();
-    SpawnedVehicles.Reset();
+    SpawnedPrefabs.Empty();
+    SpawnedVehicles.Empty();
+}
+
+void UGameManagerSubSystem::CompactTrackedEntityReferences()
+{
+    const int32 RemovedPrefabs = SpawnedPrefabs.RemoveAllSwap(
+        [](const TWeakObjectPtr<APrefabActor>& Reference)
+        {
+            const APrefabActor* Actor = Reference.Get();
+            return !IsValid(Actor) || Actor->IsActorBeingDestroyed();
+        },
+        EAllowShrinking::No);
+
+    const int32 RemovedVehicles = SpawnedVehicles.RemoveAllSwap(
+        [](const TWeakObjectPtr<AVehiclePawn>& Reference)
+        {
+            const AVehiclePawn* Actor = Reference.Get();
+            return !IsValid(Actor) || Actor->IsActorBeingDestroyed();
+        },
+        EAllowShrinking::No);
+
+    // Avoid reallocating during normal placement churn, but release clearly excessive slack.
+    if (RemovedPrefabs > 0 && SpawnedPrefabs.Max() > FMath::Max(32, SpawnedPrefabs.Num() * 2))
+    {
+        SpawnedPrefabs.Shrink();
+    }
+    if (RemovedVehicles > 0 && SpawnedVehicles.Max() > FMath::Max(16, SpawnedVehicles.Num() * 2))
+    {
+        SpawnedVehicles.Shrink();
+    }
 }
 
 void UGameManagerSubSystem::ResetWorldRuntimeReferences()
 {
+    ConfigActor.Reset();
     PlayerActor = nullptr;
     CurrentCamera = nullptr;
     PostProcess = nullptr;
     CurrentWorldData = nullptr;
     ActiveWorldData = nullptr;
-    WorldManagerActor = nullptr;
+    WorldEnvManagerActor = nullptr;
     OceanActor = nullptr;
     StreamSubSystem = nullptr;
     LoadingWidgetInstance = nullptr;
@@ -1107,9 +1347,9 @@ void UGameManagerSubSystem::RunPostLoadRuntimeMemoryCleanup()
     }
 
     UWorld* CurrentWorld = GetWorld();
-    const bool bNewWorldManagerIsActive = bManagerStarted && ConfigActor.IsValid() &&
+    const bool bNewWorldEnvManagerIsActive = bManagerStarted && ConfigActor.IsValid() &&
         ConfigActor->GetWorld() == CurrentWorld;
-    if (bNewWorldManagerIsActive)
+    if (bNewWorldEnvManagerIsActive)
     {
         // PostLoadMap runs before/around BeginPlay depending on the travel path. A deferred cleanup
         // from the previous map must never stop the streaming session just started by this world.
@@ -1137,6 +1377,7 @@ void UGameManagerSubSystem::RunPostLoadRuntimeMemoryCleanup()
 
     HideLoadingWidget();
     ClearPlacementGridMesh();
+    ReleaseMaterialDefaultAsset();
     ClearTransientRuntimeReferences();
     ResetWorldRuntimeReferences();
 
@@ -1183,17 +1424,17 @@ void UGameManagerSubSystem::StopWorldSystems()
         OceanActor = nullptr;
     }
 
-    if (IsValid(WorldManagerActor))
+    if (IsValid(WorldEnvManagerActor))
     {
-        WorldManagerActor->StopRendering();
-        if (bSpawnedWorldManager)
+        WorldEnvManagerActor->StopRendering();
+        if (bSpawnedWorldEnvManager)
         {
-            WorldManagerActor->Destroy();
+            WorldEnvManagerActor->Destroy();
         }
-        WorldManagerActor = nullptr;
+        WorldEnvManagerActor = nullptr;
     }
 
-    bSpawnedWorldManager = false;
+    bSpawnedWorldEnvManager = false;
     ActivePlayerData = nullptr;
     bCurrentLevelCheatsEnabled = false;
     ActiveWorldData = nullptr;
@@ -1235,11 +1476,11 @@ void UGameManagerSubSystem::InitializeWorldBootstrap()
     LoadWorldData();
     LoadPlayerData();
     ApplyLevelSettings();
-    SpawnWorldManager();
+    SpawnWorldEnvManager();
 
-    if (IsValid(WorldManagerActor))
+    if (IsValid(WorldEnvManagerActor))
     {
-        WorldManagerActor->InitializeRendering(ActiveWorldData);
+        WorldEnvManagerActor->InitializeRendering(ActiveWorldData);
     }
 
     InitializeWorldSystems(
@@ -1251,23 +1492,23 @@ void UGameManagerSubSystem::InitializeWorldBootstrap()
     LoadWorldAsync();
 }
 
-void UGameManagerSubSystem::SpawnWorldManager()
+void UGameManagerSubSystem::SpawnWorldEnvManager()
 {
     UWorld* World = GetWorld();
-    if (IsValid(WorldManagerActor) || !World)
+    if (IsValid(WorldEnvManagerActor) || !World)
     {
         return;
     }
 
-    UClass* EffectiveWorldManagerClass = WorldManagerClass ? WorldManagerClass.Get() : AWorldManager::StaticClass();
+    UClass* EffectiveWorldEnvManagerClass = WorldEnvManagerClass ? WorldEnvManagerClass.Get() : AWorldEnvManager::StaticClass();
 
-    for (TActorIterator<AWorldManager> It(World); It; ++It)
+    for (TActorIterator<AWorldEnvManager> It(World); It; ++It)
     {
-        AWorldManager* ExistingWorldManager = *It;
-        if (IsValid(ExistingWorldManager) && ExistingWorldManager->IsA(EffectiveWorldManagerClass))
+        AWorldEnvManager* ExistingWorldEnvManager = *It;
+        if (IsValid(ExistingWorldEnvManager) && ExistingWorldEnvManager->IsA(EffectiveWorldEnvManagerClass))
         {
-            WorldManagerActor = ExistingWorldManager;
-            bSpawnedWorldManager = false;
+            WorldEnvManagerActor = ExistingWorldEnvManager;
+            bSpawnedWorldEnvManager = false;
             return;
         }
     }
@@ -1275,8 +1516,8 @@ void UGameManagerSubSystem::SpawnWorldManager()
     FActorSpawnParameters Params;
     Params.Owner = ConfigActor.Get();
     Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-    WorldManagerActor = World->SpawnActor<AWorldManager>(EffectiveWorldManagerClass, FTransform::Identity, Params);
-    bSpawnedWorldManager = IsValid(WorldManagerActor);
+    WorldEnvManagerActor = World->SpawnActor<AWorldEnvManager>(EffectiveWorldEnvManagerClass, FTransform::Identity, Params);
+    bSpawnedWorldEnvManager = IsValid(WorldEnvManagerActor);
 }
 
 bool UGameManagerSubSystem::CheckWorldSystemsLoaded()
@@ -2231,19 +2472,34 @@ void UGameManagerSubSystem::ClearTransientRuntimeReferences()
     LoadingWidgetInstance = nullptr;
     StreamSubSystem = nullptr;
     OceanActor = nullptr;
-    WorldManagerActor = nullptr;
+    WorldEnvManagerActor = nullptr;
     Root = nullptr;
     PlacementGridComponent = nullptr;
+    PlacementGridMaterial = nullptr;
+
+    // These class references may point at Blueprint packages with large dependency graphs. Revert to
+    // lightweight native defaults (or null for optional systems) once the world session is gone.
+    PrefabActorClass = APrefabActor::StaticClass();
+    VehiclePawnClass = AVehiclePawn::StaticClass();
+    WeaponActorClass = AWeaponActor::StaticClass();
+    WeatherActorClass = AWeatherActor::StaticClass();
+    WorldEnvManagerClass = AWorldEnvManager::StaticClass();
+    SpawnActorClass = AglTFStreamActor::StaticClass();
+    WaterClass = nullptr;
+    LoadingWidgetClass = nullptr;
+    OceanTransform = FTransform::Identity;
 
     EquippedWeapon = nullptr;
-    SpawnedPrefabs.Reset();
-    SpawnedVehicles.Reset();
+    SpawnedPrefabs.Empty();
+    SpawnedVehicles.Empty();
 
-    PrefabFiles.Reset();
-    VehicleFiles.Reset();
-    WeaponFiles.Reset();
-    AvailableItems.Reset();
-    ToolbarSlots.Reset();
+    // This method is used only at world/session teardown. Empty releases the allocator capacity
+    // retained by large worlds instead of carrying it into menus and subsequent level loads.
+    PrefabFiles.Empty();
+    VehicleFiles.Empty();
+    WeaponFiles.Empty();
+    AvailableItems.Empty();
+    ToolbarSlots.Empty();
     bToolbarInitialized = false;
 
     // Keep CurrentWorldName across ordinary level travel. A confirmed menu return clears it only
@@ -2264,14 +2520,15 @@ void UGameManagerSubSystem::ClearTransientRuntimeReferences()
     bLastTraceUsedFreeSpace = false;
     LastTraceStart = FVector::ZeroVector;
     LastTraceDirection = FVector::ForwardVector;
-    LastSaveMessage.Reset();
+    LastSaveMessage.Empty();
     bSavedSceneLoaded = false;
     bSavedSceneLoadInProgress = false;
     bSavedSceneLoadFailed = false;
     SavedSceneReadinessAttemptCount = 0;
     SavedSceneDataAttemptCount = 0;
+    LastKnownSceneRecords.Empty();
     bIsSavingScene = false;
-    PendingWorldBakeModels.Reset();
+    PendingWorldBakeModels.Empty();
     ActiveWorldBakeActor = nullptr;
     bWorldBakeInProgress = false;
     bWorldBakeStateFilesSaved = false;
@@ -2427,6 +2684,64 @@ FString UGameManagerSubSystem::ResolvePlacementSourcePath(
         }
     }
 
+    // Last-resort relocation support: when an author moved an asset within the selected world,
+    // search by the exact filename. Accept only one match so an ambiguous deployment can never
+    // silently spawn the wrong prefab or vehicle.
+    const FString CleanFileName = FPaths::GetCleanFilename(Trimmed);
+    if (!CleanFileName.IsEmpty())
+    {
+        const TArray<FString> SearchRoots =
+        {
+            GetPrefabDirectory(),
+            FPaths::Combine(WorldRoot, TEXT("model")),
+            GetItemsDirectory()
+        };
+        TArray<FString> UniqueMatches;
+        for (const FString& SearchRoot : SearchRoots)
+        {
+            if (!FileManager.DirectoryExists(*SearchRoot))
+            {
+                continue;
+            }
+
+            TArray<FString> Matches;
+            FileManager.FindFilesRecursive(Matches, *SearchRoot, *CleanFileName, true, false, false);
+            for (const FString& Match : Matches)
+            {
+                const FString NormalizedMatch = NormalizeFullPathForWorldData(Match);
+                if (!IsPathInsideDirectory(NormalizedMatch, WorldRoot))
+                {
+                    continue;
+                }
+                const bool bAlreadyAdded = UniqueMatches.ContainsByPredicate([&NormalizedMatch](const FString& Existing)
+                {
+                    return Existing.Equals(NormalizedMatch, ESearchCase::IgnoreCase);
+                });
+                if (!bAlreadyAdded)
+                {
+                    UniqueMatches.Add(NormalizedMatch);
+                }
+            }
+        }
+
+        if (UniqueMatches.Num() == 1)
+        {
+            UE_LOG(LogTemp, Warning,
+                TEXT("Recovered relocated saved %s by unique filename. Saved=%s Resolved=%s"),
+                Kind == EPlacedObjectKind::Vehicle ? TEXT("vehicle") : TEXT("prefab"),
+                *SavedPath,
+                *UniqueMatches[0]);
+            return UniqueMatches[0];
+        }
+        if (UniqueMatches.Num() > 1)
+        {
+            UE_LOG(LogTemp, Error,
+                TEXT("Saved entity source filename is ambiguous in the selected world. Saved=%s Matches=%d"),
+                *SavedPath,
+                UniqueMatches.Num());
+        }
+    }
+
     return FString();
 }
 
@@ -2456,7 +2771,7 @@ void UGameManagerSubSystem::ScheduleSavedSceneLoadRetry(
             TEXT("Entity DAT restore failed after %d attempts. World=%s Phase=%s Reason=%s"),
             AttemptCount,
             *GetWorldRootPath(),
-            bWaitingForWorldReadiness ? TEXT("world-readiness") : TEXT("DAT-validation"),
+            bWaitingForWorldReadiness ? TEXT("world-readiness") : TEXT("DAT-validation/apply"),
             *Reason);
         return;
     }
@@ -2486,7 +2801,7 @@ void UGameManagerSubSystem::ScheduleSavedSceneLoadRetry(
         false);
     UE_LOG(LogTemp, Warning,
         TEXT("Entity DAT load will retry. Phase=%s Attempt=%d/%d Reason=%s"),
-        bWaitingForWorldReadiness ? TEXT("world-readiness") : TEXT("DAT-validation"),
+        bWaitingForWorldReadiness ? TEXT("world-readiness") : TEXT("DAT-validation/apply"),
         AttemptCount,
         MaximumAttempts,
         *Reason);
@@ -3615,8 +3930,9 @@ int32 UGameManagerSubSystem::CountExistingBaseName(const FString& BaseName, EPla
     int32 Count = 0;
     if (Kind == EPlacedObjectKind::Prefab)
     {
-        for (const APrefabActor* Prefab : SpawnedPrefabs)
+        for (const TWeakObjectPtr<APrefabActor>& PrefabReference : SpawnedPrefabs)
         {
+            const APrefabActor* Prefab = PrefabReference.Get();
             if (IsValid(Prefab) && Prefab->GetBaseName().Equals(BaseName, ESearchCase::IgnoreCase))
             {
                 ++Count;
@@ -3625,8 +3941,9 @@ int32 UGameManagerSubSystem::CountExistingBaseName(const FString& BaseName, EPla
     }
     else if (Kind == EPlacedObjectKind::Vehicle)
     {
-        for (const AVehiclePawn* Vehicle : SpawnedVehicles)
+        for (const TWeakObjectPtr<AVehiclePawn>& VehicleReference : SpawnedVehicles)
         {
+            const AVehiclePawn* Vehicle = VehicleReference.Get();
             if (IsValid(Vehicle))
             {
                 ++Count;
@@ -3825,17 +4142,26 @@ void UGameManagerSubSystem::PlaceCurrentPrefab(const FVector& Location)
 
     FActorSpawnParameters Params;
     Params.Owner = ConfigActor.Get();
+    Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
     const FRotator SpawnRot = FRotator(0.0f, GetWorld()->GetFirstPlayerController() ? GetWorld()->GetFirstPlayerController()->GetControlRotation().Yaw : 0.0f, 0.0f);
     UClass* PrefabSpawnClass = PrefabActorClass ? PrefabActorClass.Get() : APrefabActor::StaticClass();
     APrefabActor* Actor = GetWorld()->SpawnActor<APrefabActor>(PrefabSpawnClass, FTransform(SpawnRot, Location), Params);
+    if (!IsValid(Actor) && PrefabSpawnClass != APrefabActor::StaticClass())
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("Configured prefab actor class failed to spawn; retrying with native APrefabActor. Class=%s"),
+            *GetNameSafe(PrefabSpawnClass));
+        Actor = GetWorld()->SpawnActor<APrefabActor>(APrefabActor::StaticClass(), FTransform(SpawnRot, Location), Params);
+    }
     if (IsValid(Actor))
     {
         Actor->SetRenderOnlyMode(UMultiplayerWorldSubSystem::ShouldUseClientRenderOnlyStreaming(this));
     }
     if (IsValid(Actor) && Actor->LoadPrefab(SourceFile, ObjectName))
     {
-        SpawnedPrefabs.Add(Actor);
+        SpawnedPrefabs.Add(TWeakObjectPtr<APrefabActor>(Actor));
         LastSaveMessage = FString::Printf(TEXT("설치됨: %s"), *ObjectName);
+        SaveScene();
     }
     else if (IsValid(Actor))
     {
@@ -3873,21 +4199,34 @@ void UGameManagerSubSystem::PlaceVehicle(const FVector& Location, const FString&
         VehicleSpawnClass,
         FTransform(SpawnRot, SpawnLocation),
         Params);
+    if (!IsValid(Vehicle) && VehicleSpawnClass != AVehiclePawn::StaticClass())
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("Configured vehicle actor class failed to spawn; retrying with native AVehiclePawn. Class=%s"),
+            *GetNameSafe(VehicleSpawnClass));
+        Vehicle = GetWorld()->SpawnActor<AVehiclePawn>(
+            AVehiclePawn::StaticClass(),
+            FTransform(SpawnRot, SpawnLocation),
+            Params);
+    }
     if (!IsValid(Vehicle))
     {
         LastSaveMessage = TEXT("차량 액터를 생성하지 못했습니다.");
         return;
     }
 
-    if (!Vehicle->LoadVehicleModel(NormalizedSourceFile, FPaths::GetBaseFilename(NormalizedSourceFile)))
+    const FString VehicleBaseName = FPaths::GetBaseFilename(NormalizedSourceFile);
+    const FString VehicleObjectName = MakeObjectName(VehicleBaseName, EPlacedObjectKind::Vehicle);
+    if (!Vehicle->LoadVehicleModel(NormalizedSourceFile, VehicleObjectName))
     {
         Vehicle->Destroy();
         LastSaveMessage = TEXT("차량 모델을 로드하지 못해 액터를 제거했습니다.");
         return;
     }
 
-    SpawnedVehicles.Add(Vehicle);
+    SpawnedVehicles.Add(TWeakObjectPtr<AVehiclePawn>(Vehicle));
     LastSaveMessage = TEXT("glTF 자동차 설치됨. F키로 탑승하세요.");
+    SaveScene();
 }
 
 
@@ -3923,8 +4262,10 @@ void UGameManagerSubSystem::TryEnterOrExitVehicle()
     AVehiclePawn* BestVehicle = nullptr;
     float BestDistSq = FMath::Square(VehicleEnterDistance);
 
-    for (AVehiclePawn* Vehicle : SpawnedVehicles)
+    CompactTrackedEntityReferences();
+    for (const TWeakObjectPtr<AVehiclePawn>& VehicleReference : SpawnedVehicles)
     {
+        AVehiclePawn* Vehicle = VehicleReference.Get();
         if (!IsValid(Vehicle) || Vehicle->IsOccupied())
         {
             continue;
@@ -3946,32 +4287,71 @@ void UGameManagerSubSystem::TryEnterOrExitVehicle()
 
 void UGameManagerSubSystem::CollectSceneRecords(TArray<FPlacedObjectRecord>& OutPlaced) const
 {
-    OutPlaced.Empty();
-
-    for (const APrefabActor* Prefab : SpawnedPrefabs)
+    // Start from the last fully validated snapshot. During level teardown Unreal may call actor
+    // EndPlay before the manager actor, so rebuilding only from live pointers can otherwise publish
+    // a valid but empty entities.dat over a non-empty world.
+    OutPlaced = LastKnownSceneRecords;
+    OutPlaced.RemoveAll([](const FPlacedObjectRecord& Record)
     {
-        if (IsValid(Prefab))
+        return Record.ObjectName.IsEmpty()
+            || Record.SourceFile.IsEmpty()
+            || (Record.Kind != EPlacedObjectKind::Prefab && Record.Kind != EPlacedObjectKind::Vehicle);
+    });
+
+    TSet<int32> ReplacedRecordIndices;
+    auto UpsertLiveRecord = [this, &OutPlaced, &ReplacedRecordIndices](FPlacedObjectRecord&& Record)
+    {
+        Record.SourceFile = MakePlacementSourcePathForSave(Record.SourceFile);
+        if (Record.ObjectName.IsEmpty() || Record.SourceFile.IsEmpty())
         {
-            FPlacedObjectRecord Record = Prefab->ToPlacementRecord();
-            Record.SourceFile = MakePlacementSourcePathForSave(Record.SourceFile);
-            if (!Record.SourceFile.IsEmpty())
+            return;
+        }
+
+        int32 ExistingIndex = INDEX_NONE;
+        for (int32 Index = 0; Index < OutPlaced.Num(); ++Index)
+        {
+            if (ReplacedRecordIndices.Contains(Index))
             {
-                OutPlaced.Add(MoveTemp(Record));
+                continue;
             }
+
+            const FPlacedObjectRecord& Existing = OutPlaced[Index];
+            if (Existing.Kind == Record.Kind
+                && Existing.ObjectName.Equals(Record.ObjectName, ESearchCase::IgnoreCase))
+            {
+                ExistingIndex = Index;
+                break;
+            }
+        }
+
+        if (ExistingIndex != INDEX_NONE)
+        {
+            OutPlaced[ExistingIndex] = MoveTemp(Record);
+            ReplacedRecordIndices.Add(ExistingIndex);
+        }
+        else
+        {
+            const int32 AddedIndex = OutPlaced.Add(MoveTemp(Record));
+            ReplacedRecordIndices.Add(AddedIndex);
+        }
+    };
+
+    for (const TWeakObjectPtr<APrefabActor>& PrefabReference : SpawnedPrefabs)
+    {
+        const APrefabActor* Prefab = PrefabReference.Get();
+        if (IsValid(Prefab) && !Prefab->IsActorBeingDestroyed())
+        {
+            UpsertLiveRecord(Prefab->ToPlacementRecord());
         }
     }
 
     int32 VehicleRecordIndex = 0;
-    for (const AVehiclePawn* Vehicle : SpawnedVehicles)
+    for (const TWeakObjectPtr<AVehiclePawn>& VehicleReference : SpawnedVehicles)
     {
-        if (IsValid(Vehicle))
+        const AVehiclePawn* Vehicle = VehicleReference.Get();
+        if (IsValid(Vehicle) && !Vehicle->IsActorBeingDestroyed())
         {
-            FPlacedObjectRecord Record = Vehicle->ToPlacementRecord(VehicleRecordIndex);
-            Record.SourceFile = MakePlacementSourcePathForSave(Record.SourceFile);
-            if (!Record.SourceFile.IsEmpty())
-            {
-                OutPlaced.Add(MoveTemp(Record));
-            }
+            UpsertLiveRecord(Vehicle->ToPlacementRecord(VehicleRecordIndex));
             ++VehicleRecordIndex;
         }
     }
@@ -3979,6 +4359,8 @@ void UGameManagerSubSystem::CollectSceneRecords(TArray<FPlacedObjectRecord>& Out
 
 bool UGameManagerSubSystem::SaveScene()
 {
+    CompactTrackedEntityReferences();
+
     if (const UWorld* World = GetWorld(); World && World->GetNetMode() == NM_Client)
     {
         return false;
@@ -4013,18 +4395,51 @@ bool UGameManagerSubSystem::SaveScene()
     CollectSceneRecords(Placed);
     const FString EntitiesDatPath = GetManifestPath();
     const FSafeFileWriteResult SaveResult = FBinaryDataStore::SaveEntitiesBlocking(EntitiesDatPath, Placed);
-    const bool bSaved = SaveResult.IsSuccess();
+
+    bool bSaved = SaveResult.IsSuccess();
+    FString FailureReason = SaveResult.Error;
+    if (bSaved)
+    {
+        // Do not trust a successful rename alone. Read the committed generation through the same
+        // schema/CRC parser used at startup and compare every record before publishing the snapshot.
+        TArray<FPlacedObjectRecord> VerifiedRecords;
+        FString VerifyError;
+        if (!FBinaryDataStore::LoadEntities(EntitiesDatPath, VerifiedRecords, VerifyError))
+        {
+            bSaved = false;
+            FailureReason = FString::Printf(TEXT("read-after-write validation failed: %s"), *VerifyError);
+        }
+        else if (!ArePlacedObjectRecordsEquivalent(Placed, VerifiedRecords))
+        {
+            bSaved = false;
+            FailureReason = TEXT("read-after-write validation returned different entity records");
+        }
+        else
+        {
+            LastKnownSceneRecords = MoveTemp(VerifiedRecords);
+        }
+    }
+
     LastSaveMessage = bSaved
-        ? FString::Printf(TEXT("엔티티 저장 완료: %d개"), Placed.Num())
-        : FString::Printf(TEXT("엔티티 저장 실패: %s"), *SaveResult.Error);
+        ? FString::Printf(TEXT("엔티티 저장 및 재검증 완료: %d개"), Placed.Num())
+        : FString::Printf(TEXT("엔티티 저장/검증 실패: %s"), *FailureReason);
 
     if (bSaved)
     {
-        UE_LOG(LogTemp, Verbose, TEXT("Runtime entities saved: %s"), *EntitiesDatPath);
+        UE_LOG(LogTemp, Display,
+            TEXT("Runtime entities saved and verified. World=%s Path=%s Records=%d"),
+            *GetWorldRootPath(),
+            *EntitiesDatPath,
+            Placed.Num());
     }
     else
     {
-        UE_LOG(LogTemp, Warning, TEXT("Runtime entities save failed. Path=%s Reason=%s"), *EntitiesDatPath, *SaveResult.Error);
+        UE_LOG(LogTemp, Error,
+            TEXT("Runtime entities save/verification failed. World=%s Path=%s Records=%d Reason=%s"),
+            *GetWorldRootPath(),
+            *EntitiesDatPath,
+            Placed.Num(),
+            *FailureReason);
     }
 
     bIsSavingScene = false;
@@ -4059,19 +4474,17 @@ void UGameManagerSubSystem::BakeWorldData()
     WorldBakeCompletedModels = 0;
     WorldBakeFailedModels = 0;
     WorldBakeNextModelIndex = 0;
-    PendingWorldBakeModels.Reset();
+    PendingWorldBakeModels.Empty();
     ActiveWorldBakeActor = nullptr;
     OnWorldBakeProgress.Broadcast(0.0f);
 
-    TArray<FPlacedObjectRecord> EntityRecords;
-    CollectSceneRecords(EntityRecords);
-    const FSafeFileWriteResult EntitiesResult = FBinaryDataStore::SaveEntitiesBlocking(
-        GetManifestPath(),
-        EntityRecords);
-    bWorldBakeStateFilesSaved &= EntitiesResult.IsSuccess();
-    if (!EntitiesResult.IsSuccess())
+    const bool bEntitiesSaved = SaveScene();
+    bWorldBakeStateFilesSaved &= bEntitiesSaved;
+    if (!bEntitiesSaved)
     {
-        UE_LOG(LogTemp, Error, TEXT("World bake failed to write entities.dat: %s"), *EntitiesResult.Error);
+        UE_LOG(LogTemp, Error,
+            TEXT("World bake failed to write and verify entities.dat. Path=%s"),
+            *GetManifestPath());
     }
 
     FWorldRuntimeData RuntimeData;
@@ -4286,7 +4699,7 @@ void UGameManagerSubSystem::FinishWorldBake()
             WorldBakeTotalModels);
 
     bWorldBakeInProgress = false;
-    PendingWorldBakeModels.Reset();
+    PendingWorldBakeModels.Empty();
     ActiveWorldBakeActor = nullptr;
     WorldBakeNextModelIndex = 0;
     LastSaveMessage = Message;
@@ -4310,7 +4723,7 @@ void UGameManagerSubSystem::CancelWorldBake()
     }
 
     ActiveWorldBakeActor = nullptr;
-    PendingWorldBakeModels.Reset();
+    PendingWorldBakeModels.Empty();
     bWorldBakeInProgress = false;
     bWorldBakeStateFilesSaved = false;
     WorldBakeTotalModels = 0;
@@ -4331,6 +4744,7 @@ bool UGameManagerSubSystem::LoadSavedScene()
     if (World && World->GetNetMode() == NM_Client)
     {
         // Clients receive authoritative gameplay actors from the server.
+        LastKnownSceneRecords.Empty();
         bSavedSceneLoaded = true;
         bSavedSceneLoadFailed = false;
         SavedSceneReadinessAttemptCount = 0;
@@ -4338,8 +4752,8 @@ bool UGameManagerSubSystem::LoadSavedScene()
         return true;
     }
 
-    if (!World || !ConfigActor.IsValid() || GetWorldRootPath().IsEmpty() ||
-        !IsValid(UInstancedEntitySubsystem::Get(this)))
+    if (!World || !ConfigActor.IsValid() || GetWorldRootPath().IsEmpty()
+        || !IsValid(UInstancedEntitySubsystem::Get(this)))
     {
         ++SavedSceneReadinessAttemptCount;
         ScheduleSavedSceneLoadRetry(
@@ -4348,22 +4762,70 @@ bool UGameManagerSubSystem::LoadSavedScene()
         return false;
     }
 
+    // The startup next-tick callback can run before world-model streaming has registered its shared
+    // ISM assets. A synchronous prefab load at that point can fail even though both DAT and model are
+    // valid. Leave the restoration node pending; LoadWorldAsync calls this again once streaming is ready.
+    UglTFStreamSubSystem* ActiveStreamSubsystem = IsValid(StreamSubSystem)
+        ? StreamSubSystem.Get()
+        : UglTFStreamSubSystem::Get(this);
+    if (IsValid(ActiveStreamSubsystem)
+        && ActiveStreamSubsystem->IsActiveForWorld(World)
+        && !ActiveStreamSubsystem->IsInitialWorldReady())
+    {
+        UE_LOG(LogTemp, VeryVerbose,
+            TEXT("Entity DAT restore is waiting for initial world streaming. World=%s Path=%s"),
+            *GetWorldRootPath(),
+            *GetManifestPath());
+        return false;
+    }
+
     bSavedSceneLoadInProgress = true;
     SavedSceneReadinessAttemptCount = 0;
     World->GetTimerManager().ClearTimer(SavedSceneLoadRetryTimerHandle);
 
     const FString EntitiesDatPath = GetManifestPath();
-    const bool bHadDatGeneration = IFileManager::Get().FileExists(*EntitiesDatPath) ||
-        IFileManager::Get().FileExists(*(EntitiesDatPath + TEXT(".bak")));
+    const FString EntitiesBackupPath = EntitiesDatPath + TEXT(".bak");
+    const bool bPrimaryDatExists = IFileManager::Get().FileExists(*EntitiesDatPath);
+    const bool bBackupDatExists = IFileManager::Get().FileExists(*EntitiesBackupPath);
+    const bool bHadDatGeneration = bPrimaryDatExists || bBackupDatExists;
 
     TArray<FPlacedObjectRecord> Placed;
     FString LoadError;
     bool bLoaded = FBinaryDataStore::LoadEntities(EntitiesDatPath, Placed, LoadError);
+    bool bRecoveredNonEmptyBackup = false;
     bool bMigratedLegacyJson = false;
     bool bHadLegacySource = false;
 
+    // Older builds could commit an empty but structurally valid primary during EndPlay after the
+    // entity actors had already been destroyed. Normal CRC fallback cannot identify that semantic
+    // data loss, so recover a valid non-empty backup when the primary is empty.
+    if (bLoaded && Placed.IsEmpty() && bPrimaryDatExists && bBackupDatExists)
+    {
+        TArray<FPlacedObjectRecord> BackupRecords;
+        FString BackupError;
+        if (FBinaryDataStore::LoadEntities(EntitiesBackupPath, BackupRecords, BackupError)
+            && !BackupRecords.IsEmpty())
+        {
+            UE_LOG(LogTemp, Warning,
+                TEXT("Recovered non-empty entities.dat.bak over an empty primary. Path=%s Records=%d"),
+                *EntitiesDatPath,
+                BackupRecords.Num());
+            Placed = MoveTemp(BackupRecords);
+            bRecoveredNonEmptyBackup = true;
+        }
+        else if (!BackupError.IsEmpty())
+        {
+            UE_LOG(LogTemp, Warning,
+                TEXT("Empty primary entity DAT had no usable non-empty backup. Path=%s Reason=%s"),
+                *EntitiesDatPath,
+                *BackupError);
+        }
+    }
+
     // One-way compatibility migration. Legacy JSON is read-only and is never rewritten or backed up.
-    if (!bLoaded)
+    // It may also rescue a non-empty legacy scene after an older build committed an empty DAT and
+    // no usable non-empty DAT backup remains.
+    if (!bLoaded || (Placed.IsEmpty() && !bRecoveredNonEmptyBackup))
     {
         const TArray<FString> LegacyPaths =
         {
@@ -4389,8 +4851,8 @@ bool UGameManagerSubSystem::LoadSavedScene()
             }
 
             const TArray<TSharedPtr<FJsonValue>>* Values = nullptr;
-            if (!Legacy.JsonObject->TryGetArrayField(TEXT("Objects"), Values) || !Values ||
-                Values->Num() > Limits.MaxContainerEntries)
+            if (!Legacy.JsonObject->TryGetArrayField(TEXT("Objects"), Values) || !Values
+                || Values->Num() > Limits.MaxContainerEntries)
             {
                 continue;
             }
@@ -4401,8 +4863,8 @@ bool UGameManagerSubSystem::LoadSavedScene()
             for (const TSharedPtr<FJsonValue>& Value : *Values)
             {
                 FPlacedObjectRecord Record;
-                if (!Value.IsValid() || Value->Type != EJson::Object ||
-                    !Record.FromJson(Value->AsObject()))
+                if (!Value.IsValid() || Value->Type != EJson::Object
+                    || !Record.FromJson(Value->AsObject()))
                 {
                     bAllValid = false;
                     break;
@@ -4414,14 +4876,15 @@ bool UGameManagerSubSystem::LoadSavedScene()
                     Parsed.Add(MoveTemp(Record));
                 }
             }
-            if (bAllValid)
+            if (bAllValid && (!bLoaded || !Parsed.IsEmpty()))
             {
                 Placed = MoveTemp(Parsed);
                 bLoaded = true;
                 bMigratedLegacyJson = true;
                 UE_LOG(LogTemp, Log,
-                    TEXT("Migrating legacy entity JSON to data/entities.dat. Source=%s"),
-                    *LegacyPath);
+                    TEXT("Migrating legacy entity JSON to data/entities.dat. Source=%s Records=%d"),
+                    *LegacyPath,
+                    Placed.Num());
                 break;
             }
         }
@@ -4432,12 +4895,16 @@ bool UGameManagerSubSystem::LoadSavedScene()
         if (!bHadDatGeneration && !bHadLegacySource)
         {
             // A world with no saved entities is a valid empty scene, not a load failure.
+            LastKnownSceneRecords.Empty();
             bSavedSceneLoadInProgress = false;
             bSavedSceneLoaded = true;
             bSavedSceneLoadFailed = false;
             SavedSceneReadinessAttemptCount = 0;
             SavedSceneDataAttemptCount = 0;
-            UE_LOG(LogTemp, Verbose, TEXT("No entities.dat exists; continuing with an empty scene. Path=%s"), *EntitiesDatPath);
+            UE_LOG(LogTemp, Display,
+                TEXT("No entities.dat exists; continuing with an empty scene. World=%s Path=%s"),
+                *GetWorldRootPath(),
+                *EntitiesDatPath);
             NotifyStateChanged();
             return true;
         }
@@ -4450,13 +4917,28 @@ bool UGameManagerSubSystem::LoadSavedScene()
         return false;
     }
 
+    UE_LOG(LogTemp, Display,
+        TEXT("Validated entity DAT for restoration. World=%s Path=%s Records=%d Attempt=%d/%d"),
+        *GetWorldRootPath(),
+        *EntitiesDatPath,
+        Placed.Num(),
+        SavedSceneDataAttemptCount + 1,
+        MaxSavedSceneDataAttempts);
+
     FActorSpawnParameters Params;
     Params.Owner = ConfigActor.Get();
+    Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+
     int32 SpawnedCount = 0;
     int32 MissingSourceCount = 0;
-    int32 FailedSpawnCount = 0;
-    bool bNormalizedRecordChanged = bMigratedLegacyJson;
+    int32 InvalidSourceCount = 0;
+    int32 TransientSpawnFailureCount = 0;
+    bool bNormalizedRecordChanged = bMigratedLegacyJson || bRecoveredNonEmptyBackup;
     TArray<FPlacedObjectRecord> NormalizedRecords = Placed;
+    TArray<APrefabActor*> AttemptPrefabs;
+    TArray<AVehiclePawn*> AttemptVehicles;
+    AttemptPrefabs.Reserve(Placed.Num());
+    AttemptVehicles.Reserve(Placed.Num());
 
     for (int32 RecordIndex = 0; RecordIndex < Placed.Num(); ++RecordIndex)
     {
@@ -4465,9 +4947,11 @@ bool UGameManagerSubSystem::LoadSavedScene()
         if (ResolvedSourceFile.IsEmpty())
         {
             ++MissingSourceCount;
-            UE_LOG(LogTemp, Warning,
-                TEXT("Saved entity skipped because its source file could not be resolved. Kind=%d Source=%s World=%s"),
+            UE_LOG(LogTemp, Error,
+                TEXT("Saved entity source could not be resolved. Index=%d Kind=%d Name=%s Source=%s World=%s"),
+                RecordIndex,
                 static_cast<int32>(Record.Kind),
+                *Record.ObjectName,
                 *Record.SourceFile,
                 *GetWorldRootPath());
             continue;
@@ -4476,17 +4960,19 @@ bool UGameManagerSubSystem::LoadSavedScene()
         FString ValidationReason;
         if (!GlbValidation::ValidateRuntimeModelFile(ResolvedSourceFile, ValidationReason))
         {
-            ++FailedSpawnCount;
-            UE_LOG(LogTemp, Warning,
-                TEXT("Saved entity skipped because its model failed validation. Source=%s Reason=%s"),
+            ++InvalidSourceCount;
+            UE_LOG(LogTemp, Error,
+                TEXT("Saved entity model failed validation. Index=%d Name=%s Source=%s Reason=%s"),
+                RecordIndex,
+                *Record.ObjectName,
                 *ResolvedSourceFile,
                 *ValidationReason);
             continue;
         }
 
         const FString PortableSource = MakePlacementSourcePathForSave(ResolvedSourceFile);
-        if (NormalizedRecords.IsValidIndex(RecordIndex) && !PortableSource.IsEmpty() &&
-            !NormalizedRecords[RecordIndex].SourceFile.Equals(PortableSource, ESearchCase::CaseSensitive))
+        if (NormalizedRecords.IsValidIndex(RecordIndex) && !PortableSource.IsEmpty()
+            && !NormalizedRecords[RecordIndex].SourceFile.Equals(PortableSource, ESearchCase::CaseSensitive))
         {
             NormalizedRecords[RecordIndex].SourceFile = PortableSource;
             bNormalizedRecordChanged = true;
@@ -4496,18 +4982,36 @@ bool UGameManagerSubSystem::LoadSavedScene()
         {
             UClass* PrefabSpawnClass = PrefabActorClass ? PrefabActorClass.Get() : APrefabActor::StaticClass();
             APrefabActor* Prefab = World->SpawnActor<APrefabActor>(PrefabSpawnClass, Record.Transform, Params);
+            if (!IsValid(Prefab) && PrefabSpawnClass != APrefabActor::StaticClass())
+            {
+                UE_LOG(LogTemp, Warning,
+                    TEXT("Configured prefab restore class failed; retrying native class. Class=%s Name=%s"),
+                    *GetNameSafe(PrefabSpawnClass),
+                    *Record.ObjectName);
+                Prefab = World->SpawnActor<APrefabActor>(APrefabActor::StaticClass(), Record.Transform, Params);
+            }
             if (IsValid(Prefab))
             {
                 Prefab->SetRenderOnlyMode(UMultiplayerWorldSubSystem::ShouldUseClientRenderOnlyStreaming(this));
             }
             if (IsValid(Prefab) && Prefab->LoadPrefab(ResolvedSourceFile, Record.ObjectName))
             {
-                SpawnedPrefabs.Add(Prefab);
+                AttemptPrefabs.Add(Prefab);
                 ++SpawnedCount;
+                UE_LOG(LogTemp, Display,
+                    TEXT("Restored prefab entity. Index=%d Name=%s Source=%s"),
+                    RecordIndex,
+                    *Record.ObjectName,
+                    *ResolvedSourceFile);
             }
             else
             {
-                ++FailedSpawnCount;
+                ++TransientSpawnFailureCount;
+                UE_LOG(LogTemp, Warning,
+                    TEXT("Prefab restoration attempt failed. Index=%d Name=%s Source=%s"),
+                    RecordIndex,
+                    *Record.ObjectName,
+                    *ResolvedSourceFile);
                 if (IsValid(Prefab))
                 {
                     Prefab->Destroy();
@@ -4516,28 +5020,99 @@ bool UGameManagerSubSystem::LoadSavedScene()
         }
         else if (Record.Kind == EPlacedObjectKind::Vehicle)
         {
-            FActorSpawnParameters VehicleParams = Params;
-            VehicleParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
             UClass* VehicleSpawnClass = VehiclePawnClass ? VehiclePawnClass.Get() : AVehiclePawn::StaticClass();
-            AVehiclePawn* Vehicle = World->SpawnActor<AVehiclePawn>(VehicleSpawnClass, Record.Transform, VehicleParams);
+            AVehiclePawn* Vehicle = World->SpawnActor<AVehiclePawn>(VehicleSpawnClass, Record.Transform, Params);
+            if (!IsValid(Vehicle) && VehicleSpawnClass != AVehiclePawn::StaticClass())
+            {
+                UE_LOG(LogTemp, Warning,
+                    TEXT("Configured vehicle restore class failed; retrying native class. Class=%s Name=%s"),
+                    *GetNameSafe(VehicleSpawnClass),
+                    *Record.ObjectName);
+                Vehicle = World->SpawnActor<AVehiclePawn>(AVehiclePawn::StaticClass(), Record.Transform, Params);
+            }
             if (IsValid(Vehicle) && Vehicle->LoadVehicleModel(ResolvedSourceFile, Record.ObjectName))
             {
-                SpawnedVehicles.Add(Vehicle);
+                AttemptVehicles.Add(Vehicle);
                 ++SpawnedCount;
+                UE_LOG(LogTemp, Display,
+                    TEXT("Restored vehicle entity. Index=%d Name=%s Source=%s"),
+                    RecordIndex,
+                    *Record.ObjectName,
+                    *ResolvedSourceFile);
             }
             else
             {
-                ++FailedSpawnCount;
+                ++TransientSpawnFailureCount;
+                UE_LOG(LogTemp, Warning,
+                    TEXT("Vehicle restoration attempt failed. Index=%d Name=%s Source=%s"),
+                    RecordIndex,
+                    *Record.ObjectName,
+                    *ResolvedSourceFile);
                 if (IsValid(Vehicle))
                 {
                     Vehicle->Destroy();
                 }
             }
         }
+        else
+        {
+            ++InvalidSourceCount;
+            UE_LOG(LogTemp, Error,
+                TEXT("Unsupported entity kind in validated DAT. Index=%d Kind=%d"),
+                RecordIndex,
+                static_cast<int32>(Record.Kind));
+        }
     }
 
-    // Normalize successfully resolved legacy/absolute paths so future deployments no longer depend
-    // on the original installation directory. The DAT transaction creates and validates its own .bak.
+    if (TransientSpawnFailureCount > 0)
+    {
+        ++SavedSceneDataAttemptCount;
+        if (SavedSceneDataAttemptCount < MaxSavedSceneDataAttempts)
+        {
+            for (APrefabActor* Prefab : AttemptPrefabs)
+            {
+                if (IsValid(Prefab))
+                {
+                    Prefab->Destroy();
+                }
+            }
+            for (AVehiclePawn* Vehicle : AttemptVehicles)
+            {
+                if (IsValid(Vehicle))
+                {
+                    Vehicle->Destroy();
+                }
+            }
+
+            const FString RetryReason = FString::Printf(
+                TEXT("%d entity model(s) failed to register after DAT validation"),
+                TransientSpawnFailureCount);
+            ScheduleSavedSceneLoadRetry(RetryReason, false);
+            return false;
+        }
+    }
+
+    for (APrefabActor* Prefab : AttemptPrefabs)
+    {
+        if (IsValid(Prefab))
+        {
+            SpawnedPrefabs.Add(TWeakObjectPtr<APrefabActor>(Prefab));
+        }
+    }
+    for (AVehiclePawn* Vehicle : AttemptVehicles)
+    {
+        if (IsValid(Vehicle))
+        {
+            SpawnedVehicles.Add(TWeakObjectPtr<AVehiclePawn>(Vehicle));
+        }
+    }
+
+    // Preserve every validated record, including temporarily unresolved records. This prevents any
+    // later teardown save from deleting data that was present in the committed DAT generation.
+    LastKnownSceneRecords = NormalizedRecords;
+
+    // Normalize successfully resolved legacy/absolute paths and recommit a recovered non-empty
+    // backup. The DAT transaction creates and validates its own .bak generation.
     if (bNormalizedRecordChanged)
     {
         const FSafeFileWriteResult NormalizeResult =
@@ -4545,12 +5120,31 @@ bool UGameManagerSubSystem::LoadSavedScene()
         if (!NormalizeResult.IsSuccess())
         {
             UE_LOG(LogTemp, Warning,
-                TEXT("Loaded entities but could not normalize their paths in entities.dat: %s"),
+                TEXT("Loaded entities but could not normalize/recover entities.dat: %s"),
                 *NormalizeResult.Error);
+        }
+        else
+        {
+            TArray<FPlacedObjectRecord> VerifiedNormalizedRecords;
+            FString VerifyError;
+            if (!FBinaryDataStore::LoadEntities(EntitiesDatPath, VerifiedNormalizedRecords, VerifyError)
+                || !ArePlacedObjectRecordsEquivalent(NormalizedRecords, VerifiedNormalizedRecords))
+            {
+                UE_LOG(LogTemp, Error,
+                    TEXT("Normalized entity DAT failed read-after-write verification. Path=%s Reason=%s"),
+                    *EntitiesDatPath,
+                    *VerifyError);
+            }
+            else
+            {
+                LastKnownSceneRecords = MoveTemp(VerifiedNormalizedRecords);
+            }
         }
     }
 
-    const bool bPartialApplyFailure = MissingSourceCount > 0 || FailedSpawnCount > 0;
+    const bool bPartialApplyFailure = MissingSourceCount > 0
+        || InvalidSourceCount > 0
+        || TransientSpawnFailureCount > 0;
     bSavedSceneLoadInProgress = false;
     bSavedSceneLoaded = true;
     bSavedSceneLoadFailed = bPartialApplyFailure;
@@ -4560,17 +5154,20 @@ bool UGameManagerSubSystem::LoadSavedScene()
     {
         LastSaveMessage = TEXT("entities.dat은 로드했지만 일부 엔티티를 복원하지 못해 기존 DAT 보호를 위해 자동 저장을 잠갔습니다.");
         UE_LOG(LogTemp, Error,
-            TEXT("Entity DAT was only partially applied; scene saving is locked to preserve unresolved records. Path=%s Records=%d Spawned=%d MissingSource=%d Failed=%d"),
+            TEXT("Entity DAT was only partially applied; scene saving is locked. Path=%s Records=%d Spawned=%d Missing=%d Invalid=%d SpawnFailed=%d"),
             *EntitiesDatPath,
             Placed.Num(),
             SpawnedCount,
             MissingSourceCount,
-            FailedSpawnCount);
+            InvalidSourceCount,
+            TransientSpawnFailureCount);
     }
     else
     {
+        LastSaveMessage = FString::Printf(TEXT("엔티티 복원 완료: %d개"), SpawnedCount);
         UE_LOG(LogTemp, Display,
-            TEXT("Entity DAT fully applied. Path=%s Records=%d Spawned=%d"),
+            TEXT("Entity DAT fully applied. World=%s Path=%s Records=%d Spawned=%d"),
+            *GetWorldRootPath(),
             *EntitiesDatPath,
             Placed.Num(),
             SpawnedCount);

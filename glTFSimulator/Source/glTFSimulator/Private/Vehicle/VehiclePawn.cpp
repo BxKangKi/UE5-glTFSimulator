@@ -30,6 +30,7 @@
 #include "Setting/GameSettings.h"
 #include "System/ActorHelper.h"
 #include "System/FileFunctionLibrary.h"
+#include "System/GameManagerSubSystem.h"
 #include "System/GlbValidation.h"
 #include "System/MathHelper.h"
 #include "System/MacroLibrary.h"
@@ -1131,6 +1132,9 @@ void AVehiclePawn::ResetVehicleTuningToClassDefaults()
     FrontWheelHeightOffset = Defaults->FrontWheelHeightOffset;
     RearWheelHeightOffset = Defaults->RearWheelHeightOffset;
     WheelHeightOffsets = Defaults->WheelHeightOffsets;
+    WheelSpinDirection = FMath::IsNearlyZero(Defaults->WheelSpinDirection)
+        ? -1.0f
+        : (Defaults->WheelSpinDirection < 0.0f ? -1.0f : 1.0f);
     WheelMeshNames = Defaults->WheelMeshNames;
     StableRideHeightGroundBuffer = Defaults->StableRideHeightGroundBuffer;
     WheelVisualGroundContactBuffer = Defaults->WheelVisualGroundContactBuffer;
@@ -1241,6 +1245,11 @@ bool AVehiclePawn::ApplyVehicleTuningJsonObject(const TSharedPtr<FJsonObject>& J
     ReadFloat(TEXT("WheelMountHeightOffset"), WheelHeightOffset, -VehicleWheelHeightOffsetLimit, VehicleWheelHeightOffsetLimit);
     ReadFloat(TEXT("FrontWheelHeightOffset"), FrontWheelHeightOffset, -VehicleWheelHeightOffsetLimit, VehicleWheelHeightOffsetLimit);
     ReadFloat(TEXT("RearWheelHeightOffset"), RearWheelHeightOffset, -VehicleWheelHeightOffsetLimit, VehicleWheelHeightOffsetLimit);
+    ReadFloat(TEXT("WheelSpinDirection"), WheelSpinDirection, -1.0f, 1.0f);
+    ReadFloat(TEXT("WheelRotationDirection"), WheelSpinDirection, -1.0f, 1.0f);
+    WheelSpinDirection = FMath::IsNearlyZero(WheelSpinDirection)
+        ? -1.0f
+        : (WheelSpinDirection < 0.0f ? -1.0f : 1.0f);
     ReadFloat(TEXT("StableRideHeightGroundBuffer"), StableRideHeightGroundBuffer, 0.0f, 6.0f);
     ReadFloat(TEXT("WheelVisualGroundContactBuffer"), WheelVisualGroundContactBuffer, 0.0f, 6.0f);
 
@@ -1357,6 +1366,7 @@ bool AVehiclePawn::SaveVehicleTuningJsonTemplate(const FString& JsonPath) const
     RootObject->SetNumberField(TEXT("WheelHeightOffset"), WheelHeightOffset);
     RootObject->SetNumberField(TEXT("FrontWheelHeightOffset"), FrontWheelHeightOffset);
     RootObject->SetNumberField(TEXT("RearWheelHeightOffset"), RearWheelHeightOffset);
+    RootObject->SetNumberField(TEXT("WheelSpinDirection"), WheelSpinDirection);
     TArray<TSharedPtr<FJsonValue>> WheelHeightArray;
     const int32 TemplateWheelCount = FMath::Max(WheelOffsets.Num(), WheelHeightOffsets.Num());
     WheelHeightArray.Reserve(TemplateWheelCount);
@@ -1474,14 +1484,12 @@ UStaticMesh* AVehiclePawn::LoadMeshByIndex(int32 MeshIndex)
     MeshConfig.MaterialsConfig.ImagesConfig.bCompressMips = false;
     MeshConfig.MaterialsConfig.ImagesConfig.bStreaming = false;
     MeshConfig.MaterialsConfig.bLoadMipMaps = false;
-    const TMap<EglTFRuntimeMaterialType, UMaterialInterface*> LitOverrides =
-        glTFMaterialOverrideUtils::BuildOverrideMap(MaterialAssets);
-    if (LitOverrides.Num() > 0)
+    if (UGameManagerSubSystem* GameManager = UGameManagerSubSystem::GetSubSystem(this))
     {
-        MeshConfig.MaterialsConfig.UberMaterialsOverrideMap = LitOverrides;
-        MeshConfig.MaterialsConfig.UnlitOverrideMap = LitOverrides;
+        glTFMaterialOverrideUtils::ApplyOverrides(
+            GameManager->GetMaterialDefaultReferences(),
+            MeshConfig.MaterialsConfig);
     }
-    glTFMaterialOverrideUtils::ApplyNamedOverrides(MaterialAssets, MeshConfig.MaterialsConfig);
     MeshConfig.bAllowCPUAccess = false;
     MeshConfig.bBuildLumenCards = true;
     MeshConfig.bBuildSimpleCollision = false;
@@ -5084,7 +5092,18 @@ void AVehiclePawn::UpdateWheelVisuals(float DeltaSeconds)
             ? (VisualLinearVelocity + FVector::CrossProduct(VisualAngularVelocity, WheelCenterWorld - BodyTransform.GetLocation()))
             : (Body ? Body->GetPhysicsLinearVelocityAtPoint(WheelCenterWorld) : FVector::ZeroVector);
         const float ForwardSpeed = FVector::DotProduct(Velocity, Forward);
-        WheelSpinDegrees[WheelIndex] += FMath::RadiansToDegrees((ForwardSpeed / SafeWheelRadius) * DeltaSeconds);
+        const FVector AuthoredWheelScale = LoadedWheelBaseScales.IsValidIndex(WheelIndex)
+            ? LoadedWheelBaseScales[WheelIndex]
+            : FVector::OneVector;
+        const float MirrorSign = (AuthoredWheelScale.X * AuthoredWheelScale.Y * AuthoredWheelScale.Z) < 0.0f
+            ? -1.0f
+            : 1.0f;
+        const float AuthoredSpinSign = WheelSpinDirection > 0.0f ? 1.0f : -1.0f;
+        WheelSpinDegrees[WheelIndex] = FMath::UnwindDegrees(
+            WheelSpinDegrees[WheelIndex]
+            + FMath::RadiansToDegrees((ForwardSpeed / SafeWheelRadius) * DeltaSeconds)
+                * AuthoredSpinSign
+                * MirrorSign);
 
         const bool bFrontWheel = WheelOffsets[WheelIndex].X > 0.0f;
         OutRelativeRotation = FRotator(WheelSpinDegrees[WheelIndex], bFrontWheel ? SteeringDegrees : 0.0f, 0.0f);

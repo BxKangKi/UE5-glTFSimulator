@@ -12,6 +12,7 @@ namespace glTFMaterialOverrideUtils
         const FglTFMaterialAssetReferences& References)
     {
         TMap<EglTFRuntimeMaterialType, UMaterialInterface*> Overrides;
+        Overrides.Reserve(6);
 
         const auto AddIfAssigned = [&Overrides](const EglTFRuntimeMaterialType Type, UMaterialInterface* Material)
         {
@@ -31,36 +32,53 @@ namespace glTFMaterialOverrideUtils
         return Overrides;
     }
 
-    inline TMap<FString, UMaterialInterface*> BuildNamedOverrideMap(
-        const FglTFMaterialAssetReferences& References)
-    {
-        TMap<FString, UMaterialInterface*> Overrides;
-        for (const TPair<FString, TObjectPtr<UMaterialInterface>>& Pair : References.ByMaterialName)
-        {
-            const FString MaterialName = Pair.Key.TrimStartAndEnd();
-            UMaterialInterface* Material = Pair.Value.Get();
-            if (!MaterialName.IsEmpty() && IsValid(Material))
-            {
-                Overrides.Add(MaterialName, Material);
-            }
-        }
-        return Overrides;
-    }
-
     inline void ApplyNamedOverrides(
         const FglTFMaterialAssetReferences& References,
         FglTFRuntimeMaterialsConfig& MaterialsConfig)
     {
-        const TMap<FString, UMaterialInterface*> NamedOverrides = BuildNamedOverrideMap(References);
-        if (NamedOverrides.Num() > 0)
+        if (References.ByMaterialName.Num() == 0)
         {
-            for (const TPair<FString, UMaterialInterface*>& Pair : NamedOverrides)
+            return;
+        }
+
+        MaterialsConfig.MaterialsOverrideByNameMap.Reserve(
+            MaterialsConfig.MaterialsOverrideByNameMap.Num() + References.ByMaterialName.Num());
+
+        bool bAddedAnyOverride = false;
+        for (const TPair<FString, TObjectPtr<UMaterialInterface>>& Pair : References.ByMaterialName)
+        {
+            FString MaterialName = Pair.Key;
+            MaterialName.TrimStartAndEndInline();
+            UMaterialInterface* Material = Pair.Value.Get();
+            if (MaterialName.IsEmpty() || !IsValid(Material))
             {
-                MaterialsConfig.MaterialsOverrideByNameMap.Add(Pair.Key, Pair.Value);
+                continue;
             }
+
+            MaterialsConfig.MaterialsOverrideByNameMap.Add(MoveTemp(MaterialName), Material);
+            bAddedAnyOverride = true;
+        }
+
+        if (bAddedAnyOverride)
+        {
             // Keep glTF factors and textures. Without injection, glTFRuntime returns the base
             // material directly and the imported texture parameters are not applied.
             MaterialsConfig.bMaterialsOverrideMapInjectParams = true;
         }
     }
+
+    inline void ApplyOverrides(
+        const FglTFMaterialAssetReferences& References,
+        FglTFRuntimeMaterialsConfig& MaterialsConfig)
+    {
+        TMap<EglTFRuntimeMaterialType, UMaterialInterface*> TypeOverrides = BuildOverrideMap(References);
+        if (TypeOverrides.Num() > 0)
+        {
+            MaterialsConfig.UberMaterialsOverrideMap = TypeOverrides;
+            MaterialsConfig.UnlitOverrideMap = MoveTemp(TypeOverrides);
+        }
+
+        ApplyNamedOverrides(References, MaterialsConfig);
+    }
+
 }

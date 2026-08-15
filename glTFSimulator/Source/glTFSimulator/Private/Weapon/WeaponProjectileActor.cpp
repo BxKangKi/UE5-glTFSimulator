@@ -70,9 +70,12 @@ void AWeaponProjectileActor::RegisterGameUpdate()
     {
         GameUpdateTickHandle = GameUpdate->RegisterUpdate(
             this,
-            [this](const float DeltaSeconds)
+            [WeakThis = TWeakObjectPtr<AWeaponProjectileActor>(this)](const float DeltaSeconds)
             {
-                UpdateProjectile(DeltaSeconds);
+                if (AWeaponProjectileActor* StrongThis = WeakThis.Get())
+                {
+                    StrongThis->UpdateProjectile(DeltaSeconds);
+                }
             },
             25);
     }

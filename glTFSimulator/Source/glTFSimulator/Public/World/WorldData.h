@@ -84,6 +84,20 @@ struct GLTFSIMULATOR_API FLevelGameplaySettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level|Gameplay", meta=(ClampMin="1.0"))
     float PlayerMaxHealth = 100.0f;
 
+    /**
+     * Map-authored non-ragdoll character mass in kilograms. CharacterMovement uses this value for
+     * momentum, standing weight, object impacts, and the mass-aware push-force calculation.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level|Gameplay", meta=(ClampMin="1.0", ClampMax="10000.0"))
+    float PlayerMassKg = 80.0f;
+
+    /**
+     * Effective horizontal traction used while a walking character pushes a simulated body.
+     * The sustained push-force limit is PlayerMassKg * gravity * this coefficient.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level|Gameplay", meta=(ClampMin="0.0", ClampMax="2.0"))
+    float PlayerPushTractionCoefficient = 0.30f;
+
     TSharedRef<FJsonObject> ToJson() const;
     bool FromJson(const TSharedPtr<FJsonObject>& Json);
 };

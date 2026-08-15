@@ -6,7 +6,6 @@
 #include "HAL/ThreadSafeCounter.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
-#include "Model/glTFMaterialAssetReferences.h"
 #include "World/PlacementTypes.h"
 #include "VehiclePawn.generated.h"
 
@@ -145,10 +144,6 @@ private:
 
     UPROPERTY(EditAnywhere, Category="Vehicle|Camera")
     bool bResetCharacterCameraOnExit = true;
-
-    /** glTFRuntime material assets assigned directly in the owning Blueprint/class defaults. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Vehicle|Assets", meta=(AllowPrivateAccess="true"))
-    FglTFMaterialAssetReferences MaterialAssets;
 
     UPROPERTY(Transient)
     TObjectPtr<UPhysicalMaterial> LowFrictionPhysicalMaterial;
@@ -450,6 +445,14 @@ private:
     /** Optional additive offsets per sorted wheel (front-right, front-left, rear-right, rear-left). */
     UPROPERTY(EditAnywhere, Category="Vehicle|Wheels")
     TArray<float> WheelHeightOffsets;
+
+    /**
+     * Visual rolling direction for forward travel. Unreal's vehicle-forward axis requires -1 for
+     * the usual glTF wheel orientation. Set this to 1 in the read-only vehicle JSON only when an
+     * authored model uses the opposite wheel-axis convention.
+     */
+    UPROPERTY(EditAnywhere, Category="Vehicle|Wheels", meta=(ClampMin="-1.0", ClampMax="1.0"))
+    float WheelSpinDirection = -1.0f;
 
     /**
      * Optional exact node/mesh names that identify wheel meshes when the model does not use the

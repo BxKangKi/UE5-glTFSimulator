@@ -5,6 +5,7 @@
 #include "CoreMinimal.h"
 #include "Engine/HitResult.h"
 #include "GameFramework/Actor.h"
+#include "Model/glTFMaterialAssetReferences.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "TimerManager.h"
 #include "World/PlacementTypes.h"
@@ -15,13 +16,15 @@ class AVehiclePawn;
 class AWeaponActor;
 class UCameraComponent;
 class UMaterialInterface;
+class UMaterialDefaultAsset;
+class UMaterialDefaultRuntimeCache;
 class UProceduralMeshComponent;
 class USceneComponent;
 class UWorldData;
 class UPlayerData;
 class AWeatherActor;
 class UUserWidget;
-class AWorldManager;
+class AWorldEnvManager;
 class AglTFStreamActor;
 class UglTFStreamSubSystem;
 class UGameSettings;
@@ -102,6 +105,23 @@ public:
     static UGameManagerSubSystem* GetSubSystem(const UObject* WorldContextObject);
     UFUNCTION(BlueprintPure, Category="Game", meta=(WorldContext="WorldContextObject"))
     static UGameManagerSubSystem* FindGameManager(const UObject* WorldContextObject);
+
+    /**
+     * Returns the single resolved material set owned by the game system. The returned reference is
+     * valid for the current game-thread call and remains GC-safe because every UObject is held by a
+     * UPROPERTY on this subsystem. Missing/invalid assets produce an empty set rather than a crash.
+     */
+    const FglTFMaterialAssetReferences& GetMaterialDefaultReferences();
+
+    /**
+     * Returns the shared request-lifetime GC guard used by asynchronous glTFRuntime operations.
+     * Call only on the game thread. The returned object may outlive the active world when a native
+     * callback is still draining, but it never retains actors, worlds, parsers, or components.
+     */
+    UMaterialDefaultRuntimeCache* AcquireMaterialDefaultReferenceGuard();
+
+    UFUNCTION(BlueprintPure, Category="Game|Assets")
+    bool IsMaterialDefaultAssetReady() const { return bMaterialDefaultAssetResolved; }
 
     // Opens the directly assigned menu world and asks its StartActor to show world selection after travel.
     UFUNCTION(BlueprintCallable, Category="Game|Lifecycle", meta=(WorldContext="WorldContextObject"))
@@ -426,13 +446,9 @@ public:
     UFUNCTION(BlueprintCallable, Category="Game|Lifecycle")
     void PrepareForReturnToMenuLevel();
 
-    /** Legacy wrapper kept for MainWorld menu travel. Use PrepareForReturnToMenuLevel() for the common cleanup path. */
+    /** MainWorld-specific entry point that shares the common menu-travel cleanup path. */
     UFUNCTION(BlueprintCallable, Category="Game|Lifecycle")
     void PrepareForReturnToMainWorld();
-
-    /** Backward-compatible wrapper for older Blueprint/C++ calls that still refer to StartWorld. */
-    UFUNCTION(BlueprintCallable, Category="Game|Lifecycle", meta=(DeprecatedFunction, DeprecationMessage="StartWorld was renamed to MainWorld. Use PrepareForReturnToMainWorld instead."))
-    void PrepareForReturnToStartWorld();
 
     /** Releases runtime main-world actors/assets that can otherwise survive a level transition through GameInstance subsystems. */
     UFUNCTION(BlueprintCallable, Category="Game|Lifecycle")
@@ -445,10 +461,6 @@ public:
     UFUNCTION(BlueprintCallable, Category="Game|Lifecycle")
     void RequestWorldSelectionMenuOnNextMainWorld();
 
-    /** Backward-compatible wrapper for older Blueprint/C++ calls that still refer to StartWorld. */
-    UFUNCTION(BlueprintCallable, Category="Game|Lifecycle", meta=(DeprecatedFunction, DeprecationMessage="StartWorld was renamed to MainWorld. Use RequestWorldSelectionMenuOnNextMainWorld instead."))
-    void RequestWorldSelectionMenuOnNextStartWorld();
-
     /** Consumes and clears the pending MainWorld world-selection request. */
     UFUNCTION(BlueprintCallable, Category="Game|Lifecycle")
     bool ConsumeWorldSelectionMenuRequest();
@@ -459,9 +471,6 @@ public:
 
     UFUNCTION(BlueprintPure, Category="Game|Lifecycle")
     bool ShouldOpenWorldSelectionMenuOnNextMainWorld() const { return bOpenWorldSelectionMenuOnNextMainWorld; }
-
-    UFUNCTION(BlueprintPure, Category="Game|Lifecycle", meta=(DeprecatedFunction, DeprecationMessage="StartWorld was renamed to MainWorld. Use ShouldOpenWorldSelectionMenuOnNextMainWorld instead."))
-    bool ShouldOpenWorldSelectionMenuOnNextStartWorld() const { return ShouldOpenWorldSelectionMenuOnNextMainWorld(); }
 
 
     /** Returns the gameplay-owned world data object that drives time, sky, player position, and save data. */
@@ -524,6 +533,8 @@ private:
     FTimerManager& GetWorldTimerManager() const;
     FVector GetManagerActorLocation() const;
     void EnsureRuntimeComponents();
+    bool ResolveMaterialDefaultAsset();
+    void ReleaseMaterialDefaultAsset();
 
     UPROPERTY(Transient)
     TObjectPtr<USceneComponent> Root;
@@ -533,6 +544,28 @@ private:
 
     UPROPERTY(Transient)
     TObjectPtr<UMaterialInterface> PlacementGridMaterial;
+
+
+    /** Class copied from the configuration actor. No mutable configuration instance exists before play. */
+    UPROPERTY(Transient)
+    TSubclassOf<UMaterialDefaultAsset> MaterialDefaultAssetClass;
+
+    /**
+     * Transient configuration instance created on the game thread when the manager starts. Keeping
+     * it as a UPROPERTY prevents collection during nested synchronous material loads or re-entrant calls.
+     */
+    UPROPERTY(Transient)
+    TObjectPtr<UMaterialDefaultAsset> MaterialDefaultAssetInstance;
+
+    /**
+     * The one shared strong-reference object for the active world. Async requests retain this guard
+     * in addition to their plugin-required request-local maps, preventing GC races during native callbacks.
+     */
+    UPROPERTY(Transient)
+    TObjectPtr<UMaterialDefaultRuntimeCache> MaterialDefaultRuntimeCache;
+
+    bool bMaterialDefaultAssetResolved = false;
+    bool bMaterialDefaultAssetResolving = false;
 
     UPROPERTY(Transient)
     float PlacementGridSpacing = 100.0f;
@@ -562,9 +595,9 @@ private:
     UPROPERTY(Transient)
     TSubclassOf<AWeatherActor> WeatherActorClass;
 
-    // GameManager owns the world boot sequence so WorldManager can stay rendering-only.
+    // GameManager owns the world boot sequence so WorldEnvManager can stay rendering-only.
     UPROPERTY(Transient)
-    TSubclassOf<AWorldManager> WorldManagerClass;
+    TSubclassOf<AWorldEnvManager> WorldEnvManagerClass;
 
     UPROPERTY(Transient)
     TSubclassOf<AglTFStreamActor> SpawnActorClass;
@@ -588,7 +621,7 @@ private:
     TObjectPtr<AWeatherActor> ActiveWeatherActor;
 
     UPROPERTY()
-    TObjectPtr<AWorldManager> WorldManagerActor;
+    TObjectPtr<AWorldEnvManager> WorldEnvManagerActor;
 
     UPROPERTY()
     TObjectPtr<AActor> OceanActor;
@@ -602,7 +635,7 @@ private:
     bool bManagerStarted = false;
     bool bWorldBootstrapStarted = false;
     bool bWorldLoadCompleted = false;
-    bool bSpawnedWorldManager = false;
+    bool bSpawnedWorldEnvManager = false;
     bool bPendingMainWorldRuntimePurge = false;
     bool bOpenWorldSelectionMenuOnNextMainWorld = false;
     /** Separate from the destination-menu request so compatibility code may pre-set that request safely. */
@@ -681,11 +714,12 @@ private:
     UPROPERTY()
     TObjectPtr<AWeaponActor> EquippedWeapon;
 
-    UPROPERTY()
-    TArray<TObjectPtr<APrefabActor>> SpawnedPrefabs;
+    /** Non-owning tracking only; the UWorld owns actor lifetime. */
+    UPROPERTY(Transient)
+    TArray<TWeakObjectPtr<APrefabActor>> SpawnedPrefabs;
 
-    UPROPERTY()
-    TArray<TObjectPtr<AVehiclePawn>> SpawnedVehicles;
+    UPROPERTY(Transient)
+    TArray<TWeakObjectPtr<AVehiclePawn>> SpawnedVehicles;
 
     TArray<FString> PrefabFiles;
     TArray<FString> VehicleFiles;
@@ -709,6 +743,8 @@ private:
     bool bSavedSceneLoadFailed = false;
     int32 SavedSceneReadinessAttemptCount = 0;
     int32 SavedSceneDataAttemptCount = 0;
+    /** Last validated entity snapshot. Preserves records while actors are tearing down or temporarily unavailable. */
+    TArray<FPlacedObjectRecord> LastKnownSceneRecords;
     FVector LastTraceStart = FVector::ZeroVector;
     FVector LastTraceDirection = FVector::ForwardVector;
     FHitResult LastTraceHit;
@@ -740,6 +776,7 @@ private:
 
     void ClearTransientRuntimeReferences();
     void DestroyTrackedRuntimeActors();
+    void CompactTrackedEntityReferences();
     void ResetWorldRuntimeReferences();
     void RequestRuntimeGarbageCollection(const TCHAR* Reason) const;
     void PrepareForMenuLevelTravelRequest();
@@ -790,7 +827,7 @@ private:
     void MainWorldStreaming(const FString& InModelDirectory, const FString& InPlayerDirectory, const FString& InInitialPlayerName);
     void StartWorldStreaming(const FString& InModelDirectory, const FString& InPlayerDirectory, const FString& InInitialPlayerName);
     void InitializeWorldBootstrap();
-    void SpawnWorldManager();
+    void SpawnWorldEnvManager();
     bool CheckWorldSystemsLoaded();
     void LoadWorldData();
     void LoadPlayerData();

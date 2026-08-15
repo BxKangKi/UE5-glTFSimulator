@@ -90,8 +90,7 @@ void UInstancedEntitySubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
     check(IsInGameThread());
     Super::Initialize(Collection);
-
-    RegisterGameUpdate();
+    // Register lazily after the first successful entity registration.
 }
 
 void UInstancedEntitySubsystem::RegisterGameUpdate()
@@ -104,25 +103,40 @@ void UInstancedEntitySubsystem::RegisterGameUpdate()
 
     if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
     {
+        TWeakObjectPtr<UInstancedEntitySubsystem> WeakThis(this);
         GameUpdateHandle = GameUpdate->RegisterUpdate(
             this,
-            [this](const float DeltaSeconds)
+            [WeakThis](const float DeltaSeconds)
             {
-                UpdateFromGameUpdate(DeltaSeconds);
+                if (UInstancedEntitySubsystem* StrongThis = WeakThis.Get())
+                {
+                    StrongThis->UpdateFromGameUpdate(DeltaSeconds);
+                }
             },
             80);
     }
 }
 
-void UInstancedEntitySubsystem::Deinitialize()
+void UInstancedEntitySubsystem::UnregisterGameUpdate()
 {
     check(IsInGameThread());
+    if (GameUpdateHandle == INDEX_NONE)
+    {
+        return;
+    }
 
     if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
     {
         GameUpdate->UnregisterUpdate(GameUpdateHandle);
     }
     GameUpdateHandle = INDEX_NONE;
+}
+
+void UInstancedEntitySubsystem::Deinitialize()
+{
+    check(IsInGameThread());
+
+    UnregisterGameUpdate();
 
     TArray<int32> RegistrationIds;
     Registrations.GetKeys(RegistrationIds);
@@ -211,7 +225,6 @@ int32 UInstancedEntitySubsystem::RegisterEntity(
     const FBox& LocalBounds)
 {
     check(IsInGameThread());
-    RegisterGameUpdate();
 
     if (!IsValid(Owner) || MeshParts.Num() == 0)
     {
@@ -333,6 +346,7 @@ int32 UInstancedEntitySubsystem::RegisterEntity(
 
     const int32 RegistrationId = Registration.Id;
     Registrations.Add(RegistrationId, MoveTemp(Registration));
+    RegisterGameUpdate();
     return RegistrationId;
 }
 
@@ -520,6 +534,11 @@ void UInstancedEntitySubsystem::UnregisterEntity(int32 RegistrationId)
 
     Registrations.Remove(RegistrationId);
     ReleaseResourceIfUnused(ResourceKey);
+    if (Registrations.Num() == 0)
+    {
+        Registrations.Empty();
+        UnregisterGameUpdate();
+    }
 }
 
 

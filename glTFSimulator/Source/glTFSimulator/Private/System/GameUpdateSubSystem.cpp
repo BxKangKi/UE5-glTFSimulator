@@ -70,6 +70,8 @@ void UGameUpdateSubSystem::Deinitialize()
     PendingRemoveHandleSet.Empty();
     SortedHandles.Empty();
     UpdateEntries.Empty();
+    NextHandle = 1;
+    NextSerial = 1;
     Super::Deinitialize();
 }
 
@@ -91,7 +93,33 @@ int32 UGameUpdateSubSystem::RegisterUpdate(UObject* Owner, TFunction<void(float)
         return INDEX_NONE;
     }
 
-    const int32 Handle = NextHandle++;
+    // The counter normally never wraps, but persistent game instances can run indefinitely. Skip
+    // INDEX_NONE/non-positive values and any still-live handle rather than overwriting a callback.
+    int32 Handle = NextHandle;
+    for (int32 Attempts = 0; Attempts < MAX_int32; ++Attempts)
+    {
+        if (NextHandle >= MAX_int32)
+        {
+            NextHandle = 1;
+        }
+        else
+        {
+            ++NextHandle;
+        }
+
+        if (Handle > 0 && Handle != INDEX_NONE && !UpdateEntries.Contains(Handle))
+        {
+            break;
+        }
+        Handle = NextHandle;
+    }
+
+    if (Handle <= 0 || Handle == INDEX_NONE || UpdateEntries.Contains(Handle))
+    {
+        ensureMsgf(false, TEXT("UGameUpdateSubSystem exhausted all callback handles"));
+        return INDEX_NONE;
+    }
+
     FGameUpdateEntry& Entry = UpdateEntries.Add(Handle);
     Entry.Owner = Owner;
     Entry.UpdateFunction = MoveTemp(UpdateFunction);
@@ -122,7 +150,19 @@ void UGameUpdateSubSystem::UnregisterUpdate(int32 Handle)
 
     if (UpdateEntries.Remove(Handle) > 0)
     {
-        MarkDispatchOrderDirty();
+        if (UpdateEntries.Num() == 0)
+        {
+            // GameInstance subsystems survive map travel. Release all callback/capture allocator
+            // storage when the last world-owned registration disappears.
+            UpdateEntries.Empty();
+            SortedHandles.Empty();
+            PendingRemoveHandleSet.Empty();
+            bSortedHandlesDirty = false;
+        }
+        else
+        {
+            MarkDispatchOrderDirty();
+        }
     }
 }
 
@@ -291,6 +331,16 @@ void UGameUpdateSubSystem::FlushPendingRemovals()
 
     if (RemovedCount > 0)
     {
-        MarkDispatchOrderDirty();
+        if (UpdateEntries.Num() == 0)
+        {
+            UpdateEntries.Empty();
+            SortedHandles.Empty();
+            PendingRemoveHandleSet.Empty();
+            bSortedHandlesDirty = false;
+        }
+        else
+        {
+            MarkDispatchOrderDirty();
+        }
     }
 }

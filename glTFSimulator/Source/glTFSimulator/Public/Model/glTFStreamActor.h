@@ -7,7 +7,6 @@
 #include "GameFramework/Actor.h"
 #include "HAL/ThreadSafeCounter.h"
 #include "Model/ModelData.h"
-#include "Model/StreamDefaultAsset.h"
 #include "glTFRuntimeParser.h"
 #include "glTFStreamActor.generated.h"
 
@@ -96,9 +95,6 @@ public:
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite)
     float StreamDistance = 64.0f;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite)
-    FStreamDefaultAsset Default;
 
     UPROPERTY(EditAnywhere, BlueprintReadOnly)
     TObjectPtr<UMaterialInterface> DecalLight;

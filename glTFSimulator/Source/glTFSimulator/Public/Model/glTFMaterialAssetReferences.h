@@ -43,4 +43,26 @@ struct GLTFSIMULATOR_API FglTFMaterialAssetReferences
      */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="glTF Material Assets|By glTF Name")
     TMap<FString, TObjectPtr<UMaterialInterface>> ByMaterialName;
+
+    bool IsEmpty() const
+    {
+        return !IsValid(Opaque.Get())
+            && !IsValid(Masked.Get())
+            && !IsValid(TwoSided.Get())
+            && !IsValid(TwoSidedMasked.Get())
+            && !IsValid(Translucent.Get())
+            && !IsValid(TwoSidedTranslucent.Get())
+            && ByMaterialName.Num() == 0;
+    }
+
+    void Reset()
+    {
+        Opaque = nullptr;
+        Masked = nullptr;
+        TwoSided = nullptr;
+        TwoSidedMasked = nullptr;
+        Translucent = nullptr;
+        TwoSidedTranslucent = nullptr;
+        ByMaterialName.Empty();
+    }
 };

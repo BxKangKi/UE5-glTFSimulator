@@ -120,17 +120,12 @@ UPhysicsTransformInterpolationSubSystem* UPhysicsTransformInterpolationSubSystem
 void UPhysicsTransformInterpolationSubSystem::Initialize(FSubsystemCollectionBase& Collection)
 {
     Super::Initialize(Collection);
-    RegisterGameUpdate();
+    // Register lazily only while at least one transform still needs interpolation.
 }
 
 void UPhysicsTransformInterpolationSubSystem::Deinitialize()
 {
-    if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
-    {
-        GameUpdate->UnregisterUpdate(GameUpdateHandle);
-    }
-
-    GameUpdateHandle = INDEX_NONE;
+    UnregisterGameUpdate();
     Entries.Empty();
     Super::Deinitialize();
 }
@@ -144,14 +139,32 @@ void UPhysicsTransformInterpolationSubSystem::RegisterGameUpdate()
 
     if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
     {
+        TWeakObjectPtr<UPhysicsTransformInterpolationSubSystem> WeakThis(this);
         GameUpdateHandle = GameUpdate->RegisterUpdate(
             this,
-            [this](const float DeltaSeconds)
+            [WeakThis](const float DeltaSeconds)
             {
-                UpdateFromGameUpdate(DeltaSeconds);
+                if (UPhysicsTransformInterpolationSubSystem* StrongThis = WeakThis.Get())
+                {
+                    StrongThis->UpdateFromGameUpdate(DeltaSeconds);
+                }
             },
             -50);
     }
+}
+
+void UPhysicsTransformInterpolationSubSystem::UnregisterGameUpdate()
+{
+    if (GameUpdateHandle == INDEX_NONE)
+    {
+        return;
+    }
+
+    if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
+    {
+        GameUpdate->UnregisterUpdate(GameUpdateHandle);
+    }
+    GameUpdateHandle = INDEX_NONE;
 }
 
 void UPhysicsTransformInterpolationSubSystem::SubmitPhysicsTransformForComponent(
@@ -182,8 +195,6 @@ void UPhysicsTransformInterpolationSubSystem::SubmitTransform(
         return;
     }
 
-    RegisterGameUpdate();
-
     for (FInterpolatedTransformEntry& Entry : Entries)
     {
         if (Entry.Component.Get() == Component)
@@ -203,6 +214,10 @@ void UPhysicsTransformInterpolationSubSystem::SubmitTransform(
             Entry.bApplyScale = bApplyScale;
             Entry.bCanMoveSimulatingPrimitive = bCanMoveSimulatingPrimitive;
             Entry.bAtTarget = Entry.bAtTarget && !bTargetChanged && !bSettingsChanged;
+            if (!Entry.bAtTarget)
+            {
+                RegisterGameUpdate();
+            }
             return;
         }
     }
@@ -215,6 +230,7 @@ void UPhysicsTransformInterpolationSubSystem::SubmitTransform(
     NewEntry.bApplyScale = bApplyScale;
     NewEntry.bCanMoveSimulatingPrimitive = bCanMoveSimulatingPrimitive;
     Entries.Add(MoveTemp(NewEntry));
+    RegisterGameUpdate();
 }
 
 void UPhysicsTransformInterpolationSubSystem::ClearComponent(USceneComponent* Component)
@@ -224,10 +240,15 @@ void UPhysicsTransformInterpolationSubSystem::ClearComponent(USceneComponent* Co
         return;
     }
 
-    Entries.RemoveAll([Component](const FInterpolatedTransformEntry& Entry)
+    Entries.RemoveAllSwap([Component](const FInterpolatedTransformEntry& Entry)
     {
         return !Entry.Component.IsValid() || Entry.Component.Get() == Component;
-    });
+    }, EAllowShrinking::No);
+    if (Entries.Num() == 0)
+    {
+        Entries.Empty();
+        UnregisterGameUpdate();
+    }
 }
 
 void UPhysicsTransformInterpolationSubSystem::ClearOwner(const UObject* Owner)
@@ -237,11 +258,16 @@ void UPhysicsTransformInterpolationSubSystem::ClearOwner(const UObject* Owner)
         return;
     }
 
-    Entries.RemoveAll([Owner](const FInterpolatedTransformEntry& Entry)
+    Entries.RemoveAllSwap([Owner](const FInterpolatedTransformEntry& Entry)
     {
         const USceneComponent* Component = Entry.Component.Get();
         return !Component || Component->GetOwner() == Owner;
-    });
+    }, EAllowShrinking::No);
+    if (Entries.Num() == 0)
+    {
+        Entries.Empty();
+        UnregisterGameUpdate();
+    }
 }
 
 bool UPhysicsTransformInterpolationSubSystem::ShouldSkipComponent(const USceneComponent* Component, bool bCanMoveSimulatingPrimitive) const
@@ -353,6 +379,23 @@ void UPhysicsTransformInterpolationSubSystem::UpdateFromGameUpdate(float DeltaTi
             }
         }
         Entry.bAtTarget = Work.bAtTarget;
+    }
+
+    bool bHasPendingInterpolation = false;
+    for (const FInterpolatedTransformEntry& Entry : Entries)
+    {
+        if (Entry.Component.IsValid() && !Entry.bAtTarget)
+        {
+            bHasPendingInterpolation = true;
+            break;
+        }
+    }
+    if (!bHasPendingInterpolation)
+    {
+        // Completed targets do not need to remain in a persistent GameInstance subsystem. A later
+        // submission recreates its compact entry and re-registers the dispatcher on demand.
+        Entries.Empty();
+        UnregisterGameUpdate();
     }
 }
 

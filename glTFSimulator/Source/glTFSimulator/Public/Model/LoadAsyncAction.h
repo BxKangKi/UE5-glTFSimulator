@@ -11,6 +11,7 @@
 #include "LoadAsyncAction.generated.h"
 
 class UglTFRuntimeAsset;
+class UMaterialDefaultRuntimeCache;
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
     FLoadAsyncCompleted,
@@ -57,6 +58,10 @@ public:
 private:
     UPROPERTY()
     TObjectPtr<UObject> WorldContextObject;
+
+    /** Shared GC guard retained until all native glTFRuntime callbacks have drained. */
+    UPROPERTY(Transient)
+    TObjectPtr<UMaterialDefaultRuntimeCache> MaterialReferenceGuard;
 
     UPROPERTY()
     TObjectPtr<UglTFRuntimeAsset> Asset;

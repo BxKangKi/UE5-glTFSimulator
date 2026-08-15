@@ -30,7 +30,7 @@ namespace
     constexpr double PLAYER_ACTOR_WAIT_TIMEOUT_SECONDS = 30.0;
     constexpr double PLAYER_LOAD_TIMEOUT_SECONDS = 120.0;
     constexpr double MODEL_LOAD_TIMEOUT_SECONDS = 180.0;
-    constexpr int32 MAX_CONCURRENT_INITIAL_MODEL_LOADS = 3;
+    constexpr int32 MAX_CONCURRENT_INITIAL_MODEL_LOADS = 1;
 
     /** Pure-data result produced off the game thread for one initial model path. */
     struct FInitialModelPreflightResult
@@ -235,8 +235,8 @@ void UglTFStreamSubSystem::StartMainWorldStreaming(AActor* InOwnerActor, TSubcla
         *InitialPlayerName,
         bRenderOnlyStreaming ? TEXT("true") : TEXT("false")));
 
-    // Initial GLB validation/metadata parsing and metadata-less bounds calculation run in a
-    // bounded three-file pipeline. UObject/component work is still marshalled to the game thread.
+    // Initial GLB validation/metadata parsing and metadata-less bounds calculation run one model
+    // at a time. This keeps parser, LOD, texture, and collision peaks from overlapping at map entry.
     ScheduleProcessNextPath();
 }
 
@@ -285,6 +285,7 @@ void UglTFStreamSubSystem::StopMainWorldStreaming()
 
     GlbFilePaths.Empty();
     PlayerGlbFilePaths.Empty();
+    ModelDirectory.Reset();
     CurrentPlayerPath.Reset();
     PendingPlayerPath.Reset();
     PlayerDirectory.Reset();
@@ -507,7 +508,7 @@ void UglTFStreamSubSystem::ProcessNextPathAsync()
         return;
     }
 
-    // Keep at most three GLBs in the combined preflight/bounds-calculation pipeline. A path whose
+    // Keep one GLB in the combined preflight/bounds-calculation pipeline. A path whose
     // metadata already proves it is outside the streaming range releases its slot immediately;
     // an in-range path retains the slot until its stream actor finishes loading.
     while (CurrentPathIndex < GlbFilePaths.Num() &&
@@ -648,7 +649,7 @@ void UglTFStreamSubSystem::StartInitialPathPreflight(
                             StrongThis->MetadataUnavailablePaths.Remove(GlbPath);
                             StrongThis->ModelMetadataMap.Add(GlbPath, Result.Metadata);
                             StrongThis->WriteLogAsync(FString::Printf(
-                                TEXT("Valid model SCZ loaded in parallel. GLB=%s Center=%s Size=%s"),
+                                TEXT("Valid model SCZ loaded safely. GLB=%s Center=%s Size=%s"),
                                 *GlbPath,
                                 *Result.Metadata.Center.ToCompactString(),
                                 *Result.Metadata.Size.ToCompactString()));
@@ -668,7 +669,7 @@ void UglTFStreamSubSystem::StartInitialPathPreflight(
                         {
                             StrongThis->MetadataUnavailablePaths.Add(GlbPath);
                             StrongThis->WriteLogAsync(FString::Printf(
-                                TEXT("Model SCZ unavailable; bounds will be calculated by a parallel stream actor. GLB=%s SczExists=%s Reason=%s"),
+                                TEXT("Model SCZ unavailable; bounds will be calculated by a dedicated stream actor. GLB=%s SczExists=%s Reason=%s"),
                                 *GlbPath,
                                 Result.bSizeCacheExists ? TEXT("true") : TEXT("false"),
                                 *Result.Reason));
@@ -1701,7 +1702,7 @@ void UglTFStreamSubSystem::FinalizeInitialPathScanIfReady()
         SetInitialPathProgress(GlbPath, 1.0f);
     }
     WriteLogAsync(FString::Printf(
-        TEXT("Initial GLB scan completed with bounded parallelism. Paths=%d"),
+        TEXT("Initial GLB scan completed with serialized runtime loading. Paths=%d"),
         GlbFilePaths.Num()));
     BeginInitialPlayerStreamingIfNeeded();
     ScheduleUpdateStreaming();

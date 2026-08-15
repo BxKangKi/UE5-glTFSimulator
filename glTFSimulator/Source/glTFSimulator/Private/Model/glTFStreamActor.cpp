@@ -23,6 +23,7 @@
 #include "System/SafeFileIO.h"
 #include "System/glTFRuntimeSafety.h"
 #include "TimerManager.h"
+#include "UObject/UObjectGlobals.h"
 #include "World/WaterActor.h"
 
 namespace
@@ -246,8 +247,8 @@ void AglTFStreamActor::LoadAssetAsync(EGLTFStreamAssetPhase Phase)
         }
         else
         {
-            // Each GLB receives an independent parser. Construction is bounded rather than globally
-            // serialized, allowing several files to preflight/parse concurrently without unbounded peaks.
+            // Each GLB receives an independent parser, but third-party parser construction is
+            // serialized process-wide to avoid overlapping large native allocations at map entry.
             Parser = FglTFRuntimeSafety::CreateParserSafely(RequestedFilePath, Config);
             if (!Parser.IsValid())
             {
@@ -411,7 +412,10 @@ void AglTFStreamActor::StartSizeScan(UglTFRuntimeAsset* Asset)
     }
 
     FglTFRuntimeStaticMeshConfig Config;
-    Config.Outer = this;
+    // Native mesh construction can finish after this actor has begun world teardown. Use the
+    // process-lifetime transient package as a non-dangling outer; live ISMs/actions provide the
+    // actual strong references, so unused probe meshes are still reclaimable by GC.
+    Config.Outer = GetTransientPackage();
     // The probe deliberately uses None: it skips materials/normals/tangents and must not poison
     // the later full-quality ReadWrite cache with a differently configured temporary mesh.
     Config.CacheMode = EglTFRuntimeCacheMode::None;
@@ -609,6 +613,18 @@ void AglTFStreamActor::ReleaseStreamingResources()
         return;
     }
 
+    const auto DestroyOwnedRuntimeComponent = [this](UActorComponent* Component)
+    {
+        if (!IsValid(Component))
+        {
+            return;
+        }
+
+        RemoveInstanceComponent(Component);
+        Component->UnregisterComponent();
+        Component->DestroyComponent();
+    };
+
     for (TPair<FName, TObjectPtr<UInstancedStaticMeshComponent>>& Pair : InstanceMap)
     {
         UInstancedStaticMeshComponent* ISMC = Pair.Value.Get();
@@ -626,18 +642,14 @@ void AglTFStreamActor::ReleaseStreamingResources()
             ISMC->SetMaterial(MaterialIndex, nullptr);
         }
         ISMC->SetStaticMesh(nullptr);
-        ISMC->UnregisterComponent();
-        ISMC->DestroyComponent();
+        DestroyOwnedRuntimeComponent(ISMC);
     }
     InstanceMap.Empty();
     LoadedNodes.Empty();
 
     for (TPair<FName, TObjectPtr<UBoxComponent>>& Pair : UnloadBoxMap)
     {
-        if (IsValid(Pair.Value))
-        {
-            Pair.Value->DestroyComponent();
-        }
+        DestroyOwnedRuntimeComponent(Pair.Value.Get());
     }
     UnloadBoxMap.Empty();
 
@@ -645,17 +657,11 @@ void AglTFStreamActor::ReleaseStreamingResources()
     {
         for (UShapeComponent* Collider : Pair.Value.Colliders)
         {
-            if (IsValid(Collider))
-            {
-                Collider->DestroyComponent();
-            }
+            DestroyOwnedRuntimeComponent(Collider);
         }
         for (ULightComponent* Light : Pair.Value.Lights)
         {
-            if (IsValid(Light))
-            {
-                Light->DestroyComponent();
-            }
+            DestroyOwnedRuntimeComponent(Light);
         }
     }
     DynamicComponentMap.Empty();
@@ -762,9 +768,12 @@ void AglTFStreamActor::RegisterGameUpdate()
     {
         GameUpdateTickHandle = GameUpdate->RegisterUpdate(
             this,
-            [this](const float DeltaSeconds)
+            [WeakThis = TWeakObjectPtr<AglTFStreamActor>(this)](const float DeltaSeconds)
             {
-                UpdateStreamingFromGameUpdate(DeltaSeconds);
+                if (AglTFStreamActor* StrongThis = WeakThis.Get())
+                {
+                    StrongThis->UpdateStreamingFromGameUpdate(DeltaSeconds);
+                }
             },
             15);
     }
@@ -806,21 +815,15 @@ FglTFRuntimeStaticMeshConfig AglTFStreamActor::BuildStreamingStaticMeshConfig()
     Config.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
     Config.CollisionComplexity = ECollisionTraceFlag::CTF_UseComplexAsSimple;
 
-    // One canonical editor-assigned material set. glTF-internal material names remain valid
-    // runtime metadata through Materials.ByMaterialName. No Unreal asset is found by name/path.
-    const FglTFMaterialAssetReferences& MaterialReferences = Default.Materials;
-    const TMap<EglTFRuntimeMaterialType, UMaterialInterface*> MaterialOverrides =
-        glTFMaterialOverrideUtils::BuildOverrideMap(MaterialReferences);
+    // The game subsystem owns one GC-safe material table for every glTF consumer. Stream actors
+    // borrow it only while constructing the local config; they never retain per-actor asset references.
     Config.MaterialsConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
-    if (MaterialOverrides.Num() > 0)
+    if (UGameManagerSubSystem* GameManager = UGameManagerSubSystem::GetSubSystem(this))
     {
-        Config.MaterialsConfig.UberMaterialsOverrideMap = MaterialOverrides;
-        Config.MaterialsConfig.UnlitOverrideMap = MaterialOverrides;
+        glTFMaterialOverrideUtils::ApplyOverrides(
+            GameManager->GetMaterialDefaultReferences(),
+            Config.MaterialsConfig);
     }
-
-    // Named overrides are keyed only by names stored inside the imported glTF document.
-    // Parameter injection preserves base-color/normal/ORM/emissive textures on the selected base material.
-    glTFMaterialOverrideUtils::ApplyNamedOverrides(MaterialReferences, Config.MaterialsConfig);
 
     Config.MaterialsConfig.bGeneratesMipMaps = true;
     Config.MaterialsConfig.SpecularFactor = 0.0f;
@@ -830,8 +833,10 @@ FglTFRuntimeStaticMeshConfig AglTFStreamActor::BuildStreamingStaticMeshConfig()
     Config.MaterialsConfig.ImagesConfig.bCompressMips = true;
     Config.MaterialsConfig.ImagesConfig.bStreaming = true;
     Config.MaterialsConfig.bLoadMipMaps = true;
-    Config.Outer = this;
-    Config.bAllowCPUAccess = true;
+    // UStreamAsyncAction supplies a transient world-aware outer whose lifetime covers the native
+    // request without retaining the actor or world during teardown.
+    Config.Outer = nullptr;
+    Config.bAllowCPUAccess = !bRenderOnlyStreaming;
     // Single-player and listen-server worlds need runtime lighting cards and nav collision.
     // Client render-only streaming skips them because authority/collision lives on the server.
     Config.bBuildLumenCards = true;

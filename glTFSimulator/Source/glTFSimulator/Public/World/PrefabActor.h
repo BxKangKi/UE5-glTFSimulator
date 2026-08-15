@@ -4,7 +4,6 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
-#include "Model/glTFMaterialAssetReferences.h"
 #include "World/PlacementTypes.h"
 #include "PrefabActor.generated.h"
 
@@ -35,6 +34,10 @@ struct GLTFSIMULATOR_API FPrefabActorConfig
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Prefab")
     bool bSimulatePhysics = false;
+
+    /** Optional authored rigid-body mass. A value <= 0 keeps Chaos auto-calculated mass. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Prefab", meta=(ClampMin="0.0"))
+    float MassKg = 0.0f;
 };
 
 UCLASS(BlueprintType)
@@ -81,9 +84,6 @@ protected:
     virtual void Destroyed() override;
 
 private:
-    /** glTFRuntime material assets assigned directly in the owning Blueprint/class defaults. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Prefab|Assets", meta=(AllowPrivateAccess="true"))
-    FglTFMaterialAssetReferences MaterialAssets;
 
     /** Lightweight per-entity physics/collision proxy. Rendering is owned by UInstancedEntitySubsystem. */
     UPROPERTY(VisibleAnywhere)

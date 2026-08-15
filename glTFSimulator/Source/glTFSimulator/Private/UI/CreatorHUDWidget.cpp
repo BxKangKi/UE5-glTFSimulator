@@ -80,9 +80,12 @@ void UCreatorHUDWidget::NativeConstruct()
         {
             GameUpdateTickHandle = GameUpdate->RegisterUpdate(
                 this,
-                [this](const float DeltaSeconds)
+                [WeakThis = TWeakObjectPtr<UCreatorHUDWidget>(this)](const float DeltaSeconds)
                 {
-                    UpdateFromGameUpdate(DeltaSeconds);
+                    if (UCreatorHUDWidget* StrongThis = WeakThis.Get())
+                    {
+                        StrongThis->UpdateFromGameUpdate(DeltaSeconds);
+                    }
                 },
                 60);
         }

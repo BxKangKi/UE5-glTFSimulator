@@ -4,7 +4,6 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
-#include "Model/glTFMaterialAssetReferences.h"
 #include "WeaponActor.generated.h"
 
 class UglTFRuntimeAsset;
@@ -99,9 +98,6 @@ protected:
     virtual void Destroyed() override;
 
 private:
-    /** glTFRuntime material assets assigned directly in the owning Blueprint/class defaults. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Weapon|Assets", meta=(AllowPrivateAccess="true"))
-    FglTFMaterialAssetReferences MaterialAssets;
 
     /** Mesh used by EquipDefault and as the visual fallback when an external weapon file cannot be loaded. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Weapon|Assets", meta=(AllowPrivateAccess="true"))

@@ -6,8 +6,31 @@
 #include "Engine/World.h"
 #include "Subsystems/SubsystemCollection.h"
 #include "System/GameUpdateSubSystem.h"
+#include "GameFramework/Actor.h"
 #include "GameFramework/PlayerController.h"
 #include "Kismet/GameplayStatics.h"
+
+
+namespace
+{
+    void DestroyManagedDecal(UDecalComponent* Decal)
+    {
+        if (!IsValid(Decal))
+        {
+            return;
+        }
+
+        // The decal is dynamically added to the light owner's InstanceComponents array. Clear the
+        // material first, remove the ownership entry, and only then destroy the component.
+        Decal->SetDecalMaterial(nullptr);
+        if (AActor* Owner = Decal->GetOwner(); IsValid(Owner))
+        {
+            Owner->RemoveInstanceComponent(Decal);
+        }
+        Decal->UnregisterComponent();
+        Decal->DestroyComponent();
+    }
+}
 
 void UDynamicLightSubsystem::Initialize(FSubsystemCollectionBase &Collection)
 {
@@ -16,11 +39,13 @@ void UDynamicLightSubsystem::Initialize(FSubsystemCollectionBase &Collection)
 
 void UDynamicLightSubsystem::Deinitialize()
 {
-    if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
+    UnregisterGameUpdate();
+    for (FLightOptimizationData& Data : ManagedLights)
     {
-        GameUpdate->UnregisterUpdate(GameUpdateHandle);
+        DestroyManagedDecal(Data.DecalComponent.Get());
+        Data.DecalComponent.Reset();
+        Data.TargetDecalMaterial.Reset();
     }
-    GameUpdateHandle = INDEX_NONE;
     ManagedLights.Empty();
     Super::Deinitialize();
 }
@@ -32,6 +57,8 @@ void UDynamicLightSubsystem::RegisterLight(UDynamicPointLightComponent *InLight)
         return;
     }
 
+    CompactManagedLights();
+
     // Component re-registration must not create duplicate work or duplicate fallback decals.
     if (ManagedLights.ContainsByPredicate([InLight](const FLightOptimizationData& Data)
         {
@@ -39,21 +66,6 @@ void UDynamicLightSubsystem::RegisterLight(UDynamicPointLightComponent *InLight)
         }))
     {
         return;
-    }
-
-    // Pay the per-frame update cost only while at least one managed light exists.
-    if (GameUpdateHandle == INDEX_NONE)
-    {
-        if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
-        {
-            GameUpdateHandle = GameUpdate->RegisterUpdate(
-                this,
-                [this](const float DeltaSeconds)
-                {
-                    UpdateLightsFromGameUpdate(DeltaSeconds);
-                },
-                40);
-        }
     }
 
     FLightOptimizationData NewData;
@@ -70,6 +82,7 @@ void UDynamicLightSubsystem::RegisterLight(UDynamicPointLightComponent *InLight)
     NewData.bCurrentLightVisibility = InLight->IsVisible();
 
     ManagedLights.Add(NewData);
+    RegisterGameUpdate();
 }
 
 void UDynamicLightSubsystem::UnregisterLight(UDynamicPointLightComponent *InLight)
@@ -79,28 +92,88 @@ void UDynamicLightSubsystem::UnregisterLight(UDynamicPointLightComponent *InLigh
         if (ManagedLights[i].LightComponent.Get() == InLight)
         {
             // Destroy dynamically spawned decal components, if any.
-            if (UDecalComponent *Decal = ManagedLights[i].DecalComponent.Get())
-            {
-                Decal->UnregisterComponent();
-                Decal->DestroyComponent();
-            }
-            ManagedLights.RemoveAtSwap(i);
+            DestroyManagedDecal(ManagedLights[i].DecalComponent.Get());
+            ManagedLights[i].DecalComponent.Reset();
+            ManagedLights[i].TargetDecalMaterial.Reset();
+            ManagedLights.RemoveAtSwap(i, 1, EAllowShrinking::No);
             break;
         }
     }
 
-    if (ManagedLights.IsEmpty() && GameUpdateHandle != INDEX_NONE)
+    CompactManagedLights();
+}
+
+void UDynamicLightSubsystem::RegisterGameUpdate()
+{
+    check(IsInGameThread());
+    if (GameUpdateHandle != INDEX_NONE)
     {
-        if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
+        return;
+    }
+
+    if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
+    {
+        TWeakObjectPtr<UDynamicLightSubsystem> WeakThis(this);
+        GameUpdateHandle = GameUpdate->RegisterUpdate(
+            this,
+            [WeakThis](const float DeltaSeconds)
+            {
+                if (UDynamicLightSubsystem* StrongThis = WeakThis.Get())
+                {
+                    StrongThis->UpdateLightsFromGameUpdate(DeltaSeconds);
+                }
+            },
+            40);
+    }
+}
+
+void UDynamicLightSubsystem::UnregisterGameUpdate()
+{
+    check(IsInGameThread());
+    if (GameUpdateHandle == INDEX_NONE)
+    {
+        return;
+    }
+
+    if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
+    {
+        GameUpdate->UnregisterUpdate(GameUpdateHandle);
+    }
+    GameUpdateHandle = INDEX_NONE;
+}
+
+void UDynamicLightSubsystem::CompactManagedLights()
+{
+    check(IsInGameThread());
+    int32 RemovedCount = 0;
+    for (int32 Index = ManagedLights.Num() - 1; Index >= 0; --Index)
+    {
+        if (ManagedLights[Index].LightComponent.IsValid())
         {
-            GameUpdate->UnregisterUpdate(GameUpdateHandle);
+            continue;
         }
-        GameUpdateHandle = INDEX_NONE;
+
+        DestroyManagedDecal(ManagedLights[Index].DecalComponent.Get());
+        ManagedLights[Index].DecalComponent.Reset();
+        ManagedLights[Index].TargetDecalMaterial.Reset();
+        ManagedLights.RemoveAtSwap(Index, 1, EAllowShrinking::No);
+        ++RemovedCount;
+    }
+
+    if (ManagedLights.Num() == 0)
+    {
+        ManagedLights.Empty();
+        UnregisterGameUpdate();
+    }
+    else if (RemovedCount > 0 && ManagedLights.Max() > FMath::Max(32, ManagedLights.Num() * 2))
+    {
+        ManagedLights.Shrink();
     }
 }
 
 void UDynamicLightSubsystem::UpdateLightsFromGameUpdate(float /*DeltaTime*/)
 {
+    CompactManagedLights();
     if (ManagedLights.Num() == 0)
     {
         return;

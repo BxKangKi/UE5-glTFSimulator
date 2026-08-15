@@ -163,8 +163,75 @@ bool AInstancedEntityRenderActor::RemoveMeshInstance(int32 MeshKey, int32 Instan
     (*Transforms)[InstanceIndex] = HiddenTransform;
     FreeInstanceIndices.FindOrAdd(MeshKey).Add(InstanceIndex);
     ActiveInstanceCounts.FindOrAdd(MeshKey) = FMath::Max(0, ActiveInstanceCounts.FindRef(MeshKey) - 1);
-    DirtyMeshKeys.Add(MeshKey);
+
+    if (ActiveInstanceCounts.FindRef(MeshKey) == 0)
+    {
+        // No entity can hold an index for this mesh now, so release the entire instance buffer safely.
+        ComponentPtr->Get()->ClearInstances();
+        Transforms->Empty();
+        ActiveSlots->Empty();
+        FreeInstanceIndices.FindOrAdd(MeshKey).Empty();
+        DirtyMeshKeys.Remove(MeshKey);
+    }
+    else
+    {
+        // Removing only inactive tail indices never changes any live entity binding.
+        TrimInactiveTail(MeshKey, ComponentPtr->Get());
+        DirtyMeshKeys.Add(MeshKey);
+    }
     return true;
+}
+
+void AInstancedEntityRenderActor::TrimInactiveTail(
+    int32 MeshKey,
+    UInstancedStaticMeshComponent* Component)
+{
+    if (!IsValid(Component))
+    {
+        return;
+    }
+
+    TArray<FTransform>* Transforms = CachedWorldTransforms.Find(MeshKey);
+    TArray<bool>* ActiveSlots = ActiveInstanceSlots.Find(MeshKey);
+    TArray<int32>* FreeSlots = FreeInstanceIndices.Find(MeshKey);
+    if (!Transforms || !ActiveSlots || !FreeSlots || Transforms->Num() != ActiveSlots->Num())
+    {
+        return;
+    }
+
+    while (Transforms->Num() > 0)
+    {
+        const int32 TailIndex = Transforms->Num() - 1;
+        if ((*ActiveSlots)[TailIndex])
+        {
+            break;
+        }
+
+        // Tail removal cannot swap a live instance into another index. Abort if the component and
+        // our mirrored arrays ever disagree instead of attempting to repair with unsafe remapping.
+        if (!Component->RemoveInstance(TailIndex))
+        {
+            break;
+        }
+
+        Transforms->Pop(EAllowShrinking::No);
+        ActiveSlots->Pop(EAllowShrinking::No);
+    }
+
+    const int32 NewCount = Transforms->Num();
+    FreeSlots->RemoveAllSwap(
+        [NewCount](const int32 Index)
+        {
+            return Index < 0 || Index >= NewCount;
+        },
+        EAllowShrinking::No);
+
+    if (Transforms->Max() > FMath::Max(64, NewCount * 2))
+    {
+        Transforms->Shrink();
+        ActiveSlots->Shrink();
+        FreeSlots->Shrink();
+    }
 }
 
 
@@ -217,7 +284,7 @@ void AInstancedEntityRenderActor::FlushDirtyTransforms()
             false);
     }
 
-    DirtyMeshKeys.Empty();
+    DirtyMeshKeys.Reset();
 }
 
 UStaticMesh* AInstancedEntityRenderActor::FindMesh(int32 MeshKey) const
@@ -263,6 +330,7 @@ void AInstancedEntityRenderActor::ReleaseRuntimeResources()
         }
 
         Component->ClearInstances();
+        RemoveInstanceComponent(Component);
         Component->UnregisterComponent();
         Component->DestroyComponent();
     }

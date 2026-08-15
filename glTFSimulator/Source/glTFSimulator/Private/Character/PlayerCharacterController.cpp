@@ -113,9 +113,12 @@ void APlayerCharacterController::BeginPlay()
     {
         GameUpdateTickHandle = GameUpdate->RegisterUpdate(
             this,
-            [this](const float DeltaSeconds)
+            [WeakThis = TWeakObjectPtr<APlayerCharacterController>(this)](const float DeltaSeconds)
             {
-                UpdateFromGameUpdate(DeltaSeconds);
+                if (APlayerCharacterController* StrongThis = WeakThis.Get())
+                {
+                    StrongThis->UpdateFromGameUpdate(DeltaSeconds);
+                }
             },
             1);
     }

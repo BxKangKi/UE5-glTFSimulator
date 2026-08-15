@@ -15,6 +15,7 @@
 #include "Model/glTFMaterialOverrideUtils.h"
 #include "Misc/Paths.h"
 #include "Setting/GameSettings.h"
+#include "System/GameManagerSubSystem.h"
 #include "System/GlbValidation.h"
 #include "System/glTFRuntimeSafety.h"
 #include "System/MacroLibrary.h"
@@ -341,6 +342,7 @@ void AWeaponActor::ClearLoadedComponents()
                 MeshesToRelease.Add(Mesh);
             }
             Component->SetStaticMesh(nullptr);
+            RemoveInstanceComponent(Component);
             Component->UnregisterComponent();
             Component->DestroyComponent();
         }
@@ -389,14 +391,12 @@ UStaticMesh* AWeaponActor::LoadMeshByIndex(int32 MeshIndex)
     MeshConfig.MaterialsConfig.ImagesConfig.bCompressMips = false;
     MeshConfig.MaterialsConfig.ImagesConfig.bStreaming = false;
     MeshConfig.MaterialsConfig.bLoadMipMaps = false;
-    const TMap<EglTFRuntimeMaterialType, UMaterialInterface*> MaterialOverrides =
-        glTFMaterialOverrideUtils::BuildOverrideMap(MaterialAssets);
-    if (MaterialOverrides.Num() > 0)
+    if (UGameManagerSubSystem* GameManager = UGameManagerSubSystem::GetSubSystem(this))
     {
-        MeshConfig.MaterialsConfig.UberMaterialsOverrideMap = MaterialOverrides;
-        MeshConfig.MaterialsConfig.UnlitOverrideMap = MaterialOverrides;
+        glTFMaterialOverrideUtils::ApplyOverrides(
+            GameManager->GetMaterialDefaultReferences(),
+            MeshConfig.MaterialsConfig);
     }
-    glTFMaterialOverrideUtils::ApplyNamedOverrides(MaterialAssets, MeshConfig.MaterialsConfig);
     MeshConfig.bAllowCPUAccess = false;
     MeshConfig.bBuildLumenCards = true;
     MeshConfig.bBuildSimpleCollision = false;

@@ -1,7 +1,7 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
-#include "World/WorldManager.h"
+#include "World/WorldEnvManager.h"
 
 #include "Components/DirectionalLightComponent.h"
 #include "Components/ExponentialHeightFogComponent.h"
@@ -21,7 +21,7 @@
 #include "World/SkyUpdateAsyncAction.h"
 #include "World/WorldData.h"
 
-AWorldManager::AWorldManager()
+AWorldEnvManager::AWorldEnvManager()
 {
     RootComponent = CreateDefaultSubobject<USceneComponent>(TEXT("Root"));
 
@@ -40,7 +40,7 @@ AWorldManager::AWorldManager()
 
     Moon = CreateDefaultSubobject<UDirectionalLightComponent>(TEXT("Moon"));
     Moon->SetupAttachment(RootComponent);
-    Moon->SetIntensity(0.01f);
+    Moon->SetIntensity(0.005f);
     Moon->SetUseTemperature(true);
     Moon->SetEnableLightShaftOcclusion(true);
     Moon->SetEnableLightShaftBloom(true);
@@ -81,35 +81,36 @@ AWorldManager::AWorldManager()
     SkyLight->bAffectTranslucentLighting = true;
 }
 
-void AWorldManager::BeginPlay()
+void AWorldEnvManager::BeginPlay()
 {
     Super::BeginPlay();
 
     SubSystem = UGameManagerSubSystem::GetSubSystem(this);
     ConfigureRenderingSettings();
 
-    // Placed WorldManager actors can begin rendering once GameManagerSubSystem has already loaded world data.
-    if (IsValid(SubSystem) && IsValid(SubSystem->GetWorldData()))
+    // Placed WorldEnvManager actors can begin rendering once GameManagerSubSystem has already loaded world data.
+    if (UGameManagerSubSystem* GameManager = SubSystem.Get(); IsValid(GameManager) && IsValid(GameManager->GetWorldData()))
     {
-        InitializeRendering(SubSystem->GetWorldData());
+        InitializeRendering(GameManager->GetWorldData());
     }
 }
 
-void AWorldManager::EndPlay(const EEndPlayReason::Type EndPlayReason)
+void AWorldEnvManager::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
     StopRendering();
+    SubSystem.Reset();
     Super::EndPlay(EndPlayReason);
 }
 
-void AWorldManager::InitializeRendering(UWorldData* InWorldData)
+void AWorldEnvManager::InitializeRendering(UWorldData* InWorldData)
 {
-    Data = InWorldData;
-    if (!IsValid(Data))
+    if (!IsValid(InWorldData))
     {
-        bRenderingActive = false;
+        StopRendering();
         return;
     }
 
+    Data = InWorldData;
     bRenderingActive = true;
     ConfigureRenderingSettings();
     ApplyCloudSettings();
@@ -117,75 +118,110 @@ void AWorldManager::InitializeRendering(UWorldData* InWorldData)
     UpdateSkyLighting();
 }
 
-void AWorldManager::StopRendering()
+void AWorldEnvManager::StopRendering()
 {
     bRenderingActive = false;
     UnregisterGameUpdate();
+    ReleaseDynamicRenderingResources();
     Data = nullptr;
 }
 
-void AWorldManager::ConfigureRenderingSettings()
+void AWorldEnvManager::ConfigureRenderingSettings()
 {
-    if (!IsValid(SubSystem) || !IsValid(PostProcess))
+    UGameManagerSubSystem* GameManager = SubSystem.Get();
+    if (!IsValid(GameManager))
+    {
+        GameManager = UGameManagerSubSystem::GetSubSystem(this);
+        SubSystem = GameManager;
+    }
+
+    if (!IsValid(GameManager) || !IsValid(PostProcess))
     {
         return;
     }
 
-    UGameSettings* Setting = SubSystem->GetGameSettings();
-    SubSystem->SetPostProcess(PostProcess);
+    UGameSettings* Setting = GameManager->GetGameSettings();
+    GameManager->SetPostProcess(PostProcess);
 
     if (IsValid(Setting))
     {
-        if (Setting->bHeightFog && !IsValid(Fog))
+        if (Setting->bHeightFog)
         {
-            Fog = NewObject<UExponentialHeightFogComponent>(this);
-            AddInstanceComponent(Fog);
-            Fog->SetVolumetricFog(true);
-            Fog->SetVolumetricFogScatteringDistribution(0.25f);
-            Fog->SetVolumetricFogExtinctionScale(1.2f);
-            Fog->SetupAttachment(GetRootComponent());
-            Fog->SetFogDensity(0.02f);
-            Fog->SetFogHeightFalloff(0.2f);
-            Fog->SetSecondFogDensity(0.0f);
-            Fog->RegisterComponent();
-
+            if (!IsValid(Fog))
+            {
+                Fog = NewObject<UExponentialHeightFogComponent>(this, TEXT("RuntimeHeightFog"));
+                if (IsValid(Fog))
+                {
+                    AddInstanceComponent(Fog);
+                    Fog->SetVolumetricFog(true);
+                    Fog->SetVolumetricFogScatteringDistribution(0.25f);
+                    Fog->SetVolumetricFogExtinctionScale(1.2f);
+                    Fog->SetupAttachment(GetRootComponent());
+                    Fog->SetFogDensity(0.02f);
+                    Fog->SetFogHeightFalloff(0.2f);
+                    Fog->SetSecondFogDensity(0.0f);
+                    Fog->RegisterComponent();
+                }
+            }
+        }
+        else
+        {
+            DestroyFogComponent();
         }
 
-        const bool bLevelAllowsCloud = !IsValid(Data) || Data->Cloud.bEnabled;
-        if (Setting->bCloud && bLevelAllowsCloud && !IsValid(Cloud))
+        // Do not allocate the cloud component before validated world data is available.
+        const bool bLevelAllowsCloud = IsValid(Data) && Data->Cloud.bEnabled;
+        if (Setting->bCloud && bLevelAllowsCloud)
         {
-            Cloud = NewObject<UVolumetricCloudComponent>(this);
-            AddInstanceComponent(Cloud);
-            Cloud->SetupAttachment(GetRootComponent());
-            Cloud->RegisterComponent();
+            if (!IsValid(Cloud))
+            {
+                Cloud = NewObject<UVolumetricCloudComponent>(this, TEXT("RuntimeVolumetricCloud"));
+                if (IsValid(Cloud))
+                {
+                    AddInstanceComponent(Cloud);
+                    Cloud->SetupAttachment(GetRootComponent());
+                    Cloud->RegisterComponent();
+                }
+            }
+        }
+        else
+        {
+            DestroyCloudComponent();
         }
     }
 
     ApplyCloudSettings();
-    SubSystem->UpdateSettings();
+    GameManager->UpdateSettings();
 }
 
-void AWorldManager::ApplyCloudSettings()
+void AWorldEnvManager::ApplyCloudSettings()
 {
     if (!IsValid(Data))
     {
         return;
     }
 
-    if (!Data->Cloud.bEnabled)
+    UGameSettings* Setting = nullptr;
+    if (UGameManagerSubSystem* GameManager = SubSystem.Get())
     {
-        if (IsValid(Cloud))
-        {
-            Cloud->DestroyComponent();
-            Cloud = nullptr;
-            CloudMID = nullptr;
-        }
+        Setting = GameManager->GetGameSettings();
+    }
+
+    const bool bCloudEnabled = Data->Cloud.bEnabled && (!IsValid(Setting) || Setting->bCloud);
+    if (!bCloudEnabled)
+    {
+        DestroyCloudComponent();
         return;
     }
 
     if (!IsValid(Cloud))
     {
-        Cloud = NewObject<UVolumetricCloudComponent>(this);
+        Cloud = NewObject<UVolumetricCloudComponent>(this, TEXT("RuntimeVolumetricCloud"));
+        if (!IsValid(Cloud))
+        {
+            return;
+        }
+
         AddInstanceComponent(Cloud);
         Cloud->SetupAttachment(GetRootComponent());
         Cloud->RegisterComponent();
@@ -194,14 +230,17 @@ void AWorldManager::ApplyCloudSettings()
     if (!IsValid(CloudMID))
     {
         UMaterialInterface* SourceMaterial = CloudMaterial.Get();
-        if (!SourceMaterial && IsValid(Cloud))
+        if (!IsValid(SourceMaterial))
         {
             SourceMaterial = Cloud->GetMaterial();
         }
-        if (SourceMaterial)
+        if (IsValid(SourceMaterial))
         {
             CloudMID = UMaterialInstanceDynamic::Create(SourceMaterial, this);
-            Cloud->SetMaterial(CloudMID);
+            if (IsValid(CloudMID))
+            {
+                Cloud->SetMaterial(CloudMID);
+            }
         }
     }
 
@@ -216,7 +255,42 @@ void AWorldManager::ApplyCloudSettings()
     }
 }
 
-void AWorldManager::RegisterGameUpdate()
+void AWorldEnvManager::DestroyCloudComponent()
+{
+    // Runtime-created components are stored in the actor's InstanceComponents array. Remove the
+    // ownership entry before destruction so a stopped/placed manager cannot retain a dead component
+    // or its material graph until the actor itself is collected.
+    if (IsValid(Cloud))
+    {
+        Cloud->SetMaterial(nullptr);
+        RemoveInstanceComponent(Cloud);
+        Cloud->UnregisterComponent();
+        Cloud->DestroyComponent();
+    }
+
+    Cloud = nullptr;
+    CloudMID = nullptr;
+}
+
+void AWorldEnvManager::DestroyFogComponent()
+{
+    if (IsValid(Fog))
+    {
+        RemoveInstanceComponent(Fog);
+        Fog->UnregisterComponent();
+        Fog->DestroyComponent();
+    }
+
+    Fog = nullptr;
+}
+
+void AWorldEnvManager::ReleaseDynamicRenderingResources()
+{
+    DestroyCloudComponent();
+    DestroyFogComponent();
+}
+
+void AWorldEnvManager::RegisterGameUpdate()
 {
     if (GameUpdateTickHandle != INDEX_NONE)
     {
@@ -225,18 +299,27 @@ void AWorldManager::RegisterGameUpdate()
 
     if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
     {
+        TWeakObjectPtr<AWorldEnvManager> WeakThis(this);
         GameUpdateTickHandle = GameUpdate->RegisterUpdate(
             this,
-            [this](const float DeltaSeconds)
+            [WeakThis](const float DeltaSeconds)
             {
-                UpdateFromGameUpdate(DeltaSeconds);
+                if (AWorldEnvManager* StrongThis = WeakThis.Get())
+                {
+                    StrongThis->UpdateFromGameUpdate(DeltaSeconds);
+                }
             },
             35);
     }
 }
 
-void AWorldManager::UnregisterGameUpdate()
+void AWorldEnvManager::UnregisterGameUpdate()
 {
+    if (GameUpdateTickHandle == INDEX_NONE)
+    {
+        return;
+    }
+
     if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
     {
         GameUpdate->UnregisterUpdate(GameUpdateTickHandle);
@@ -244,13 +327,13 @@ void AWorldManager::UnregisterGameUpdate()
     GameUpdateTickHandle = INDEX_NONE;
 }
 
-void AWorldManager::UpdateFromGameUpdate(float DeltaSeconds)
+void AWorldEnvManager::UpdateFromGameUpdate(float /*DeltaSeconds*/)
 {
     // Cloud settings are applied when rendering/settings change, not redundantly every frame.
     UpdateSkyLighting();
 }
 
-void AWorldManager::UpdateSkyLighting()
+void AWorldEnvManager::UpdateSkyLighting()
 {
     if (!bRenderingActive || !IsValid(Data))
     {

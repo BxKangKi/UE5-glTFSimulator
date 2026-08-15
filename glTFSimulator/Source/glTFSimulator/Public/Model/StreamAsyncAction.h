@@ -11,6 +11,7 @@
 #include "StreamAsyncAction.generated.h"
 
 class AglTFStreamActor;
+class UMaterialDefaultRuntimeCache;
 class UStaticMeshComponent;
 class UStaticMesh;
 class UInstancedStaticMeshComponent;
@@ -18,6 +19,34 @@ class UBoxComponent;
 class UShapeComponent;
 class ULightComponent;
 class AWaterActor;
+class UWorld;
+
+/**
+ * Stable async-build outer for runtime static meshes.
+ *
+ * glTFRuntime queries StaticMesh->GetWorld() while finalizing complex collision. A weak world
+ * reference is retained for completed meshes, while PinWorldForBuild() temporarily holds a strong
+ * reference for the exact lifetime of one native collision build. This prevents map teardown or GC
+ * from nulling the world halfway through Chaos cooking without making completed meshes retain it.
+ */
+UCLASS(Transient)
+class GLTFSIMULATOR_API UglTFGeneratedStaticMeshWorldContext : public UObject
+{
+    GENERATED_BODY()
+
+public:
+    void Initialize(UWorld* InWorld);
+    bool PinWorldForBuild();
+    void ReleaseWorldPin();
+    virtual UWorld* GetWorld() const override;
+
+private:
+    UPROPERTY(Transient)
+    TObjectPtr<UWorld> PinnedWorld;
+
+    UPROPERTY(Transient)
+    TWeakObjectPtr<UWorld> World;
+};
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
     FOnUpdateCompleted,
@@ -56,6 +85,14 @@ public:
 private:
     UPROPERTY()
     TObjectPtr<UObject> WorldContextObject;
+
+    /** Shared GC guard retained until all native glTFRuntime callbacks have drained. */
+    UPROPERTY(Transient)
+    TObjectPtr<UMaterialDefaultRuntimeCache> MaterialReferenceGuard;
+
+    /** World-aware outer retained for every static mesh build owned by this action. */
+    UPROPERTY(Transient)
+    TObjectPtr<UglTFGeneratedStaticMeshWorldContext> GeneratedMeshWorldContext;
     UPROPERTY()
     TMap<FName, FModelNodeData> NodeMap;
     UPROPERTY()

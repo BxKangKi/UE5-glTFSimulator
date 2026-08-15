@@ -17,6 +17,7 @@
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "Setting/GameSettings.h"
+#include "System/GameManagerSubSystem.h"
 #include "System/GlbValidation.h"
 #include "System/MacroLibrary.h"
 #include "System/MultiplayerWorldSubSystem.h"
@@ -308,6 +309,13 @@ bool APrefabActor::LoadConfigJson(const FString& JsonPath)
     RootObject->TryGetBoolField(TEXT("bEnableCollision"), Config.bEnableCollision);
     RootObject->TryGetBoolField(TEXT("SimulatePhysics"), Config.bSimulatePhysics);
     RootObject->TryGetBoolField(TEXT("bSimulatePhysics"), Config.bSimulatePhysics);
+    double LoadedMassKg = Config.MassKg;
+    if ((RootObject->TryGetNumberField(TEXT("MassKg"), LoadedMassKg)
+            || RootObject->TryGetNumberField(TEXT("PhysicsMassKg"), LoadedMassKg))
+        && FMath::IsFinite(LoadedMassKg))
+    {
+        Config.MassKg = FMath::Clamp(static_cast<float>(LoadedMassKg), 0.0f, 1000000000.0f);
+    }
     RootObject->TryGetStringField(TEXT("CollisionProfile"), Config.CollisionProfileName);
     RootObject->TryGetStringField(TEXT("CollisionProfileName"), Config.CollisionProfileName);
 
@@ -343,9 +351,21 @@ void APrefabActor::ApplyConfigToPhysicsProxy()
     Root->SetCollisionProfileName(CollisionProfileName);
     Root->SetCollisionEnabled(bEnablePhysicsCollision ? ECollisionEnabled::QueryAndPhysics : ECollisionEnabled::NoCollision);
     Root->SetGenerateOverlapEvents(bEnablePhysicsCollision);
-    if (bEnablePhysicsCollision && Config.bSimulatePhysics && !Root->IsSimulatingPhysics())
+    if (bEnablePhysicsCollision && Config.bSimulatePhysics)
     {
-        Root->SetSimulatePhysics(true);
+        if (!Root->IsSimulatingPhysics())
+        {
+            Root->SetSimulatePhysics(true);
+        }
+
+        if (Config.MassKg > 0.0f)
+        {
+            Root->SetMassOverrideInKg(NAME_None, Config.MassKg, true);
+        }
+        else
+        {
+            Root->SetMassOverrideInKg(NAME_None, 0.0f, false);
+        }
     }
 }
 
@@ -382,16 +402,12 @@ UStaticMesh* APrefabActor::LoadMeshByIndex(int32 MeshIndex)
     MeshConfig.MaterialsConfig.ImagesConfig.bCompressMips = false;
     MeshConfig.MaterialsConfig.ImagesConfig.bStreaming = false;
     MeshConfig.MaterialsConfig.bLoadMipMaps = false;
+    if (UGameManagerSubSystem* GameManager = UGameManagerSubSystem::GetSubSystem(this))
     {
-        const TMap<EglTFRuntimeMaterialType, UMaterialInterface*> LitOverrides =
-            glTFMaterialOverrideUtils::BuildOverrideMap(MaterialAssets);
-        if (LitOverrides.Num() > 0)
-        {
-            MeshConfig.MaterialsConfig.UberMaterialsOverrideMap = LitOverrides;
-            MeshConfig.MaterialsConfig.UnlitOverrideMap = LitOverrides;
-        }
+        glTFMaterialOverrideUtils::ApplyOverrides(
+            GameManager->GetMaterialDefaultReferences(),
+            MeshConfig.MaterialsConfig);
     }
-    glTFMaterialOverrideUtils::ApplyNamedOverrides(MaterialAssets, MeshConfig.MaterialsConfig);
     MeshConfig.bAllowCPUAccess = false;
     MeshConfig.bBuildLumenCards = true;
     MeshConfig.bBuildSimpleCollision = false;

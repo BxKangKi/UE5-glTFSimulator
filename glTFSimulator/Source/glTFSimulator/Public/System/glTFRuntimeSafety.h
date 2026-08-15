@@ -3,7 +3,7 @@
 
 /**
  * @file glTFRuntimeSafety.h
- * @brief Coordinates bounded parallel glTFRuntime work and safe runtime-asset cache teardown.
+ * @brief Serializes native glTFRuntime work and coordinates safe runtime-asset cache teardown.
  */
 #pragma once
 
@@ -17,9 +17,9 @@ struct FglTFRuntimeConfig;
 /**
  * Process-local safety coordinator for third-party glTF parser and mesh-build calls.
  *
- * glTFRuntime keeps mutable caches inside each parser. Operations that share one
- * UglTFRuntimeAsset therefore remain strictly serialized, while operations belonging to
- * different assets may run in parallel under a conservative global memory-pressure cap.
+ * glTFRuntime keeps mutable caches and runtime mesh-build state inside its parsers. Native
+ * operations are globally serialized: this is deliberately conservative, but it prevents the
+ * plugin's multi-file startup and LOD builders from overlapping unsafe native allocations.
  *
  * Native access violations and memory corruption cannot be recovered with C++ exceptions.
  * This coordinator instead validates external files before entry, keeps UObject work on the
@@ -35,8 +35,8 @@ public:
     /**
      * Creates an independent parser on a worker thread.
      *
-     * Parser creation is bounded but no longer globally serialized, so different GLB files can
-     * parse concurrently without allowing an unbounded peak-memory spike.
+     * Parser creation is globally serialized. Pure file validation may still run in parallel, but
+     * only one third-party parser constructor is allowed to allocate native state at a time.
      */
     static TSharedPtr<FglTFRuntimeParser> CreateParserSafely(
         const FString& FilePath,
@@ -46,8 +46,8 @@ public:
      * Enqueues one game-thread glTFRuntime operation for Asset.
      *
      * Start receives a ticket that the caller must return through CompleteOperation from every
-     * terminal success/failure/cancellation callback. The same Asset never has two active native
-     * operations, but different assets can use separate slots concurrently.
+     * terminal success/failure/cancellation callback. Only one native operation is active process-
+     * wide, including when the operations belong to different runtime assets.
      */
     static uint64 EnqueueOperation(
         UObject* Owner,
@@ -58,6 +58,14 @@ public:
 
     /** Releases an active ticket, performs any now-safe cache teardown, and pumps queued work. */
     static void CompleteOperation(uint64 Ticket);
+
+    /**
+     * Defers ticket release to the next game-thread task.
+     *
+     * glTFRuntime invokes project delegates before unregistering its internal FGCObject. Terminal
+     * plugin callbacks must use this method so ClearCache cannot run while that wrapper is unwinding.
+     */
+    static void CompleteOperationAfterCallback(uint64 Ticket);
 
     /** Removes queued work owned by Owner. Game-thread only; active native work is allowed to finish. */
     static void CancelQueuedOperations(UObject* Owner);

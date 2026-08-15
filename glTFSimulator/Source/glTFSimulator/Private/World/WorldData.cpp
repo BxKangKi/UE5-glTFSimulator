@@ -91,6 +91,8 @@ TSharedRef<FJsonObject> FLevelGameplaySettings::ToJson() const
     Json->SetStringField(TEXT("WorldGameMode"), WorldGameMode);
     Json->SetBoolField(TEXT("bCheatsEnabled"), bCheatsEnabled);
     Json->SetNumberField(TEXT("PlayerMaxHealth"), FMath::Max(1.0f, PlayerMaxHealth));
+    Json->SetNumberField(TEXT("PlayerMassKg"), FMath::Clamp(PlayerMassKg, 1.0f, 10000.0f));
+    Json->SetNumberField(TEXT("PlayerPushTractionCoefficient"), FMath::Clamp(PlayerPushTractionCoefficient, 0.0f, 2.0f));
     return Json;
 }
 
@@ -107,6 +109,23 @@ bool FLevelGameplaySettings::FromJson(const TSharedPtr<FJsonObject>& Json)
     if (Json->TryGetNumberField(TEXT("PlayerMaxHealth"), LoadedMaxHealth) && FMath::IsFinite(LoadedMaxHealth))
     {
         PlayerMaxHealth = FMath::Clamp(static_cast<float>(LoadedMaxHealth), 1.0f, 1000000000.0f);
+    }
+
+    double LoadedMassKg = PlayerMassKg;
+    const bool bHasPlayerMass = Json->TryGetNumberField(TEXT("PlayerMassKg"), LoadedMassKg)
+        || Json->TryGetNumberField(TEXT("CharacterMassKg"), LoadedMassKg)
+        || Json->TryGetNumberField(TEXT("PlayerWeightKg"), LoadedMassKg);
+    if (bHasPlayerMass && FMath::IsFinite(LoadedMassKg))
+    {
+        PlayerMassKg = FMath::Clamp(static_cast<float>(LoadedMassKg), 1.0f, 10000.0f);
+    }
+
+    double LoadedTraction = PlayerPushTractionCoefficient;
+    const bool bHasPushTraction = Json->TryGetNumberField(TEXT("PlayerPushTractionCoefficient"), LoadedTraction)
+        || Json->TryGetNumberField(TEXT("CharacterPushTractionCoefficient"), LoadedTraction);
+    if (bHasPushTraction && FMath::IsFinite(LoadedTraction))
+    {
+        PlayerPushTractionCoefficient = FMath::Clamp(static_cast<float>(LoadedTraction), 0.0f, 2.0f);
     }
     return true;
 }

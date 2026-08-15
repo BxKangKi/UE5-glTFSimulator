@@ -5,7 +5,7 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
-#include "WorldManager.generated.h"
+#include "WorldEnvManager.generated.h"
 
 class UGameManagerSubSystem;
 class UDirectionalLightComponent;
@@ -24,15 +24,15 @@ class UGameUpdateSubSystem;
  * Rendering-only world actor.
  *
  * GameManagerSubSystem owns loading, time, saving, water, and streamed model spawning.
- * WorldManager only owns sky/fog/cloud/light components and continuously reflects the current UWorldData.
+ * WorldEnvManager only owns sky/fog/cloud/light components and continuously reflects the current UWorldData.
  */
-UCLASS()
-class GLTFSIMULATOR_API AWorldManager : public AActor
+UCLASS(Blueprintable, BlueprintType)
+class GLTFSIMULATOR_API AWorldEnvManager : public AActor
 {
     GENERATED_BODY()
 
 public:
-    AWorldManager();
+    AWorldEnvManager();
 
     /** Starts sky/light rendering updates from the supplied world data object. */
     UFUNCTION(BlueprintCallable, Category="World|Rendering")
@@ -54,28 +54,31 @@ protected:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="World|Rendering")
     TObjectPtr<UMaterialInterface> CloudMaterial;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="World|Rendering")
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="World|Rendering")
     TObjectPtr<UStaticMeshComponent> Skybox;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="World|Rendering")
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="World|Rendering")
     TObjectPtr<UPostProcessComponent> PostProcess;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="World|Rendering")
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="World|Rendering")
     TObjectPtr<USkyAtmosphereComponent> SkyAtmosphere;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="World|Rendering")
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="World|Rendering")
     TObjectPtr<USkyLightComponent> SkyLight;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="World|Rendering")
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="World|Rendering")
     TObjectPtr<UDirectionalLightComponent> Sun;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="World|Rendering")
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="World|Rendering")
     TObjectPtr<UDirectionalLightComponent> Moon;
 
 private:
     /** Reads current settings and creates optional fog/cloud components. */
     void ConfigureRenderingSettings();
     void ApplyCloudSettings();
+    void DestroyCloudComponent();
+    void DestroyFogComponent();
+    void ReleaseDynamicRenderingResources();
 
     void RegisterGameUpdate();
     void UnregisterGameUpdate();
@@ -84,20 +87,21 @@ private:
     /** Calculates and applies the current sun/moon rotations without a per-frame UObject. */
     void UpdateSkyLighting();
 
-    UPROPERTY()
+    UPROPERTY(Transient)
     TObjectPtr<UWorldData> Data;
 
-    UPROPERTY()
+    UPROPERTY(Transient)
     TObjectPtr<UVolumetricCloudComponent> Cloud;
 
-    UPROPERTY()
+    UPROPERTY(Transient)
     TObjectPtr<UMaterialInstanceDynamic> CloudMID;
 
-    UPROPERTY()
+    UPROPERTY(Transient)
     TObjectPtr<UExponentialHeightFogComponent> Fog;
 
-    UPROPERTY()
-    TObjectPtr<UGameManagerSubSystem> SubSystem;
+    /** Non-owning reference: the game-instance subsystem outlives this world actor. */
+    UPROPERTY(Transient)
+    TWeakObjectPtr<UGameManagerSubSystem> SubSystem;
 
     int32 GameUpdateTickHandle = INDEX_NONE;
     bool bRenderingActive = false;

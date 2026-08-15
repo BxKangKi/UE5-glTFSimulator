@@ -2,6 +2,7 @@
 // Copyright © 2025 Epic Games, Inc. All rights reserved.
 
 #include "Model/LoadAsyncAction.h"
+#include "System/GameManagerSubSystem.h"
 
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
@@ -104,6 +105,10 @@ ULoadAsyncAction *ULoadAsyncAction::LoadAsync(
     Action->WorldContextObject = WorldContextObject;
     Action->Asset = Asset;
     Action->StaticMeshConfig = StaticMeshConfig;
+    if (UGameManagerSubSystem* GameManager = UGameManagerSubSystem::GetSubSystem(WorldContextObject))
+    {
+        Action->MaterialReferenceGuard = GameManager->AcquireMaterialDefaultReferenceGuard();
+    }
     Action->ChunkSize = FMath::Max(1, ChunkSize);
     Action->SourceFilePath = FSafeFileIO::NormalizeFilePath(InSourceFilePath);
     Action->JsonFilePath = FSafeFileIO::NormalizeFilePath(InJsonFilePath);
@@ -467,6 +472,7 @@ void ULoadAsyncAction::ReleaseActionReferences()
     Progress.Clear();
     Asset = nullptr;
     WorldContextObject = nullptr;
+    MaterialReferenceGuard = nullptr;
     Nodes.Empty();
     NodeWorkValidity.Empty();
     MeshMap.Empty();
@@ -934,7 +940,7 @@ void ULoadAsyncAction::GetStaticMesh(UStaticMesh *StaticMesh)
     bStaticMeshLoadInFlight = false;
     ON_SCOPE_EXIT
     {
-        FglTFRuntimeSafety::CompleteOperation(CompletedTicket);
+        FglTFRuntimeSafety::CompleteOperationAfterCallback(CompletedTicket);
     };
     if (bCancelled)
     {

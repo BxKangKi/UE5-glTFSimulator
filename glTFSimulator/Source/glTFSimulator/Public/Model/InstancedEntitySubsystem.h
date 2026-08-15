@@ -197,6 +197,7 @@ private:
 
     FString MakeResourceKey(const FString& SourceFilePath) const;
     void RegisterGameUpdate();
+    void UnregisterGameUpdate();
     AInstancedEntityRenderActor* GetOrCreateRenderActor(const FString& ResourceKey);
     FTransform GetRegistrationRootTransform(const FEntityRegistration& Registration) const;
     void GatherObserverLocations(TArray<FVector>& OutLocations) const;

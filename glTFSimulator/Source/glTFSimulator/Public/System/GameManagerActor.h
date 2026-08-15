@@ -10,10 +10,11 @@
 class APrefabActor;
 class AVehiclePawn;
 class AWeaponActor;
-class AWorldManager;
+class AWorldEnvManager;
 class AWeatherActor;
 class AglTFStreamActor;
 class UMaterialInterface;
+class UMaterialDefaultAsset;
 class UUserWidget;
 class UGameUpdateSubSystem;
 
@@ -30,6 +31,7 @@ public:
     AGameManagerActor();
 
 protected:
+    virtual void PostLoad() override;
     virtual void BeginPlay() override;
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
@@ -61,8 +63,17 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|Classes")
     TSubclassOf<AWeaponActor> WeaponActorClass;
 
+    /**
+     * Data-only Blueprint class containing the project-wide glTF material defaults. The game
+     * subsystem creates one transient instance on the game thread when this manager starts, then
+     * owns the resolved material references for the active world.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Game|Assets", meta=(AllowAbstract="false"))
+    TSubclassOf<UMaterialDefaultAsset> MaterialDefaultAssetClass;
+
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|World")
-    TSubclassOf<AWorldManager> WorldManagerClass;
+    TSubclassOf<AWorldEnvManager> WorldEnvManagerClass;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|World")
     TSubclassOf<AglTFStreamActor> SpawnActorClass;

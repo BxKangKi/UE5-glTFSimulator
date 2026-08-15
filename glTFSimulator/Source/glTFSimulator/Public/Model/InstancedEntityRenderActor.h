@@ -68,4 +68,5 @@ private:
         UStaticMesh* Mesh,
         int32 StartCullDistance,
         int32 EndCullDistance);
+    void TrimInactiveTail(int32 MeshKey, UInstancedStaticMeshComponent* Component);
 };
