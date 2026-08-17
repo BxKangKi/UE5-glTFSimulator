@@ -8,12 +8,15 @@
 #include "Editor/TransBuffer.h"
 #endif
 #include "System/GameManagerActor.h"
-#include "Model/EditableMeshActor.h"
+#include "System/BinaryDataStore.h"
+#include "System/ActorHelper.h"
+#include "System/SafeFileIO.h"
 #include "World/PrefabActor.h"
 #include "Vehicle/VehiclePawn.h"
 #include "Weapon/WeaponActor.h"
 #include "Model/glTFStreamActor.h"
-#include "World/WorldManager.h"
+#include "Model/MaterialDefaultAsset.h"
+#include "World/WorldEnvManager.h"
 #include "World/WeatherActor.h"
 #include "World/PlayerData.h"
 #include "ProceduralMeshComponent.h"
@@ -29,13 +32,13 @@
 #include "GameFramework/WorldSettings.h"
 #include "System/SystemInfoFunctionLibrary.h"
 #include "Components/PostProcessComponent.h"
-#include "Model/glTFSaveLibrary.h"
 #include "Model/glTFStreamSubSystem.h"
-#include "World/WorldData.h"
+#include "Model/InstancedEntitySubsystem.h"
 #include "Character/CharacterController.h"
 #include "Character/CharacterComponent.h"
 #include "Character/PlayerCharacterController.h"
 #include "System/FileFunctionLibrary.h"
+#include "System/GlbValidation.h"
 #include "Camera/CameraComponent.h"
 #include "Blueprint/UserWidget.h"
 #include "Components/PrimitiveComponent.h"
@@ -54,6 +57,7 @@
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "RenderingThread.h"
+#include "Templates/UnrealTemplate.h"
 #include "UObject/UObjectGlobals.h"
 #include "UObject/GarbageCollection.h"
 #include "Engine/GameInstance.h"
@@ -64,6 +68,145 @@ static constexpr int32 ToolbarSlotCount = 7;
 
 namespace
 {
+    constexpr int32 MaxSavedSceneReadinessAttempts = 120; // 30 seconds at 0.25 s intervals.
+    constexpr int32 MaxSavedSceneDataAttempts = 20; // Allow transient model-registration failures to settle for up to five seconds.
+    constexpr float SavedSceneLoadRetryDelaySeconds = 0.25f;
+
+    FString NormalizeFullPathForWorldData(const FString& Path)
+    {
+        FString Normalized = Path.TrimStartAndEnd();
+        if (Normalized.IsEmpty())
+        {
+            return FString();
+        }
+
+        Normalized = FPaths::ConvertRelativePathToFull(Normalized);
+        FPaths::NormalizeFilename(Normalized);
+        if (!FPaths::CollapseRelativeDirectories(Normalized))
+        {
+            return FString();
+        }
+        return Normalized;
+    }
+
+    bool IsPathInsideDirectory(const FString& CandidatePath, const FString& DirectoryPath)
+    {
+        const FString Candidate = NormalizeFullPathForWorldData(CandidatePath);
+        FString Directory = NormalizeFullPathForWorldData(DirectoryPath);
+        if (Candidate.IsEmpty() || Directory.IsEmpty())
+        {
+            return false;
+        }
+
+        while (Directory.EndsWith(TEXT("/")))
+        {
+            Directory.LeftChopInline(1, EAllowShrinking::No);
+        }
+        const FString Prefix = Directory + TEXT("/");
+        return Candidate.Equals(Directory, ESearchCase::IgnoreCase) ||
+            Candidate.StartsWith(Prefix, ESearchCase::IgnoreCase);
+    }
+
+    bool ArePlacedObjectRecordsEquivalent(
+        const TArray<FPlacedObjectRecord>& A,
+        const TArray<FPlacedObjectRecord>& B)
+    {
+        if (A.Num() != B.Num())
+        {
+            return false;
+        }
+
+        for (int32 Index = 0; Index < A.Num(); ++Index)
+        {
+            const FPlacedObjectRecord& Left = A[Index];
+            const FPlacedObjectRecord& Right = B[Index];
+            if (Left.Kind != Right.Kind
+                || !Left.ObjectName.Equals(Right.ObjectName, ESearchCase::CaseSensitive)
+                || !Left.BaseName.Equals(Right.BaseName, ESearchCase::CaseSensitive)
+                || !Left.SourceFile.Equals(Right.SourceFile, ESearchCase::CaseSensitive)
+                || !Left.Transform.Equals(Right.Transform, 0.001f))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    enum class EAuthoredAssetType : uint8
+    {
+        Auto,
+        Entity,
+        Vehicle,
+        Weapon
+    };
+
+    EAuthoredAssetType ReadAuthoredAssetType(const FString& ModelPath, bool& bOutExplicit)
+    {
+        bOutExplicit = false;
+        const FString JsonPath = FPaths::ChangeExtension(ModelPath, TEXT("json"));
+        if (!IFileManager::Get().FileExists(*JsonPath))
+        {
+            return EAuthoredAssetType::Auto;
+        }
+
+        FSafeJsonLimits Limits;
+        Limits.MaxFileBytes = 64ll * 1024ll * 1024ll;
+        Limits.MaxDepth = 32;
+        Limits.MaxValues = 100000;
+        Limits.MaxContainerEntries = 100000;
+        Limits.MaxStringCharacters = 32768;
+        Limits.MaxPrimitiveCharacters = 1024;
+        Limits.bAllowBackupRecovery = false;
+        const FSafeJsonLoadResult LoadResult = FSafeFileIO::LoadJsonBlocking(JsonPath, Limits);
+        if (!LoadResult.IsSuccess() || !LoadResult.JsonObject.IsValid())
+        {
+            UE_LOG(LogTemp, Warning,
+                TEXT("AssetType was ignored because the sibling JSON is invalid. Path=%s Reason=%s"),
+                *JsonPath,
+                *LoadResult.Error);
+            return EAuthoredAssetType::Auto;
+        }
+
+        FString Value;
+        if (!LoadResult.JsonObject->TryGetStringField(TEXT("AssetType"), Value))
+        {
+            return EAuthoredAssetType::Auto;
+        }
+
+        bOutExplicit = true;
+        Value.TrimStartAndEndInline();
+        FString Canonical = Value;
+        Canonical.ReplaceInline(TEXT(" "), TEXT(""));
+        Canonical.ReplaceInline(TEXT("_"), TEXT(""));
+        Canonical.ReplaceInline(TEXT("-"), TEXT(""));
+        if (Canonical.Equals(TEXT("Entity"), ESearchCase::IgnoreCase) ||
+            Canonical.Equals(TEXT("Prefab"), ESearchCase::IgnoreCase))
+        {
+            return EAuthoredAssetType::Entity;
+        }
+        if (Canonical.Equals(TEXT("Vehicle"), ESearchCase::IgnoreCase) ||
+            Canonical.Equals(TEXT("Car"), ESearchCase::IgnoreCase))
+        {
+            return EAuthoredAssetType::Vehicle;
+        }
+        if (Canonical.Equals(TEXT("Weapon"), ESearchCase::IgnoreCase) ||
+            Canonical.Equals(TEXT("Item"), ESearchCase::IgnoreCase))
+        {
+            return EAuthoredAssetType::Weapon;
+        }
+        if (Canonical.Equals(TEXT("Auto"), ESearchCase::IgnoreCase))
+        {
+            return EAuthoredAssetType::Auto;
+        }
+
+        UE_LOG(LogTemp, Warning,
+            TEXT("Unknown AssetType '%s'. Falling back to folder/wheel-tag classification. Path=%s"),
+            *Value,
+            *JsonPath);
+        bOutExplicit = false;
+        return EAuthoredAssetType::Auto;
+    }
+
     /**
      * Resolves the external world JSON play-mode key without letting a previous world's value leak
      * through the GameInstance subsystem. Empty/Default/SinglePlayer means use the map's directly
@@ -224,15 +367,14 @@ UGameManagerSubSystem::UGameManagerSubSystem()
     bIsGamePaused = false;
     bIsWorldLoading = false;
     bIsGamePaused = false;
-    LoadingStatus = 0;
+    LoadingStatus = 0.0f;
     TotalSumFPS = 0;
     TotalCountFPS = 0;
     PrefabActorClass = APrefabActor::StaticClass();
-    EditableMeshActorClass = AEditableMeshActor::StaticClass();
     VehiclePawnClass = AVehiclePawn::StaticClass();
     WeaponActorClass = AWeaponActor::StaticClass();
     WeatherActorClass = AWeatherActor::StaticClass();
-    WorldManagerClass = AWorldManager::StaticClass();
+    WorldEnvManagerClass = AWorldEnvManager::StaticClass();
     SpawnActorClass = AglTFStreamActor::StaticClass();
 }
 
@@ -269,6 +411,7 @@ void UGameManagerSubSystem::Deinitialize()
         PostLoadMapCleanupHandle.Reset();
     }
 
+    ReleaseMaterialDefaultAsset();
     RegisteredWorldSelectionWorld.Reset();
     WorldSelectionTravelSourceWorld.Reset();
     WorldNameBeforeMenuTravel.Reset();
@@ -276,6 +419,145 @@ void UGameManagerSubSystem::Deinitialize()
     bMenuTravelSaveCompleted = false;
 
     Super::Deinitialize();
+}
+
+const FglTFMaterialAssetReferences& UGameManagerSubSystem::GetMaterialDefaultReferences()
+{
+    if (UMaterialDefaultRuntimeCache* Guard = AcquireMaterialDefaultReferenceGuard())
+    {
+        return Guard->References;
+    }
+
+    static const FglTFMaterialAssetReferences EmptyReferences;
+    return EmptyReferences;
+}
+
+UMaterialDefaultRuntimeCache* UGameManagerSubSystem::AcquireMaterialDefaultReferenceGuard()
+{
+    // UObject loads and mutation of the shared table are game-thread-owned. Returning null
+    // off-thread prevents a data race and prevents an accidental synchronous asset load.
+    if (!ensureMsgf(IsInGameThread(), TEXT("AcquireMaterialDefaultReferenceGuard must run on the game thread")))
+    {
+        return nullptr;
+    }
+
+    if (!bMaterialDefaultAssetResolved && !bMaterialDefaultAssetResolving)
+    {
+        ResolveMaterialDefaultAsset();
+    }
+
+    return IsValid(MaterialDefaultRuntimeCache) ? MaterialDefaultRuntimeCache.Get() : nullptr;
+}
+
+bool UGameManagerSubSystem::ResolveMaterialDefaultAsset()
+{
+    if (!ensureMsgf(IsInGameThread(), TEXT("MaterialDefaultAsset must be resolved on the game thread")))
+    {
+        return false;
+    }
+
+    if (bMaterialDefaultAssetResolving)
+    {
+        return IsValid(MaterialDefaultRuntimeCache);
+    }
+    TGuardValue<bool> ResolvingGuard(bMaterialDefaultAssetResolving, true);
+
+    bMaterialDefaultAssetResolved = false;
+
+    // Never mutate an old guard: a cancelled native glTFRuntime callback may still hold it.
+    // Installing fresh objects makes world replacement atomic from the request's perspective.
+    MaterialDefaultRuntimeCache = nullptr;
+    MaterialDefaultAssetInstance = nullptr;
+
+    UMaterialDefaultAsset* ConfigInstance = nullptr;
+    FString ConfigSource;
+
+    if (UClass* ConfigClass = MaterialDefaultAssetClass.Get())
+    {
+        const bool bUsableClass =
+            ConfigClass->IsChildOf(UMaterialDefaultAsset::StaticClass()) &&
+            !ConfigClass->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists);
+        if (!bUsableClass)
+        {
+            bMaterialDefaultAssetResolved = true;
+            UE_LOG(LogTemp, Error,
+                TEXT("MaterialDefaultAssetClass is not instantiable. Runtime glTF actors will use plugin defaults. Class=%s"),
+                *GetPathNameSafe(ConfigClass));
+            return false;
+        }
+
+        // StartGameManager is entered from AGameManagerActor::BeginPlay. Creating the object here
+        // keeps UObject allocation and all subsequent soft-material loads on the game thread.
+        ConfigInstance = NewObject<UMaterialDefaultAsset>(
+            this,
+            ConfigClass,
+            NAME_None,
+            RF_Transient);
+        if (!IsValid(ConfigInstance))
+        {
+            bMaterialDefaultAssetResolved = true;
+            UE_LOG(LogTemp, Error,
+                TEXT("MaterialDefaultAssetClass instance could not be created. Runtime glTF actors will use plugin defaults. Class=%s"),
+                *GetPathNameSafe(ConfigClass));
+            return false;
+        }
+
+        // Root the instance before resolving. ResolveMaterials may synchronously load packages, and
+        // a nested game-thread call must never observe an unreferenced configuration object.
+        MaterialDefaultAssetInstance = ConfigInstance;
+        ConfigSource = ConfigClass->GetPathName();
+    }
+    else
+    {
+        bMaterialDefaultAssetResolved = true;
+        UE_LOG(LogTemp, Display,
+            TEXT("No MaterialDefaultAssetClass is configured; glTFRuntime material defaults will be used."));
+        return true;
+    }
+
+    UMaterialDefaultRuntimeCache* NewCache = NewObject<UMaterialDefaultRuntimeCache>(this);
+    if (!IsValid(NewCache))
+    {
+        MaterialDefaultAssetInstance = nullptr;
+        bMaterialDefaultAssetResolved = true;
+        UE_LOG(LogTemp, Error, TEXT("MaterialDefaultAsset runtime reference guard could not be allocated."));
+        return false;
+    }
+
+    // Assign before resolving so any re-entrant game-thread lookup sees a GC-rooted object.
+    MaterialDefaultRuntimeCache = NewCache;
+
+    TArray<FString> Failures;
+    const bool bResolveCallSucceeded = ConfigInstance->ResolveMaterials(
+        NewCache->References,
+        Failures);
+    bMaterialDefaultAssetResolved = true;
+
+    for (const FString& Failure : Failures)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("MaterialDefaultAsset reference skipped: %s"), *Failure);
+    }
+
+    UE_LOG(LogTemp, Display,
+        TEXT("MaterialDefaultAsset runtime instance resolved for the active world. Configured=%d Named=%d Failures=%d Source=%s Instance=%s"),
+        ConfigInstance->Materials.NumConfiguredReferences(),
+        NewCache->References.ByMaterialName.Num(),
+        Failures.Num(),
+        *ConfigSource,
+        *GetNameSafe(ConfigInstance));
+
+    return bResolveCallSucceeded;
+}
+
+void UGameManagerSubSystem::ReleaseMaterialDefaultAsset()
+{
+    // Drop only the subsystem's pointer. Never Reset() the cache object itself: an async action may
+    // still be holding the same guard until a native glTFRuntime callback reaches its terminal path.
+    MaterialDefaultRuntimeCache = nullptr;
+    MaterialDefaultAssetInstance = nullptr;
+    MaterialDefaultAssetClass = nullptr;
+    bMaterialDefaultAssetResolved = false;
+    bMaterialDefaultAssetResolving = false;
 }
 
 void UGameManagerSubSystem::SaveSettings()
@@ -571,11 +853,32 @@ void UGameManagerSubSystem::ApplyEditorConfig(const AGameManagerActor* InConfigA
     PlacementGridStrongRadius = InConfigActor->PlacementGridStrongRadius;
     PlacementGridFadeRadius = InConfigActor->PlacementGridFadeRadius;
     PrefabActorClass = InConfigActor->PrefabActorClass;
-    EditableMeshActorClass = InConfigActor->EditableMeshActorClass;
     VehiclePawnClass = InConfigActor->VehiclePawnClass;
     WeaponActorClass = InConfigActor->WeaponActorClass;
     WeatherActorClass = InConfigActor->WeatherActorClass;
-    WorldManagerClass = InConfigActor->WorldManagerClass;
+
+    // Use the editor-authored world environment class, with the native class as a safe fallback.
+    if (InConfigActor->WorldEnvManagerClass)
+    {
+        WorldEnvManagerClass = InConfigActor->WorldEnvManagerClass;
+    }
+    else
+    {
+        WorldEnvManagerClass = AWorldEnvManager::StaticClass();
+    }
+
+    // Player/input code may call StartGameManager repeatedly. Rebuild this immutable runtime
+    // configuration only when its effective editor-authored source changes.
+    const UClass* RequestedMaterialClass = InConfigActor->MaterialDefaultAssetClass.Get();
+    const bool bMaterialConfigurationChanged =
+        MaterialDefaultAssetClass.Get() != RequestedMaterialClass;
+    if (!bMaterialDefaultAssetResolved || bMaterialConfigurationChanged)
+    {
+        ReleaseMaterialDefaultAsset();
+        MaterialDefaultAssetClass = InConfigActor->MaterialDefaultAssetClass;
+        ResolveMaterialDefaultAsset();
+    }
+
     SpawnActorClass = InConfigActor->SpawnActorClass;
     WaterClass = InConfigActor->WaterClass;
     OceanTransform = InConfigActor->OceanTransform;
@@ -586,11 +889,7 @@ void UGameManagerSubSystem::ApplyEditorConfig(const AGameManagerActor* InConfigA
     bAllowFreeSpacePlacement = InConfigActor->bAllowFreeSpacePlacement;
     GridSize = InConfigActor->GridSize;
     SurfacePlacementOffset = InConfigActor->SurfacePlacementOffset;
-    VertexSelectionRayDistance = InConfigActor->VertexSelectionRayDistance;
-    VertexDragHoldSeconds = InConfigActor->VertexDragHoldSeconds;
-    VertexDragStartDistance = InConfigActor->VertexDragStartDistance;
     VehicleEnterDistance = InConfigActor->VehicleEnterDistance;
-    bEnableObjectVertexCreation = InConfigActor->bEnableObjectVertexCreation;
     bAutoSaveScene = InConfigActor->bAutoSaveScene;
     SceneAutoSaveIntervalSeconds = InConfigActor->SceneAutoSaveIntervalSeconds;
     bSaveSceneOnEndPlay = InConfigActor->bSaveSceneOnEndPlay;
@@ -610,21 +909,23 @@ FVector UGameManagerSubSystem::GetManagerActorLocation() const
 
 void UGameManagerSubSystem::EnsureRuntimeComponents()
 {
-    if (!ConfigActor.IsValid())
+    AGameManagerActor* OwnerActor = ConfigActor.Get();
+    if (!IsValid(OwnerActor))
     {
         return;
     }
 
-    Root = ConfigActor->GetRootComponent();
+    Root = OwnerActor->GetRootComponent();
     if (IsValid(PlacementGridComponent))
     {
         return;
     }
 
     // The grid mesh is runtime state, so it is created by the subsystem on the config actor instead of being an editor property.
-    PlacementGridComponent = NewObject<UProceduralMeshComponent>(ConfigActor.Get(), TEXT("PlacementGrid_Runtime"));
+    PlacementGridComponent = NewObject<UProceduralMeshComponent>(OwnerActor, TEXT("PlacementGrid_Runtime"));
     if (IsValid(PlacementGridComponent))
     {
+        OwnerActor->AddInstanceComponent(PlacementGridComponent);
         PlacementGridComponent->SetupAttachment(Root);
         PlacementGridComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
         PlacementGridComponent->SetGenerateOverlapEvents(false);
@@ -637,7 +938,15 @@ void UGameManagerSubSystem::EnsureRuntimeComponents()
 
 void UGameManagerSubSystem::StartGameManager(AGameManagerActor* InConfigActor)
 {
-    if (ConfigActor.IsValid() && ConfigActor.Get() != InConfigActor)
+    if (!IsValid(InConfigActor))
+    {
+        return;
+    }
+
+    // GameInstance subsystems survive level travel. If the previous actor weak pointer expired
+    // before its EndPlay callback reset the flags, bManagerStarted can still describe the old world.
+    // Force-release that stale session before accepting the destination world's manager actor.
+    if (bManagerStarted && ConfigActor.Get() != InConfigActor)
     {
         StopGameManager(EEndPlayReason::Destroyed);
     }
@@ -658,11 +967,17 @@ void UGameManagerSubSystem::StartGameManager(AGameManagerActor* InConfigActor)
         {
             CurrentWorldName = FString(WorldOption);
         }
-        else if (CurrentWorldName.IsEmpty() && IsValid(Multiplayer))
+        else if (IsValid(Multiplayer))
         {
-            // Single-player OpenLevel historically omitted the World URL option. Recover from the
-            // GameInstance subsystem so the selected folder survives MainWorld -> SingleWorld travel.
-            CurrentWorldName = Multiplayer->GetSelectedWorldFolderName();
+            // Single-player OpenLevel historically omitted the World URL option. Always prefer the
+            // current world-selection value over a name retained by this persistent subsystem from
+            // an earlier map; otherwise entities.dat can be read from the previous world's folder.
+            FString SelectedWorldName = Multiplayer->GetSelectedWorldFolderName();
+            SelectedWorldName.TrimStartAndEndInline();
+            if (!SelectedWorldName.IsEmpty())
+            {
+                CurrentWorldName = MoveTemp(SelectedWorldName);
+            }
         }
 
         CurrentWorldName.TrimStartAndEndInline();
@@ -670,6 +985,11 @@ void UGameManagerSubSystem::StartGameManager(AGameManagerActor* InConfigActor)
         {
             Multiplayer->SetSelectedWorldFolderName(CurrentWorldName);
         }
+        UE_LOG(LogTemp, Display,
+            TEXT("Resolved runtime world data root. SelectedWorld=%s Root=%s EntityDat=%s"),
+            CurrentWorldName.IsEmpty() ? TEXT("<empty>") : *CurrentWorldName,
+            *GetWorldRootPath(),
+            *GetManifestPath());
 
         if (World->GetNetMode() != NM_Standalone && World->GetNetMode() != NM_Client)
         {
@@ -722,19 +1042,33 @@ void UGameManagerSubSystem::StartGameManager(AGameManagerActor* InConfigActor)
     }
 }
 
-void UGameManagerSubSystem::StopGameManager(const EEndPlayReason::Type EndPlayReason)
+void UGameManagerSubSystem::StopGameManager(
+    const EEndPlayReason::Type EndPlayReason,
+    const AGameManagerActor* RequestingActor)
 {
+    // An old map actor can finish EndPlay after the destination map has already started its own
+    // manager. Never let that stale callback tear down the destination world's streaming session.
+    if (RequestingActor && ConfigActor.IsValid() && ConfigActor.Get() != RequestingActor)
+    {
+        UE_LOG(LogTemp, Display,
+            TEXT("[Gameplay] Ignored stale GameManagerActor EndPlay. Requester=%s Active=%s"),
+            *GetNameSafe(RequestingActor),
+            *GetNameSafe(ConfigActor.Get()));
+        return;
+    }
+
+    CancelWorldBake();
+    CompactTrackedEntityReferences();
+
     const bool bHadActiveMainWorld = bManagerStarted
         || bWorldBootstrapStarted
         || IsValid(StreamSubSystem)
-        || IsValid(WorldManagerActor)
+        || IsValid(WorldEnvManagerActor)
         || IsValid(OceanActor)
         || IsValid(LoadingWidgetInstance)
         || SpawnedPrefabs.Num() > 0
-        || SpawnedGeneratedMeshes.Num() > 0
         || SpawnedVehicles.Num() > 0
-        || IsValid(CurrentEditableActor)
-        || IsValid(PendingEmptyObjectPreviewActor)
+        || LastKnownSceneRecords.Num() > 0
         || IsValid(EquippedWeapon);
 
     if (UWorld* World = GetWorld())
@@ -747,8 +1081,8 @@ void UGameManagerSubSystem::StopGameManager(const EEndPlayReason::Type EndPlayRe
     if (bHadActiveMainWorld && bSaveSceneOnEndPlay && !bMenuTravelSaveCompleted
         && EndPlayReason != EEndPlayReason::Destroyed)
     {
-        // Saving is intentionally performed from EndPlay rather than the pause-menu OnClicked
-        // handler. This keeps Exit responsive even when the streamed glTF scene is large.
+        // Fallback for editor shutdown or travel paths that did not run the pre-travel commit.
+        // CollectSceneRecords retains the last validated snapshot if entity EndPlay ran first.
         SaveScene();
         SaveWorldData();
         SavePlayerData();
@@ -757,8 +1091,7 @@ void UGameManagerSubSystem::StopGameManager(const EEndPlayReason::Type EndPlayRe
 
     if (bMenuTravelStatePrepared)
     {
-        // The source folder must remain valid until the EndPlay save above finishes. Clear it only
-        // after level teardown has committed the gameplay state.
+        // The source folder remains valid through the pre-travel commit and teardown fallback.
         CurrentWorldName.Reset();
         if (UMultiplayerWorldSubSystem* Multiplayer = UMultiplayerWorldSubSystem::Get(this))
         {
@@ -777,11 +1110,22 @@ void UGameManagerSubSystem::PrepareForMenuLevelTravelRequest()
         return;
     }
 
-    // The button callback only records intent and unpauses travel. Saving, actor destruction,
-    // asset release, and the expensive purge all occur during level teardown/PostLoadMap.
+    // Commit while every tracked actor is still alive. EndPlay ordering is not deterministic: a
+    // prefab or vehicle can be destroyed before the manager receives its own EndPlay callback,
+    // which previously allowed an empty entity snapshot to replace a populated entities.dat.
     WorldNameBeforeMenuTravel = CurrentWorldName;
+    const bool bEntitySaveCompleted = SaveScene();
+    SaveWorldData();
+    SavePlayerData();
+
     bMenuTravelStatePrepared = true;
-    bMenuTravelSaveCompleted = false;
+    // A failed/blocked save intentionally leaves the last committed DAT untouched. Do not retry
+    // from actor teardown, where the snapshot is less trustworthy than it is at this point.
+    bMenuTravelSaveCompleted = true;
+    UE_LOG(LogTemp, Display,
+        TEXT("Pre-travel runtime save finished. World=%s EntitySave=%s"),
+        *WorldNameBeforeMenuTravel,
+        bEntitySaveCompleted ? TEXT("success") : TEXT("preserved-previous-generation"));
     RequestPostLoadRuntimeMemoryCleanup();
     SetGamePaused(false);
 }
@@ -799,21 +1143,9 @@ void UGameManagerSubSystem::PrepareForReturnToMainWorld()
     PrepareForReturnToMenuLevel();
 }
 
-void UGameManagerSubSystem::PrepareForReturnToStartWorld()
-{
-    // Backward-compatible Blueprint/C++ entry point for projects that have not refreshed renamed nodes yet.
-    PrepareForReturnToMainWorld();
-}
-
 void UGameManagerSubSystem::RequestWorldSelectionMenuOnNextMainWorld()
 {
     bOpenWorldSelectionMenuOnNextMainWorld = true;
-}
-
-void UGameManagerSubSystem::RequestWorldSelectionMenuOnNextStartWorld()
-{
-    // Backward-compatible Blueprint/C++ entry point for projects that have not refreshed renamed nodes yet.
-    RequestWorldSelectionMenuOnNextMainWorld();
 }
 
 bool UGameManagerSubSystem::ConsumeWorldSelectionMenuRequest()
@@ -831,7 +1163,7 @@ void UGameManagerSubSystem::ClearWorldSelectionMenuRequest()
 void UGameManagerSubSystem::ReleaseMainWorldRuntimeMemory(bool bForceGarbageCollection)
 {
     // GameInstance subsystems survive level travel, so every UPROPERTY reference held here can keep
-    // gameplay-world actors, generated meshes/textures, glTF assets, and async-load state reachable.
+    // gameplay-world actors, streamed glTF assets, and async-load state reachable.
     SetWorldLoading(false);
     SetGamePaused(false);
     HideLoadingWidget();
@@ -845,10 +1177,17 @@ void UGameManagerSubSystem::ReleaseMainWorldRuntimeMemory(bool bForceGarbageColl
 
     StopWorldSystems();
     DestroyTrackedRuntimeActors();
+    ReleaseMaterialDefaultAsset();
 
     ClearPlacementGridMesh();
     if (IsValid(PlacementGridComponent))
     {
+        PlacementGridComponent->SetMaterial(0, nullptr);
+        if (AActor* OwnerActor = PlacementGridComponent->GetOwner(); IsValid(OwnerActor))
+        {
+            OwnerActor->RemoveInstanceComponent(PlacementGridComponent);
+        }
+        PlacementGridComponent->UnregisterComponent();
         PlacementGridComponent->DestroyComponent();
         PlacementGridComponent = nullptr;
     }
@@ -861,10 +1200,10 @@ void UGameManagerSubSystem::ReleaseMainWorldRuntimeMemory(bool bForceGarbageColl
     bManagerStarted = false;
     bWorldBootstrapStarted = false;
     bWorldLoadCompleted = false;
-    bSpawnedWorldManager = false;
+    bSpawnedWorldEnvManager = false;
     bIsWorldLoading = false;
     bIsGamePaused = false;
-    LoadingStatus = 0;
+    LoadingStatus = 0.0f;
 
     if (bForceGarbageCollection)
     {
@@ -885,23 +1224,15 @@ void UGameManagerSubSystem::DestroyTrackedRuntimeActors()
         }
     };
 
-    DestroyActorIfValid(PendingEmptyObjectPreviewActor.Get());
-    if (CurrentEditableActor.Get() != PendingEmptyObjectPreviewActor.Get())
-    {
-        DestroyActorIfValid(CurrentEditableActor.Get());
-    }
     DestroyActorIfValid(EquippedWeapon.Get());
 
-    for (APrefabActor* Prefab : SpawnedPrefabs)
+    for (const TWeakObjectPtr<APrefabActor>& PrefabReference : SpawnedPrefabs)
     {
-        DestroyActorIfValid(Prefab);
+        DestroyActorIfValid(PrefabReference.Get());
     }
-    for (AEditableMeshActor* MeshActor : SpawnedGeneratedMeshes)
+    for (const TWeakObjectPtr<AVehiclePawn>& VehicleReference : SpawnedVehicles)
     {
-        DestroyActorIfValid(MeshActor);
-    }
-    for (AVehiclePawn* Vehicle : SpawnedVehicles)
-    {
+        AVehiclePawn* Vehicle = VehicleReference.Get();
         if (IsValid(Vehicle))
         {
             if (Vehicle->IsOccupied())
@@ -917,22 +1248,49 @@ void UGameManagerSubSystem::DestroyTrackedRuntimeActors()
         PlayerCharacter->PrepareForPawnReplacement();
     }
 
-    PendingEmptyObjectPreviewActor = nullptr;
-    CurrentEditableActor = nullptr;
     EquippedWeapon = nullptr;
-    SpawnedPrefabs.Reset();
-    SpawnedGeneratedMeshes.Reset();
-    SpawnedVehicles.Reset();
+    SpawnedPrefabs.Empty();
+    SpawnedVehicles.Empty();
+}
+
+void UGameManagerSubSystem::CompactTrackedEntityReferences()
+{
+    const int32 RemovedPrefabs = SpawnedPrefabs.RemoveAllSwap(
+        [](const TWeakObjectPtr<APrefabActor>& Reference)
+        {
+            const APrefabActor* Actor = Reference.Get();
+            return !IsValid(Actor) || Actor->IsActorBeingDestroyed();
+        },
+        EAllowShrinking::No);
+
+    const int32 RemovedVehicles = SpawnedVehicles.RemoveAllSwap(
+        [](const TWeakObjectPtr<AVehiclePawn>& Reference)
+        {
+            const AVehiclePawn* Actor = Reference.Get();
+            return !IsValid(Actor) || Actor->IsActorBeingDestroyed();
+        },
+        EAllowShrinking::No);
+
+    // Avoid reallocating during normal placement churn, but release clearly excessive slack.
+    if (RemovedPrefabs > 0 && SpawnedPrefabs.Max() > FMath::Max(32, SpawnedPrefabs.Num() * 2))
+    {
+        SpawnedPrefabs.Shrink();
+    }
+    if (RemovedVehicles > 0 && SpawnedVehicles.Max() > FMath::Max(16, SpawnedVehicles.Num() * 2))
+    {
+        SpawnedVehicles.Shrink();
+    }
 }
 
 void UGameManagerSubSystem::ResetWorldRuntimeReferences()
 {
+    ConfigActor.Reset();
     PlayerActor = nullptr;
     CurrentCamera = nullptr;
     PostProcess = nullptr;
     CurrentWorldData = nullptr;
     ActiveWorldData = nullptr;
-    WorldManagerActor = nullptr;
+    WorldEnvManagerActor = nullptr;
     OceanActor = nullptr;
     StreamSubSystem = nullptr;
     LoadingWidgetInstance = nullptr;
@@ -987,23 +1345,39 @@ void UGameManagerSubSystem::RunPostLoadRuntimeMemoryCleanup()
     {
         return;
     }
+
+    UWorld* CurrentWorld = GetWorld();
+    const bool bNewWorldEnvManagerIsActive = bManagerStarted && ConfigActor.IsValid() &&
+        ConfigActor->GetWorld() == CurrentWorld;
+    if (bNewWorldEnvManagerIsActive)
+    {
+        // PostLoadMap runs before/around BeginPlay depending on the travel path. A deferred cleanup
+        // from the previous map must never stop the streaming session just started by this world.
+        bPendingMainWorldRuntimePurge = false;
+        UE_LOG(LogTemp, Display,
+            TEXT("[Gameplay] Deferred post-load purge skipped because the destination world manager is active: %s"),
+            *GetNameSafe(CurrentWorld));
+        return;
+    }
+
     bPendingMainWorldRuntimePurge = false;
 
-    // GameInstance subsystems survive OpenLevel. After a menu/world-selection level is active, clear any last
-    // runtime references/caches that could keep gameplay glTF actors, generated assets, or render
-    // resources alive, then run a full purge with render-thread synchronization.
+    // GameInstance subsystems survive OpenLevel. Clear only stale streaming state. If another startup
+    // path already attached the subsystem to the destination world, preserving it is safer than
+    // treating a persistent subsystem as old-world state.
     UglTFStreamSubSystem* GlobalStreamSubSystem = nullptr;
     if (UGameInstance* GameInstance = GetGameInstance())
     {
         GlobalStreamSubSystem = GameInstance->GetSubsystem<UglTFStreamSubSystem>();
     }
-    if (GlobalStreamSubSystem)
+    if (GlobalStreamSubSystem && !GlobalStreamSubSystem->IsActiveForWorld(CurrentWorld))
     {
         GlobalStreamSubSystem->StopMainWorldStreaming();
     }
 
     HideLoadingWidget();
     ClearPlacementGridMesh();
+    ReleaseMaterialDefaultAsset();
     ClearTransientRuntimeReferences();
     ResetWorldRuntimeReferences();
 
@@ -1050,17 +1424,17 @@ void UGameManagerSubSystem::StopWorldSystems()
         OceanActor = nullptr;
     }
 
-    if (IsValid(WorldManagerActor))
+    if (IsValid(WorldEnvManagerActor))
     {
-        WorldManagerActor->StopRendering();
-        if (bSpawnedWorldManager)
+        WorldEnvManagerActor->StopRendering();
+        if (bSpawnedWorldEnvManager)
         {
-            WorldManagerActor->Destroy();
+            WorldEnvManagerActor->Destroy();
         }
-        WorldManagerActor = nullptr;
+        WorldEnvManagerActor = nullptr;
     }
 
-    bSpawnedWorldManager = false;
+    bSpawnedWorldEnvManager = false;
     ActivePlayerData = nullptr;
     bCurrentLevelCheatsEnabled = false;
     ActiveWorldData = nullptr;
@@ -1069,12 +1443,17 @@ void UGameManagerSubSystem::StopWorldSystems()
 
 bool UGameManagerSubSystem::AreWorldSystemsReady() const
 {
-    return !IsValid(StreamSubSystem) || StreamSubSystem->IsInitialWorldReady();
+    const bool bStreamingReady = !IsValid(StreamSubSystem) || StreamSubSystem->IsInitialWorldReady();
+    const bool bEntityRestoreResolved = bSavedSceneLoaded || bSavedSceneLoadFailed;
+    return bStreamingReady && bEntityRestoreResolved;
 }
 
 float UGameManagerSubSystem::GetWorldSystemsLoadingStatus() const
 {
-    return IsValid(StreamSubSystem) ? StreamSubSystem->GetLoadingStatus() : 1.0f;
+    // Expose the manager-composed value rather than the raw model-stream value. The latter reaches
+    // 100% before the reserved entities.dat restoration node and caused Blueprint loading bars to
+    // display completion while saved actors were still pending.
+    return bWorldLoadCompleted ? 1.0f : FMath::Clamp(LoadingStatus, 0.0f, 0.99f);
 }
 
 void UGameManagerSubSystem::InitializeWorldBootstrap()
@@ -1087,6 +1466,7 @@ void UGameManagerSubSystem::InitializeWorldBootstrap()
     // Reset its source/applied markers before reading either legacy or per-player save data.
     ResetInitialPlayerTransformState();
     bWorldBootstrapStarted = true;
+    bWorldLoadCompleted = false;
 
     SetWorldLoading(true);
     SetLoadingStatus(0.0f);
@@ -1096,11 +1476,11 @@ void UGameManagerSubSystem::InitializeWorldBootstrap()
     LoadWorldData();
     LoadPlayerData();
     ApplyLevelSettings();
-    SpawnWorldManager();
+    SpawnWorldEnvManager();
 
-    if (IsValid(WorldManagerActor))
+    if (IsValid(WorldEnvManagerActor))
     {
-        WorldManagerActor->InitializeRendering(ActiveWorldData);
+        WorldEnvManagerActor->InitializeRendering(ActiveWorldData);
     }
 
     InitializeWorldSystems(
@@ -1112,23 +1492,23 @@ void UGameManagerSubSystem::InitializeWorldBootstrap()
     LoadWorldAsync();
 }
 
-void UGameManagerSubSystem::SpawnWorldManager()
+void UGameManagerSubSystem::SpawnWorldEnvManager()
 {
     UWorld* World = GetWorld();
-    if (IsValid(WorldManagerActor) || !World)
+    if (IsValid(WorldEnvManagerActor) || !World)
     {
         return;
     }
 
-    UClass* EffectiveWorldManagerClass = WorldManagerClass ? WorldManagerClass.Get() : AWorldManager::StaticClass();
+    UClass* EffectiveWorldEnvManagerClass = WorldEnvManagerClass ? WorldEnvManagerClass.Get() : AWorldEnvManager::StaticClass();
 
-    for (TActorIterator<AWorldManager> It(World); It; ++It)
+    for (TActorIterator<AWorldEnvManager> It(World); It; ++It)
     {
-        AWorldManager* ExistingWorldManager = *It;
-        if (IsValid(ExistingWorldManager) && ExistingWorldManager->IsA(EffectiveWorldManagerClass))
+        AWorldEnvManager* ExistingWorldEnvManager = *It;
+        if (IsValid(ExistingWorldEnvManager) && ExistingWorldEnvManager->IsA(EffectiveWorldEnvManagerClass))
         {
-            WorldManagerActor = ExistingWorldManager;
-            bSpawnedWorldManager = false;
+            WorldEnvManagerActor = ExistingWorldEnvManager;
+            bSpawnedWorldEnvManager = false;
             return;
         }
     }
@@ -1136,21 +1516,31 @@ void UGameManagerSubSystem::SpawnWorldManager()
     FActorSpawnParameters Params;
     Params.Owner = ConfigActor.Get();
     Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-    WorldManagerActor = World->SpawnActor<AWorldManager>(EffectiveWorldManagerClass, FTransform::Identity, Params);
-    bSpawnedWorldManager = IsValid(WorldManagerActor);
+    WorldEnvManagerActor = World->SpawnActor<AWorldEnvManager>(EffectiveWorldEnvManagerClass, FTransform::Identity, Params);
+    bSpawnedWorldEnvManager = IsValid(WorldEnvManagerActor);
 }
 
 bool UGameManagerSubSystem::CheckWorldSystemsLoaded()
 {
+    // Reserve the final progress node for entities.dat validation and actor restoration. Without
+    // this reservation the streaming subsystem could publish 100% and hide the loading screen
+    // before saved prefabs/vehicles had actually been recreated in the destination world.
+    constexpr float EntityRestoreProgressStart = 0.96f;
+
     if (!IsValid(StreamSubSystem))
     {
-        SetLoadingStatus(1.0f);
+        SetLoadingStatus(EntityRestoreProgressStart);
         return true;
     }
 
+    // Readiness can start the selected-player load, so evaluate it before sampling progress. The
+    // streaming subsystem counts cached, calculated, duplicate, invalid, and distance-skipped model
+    // nodes. Map that complete node graph into 0..96%, leaving one truthful final restoration node.
+    const bool bSystemsReady = StreamSubSystem->IsInitialWorldReady();
     const float Percent = StreamSubSystem->GetLoadingStatus();
-    SetLoadingStatus(FMath::Clamp(Percent, 0.0f, 1.0f));
-    return StreamSubSystem->IsInitialWorldReady();
+    const bool bVisibleProgressComplete = Percent >= 1.0f - KINDA_SMALL_NUMBER;
+    SetLoadingStatus(FMath::Clamp(Percent, 0.0f, 1.0f) * EntityRestoreProgressStart);
+    return bSystemsReady && bVisibleProgressComplete;
 }
 
 void UGameManagerSubSystem::LoadWorldData()
@@ -1161,33 +1551,78 @@ void UGameManagerSubSystem::LoadWorldData()
         return;
     }
 
-    const FString Path = GetWorldFilePath(LEVEL_FILE_NAME);
-    const TSharedPtr<FJsonObject> Json = UFileFunctionLibrary::FromJson(Path);
-    const bool bLoadedWorldData = UWorldData::DeserializeData(ActiveWorldData, Json);
-    if (!bLoadedWorldData)
+    // level.json belongs to the map author. It is loaded without backup recovery and is never
+    // rewritten by runtime code. Missing/invalid files simply leave UWorldData defaults active.
+    const FString LevelJsonPath = GetWorldFilePath(LEVEL_FILE_NAME);
+    FSafeJsonLimits JsonLimits;
+    JsonLimits.MaxFileBytes = 64ll * 1024ll * 1024ll;
+    JsonLimits.bAllowBackupRecovery = false;
+    const FSafeJsonLoadResult JsonResult = FSafeFileIO::LoadJsonBlocking(LevelJsonPath, JsonLimits);
+    const TSharedPtr<FJsonObject> Json = JsonResult.IsSuccess() ? JsonResult.JsonObject : nullptr;
+    if (!UWorldData::DeserializeData(ActiveWorldData, Json))
     {
-        UE_LOG(LogTemp, Log,
-            TEXT("World file does not exist or is invalid. Deferring its initial save until PlayerStart is registered."));
+        if (JsonResult.Status != ESafeFileIOStatus::Missing)
+        {
+            UE_LOG(LogTemp, Warning,
+                TEXT("level.json could not be loaded safely; using map-setting defaults. Path=%s Error=%s"),
+                *LevelJsonPath,
+                *JsonResult.Error);
+        }
+        else
+        {
+            UE_LOG(LogTemp, Log,
+                TEXT("level.json does not exist; using map-setting defaults without creating JSON. Path=%s"),
+                *LevelJsonPath);
+        }
+    }
+
+    // Runtime state is authoritative only when the versioned/CRC-checked DAT is valid.
+    FWorldRuntimeData RuntimeData;
+    FString DatError;
+    const bool bLoadedRuntimeDat = FBinaryDataStore::LoadWorldRuntime(
+        GetWorldDatPath(),
+        RuntimeData,
+        DatError);
+    if (bLoadedRuntimeDat)
+    {
+        ActiveWorldData->WorldTime = RuntimeData.WorldTime;
+        ActiveWorldData->Player = RuntimeData.SelectedPlayer;
+    }
+    else
+    {
+        // level.json is map-author input only. Runtime time and selected-player state never migrate
+        // from JSON; missing/corrupt world.dat starts from defaults and is rewritten transactionally.
+        if (!DatError.IsEmpty())
+        {
+            UE_LOG(LogTemp, Warning,
+                TEXT("world.dat unavailable; runtime defaults will be committed to a new DAT. Path=%s Error=%s"),
+                *GetWorldDatPath(),
+                *DatError);
+        }
         bPendingInitialWorldDataSave = true;
     }
 
     FVector LegacyLocation = FVector::ZeroVector;
-    if (bLoadedWorldData && TryReadSavedLocation(Json, FString(), LegacyLocation))
+    if (Json.IsValid() && TryReadSavedLocation(Json, FString(), LegacyLocation))
     {
-        // Legacy level.json remains a migration fallback. player.json may replace this source below.
+        // Transform migration is completed by LoadPlayerData and then persisted to players.dat.
         PlayerLocation = LegacyLocation;
         ActiveWorldData->PlayerLocation = LegacyLocation;
         InitialPlayerLocationSource = EInitialPlayerLocationSource::LegacyWorldFile;
     }
     else
     {
-        // UWorldData's parser intentionally supports partial legacy files, so validate the transform
-        // independently and keep a provisional PlayerStart location instead of its default zero.
         ActiveWorldData->PlayerLocation = PlayerLocation;
-        bPendingInitialWorldDataSave = true;
     }
 
     SetWorldData(ActiveWorldData);
+
+    // world.dat does not contain player transforms, so it can be created immediately and does not
+    // need to wait for the Pawn/PlayerStart handshake.
+    if (!bLoadedRuntimeDat)
+    {
+        SaveWorldData();
+    }
 }
 
 void UGameManagerSubSystem::LoadPlayerData()
@@ -1202,30 +1637,100 @@ void UGameManagerSubSystem::LoadPlayerData()
     }
 
     ActivePlayerId = IsValid(ActiveWorldData) && !ActiveWorldData->Player.IsEmpty()
-        ? ActiveWorldData->Player
+        ? FPaths::GetCleanFilename(ActiveWorldData->Player)
         : FString(TEXT("Player"));
 
-    const FString Path = GetWorldFilePath(PLAYER_FILE_NAME);
-    const TSharedPtr<FJsonObject> Json = UFileFunctionLibrary::FromJson(Path);
-    const bool bLoadedPlayerData = UPlayerData::DeserializeData(ActivePlayerData, Json);
-    FWorldPlayerRecord& PlayerRecord = ActivePlayerData->FindOrAddPlayer(ActivePlayerId);
-    const TSharedPtr<FJsonObject> SerializedPlayer = bLoadedPlayerData
-        ? FindSerializedPlayerRecord(Json, ActivePlayerId)
-        : nullptr;
+    FString DatError;
+    bool bLoadedPlayerData = FBinaryDataStore::LoadPlayers(
+        GetPlayersDatPath(),
+        ActivePlayerData,
+        DatError);
+    bool bMigratedLegacyJson = false;
+    TSharedPtr<FJsonObject> LegacyJson;
 
-    FVector SavedPlayerLocation = FVector::ZeroVector;
-    const bool bHasValidPlayerLocation =
-        TryReadSavedLocation(SerializedPlayer, TEXT("Location"), SavedPlayerLocation);
+    if (!bLoadedPlayerData)
+    {
+        // Read old player.json/players.json once for migration. Runtime never creates or updates
+        // either file, and JSON backup recovery stays disabled because JSON is user-owned input.
+        const TArray<FString> LegacyPaths =
+        {
+            GetWorldFilePath(LEGACY_PLAYER_FILE_NAME),
+            GetWorldFilePath(LEGACY_PLAYERS_FILE_NAME)
+        };
+        FSafeJsonLimits Limits;
+        Limits.MaxFileBytes = 64ll * 1024ll * 1024ll;
+        Limits.bAllowBackupRecovery = false;
+        for (const FString& LegacyPath : LegacyPaths)
+        {
+            const FSafeJsonLoadResult LegacyResult = FSafeFileIO::LoadJsonBlocking(LegacyPath, Limits);
+            if (LegacyResult.IsSuccess() &&
+                UPlayerData::DeserializeData(ActivePlayerData, LegacyResult.JsonObject))
+            {
+                LegacyJson = LegacyResult.JsonObject;
+                bLoadedPlayerData = true;
+                bMigratedLegacyJson = true;
+                UE_LOG(LogTemp, Log,
+                    TEXT("Migrating legacy player JSON to data/players.dat. Source=%s"),
+                    *LegacyPath);
+                break;
+            }
+        }
+
+        if (!bLoadedPlayerData && !DatError.IsEmpty())
+        {
+            UE_LOG(LogTemp, Warning,
+                TEXT("players.dat unavailable; a validated default player record will be created. Path=%s Error=%s"),
+                *GetPlayersDatPath(),
+                *DatError);
+        }
+    }
+
+    const FWorldPlayerRecord* ExistingRecord = ActivePlayerData->FindPlayer(ActivePlayerId);
+    const bool bHadPersistentRecord = ExistingRecord != nullptr;
+    FWorldPlayerRecord& PlayerRecord = ActivePlayerData->FindOrAddPlayer(ActivePlayerId);
+    const float PlayerMaxHealth = IsValid(ActiveWorldData)
+        ? FMath::Max(1.0f, ActiveWorldData->Gameplay.PlayerMaxHealth)
+        : 100.0f;
+    if (!bHadPersistentRecord || !FMath::IsFinite(PlayerRecord.Health))
+    {
+        PlayerRecord.Health = PlayerMaxHealth;
+    }
+    else
+    {
+        PlayerRecord.Health = FMath::Clamp(PlayerRecord.Health, 0.0f, PlayerMaxHealth);
+    }
+
+    bool bHasValidPlayerLocation = bHadPersistentRecord && IsFiniteWorldLocation(PlayerRecord.Location);
+    bool bHasValidPlayerRotation = bHadPersistentRecord && IsFiniteRotation(PlayerRecord.Rotation);
+    if (bMigratedLegacyJson)
+    {
+        // Legacy JSON may omit individual fields and deserialize them to harmless defaults. Require
+        // the fields to have existed before treating them as an intentional saved transform.
+        const TSharedPtr<FJsonObject> SerializedPlayer =
+            FindSerializedPlayerRecord(LegacyJson, ActivePlayerId);
+        FVector LegacyLocation = FVector::ZeroVector;
+        FRotator LegacyRotation = FRotator::ZeroRotator;
+        bHasValidPlayerLocation =
+            TryReadSavedLocation(SerializedPlayer, TEXT("Location"), LegacyLocation);
+        bHasValidPlayerRotation =
+            TryReadSavedRotation(SerializedPlayer, TEXT("Rotation"), LegacyRotation);
+        if (bHasValidPlayerLocation)
+        {
+            PlayerRecord.Location = LegacyLocation;
+        }
+        if (bHasValidPlayerRotation)
+        {
+            PlayerRecord.Rotation = LegacyRotation;
+        }
+    }
+
     if (bHasValidPlayerLocation)
     {
-        PlayerLocation = SavedPlayerLocation;
-        PlayerRecord.Location = SavedPlayerLocation;
+        PlayerLocation = PlayerRecord.Location;
         InitialPlayerLocationSource = EInitialPlayerLocationSource::PlayerFile;
     }
     else
     {
-        // FindOrAddPlayer may have produced a zero-initialized record. It is not persistent state
-        // until a registered Pawn supplies its PlayerStart transform (or a valid legacy location).
         PlayerRecord.DisplayName = ActivePlayerId;
         if (InitialPlayerLocationSource == EInitialPlayerLocationSource::LegacyWorldFile)
         {
@@ -1234,12 +1739,16 @@ void UGameManagerSubSystem::LoadPlayerData()
         bPendingInitialPlayerDataSave = true;
     }
 
-    LoadedInitialPlayerRotation = FRotator::ZeroRotator;
-    bHasLoadedInitialPlayerRotation =
-        TryReadSavedRotation(SerializedPlayer, TEXT("Rotation"), LoadedInitialPlayerRotation);
+    LoadedInitialPlayerRotation = bHasValidPlayerRotation
+        ? PlayerRecord.Rotation.GetNormalized()
+        : FRotator::ZeroRotator;
+    bHasLoadedInitialPlayerRotation = bHasValidPlayerRotation;
     if (bHasValidPlayerLocation && !bHasLoadedInitialPlayerRotation)
     {
-        // Repair old/partial player records after the active Pawn contributes a valid rotation.
+        bPendingInitialPlayerDataSave = true;
+    }
+    if (bMigratedLegacyJson)
+    {
         bPendingInitialPlayerDataSave = true;
     }
 
@@ -1421,28 +1930,30 @@ void UGameManagerSubSystem::SaveWorldData()
         return;
     }
 
-    if (!IsValid(ActiveWorldData))
+    if (!IsValid(ActiveWorldData) || !FMath::IsFinite(ActiveWorldData->WorldTime))
     {
+        UE_LOG(LogTemp, Warning, TEXT("world.dat save skipped because runtime world state is invalid."));
         return;
     }
 
-    if (InitialPlayerLocationSource == EInitialPlayerLocationSource::None
-        && !bInitialPlayerTransformResolved)
-    {
-        // Never make the constructor's zero vector look like an intentional legacy save.
-        bPendingInitialWorldDataSave = true;
-        return;
-    }
-
-    if (!IsFiniteWorldLocation(PlayerLocation))
-    {
-        UE_LOG(LogTemp, Warning, TEXT("World data save skipped because PlayerLocation is invalid."));
-        return;
-    }
-
-    ActiveWorldData->PlayerLocation = PlayerLocation;
-    TSharedRef<FJsonObject> Json = UWorldData::SerializeData(ActiveWorldData);
-    UFileFunctionLibrary::ToJsonAsync(Json, GetWorldFilePath(LEVEL_FILE_NAME));
+    FWorldRuntimeData RuntimeData;
+    RuntimeData.WorldTime = ActiveWorldData->WorldTime;
+    RuntimeData.SelectedPlayer = FPaths::GetCleanFilename(ActiveWorldData->Player);
+    FBinaryDataStore::SaveWorldRuntimeAsync(
+        GetWorldDatPath(),
+        RuntimeData,
+        [](FSafeFileWriteResult Result)
+        {
+            if (!Result.IsSuccess() &&
+                Result.Status != ESafeFileIOStatus::ShuttingDown &&
+                Result.Status != ESafeFileIOStatus::Superseded)
+            {
+                UE_LOG(LogTemp, Error,
+                    TEXT("Failed to save world.dat safely. Path=%s Error=%s"),
+                    *Result.Path,
+                    *Result.Error);
+            }
+        });
     bPendingInitialWorldDataSave = false;
 }
 
@@ -1458,24 +1969,31 @@ void UGameManagerSubSystem::SavePlayerData()
         return;
     }
 
-    if (!bInitialPlayerTransformResolved
-        && (InitialPlayerLocationSource == EInitialPlayerLocationSource::None
-            || bPendingInitialPlayerDataSave))
+    if (!bInitialPlayerTransformResolved &&
+        (InitialPlayerLocationSource == EInitialPlayerLocationSource::None ||
+            bPendingInitialPlayerDataSave))
     {
-        // New/partial records need both the Pawn's PlayerStart location and its rotation. A valid
-        // legacy location alone is not enough to make the record durable before Pawn registration.
+        // A newly created record must wait until the registered Pawn supplies both a valid
+        // PlayerStart location and rotation. Existing validated DAT records can be saved directly.
         bPendingInitialPlayerDataSave = true;
         return;
     }
 
     if (!IsFiniteWorldLocation(PlayerLocation))
     {
-        UE_LOG(LogTemp, Warning, TEXT("Player data save skipped because PlayerLocation is invalid."));
+        UE_LOG(LogTemp, Warning, TEXT("players.dat save skipped because PlayerLocation is invalid."));
         return;
     }
 
     FWorldPlayerRecord& PlayerRecord = ActivePlayerData->FindOrAddPlayer(ActivePlayerId);
     PlayerRecord.Location = PlayerLocation;
+    if (IsValid(ActiveWorldData))
+    {
+        PlayerRecord.Health = FMath::Clamp(
+            FMath::IsFinite(PlayerRecord.Health) ? PlayerRecord.Health : ActiveWorldData->Gameplay.PlayerMaxHealth,
+            0.0f,
+            FMath::Max(1.0f, ActiveWorldData->Gameplay.PlayerMaxHealth));
+    }
     if (bInitialPlayerTransformResolved)
     {
         if (const AActor* Player = PlayerActor.Get())
@@ -1488,9 +2006,48 @@ void UGameManagerSubSystem::SavePlayerData()
         }
     }
 
-    const TSharedRef<FJsonObject> Json = UPlayerData::SerializeData(ActivePlayerData);
-    UFileFunctionLibrary::ToJsonAsync(Json, GetWorldFilePath(PLAYER_FILE_NAME));
+    FBinaryDataStore::SavePlayersAsync(
+        GetPlayersDatPath(),
+        ActivePlayerData,
+        [](FSafeFileWriteResult Result)
+        {
+            if (!Result.IsSuccess() &&
+                Result.Status != ESafeFileIOStatus::ShuttingDown &&
+                Result.Status != ESafeFileIOStatus::Superseded)
+            {
+                UE_LOG(LogTemp, Error,
+                    TEXT("Failed to save players.dat safely. Path=%s Error=%s"),
+                    *Result.Path,
+                    *Result.Error);
+            }
+        });
     bPendingInitialPlayerDataSave = false;
+}
+
+void UGameManagerSubSystem::SetSelectedPlayerForRuntime(const FString& PlayerFileName)
+{
+    if (!IsValid(ActiveWorldData))
+    {
+        return;
+    }
+
+    FString SafeName = FPaths::GetCleanFilename(PlayerFileName);
+    SafeName.TrimStartAndEndInline();
+    if (SafeName.Contains(TEXT("..")) || SafeName.Contains(TEXT("/")) || SafeName.Contains(TEXT("\\")))
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("Rejected unsafe selected-player name: %s"),
+            *PlayerFileName);
+        return;
+    }
+
+    ActiveWorldData->Player = SafeName;
+    ActivePlayerId = SafeName.IsEmpty() ? FString(TEXT("Player")) : SafeName;
+    if (IsValid(ActivePlayerData))
+    {
+        ActivePlayerData->FindOrAddPlayer(ActivePlayerId);
+    }
+    SaveWorldData();
 }
 
 void UGameManagerSubSystem::ValidateResolvedGameMode() const
@@ -1708,6 +2265,27 @@ void UGameManagerSubSystem::LoadWorldAsync()
 
     if (CheckWorldSystemsLoaded())
     {
+        // Re-run the idempotent DAT restore at the exact point where world streaming is ready.
+        // The earlier next-tick attempt can legitimately occur before the persistent GameInstance
+        // streaming subsystem has attached itself to this destination UWorld.
+        if (!bSavedSceneLoaded && !bSavedSceneLoadInProgress && !bSavedSceneLoadFailed)
+        {
+            LoadSavedScene();
+        }
+
+        // entities.dat is a real loading node, not a post-load side effect. Wait while validation or
+        // a bounded retry is pending. A terminal/partial failure is allowed to enter the world, but
+        // SaveScene remains locked so the unread generation cannot be overwritten by an empty one.
+        if (!bSavedSceneLoaded && !bSavedSceneLoadFailed)
+        {
+            SetLoadingStatus(0.96f);
+            if (UWorld* World = GetWorld())
+            {
+                World->GetTimerManager().SetTimerForNextTick(this, &UGameManagerSubSystem::LoadWorldAsync);
+            }
+            return;
+        }
+
         bWorldLoadCompleted = true;
         SetLoadingStatus(1.0f);
         HideLoadingWidget();
@@ -1751,8 +2329,8 @@ void UGameManagerSubSystem::UpdateWorldTime(float DeltaSeconds)
 
     ActiveWorldData->WorldTime += DeltaSeconds * ActiveWorldData->TimeSpeed;
 
-    // Player transforms live in player.json. Keep the legacy level.json location mirrored only
-    // for backward compatibility with older worlds that have not generated player.json yet.
+    // Player transforms live only in data/players.dat. Keep the in-memory mirrors current so the
+    // next periodic binary save has an immutable validated snapshot.
     const FVector CurrentLocation = GetPlayerLocation();
     ActiveWorldData->PlayerLocation = CurrentLocation;
     if (IsValid(ActivePlayerData))
@@ -1864,20 +2442,8 @@ void UGameManagerSubSystem::UpdateGameManager(float DeltaSeconds)
 {
     UpdateWorldTime(DeltaSeconds);
 
-    if (PlayMode != EPlayMode::Creator)
+    if (PlayMode != EPlayMode::Creator || CurrentMode == EToolMode::None)
     {
-        DestroyPendingEmptyObjectPreview();
-        ClearPlacementGridMesh();
-        return;
-    }
-
-    const bool bNeedsPlacementTick = CurrentMode != EToolMode::None
-        || IsValid(CurrentEditableActor)
-        || bPrimaryVertexPressActive
-        || IsSelectedToolbarItemObjectCreation();
-    if (!bNeedsPlacementTick)
-    {
-        DestroyPendingEmptyObjectPreview();
         ClearPlacementGridMesh();
         return;
     }
@@ -1886,19 +2452,18 @@ void UGameManagerSubSystem::UpdateGameManager(float DeltaSeconds)
     FVector Preview;
     if (TracePlacementLocation(Preview, Hit))
     {
-        LastPreviewLocation = ApplyGridSnap(Preview);
+        LastPreviewLocation = CurrentMode == EToolMode::PlaceVehicle
+            ? Preview
+            : ApplyGridSnap(Preview);
     }
 
-    UpdateObjectCreationPreview();
-    UpdateEditableVertexPreviewAndSelection();
     UpdatePlacementGrid();
 }
 
 void UGameManagerSubSystem::ClearTransientRuntimeReferences()
 {
     // GameInstanceSubsystems persist across level travel. Drop every strong reference to
-    // MainWorld actors, components, generated assets, UI, and world data so GC can reclaim them
-    // after the old UWorld is unloaded.
+    // gameplay actors, components, streamed assets, UI, and world data so GC can reclaim them.
     PlayerActor = nullptr;
     CurrentCamera = nullptr;
     PostProcess = nullptr;
@@ -1907,22 +2472,34 @@ void UGameManagerSubSystem::ClearTransientRuntimeReferences()
     LoadingWidgetInstance = nullptr;
     StreamSubSystem = nullptr;
     OceanActor = nullptr;
-    WorldManagerActor = nullptr;
+    WorldEnvManagerActor = nullptr;
     Root = nullptr;
     PlacementGridComponent = nullptr;
+    PlacementGridMaterial = nullptr;
 
-    CurrentEditableActor = nullptr;
-    PendingEmptyObjectPreviewActor = nullptr;
+    // These class references may point at Blueprint packages with large dependency graphs. Revert to
+    // lightweight native defaults (or null for optional systems) once the world session is gone.
+    PrefabActorClass = APrefabActor::StaticClass();
+    VehiclePawnClass = AVehiclePawn::StaticClass();
+    WeaponActorClass = AWeaponActor::StaticClass();
+    WeatherActorClass = AWeatherActor::StaticClass();
+    WorldEnvManagerClass = AWorldEnvManager::StaticClass();
+    SpawnActorClass = AglTFStreamActor::StaticClass();
+    WaterClass = nullptr;
+    LoadingWidgetClass = nullptr;
+    OceanTransform = FTransform::Identity;
+
     EquippedWeapon = nullptr;
-    SpawnedPrefabs.Reset();
-    SpawnedGeneratedMeshes.Reset();
-    SpawnedVehicles.Reset();
+    SpawnedPrefabs.Empty();
+    SpawnedVehicles.Empty();
 
-    PrefabFiles.Reset();
-    VehicleFiles.Reset();
-    WeaponFiles.Reset();
-    AvailableItems.Reset();
-    ToolbarSlots.Reset();
+    // This method is used only at world/session teardown. Empty releases the allocator capacity
+    // retained by large worlds instead of carrying it into menus and subsequent level loads.
+    PrefabFiles.Empty();
+    VehicleFiles.Empty();
+    WeaponFiles.Empty();
+    AvailableItems.Empty();
+    ToolbarSlots.Empty();
     bToolbarInitialized = false;
 
     // Keep CurrentWorldName across ordinary level travel. A confirmed menu return clears it only
@@ -1937,33 +2514,29 @@ void UGameManagerSubSystem::ClearTransientRuntimeReferences()
     bItemListWindowOpen = false;
 
     LastPreviewLocation = FVector::ZeroVector;
-    PendingEmptyObjectLocation = FVector::ZeroVector;
-    PendingVertexLocation = FVector::ZeroVector;
-    bHasPendingEmptyObjectLocation = false;
-    bHasPendingVertexLocation = false;
-    LastVertexDistance = 0.0f;
-
     LastTraceHit = FHitResult();
     bLastTraceBlockingHit = false;
     bLastTraceHasPlacementLocation = false;
     bLastTraceUsedFreeSpace = false;
     LastTraceStart = FVector::ZeroVector;
     LastTraceDirection = FVector::ForwardVector;
-    LastSaveMessage.Reset();
+    LastSaveMessage.Empty();
     bSavedSceneLoaded = false;
+    bSavedSceneLoadInProgress = false;
+    bSavedSceneLoadFailed = false;
+    SavedSceneReadinessAttemptCount = 0;
+    SavedSceneDataAttemptCount = 0;
+    LastKnownSceneRecords.Empty();
     bIsSavingScene = false;
+    PendingWorldBakeModels.Empty();
+    ActiveWorldBakeActor = nullptr;
+    bWorldBakeInProgress = false;
+    bWorldBakeStateFilesSaved = false;
+    WorldBakeTotalModels = 0;
+    WorldBakeCompletedModels = 0;
+    WorldBakeFailedModels = 0;
+    WorldBakeNextModelIndex = 0;
 
-    HighlightedEditableVertexIndex = INDEX_NONE;
-    bMovingHighlightedEditableVertex = false;
-    bPrimaryVertexPressActive = false;
-    bPrimaryVertexDragActive = false;
-    PressedEditableVertexIndex = INDEX_NONE;
-    ConnectedEditableVertexSourceIndex = INDEX_NONE;
-    PrimaryVertexPressStartTime = 0.0;
-    PrimaryVertexPressStartLocation = FVector::ZeroVector;
-    bCurrentEditableActorWasExisting = false;
-    bHasOriginalEditableMeshRecord = false;
-    OriginalEditableMeshRecord = FGeneratedMeshRecord();
     CachedPlacementGridCenter = FVector::ZeroVector;
     CachedPlacementGridRadius = 0.0f;
     bPlacementGridBuilt = false;
@@ -1973,7 +2546,7 @@ void UGameManagerSubSystem::EnsureAssetFolders() const
 {
     IFileManager::Get().MakeDirectory(*GetPrefabDirectory(), true);
     IFileManager::Get().MakeDirectory(*GetItemsDirectory(), true);
-    IFileManager::Get().MakeDirectory(*FPaths::Combine(GetWorldRootPath(), TEXT("generated")), true);
+    IFileManager::Get().MakeDirectory(*GetDataDirectory(), true);
 }
 
 FString UGameManagerSubSystem::GetWorldRootPath() const
@@ -1989,22 +2562,249 @@ FString UGameManagerSubSystem::GetPrefabDirectory() const
 
 FString UGameManagerSubSystem::GetItemsDirectory() const
 {
-    return FPaths::Combine(GetWorldRootPath(), TEXT("items"));
+    return FPaths::Combine(GetWorldRootPath(), TEXT("item"));
+}
+
+FString UGameManagerSubSystem::GetDataDirectory() const
+{
+    return FPaths::Combine(GetWorldRootPath(), TEXT("data"));
+}
+
+FString UGameManagerSubSystem::GetPlayersDatPath() const
+{
+    return FPaths::Combine(GetDataDirectory(), TEXT("players.dat"));
+}
+
+FString UGameManagerSubSystem::GetWorldDatPath() const
+{
+    return FPaths::Combine(GetDataDirectory(), TEXT("world.dat"));
 }
 
 FString UGameManagerSubSystem::GetManifestPath() const
 {
-    return FPaths::Combine(GetWorldRootPath(), TEXT("entities.json"));
+    return FPaths::Combine(GetDataDirectory(), TEXT("entities.dat"));
 }
 
-FString UGameManagerSubSystem::GetLegacyManifestPath() const
+FString UGameManagerSubSystem::MakePlacementSourcePathForSave(const FString& SourcePath) const
 {
-    return FPaths::Combine(GetWorldRootPath(), TEXT("runtime_installed.json"));
+    const FString NormalizedSource = NormalizeFullPathForWorldData(SourcePath);
+    const FString NormalizedWorldRoot = NormalizeFullPathForWorldData(GetWorldRootPath());
+    if (NormalizedSource.IsEmpty() || NormalizedWorldRoot.IsEmpty() ||
+        !IsPathInsideDirectory(NormalizedSource, NormalizedWorldRoot))
+    {
+        // External assets remain absolute so an explicitly configured shared asset can still load.
+        return NormalizedSource;
+    }
+
+    FString Relative = NormalizedSource;
+    FString RelativeBase = NormalizedWorldRoot;
+    if (!RelativeBase.EndsWith(TEXT("/")))
+    {
+        RelativeBase += TEXT("/");
+    }
+    if (!FPaths::MakePathRelativeTo(Relative, *RelativeBase))
+    {
+        return NormalizedSource;
+    }
+
+    FPaths::NormalizeFilename(Relative);
+    FPaths::CollapseRelativeDirectories(Relative);
+    if (Relative.IsEmpty() || Relative == TEXT("..") || Relative.StartsWith(TEXT("../")))
+    {
+        return NormalizedSource;
+    }
+    return Relative;
 }
 
-FString UGameManagerSubSystem::GetLegacyGltfScenePath() const
+FString UGameManagerSubSystem::ResolvePlacementSourcePath(
+    const FString& SavedPath,
+    const EPlacedObjectKind Kind) const
 {
-    return FPaths::Combine(GetWorldRootPath(), TEXT("runtime_installed.gltf"));
+    FString Trimmed = SavedPath.TrimStartAndEnd();
+    FPaths::NormalizeFilename(Trimmed);
+    if (Trimmed.IsEmpty())
+    {
+        return FString();
+    }
+
+    IFileManager& FileManager = IFileManager::Get();
+    const FString WorldRoot = NormalizeFullPathForWorldData(GetWorldRootPath());
+
+    // New records are stored relative to the selected world root. Reject traversal before testing.
+    if (FPaths::IsRelative(Trimmed))
+    {
+        const FString Candidate = NormalizeFullPathForWorldData(FPaths::Combine(WorldRoot, Trimmed));
+        if (IsPathInsideDirectory(Candidate, WorldRoot) && FileManager.FileExists(*Candidate))
+        {
+            return Candidate;
+        }
+    }
+    else
+    {
+        const FString ExistingAbsolute = NormalizeFullPathForWorldData(Trimmed);
+        if (!ExistingAbsolute.IsEmpty() && FileManager.FileExists(*ExistingAbsolute))
+        {
+            return ExistingAbsolute;
+        }
+    }
+
+    // Repair records written by older builds that embedded an absolute path to a different
+    // installation/world root. Only recognized asset-directory suffixes are carried forward.
+    FString Canonical = Trimmed;
+    Canonical.ReplaceInline(TEXT("\\"), TEXT("/"));
+    const TArray<FString> Markers =
+    {
+        TEXT("/prefab/"),
+        TEXT("/item/"),
+        TEXT("/items/"),
+        TEXT("/model/")
+    };
+    for (const FString& Marker : Markers)
+    {
+        const int32 MarkerIndex = Canonical.Find(Marker, ESearchCase::IgnoreCase, ESearchDir::FromEnd);
+        if (MarkerIndex == INDEX_NONE)
+        {
+            continue;
+        }
+
+        FString RelativeSuffix = Canonical.Mid(MarkerIndex + 1);
+        if (RelativeSuffix.StartsWith(TEXT("items/"), ESearchCase::IgnoreCase))
+        {
+            RelativeSuffix = TEXT("item/") + RelativeSuffix.Mid(6);
+        }
+        const FString Candidate = NormalizeFullPathForWorldData(FPaths::Combine(WorldRoot, RelativeSuffix));
+        if (IsPathInsideDirectory(Candidate, WorldRoot) && FileManager.FileExists(*Candidate))
+        {
+            UE_LOG(LogTemp, Log,
+                TEXT("Repaired saved %s source path for the current world. Saved=%s Resolved=%s"),
+                Kind == EPlacedObjectKind::Vehicle ? TEXT("vehicle") : TEXT("prefab"),
+                *SavedPath,
+                *Candidate);
+            return Candidate;
+        }
+    }
+
+    // Last-resort relocation support: when an author moved an asset within the selected world,
+    // search by the exact filename. Accept only one match so an ambiguous deployment can never
+    // silently spawn the wrong prefab or vehicle.
+    const FString CleanFileName = FPaths::GetCleanFilename(Trimmed);
+    if (!CleanFileName.IsEmpty())
+    {
+        const TArray<FString> SearchRoots =
+        {
+            GetPrefabDirectory(),
+            FPaths::Combine(WorldRoot, TEXT("model")),
+            GetItemsDirectory()
+        };
+        TArray<FString> UniqueMatches;
+        for (const FString& SearchRoot : SearchRoots)
+        {
+            if (!FileManager.DirectoryExists(*SearchRoot))
+            {
+                continue;
+            }
+
+            TArray<FString> Matches;
+            FileManager.FindFilesRecursive(Matches, *SearchRoot, *CleanFileName, true, false, false);
+            for (const FString& Match : Matches)
+            {
+                const FString NormalizedMatch = NormalizeFullPathForWorldData(Match);
+                if (!IsPathInsideDirectory(NormalizedMatch, WorldRoot))
+                {
+                    continue;
+                }
+                const bool bAlreadyAdded = UniqueMatches.ContainsByPredicate([&NormalizedMatch](const FString& Existing)
+                {
+                    return Existing.Equals(NormalizedMatch, ESearchCase::IgnoreCase);
+                });
+                if (!bAlreadyAdded)
+                {
+                    UniqueMatches.Add(NormalizedMatch);
+                }
+            }
+        }
+
+        if (UniqueMatches.Num() == 1)
+        {
+            UE_LOG(LogTemp, Warning,
+                TEXT("Recovered relocated saved %s by unique filename. Saved=%s Resolved=%s"),
+                Kind == EPlacedObjectKind::Vehicle ? TEXT("vehicle") : TEXT("prefab"),
+                *SavedPath,
+                *UniqueMatches[0]);
+            return UniqueMatches[0];
+        }
+        if (UniqueMatches.Num() > 1)
+        {
+            UE_LOG(LogTemp, Error,
+                TEXT("Saved entity source filename is ambiguous in the selected world. Saved=%s Matches=%d"),
+                *SavedPath,
+                UniqueMatches.Num());
+        }
+    }
+
+    return FString();
+}
+
+void UGameManagerSubSystem::ScheduleSavedSceneLoadRetry(
+    const FString& Reason,
+    const bool bWaitingForWorldReadiness)
+{
+    bSavedSceneLoadInProgress = false;
+    if (bSavedSceneLoaded)
+    {
+        return;
+    }
+
+    const int32 AttemptCount = bWaitingForWorldReadiness
+        ? SavedSceneReadinessAttemptCount
+        : SavedSceneDataAttemptCount;
+    const int32 MaximumAttempts = bWaitingForWorldReadiness
+        ? MaxSavedSceneReadinessAttempts
+        : MaxSavedSceneDataAttempts;
+
+    if (AttemptCount >= MaximumAttempts)
+    {
+        // Never pretend that restoration completed. In particular, this keeps SaveScene() from
+        // replacing an unreadable/non-applied entities.dat with an empty scene during autosave or EndPlay.
+        bSavedSceneLoadFailed = true;
+        UE_LOG(LogTemp, Error,
+            TEXT("Entity DAT restore failed after %d attempts. World=%s Phase=%s Reason=%s"),
+            AttemptCount,
+            *GetWorldRootPath(),
+            bWaitingForWorldReadiness ? TEXT("world-readiness") : TEXT("DAT-validation/apply"),
+            *Reason);
+        return;
+    }
+
+    UWorld* World = GetWorld();
+    if (!World)
+    {
+        bSavedSceneLoadFailed = true;
+        UE_LOG(LogTemp, Error,
+            TEXT("Entity DAT load could not be retried because the world is unavailable: %s"),
+            *Reason);
+        return;
+    }
+
+    World->GetTimerManager().ClearTimer(SavedSceneLoadRetryTimerHandle);
+    TWeakObjectPtr<UGameManagerSubSystem> WeakThis(this);
+    World->GetTimerManager().SetTimer(
+        SavedSceneLoadRetryTimerHandle,
+        FTimerDelegate::CreateLambda([WeakThis]()
+        {
+            if (WeakThis.IsValid())
+            {
+                WeakThis->LoadSavedScene();
+            }
+        }),
+        SavedSceneLoadRetryDelaySeconds,
+        false);
+    UE_LOG(LogTemp, Warning,
+        TEXT("Entity DAT load will retry. Phase=%s Attempt=%d/%d Reason=%s"),
+        bWaitingForWorldReadiness ? TEXT("world-readiness") : TEXT("DAT-validation/apply"),
+        AttemptCount,
+        MaximumAttempts,
+        *Reason);
 }
 
 void UGameManagerSubSystem::ScanAssetFolders()
@@ -2023,8 +2823,8 @@ void UGameManagerSubSystem::ScanAssetFolders()
 
     TArray<FString> ItemDirectories;
     ItemDirectories.Add(GetItemsDirectory());
-    ItemDirectories.Add(FPaths::Combine(FPaths::ProjectDir(), TEXT("World"), TEXT("items")));
-    ItemDirectories.Add(FPaths::Combine(FPaths::ProjectDir(), TEXT("World"), WorldName, TEXT("items")));
+    ItemDirectories.Add(FPaths::Combine(FPaths::ProjectDir(), TEXT("World"), TEXT("item")));
+    ItemDirectories.Add(FPaths::Combine(FPaths::ProjectDir(), TEXT("World"), WorldName, TEXT("item")));
 
     auto AppendGltfFiles = [&FileManager](const TArray<FString>& Directories, TArray<FString>& OutFiles)
     {
@@ -2047,18 +2847,47 @@ void UGameManagerSubSystem::ScanAssetFolders()
         }
     };
 
-    AppendGltfFiles(PrefabDirectories, PrefabFiles);
-    AppendGltfFiles(ItemDirectories, WeaponFiles);
+    TArray<FString> PrefabCandidates;
+    TArray<FString> ItemCandidates;
+    AppendGltfFiles(PrefabDirectories, PrefabCandidates);
+    AppendGltfFiles(ItemDirectories, ItemCandidates);
 
-    // A glTF/GLB prefab that contains a mesh/node name ending with ;WHEL is a driveable vehicle asset.
-    // Keep it out of the normal prefab list so the Vehicle placement path can load it into AVehiclePawn.
-    for (int32 Index = PrefabFiles.Num() - 1; Index >= 0; --Index)
+    auto ClassifyAsset = [this](const FString& ModelPath, const bool bItemFolderFallback)
     {
-        if (DoesAssetFileContainWheelTag(PrefabFiles[Index]))
+        bool bExplicitType = false;
+        EAuthoredAssetType AssetType = ReadAuthoredAssetType(ModelPath, bExplicitType);
+        if (!bExplicitType || AssetType == EAuthoredAssetType::Auto)
         {
-            VehicleFiles.AddUnique(PrefabFiles[Index]);
-            PrefabFiles.RemoveAt(Index);
+            AssetType = bItemFolderFallback
+                ? EAuthoredAssetType::Weapon
+                : (DoesAssetFileContainWheelTag(ModelPath)
+                    ? EAuthoredAssetType::Vehicle
+                    : EAuthoredAssetType::Entity);
         }
+
+        switch (AssetType)
+        {
+        case EAuthoredAssetType::Vehicle:
+            VehicleFiles.AddUnique(ModelPath);
+            break;
+        case EAuthoredAssetType::Weapon:
+            WeaponFiles.AddUnique(ModelPath);
+            break;
+        case EAuthoredAssetType::Entity:
+        case EAuthoredAssetType::Auto:
+        default:
+            PrefabFiles.AddUnique(ModelPath);
+            break;
+        }
+    };
+
+    for (const FString& ModelPath : PrefabCandidates)
+    {
+        ClassifyAsset(ModelPath, false);
+    }
+    for (const FString& ModelPath : ItemCandidates)
+    {
+        ClassifyAsset(ModelPath, true);
     }
 
     PrefabFiles.Sort();
@@ -2156,26 +2985,31 @@ void UGameManagerSubSystem::BuildAvailableItems()
 
     if (PlayMode == EPlayMode::Creator)
     {
-        if (bEnableObjectVertexCreation)
-        {
-            AvailableItems.Add(MakeToolbarItem(EToolbarItemKind::CreateObject, TEXT("오브젝트 만들기")));
-        }
-
-        AvailableItems.Add(MakeToolbarItem(EToolbarItemKind::Vehicle, TEXT("기본 차량 만들기")));
-
         for (int32 Index = 0; Index < VehicleFiles.Num(); ++Index)
         {
-            AvailableItems.Add(MakeToolbarItem(EToolbarItemKind::Vehicle, GetAssetDisplayName(VehicleFiles[Index]), VehicleFiles[Index], Index));
+            AvailableItems.Add(MakeToolbarItem(
+                EToolbarItemKind::Vehicle,
+                GetAssetDisplayName(VehicleFiles[Index]),
+                VehicleFiles[Index],
+                Index));
         }
 
         for (int32 Index = 0; Index < PrefabFiles.Num(); ++Index)
         {
-            AvailableItems.Add(MakeToolbarItem(EToolbarItemKind::Prefab, GetAssetDisplayName(PrefabFiles[Index]), PrefabFiles[Index], Index));
+            AvailableItems.Add(MakeToolbarItem(
+                EToolbarItemKind::Prefab,
+                GetAssetDisplayName(PrefabFiles[Index]),
+                PrefabFiles[Index],
+                Index));
         }
 
         for (int32 Index = 0; Index < WeaponFiles.Num(); ++Index)
         {
-            AvailableItems.Add(MakeToolbarItem(EToolbarItemKind::Weapon, GetAssetDisplayName(WeaponFiles[Index]), WeaponFiles[Index], Index));
+            AvailableItems.Add(MakeToolbarItem(
+                EToolbarItemKind::Weapon,
+                GetAssetDisplayName(WeaponFiles[Index]),
+                WeaponFiles[Index],
+                Index));
         }
     }
 
@@ -2215,25 +3049,8 @@ int32 UGameManagerSubSystem::FindAvailableItemIndexMatching(const FToolbarItem& 
             continue;
         }
 
-        if (Item.Kind == EToolbarItemKind::CreateObject)
-        {
-            return Index;
-        }
-
-        if (Item.Kind == EToolbarItemKind::Vehicle)
-        {
-            if (Item.SourcePath.IsEmpty() && Candidate.SourcePath.IsEmpty())
-            {
-                return Index;
-            }
-            if (!Item.SourcePath.IsEmpty() && Candidate.SourcePath.Equals(Item.SourcePath, ESearchCase::IgnoreCase))
-            {
-                return Index;
-            }
-            continue;
-        }
-
-        if (!Item.SourcePath.IsEmpty() && Candidate.SourcePath.Equals(Item.SourcePath, ESearchCase::IgnoreCase))
+        if (!Item.SourcePath.IsEmpty()
+            && Candidate.SourcePath.Equals(Item.SourcePath, ESearchCase::IgnoreCase))
         {
             return Index;
         }
@@ -2279,19 +3096,6 @@ void UGameManagerSubSystem::NotifyStateChanged()
 {
     OnStateChanged.Broadcast();
     OnMessageChanged.Broadcast(LastSaveMessage);
-}
-
-bool UGameManagerSubSystem::IsObjectCreationItem(const FToolbarItem& Item) const
-{
-    return bEnableObjectVertexCreation
-        && PlayMode == EPlayMode::Creator
-        && Item.Kind == EToolbarItemKind::CreateObject
-        && Item.bAvailable;
-}
-
-bool UGameManagerSubSystem::IsSelectedToolbarItemObjectCreation() const
-{
-    return IsObjectCreationItem(GetSelectedToolbarItem());
 }
 
 FToolbarItem UGameManagerSubSystem::GetToolbarItemAtSlot(int32 SlotIndex) const
@@ -2412,31 +3216,10 @@ void UGameManagerSubSystem::SetPlayMode(EPlayMode NewMode)
 
 void UGameManagerSubSystem::ApplySelectedToolbarItem(bool bBroadcastChange)
 {
-    // Cache the selected toolbar item once so the rest of the function uses a stable target even if finishing an edit broadcasts UI events.
     const FToolbarItem Item = GetSelectedToolbarItem();
-
-    // A toolbar change is a hard mode change, so any live mesh edit must be resolved before the cursor preview swaps tools.
-    // Valid meshes are finalized; meshes with only one/two dangling vertices are canceled or reverted by FinishCurrentEditableMesh().
-    CloseCurrentEditableMeshForToolChange();
-
-    // Remove the old object-creation cursor actor before the new toolbar item decides whether it needs a new preview.
-    DestroyPendingEmptyObjectPreview();
-
-    // Clear old pending locations so a previous tool cannot leave a detached cursor behind after the item changes.
-    ClearPendingPlacementSelection();
 
     switch (Item.Kind)
     {
-    case EToolbarItemKind::CreateObject:
-        if (!bEnableObjectVertexCreation)
-        {
-            CurrentMode = EToolMode::None;
-            LastSaveMessage = TEXT("오브젝트 정점 생성 기능은 현재 임시 비활성화되어 있습니다.");
-            break;
-        }
-        CurrentMode = EToolMode::PlaceEmptyObject;
-        LastSaveMessage = TEXT("오브젝트 만들기: 중앙 십자가 위치에 프리뷰가 표시됩니다. 좌클릭 또는 우클릭=새 오브젝트/기존 메시 편집");
-        break;
     case EToolbarItemKind::Prefab:
         if (Item.bAvailable && PrefabFiles.IsValidIndex(Item.SourceIndex))
         {
@@ -2586,33 +3369,6 @@ void UGameManagerSubSystem::OpenMainMenuFromWorldSelection(
     UGameplayStatics::OpenLevelBySoftObjectPtr(WorldContextObject, MainMenuWorld, true, FString());
 }
 
-FVector UGameManagerSubSystem::GetPendingPlacementSelection() const
-{
-    if (bHasPendingVertexLocation)
-    {
-        return PendingVertexLocation;
-    }
-
-    if (bHasPendingEmptyObjectLocation)
-    {
-        return PendingEmptyObjectLocation;
-    }
-
-    return LastPreviewLocation;
-}
-
-void UGameManagerSubSystem::ClearPendingPlacementSelection()
-{
-    bHasPendingEmptyObjectLocation = false;
-    bHasPendingVertexLocation = false;
-    PendingEmptyObjectLocation = FVector::ZeroVector;
-    PendingVertexLocation = FVector::ZeroVector;
-    if (IsValid(CurrentEditableActor))
-    {
-        CurrentEditableActor->ClearPreviewVertex();
-    }
-}
-
 AActor* UGameManagerSubSystem::GetCrosshairHitActor() const
 {
     return bLastTraceBlockingHit ? LastTraceHit.GetActor() : nullptr;
@@ -2662,9 +3418,6 @@ void UGameManagerSubSystem::SelectNextPrefab()
 
 void UGameManagerSubSystem::SelectPrefabPlacementTool()
 {
-    // Direct Blueprint buttons bypass the toolbar path, so close any in-progress mesh edit here as well.
-    CloseCurrentEditableMeshForToolChange();
-
     ScanAssetFolders();
     BuildAvailableItems();
     CurrentMode = EToolMode::PlacePrefab;
@@ -2672,52 +3425,10 @@ void UGameManagerSubSystem::SelectPrefabPlacementTool()
     NotifyStateChanged();
 }
 
-void UGameManagerSubSystem::SelectEmptyObjectTool()
-{
-    if (!bEnableObjectVertexCreation)
-    {
-        CloseCurrentEditableMeshForToolChange();
-        DestroyPendingEmptyObjectPreview();
-        CurrentMode = EToolMode::None;
-        LastSaveMessage = TEXT("오브젝트 정점 생성 기능은 현재 임시 비활성화되어 있습니다.");
-        NotifyStateChanged();
-        return;
-    }
-
-    // Selecting the object tool explicitly means "leave edit mode and return to placement".
-    CloseCurrentEditableMeshForToolChange();
-
-    CurrentMode = EToolMode::PlaceEmptyObject;
-    LastSaveMessage = TEXT("오브젝트 만들기 도구: 좌클릭으로 새 오브젝트를 만들고 자동으로 정점 편집에 들어갑니다.");
-    NotifyStateChanged();
-}
-
-void UGameManagerSubSystem::SelectVertexTool()
-{
-    if (!bEnableObjectVertexCreation)
-    {
-        LastSaveMessage = TEXT("오브젝트 정점 생성 기능은 현재 임시 비활성화되어 있습니다.");
-        NotifyStateChanged();
-        return;
-    }
-
-    if (IsValid(CurrentEditableActor) && !CurrentEditableActor->IsFinalized())
-    {
-        CurrentMode = EToolMode::EditVertices;
-        LastSaveMessage = TEXT("정점 편집: 중앙 십자가 위치에 정점 프리뷰가 표시됩니다. 좌클릭=정점 추가/선택 정점 이동, 우클릭=완료");
-    }
-    else
-    {
-        LastSaveMessage = TEXT("편집 중인 오브젝트가 없습니다. 오브젝트 만들기 아이템을 선택하고 좌클릭하세요.");
-    }
-    NotifyStateChanged();
-}
-
 void UGameManagerSubSystem::SelectVehicleTool()
 {
-    // Direct Blueprint buttons should not leave a half-edited mesh actor owning the runtime cursor.
-    CloseCurrentEditableMeshForToolChange();
-
+    ScanAssetFolders();
+    BuildAvailableItems();
     CurrentMode = EToolMode::PlaceVehicle;
     LastSaveMessage = TEXT("차량 도구: 중앙 십자가 위치에 좌클릭으로 차량을 설치합니다.");
     NotifyStateChanged();
@@ -2734,7 +3445,7 @@ void UGameManagerSubSystem::SelectPreviousWeapon()
     }
     else
     {
-        LastSaveMessage = TEXT("items/ 폴더에 gltf 또는 glb 무기가 없습니다.");
+        LastSaveMessage = TEXT("item/ 폴더에 gltf 또는 glb 무기가 없습니다.");
     }
     NotifyStateChanged();
 }
@@ -2750,7 +3461,7 @@ void UGameManagerSubSystem::SelectNextWeapon()
     }
     else
     {
-        LastSaveMessage = TEXT("items/ 폴더에 gltf 또는 glb 무기가 없습니다.");
+        LastSaveMessage = TEXT("item/ 폴더에 gltf 또는 glb 무기가 없습니다.");
     }
     NotifyStateChanged();
 }
@@ -2894,11 +3605,6 @@ bool UGameManagerSubSystem::TracePlacementLocation(FVector& OutLocation, FHitRes
     {
         Params.AddIgnoredActor(EquippedWeapon);
     }
-    // Ignore the translucent object-creation preview so the cursor can move through its own preview mesh.
-    if (IsValid(PendingEmptyObjectPreviewActor))
-    {
-        Params.AddIgnoredActor(PendingEmptyObjectPreviewActor);
-    }
 
     // Start with a harmless fallback ray; it is overwritten by deprojection or camera viewpoint below.
     FVector Start = FVector::ZeroVector;
@@ -2991,28 +3697,9 @@ FVector UGameManagerSubSystem::ApplyGridSnap(const FVector& Location) const
 
 bool UGameManagerSubSystem::ShouldShowPlacementGrid() const
 {
-    if (PlayMode != EPlayMode::Creator || !bLastTraceHasPlacementLocation)
-    {
-        return false;
-    }
-
-    const FToolbarItem SelectedItem = GetSelectedToolbarItem();
-    if (CurrentMode == EToolMode::PlaceVehicle || SelectedItem.Kind == EToolbarItemKind::Vehicle)
-    {
-        return false;
-    }
-
-    if (CurrentMode == EToolMode::PlacePrefab)
-    {
-        return true;
-    }
-
-    if (bEnableObjectVertexCreation && (CurrentMode == EToolMode::PlaceEmptyObject || CurrentMode == EToolMode::EditVertices))
-    {
-        return true;
-    }
-
-    return IsObjectCreationItem(SelectedItem);
+    return PlayMode == EPlayMode::Creator
+        && bLastTraceHasPlacementLocation
+        && CurrentMode == EToolMode::PlacePrefab;
 }
 
 void UGameManagerSubSystem::UpdatePlacementGrid()
@@ -3243,35 +3930,23 @@ int32 UGameManagerSubSystem::CountExistingBaseName(const FString& BaseName, EPla
     int32 Count = 0;
     if (Kind == EPlacedObjectKind::Prefab)
     {
-        for (const APrefabActor* Prefab : SpawnedPrefabs)
+        for (const TWeakObjectPtr<APrefabActor>& PrefabReference : SpawnedPrefabs)
         {
+            const APrefabActor* Prefab = PrefabReference.Get();
             if (IsValid(Prefab) && Prefab->GetBaseName().Equals(BaseName, ESearchCase::IgnoreCase))
             {
-                Count++;
+                ++Count;
             }
-        }
-    }
-    else if (Kind == EPlacedObjectKind::GeneratedMesh)
-    {
-        for (const AEditableMeshActor* Mesh : SpawnedGeneratedMeshes)
-        {
-            if (IsValid(Mesh) && Mesh->GetObjectName().StartsWith(BaseName))
-            {
-                Count++;
-            }
-        }
-        if (IsValid(CurrentEditableActor) && CurrentEditableActor->GetObjectName().StartsWith(BaseName))
-        {
-            Count++;
         }
     }
     else if (Kind == EPlacedObjectKind::Vehicle)
     {
-        for (const AVehiclePawn* Vehicle : SpawnedVehicles)
+        for (const TWeakObjectPtr<AVehiclePawn>& VehicleReference : SpawnedVehicles)
         {
+            const AVehiclePawn* Vehicle = VehicleReference.Get();
             if (IsValid(Vehicle))
             {
-                Count++;
+                ++Count;
             }
         }
     }
@@ -3309,39 +3984,15 @@ void UGameManagerSubSystem::InputPrimaryPressed()
     FVector Location;
     const bool bHasPlacementLocation = TracePlacementLocation(Location, Hit);
     const FToolbarItem Item = GetSelectedToolbarItem();
-    const bool bVehiclePlacementRequest = CurrentMode != EToolMode::EditVertices
-        && (CurrentMode == EToolMode::PlaceVehicle || Item.Kind == EToolbarItemKind::Vehicle);
-    if (!bVehiclePlacementRequest)
+    const bool bVehiclePlacement = CurrentMode == EToolMode::PlaceVehicle
+        || Item.Kind == EToolbarItemKind::Vehicle;
+    if (!bVehiclePlacement)
     {
         Location = ApplyGridSnap(Location);
     }
 
-    if (CurrentMode == EToolMode::EditVertices && IsValid(CurrentEditableActor) && !CurrentEditableActor->IsFinalized())
-    {
-        if (HighlightedEditableVertexIndex != INDEX_NONE)
-        {
-            BeginEditableVertexPrimaryPress(HighlightedEditableVertexIndex);
-        }
-        else
-        {
-            if (!bHasPlacementLocation)
-            {
-                LastSaveMessage = TEXT("정점을 찍을 중앙 십자가 위치를 계산할 수 없습니다.");
-                NotifyStateChanged();
-                return;
-            }
-            AddVertexToEditableObject(Location);
-        }
-        NotifyStateChanged();
-        return;
-    }
-
     switch (Item.Kind)
     {
-    case EToolbarItemKind::CreateObject:
-        // Object-creation item activation is shared by LMB and RMB so either click enters vertex edit in one action.
-        TryUseObjectCreationItemAtCrosshair();
-        break;
     case EToolbarItemKind::Prefab:
         if (bHasPlacementLocation)
         {
@@ -3375,27 +4026,13 @@ void UGameManagerSubSystem::InputPrimaryPressed()
         break;
     case EToolbarItemKind::None:
     default:
-        if (CurrentMode == EToolMode::PlacePrefab)
+        if (CurrentMode == EToolMode::PlacePrefab && bHasPlacementLocation)
         {
-            if (bHasPlacementLocation)
-            {
-                PlaceCurrentPrefab(Location);
-            }
-            else
-            {
-                LastSaveMessage = TEXT("Prefab을 설치할 중앙 십자가 위치를 계산할 수 없습니다.");
-            }
+            PlaceCurrentPrefab(Location);
         }
-        else if (CurrentMode == EToolMode::PlaceVehicle)
+        else if (CurrentMode == EToolMode::PlaceVehicle && bHasPlacementLocation)
         {
-            if (bHasPlacementLocation)
-            {
-                PlaceVehicle(Location, GetSelectedToolbarItem().SourcePath);
-            }
-            else
-            {
-                LastSaveMessage = TEXT("차량을 설치할 중앙 십자가 위치를 계산할 수 없습니다.");
-            }
+            PlaceVehicle(Location, Item.SourcePath);
         }
         else if (IsValid(EquippedWeapon))
         {
@@ -3410,39 +4047,16 @@ void UGameManagerSubSystem::InputPrimaryPressed()
 
 void UGameManagerSubSystem::InputPrimaryReleased()
 {
-    if (CurrentMode == EToolMode::EditVertices && bPrimaryVertexPressActive)
-    {
-        EndEditableVertexPrimaryPress();
-        NotifyStateChanged();
-    }
+    // Stable endpoint retained for existing input mappings. Placement is edge-triggered on press.
 }
 
 void UGameManagerSubSystem::InputSecondaryAction()
 {
-    // Do not let gameplay clicks leak through while the Blueprint item list is open.
-    if (bItemListWindowOpen)
+    // Stable endpoint retained for existing input mappings.
+    if (!bItemListWindowOpen)
     {
-        return;
-    }
-
-    // If a live editable mesh exists, RMB is always the one-click finish/cancel command, even if a stale mode flag says otherwise.
-    if (IsValid(CurrentEditableActor) && !CurrentEditableActor->IsFinalized())
-    {
-        FinishOrCancelCurrentVertexEditing();
         NotifyStateChanged();
-        return;
     }
-
-    // In object-placement mode, RMB now mirrors LMB so placing the object and entering vertex mode takes exactly one click.
-    if (CurrentMode == EToolMode::PlaceEmptyObject && IsSelectedToolbarItemObjectCreation())
-    {
-        TryUseObjectCreationItemAtCrosshair();
-        NotifyStateChanged();
-        return;
-    }
-
-    // Other tools currently do not use secondary input, but still broadcast so UI status text can refresh consistently.
-    NotifyStateChanged();
 }
 
 void UGameManagerSubSystem::InputInteractAction()
@@ -3504,103 +4118,7 @@ void UGameManagerSubSystem::SelectCurrentTraceLocation()
 
 void UGameManagerSubSystem::ConfirmCurrentPendingLocation()
 {
-    InputSecondaryAction();
-}
-
-bool UGameManagerSubSystem::TryUseObjectCreationItemAtCrosshair()
-{
-    if (!bEnableObjectVertexCreation)
-    {
-        DestroyPendingEmptyObjectPreview();
-        CurrentMode = EToolMode::None;
-        LastSaveMessage = TEXT("오브젝트 정점 생성 기능은 현재 임시 비활성화되어 있습니다.");
-        return false;
-    }
-
-    // Compute the current center-crosshair placement point at the exact moment the click happens.
-    FHitResult Hit;
-
-    // This location can be either a short collision hit surface or the configured free-space point.
-    FVector Location = FVector::ZeroVector;
-
-    // TracePlacementLocation also refreshes LastTraceHit, LastTraceStart, and LastTraceDirection for selection feedback.
-    const bool bHasPlacementLocation = TracePlacementLocation(Location, Hit);
-
-    // Grid snapping applies equally to surface placement and air placement.
-    Location = ApplyGridSnap(Location);
-
-    // Looking at an existing finalized runtime mesh with the object item means "edit this mesh" instead of "spawn a new one".
-    if (AEditableMeshActor* ExistingMesh = GetEditableMeshFromHit(Hit))
-    {
-        // BeginEditingExistingMesh stores a rollback copy, removes the mesh from the finalized list, and switches to EditVertices.
-        BeginEditingExistingMesh(ExistingMesh);
-
-        // The click was consumed successfully.
-        return true;
-    }
-
-    // If neither a surface nor a free-space point exists, no object can be created safely.
-    if (!bHasPlacementLocation)
-    {
-        // Keep this message Blueprint-readable for the custom toolbar/status widget.
-        LastSaveMessage = TEXT("오브젝트를 만들 중앙 십자가 위치를 계산할 수 없습니다.");
-
-        // Nothing was placed.
-        return false;
-    }
-
-    // Reuse the current translucent object-creation preview actor as the real editable object when possible.
-    AEditableMeshActor* PreviewActor = PendingEmptyObjectPreviewActor.Get();
-
-    // Detach the pointer before PlaceEmptyObject converts/destroys/owns the actor so the cursor preview cannot become a stale ghost.
-    PendingEmptyObjectPreviewActor = nullptr;
-
-    // Spawn or convert the object and make it the active editable mesh.
-    PlaceEmptyObject(Location, PreviewActor);
-
-    // Force the expected one-click state: after object creation, the next click must add/edit vertices immediately.
-    if (IsValid(CurrentEditableActor) && !CurrentEditableActor->IsFinalized())
-    {
-        // The mode assignment is duplicated intentionally to protect against stale mode changes caused by UI event order.
-        CurrentMode = EToolMode::EditVertices;
-
-        // Keep the cached preview location in sync with the spawn location so the first vertex preview appears immediately.
-        LastPreviewLocation = Location;
-
-        // Make the newly active actor show the center-crosshair vertex preview without waiting for a second click/tick.
-        UpdateEditableVertexPreviewAndSelection();
-
-        // Tell UI code that the one-click transition succeeded.
-        LastSaveMessage += TEXT(" 정점 편집 모드로 즉시 전환되었습니다.");
-
-        // Successfully entered edit mode.
-        return true;
-    }
-
-    // PlaceEmptyObject failed to create a valid actor.
-    return false;
-}
-
-bool UGameManagerSubSystem::CloseCurrentEditableMeshForToolChange()
-{
-    // No live actor means there is nothing for the mode change to resolve.
-    if (!IsValid(CurrentEditableActor) || CurrentEditableActor->IsFinalized())
-    {
-        // Clear stale click/drag flags anyway so a previous input cannot affect the next tool.
-        ClearEditableVertexMoveState();
-
-        // The toolbar switch may proceed normally.
-        return true;
-    }
-
-    // FinishCurrentEditableMesh finalizes valid meshes and cancels/reverts invalid or one/two-vertex edits.
-    const bool bClosedAsValidMesh = FinishCurrentEditableMesh();
-
-    // Always clear press/drag/source flags after a tool switch so the cursor cannot remain attached to an old edit actor.
-    ClearEditableVertexMoveState();
-
-    // Return whether the edit became a valid finalized mesh; callers currently use the cleanup side effect either way.
-    return bClosedAsValidMesh;
+    InputPrimaryPressed();
 }
 
 void UGameManagerSubSystem::PlaceCurrentPrefab(const FVector& Location)
@@ -3612,23 +4130,38 @@ void UGameManagerSubSystem::PlaceCurrentPrefab(const FVector& Location)
         return;
     }
 
-    const FString SourceFile = PrefabFiles[CurrentPrefabIndex];
+    const FString SourceFile = GlbValidation::NormalizePath(PrefabFiles[CurrentPrefabIndex]);
+    if (SourceFile.IsEmpty() || !IFileManager::Get().FileExists(*SourceFile))
+    {
+        LastSaveMessage = TEXT("Prefab 에셋 파일이 없어 설치하지 않았습니다.");
+        return;
+    }
+
     const FString BaseName = FPaths::GetBaseFilename(SourceFile);
     const FString ObjectName = MakeObjectName(BaseName, EPlacedObjectKind::Prefab);
 
     FActorSpawnParameters Params;
     Params.Owner = ConfigActor.Get();
+    Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
     const FRotator SpawnRot = FRotator(0.0f, GetWorld()->GetFirstPlayerController() ? GetWorld()->GetFirstPlayerController()->GetControlRotation().Yaw : 0.0f, 0.0f);
     UClass* PrefabSpawnClass = PrefabActorClass ? PrefabActorClass.Get() : APrefabActor::StaticClass();
     APrefabActor* Actor = GetWorld()->SpawnActor<APrefabActor>(PrefabSpawnClass, FTransform(SpawnRot, Location), Params);
+    if (!IsValid(Actor) && PrefabSpawnClass != APrefabActor::StaticClass())
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("Configured prefab actor class failed to spawn; retrying with native APrefabActor. Class=%s"),
+            *GetNameSafe(PrefabSpawnClass));
+        Actor = GetWorld()->SpawnActor<APrefabActor>(APrefabActor::StaticClass(), FTransform(SpawnRot, Location), Params);
+    }
     if (IsValid(Actor))
     {
         Actor->SetRenderOnlyMode(UMultiplayerWorldSubSystem::ShouldUseClientRenderOnlyStreaming(this));
     }
     if (IsValid(Actor) && Actor->LoadPrefab(SourceFile, ObjectName))
     {
-        SpawnedPrefabs.Add(Actor);
+        SpawnedPrefabs.Add(TWeakObjectPtr<APrefabActor>(Actor));
         LastSaveMessage = FString::Printf(TEXT("설치됨: %s"), *ObjectName);
+        SaveScene();
     }
     else if (IsValid(Actor))
     {
@@ -3637,484 +4170,65 @@ void UGameManagerSubSystem::PlaceCurrentPrefab(const FVector& Location)
     }
 }
 
-void UGameManagerSubSystem::PlaceEmptyObject(const FVector& Location, AEditableMeshActor* ExistingPreviewActor)
-{
-    if (IsValid(CurrentEditableActor) && !CurrentEditableActor->IsFinalized())
-    {
-        LastSaveMessage = TEXT("이미 편집 중인 오브젝트가 있습니다. 우클릭으로 먼저 편집을 끝내세요.");
-        return;
-    }
-
-    const FString ObjectName = MakeObjectName(TEXT("GeneratedMesh"), EPlacedObjectKind::GeneratedMesh);
-    AEditableMeshActor* Actor = ExistingPreviewActor;
-    if (!IsValid(Actor))
-    {
-        FActorSpawnParameters Params;
-        Params.Owner = ConfigActor.Get();
-        Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-        UClass* EditableSpawnClass = EditableMeshActorClass ? EditableMeshActorClass.Get() : AEditableMeshActor::StaticClass();
-        Actor = GetWorld()->SpawnActor<AEditableMeshActor>(EditableSpawnClass, FTransform(Location), Params);
-    }
-    else
-    {
-        Actor->SetActorLocation(Location);
-    }
-
-    if (IsValid(Actor))
-    {
-        Actor->BeginObject(ObjectName);
-        Actor->SetActorHiddenInGame(false);
-        Actor->SetActorEnableCollision(true);
-        CurrentEditableActor = Actor;
-        CurrentMode = EToolMode::EditVertices;
-        bCurrentEditableActorWasExisting = false;
-        bHasOriginalEditableMeshRecord = false;
-        ClearEditableVertexMoveState();
-        // Make the actor display a first candidate vertex at the object spawn/crosshair point immediately.
-        Actor->SetPreviewVertexWorld(Location);
-        LastSaveMessage = FString::Printf(TEXT("오브젝트 생성: %s. 빈 공간 좌클릭=정점 추가, 기존 정점 짧은 클릭=연결 정점 생성 모드, 기존 정점 누른 채 이동=위치 편집, 우클릭=완료/취소"), *ObjectName);
-    }
-}
-
-AEditableMeshActor* UGameManagerSubSystem::GetEditableMeshFromHit(const FHitResult& Hit) const
-{
-    AEditableMeshActor* MeshActor = Cast<AEditableMeshActor>(Hit.GetActor());
-    if (!IsValid(MeshActor) && Hit.GetComponent())
-    {
-        MeshActor = Cast<AEditableMeshActor>(Hit.GetComponent()->GetOwner());
-    }
-
-    if (IsValid(MeshActor) && MeshActor != PendingEmptyObjectPreviewActor.Get() && MeshActor->IsFinalized())
-    {
-        return MeshActor;
-    }
-    return nullptr;
-}
-
-void UGameManagerSubSystem::BeginEditingExistingMesh(AEditableMeshActor* MeshActor)
-{
-    if (!IsValid(MeshActor))
-    {
-        return;
-    }
-
-    DestroyPendingEmptyObjectPreview();
-    if (IsValid(CurrentEditableActor) && !CurrentEditableActor->IsFinalized() && CurrentEditableActor != MeshActor)
-    {
-        FinishOrCancelCurrentVertexEditing();
-    }
-
-    CurrentEditableActor = MeshActor;
-    OriginalEditableMeshRecord = MeshActor->ToGeneratedMeshRecord();
-    bHasOriginalEditableMeshRecord = true;
-    bCurrentEditableActorWasExisting = true;
-    SpawnedGeneratedMeshes.Remove(MeshActor);
-    MeshActor->BeginEditingExistingObject();
-    CurrentMode = EToolMode::EditVertices;
-    ClearEditableVertexMoveState();
-    LastSaveMessage = FString::Printf(TEXT("기존 메시 편집 시작: %s. 빈 공간 좌클릭=정점 추가, 기존 정점 짧은 클릭=연결 정점 생성 모드, 기존 정점 누른 채 이동=위치 편집, 우클릭=완료"), *MeshActor->GetObjectName());
-    NotifyStateChanged();
-}
-
-void UGameManagerSubSystem::AddVertexToEditableObject(const FVector& Location)
-{
-    // Guard against clicks when no runtime mesh is open for editing.
-    if (!IsValid(CurrentEditableActor) || CurrentEditableActor->IsFinalized())
-    {
-        // Store a BP-readable message instead of silently ignoring the click.
-        LastSaveMessage = TEXT("편집할 오브젝트가 없습니다.");
-
-        // Stop because there is no actor that can receive a new vertex.
-        return;
-    }
-
-    // If gameplay state has a connected source but the actor does not, resync the actor before adding the next vertex.
-    if (ConnectedEditableVertexSourceIndex != INDEX_NONE && CurrentEditableActor->GetConnectedVertexSourceIndex() != ConnectedEditableVertexSourceIndex)
-    {
-        // Ask the actor to seed its active polygon chain from the selected source vertex.
-        if (!CurrentEditableActor->StartConnectedVertexFromIndex(ConnectedEditableVertexSourceIndex))
-        {
-            // Drop stale source indices that no longer exist on the actor.
-            ConnectedEditableVertexSourceIndex = INDEX_NONE;
-        }
-    }
-
-    // Remember the source before adding, so the user message can say what this segment extended from.
-    const int32 PreviousConnectedSourceIndex = ConnectedEditableVertexSourceIndex;
-
-    // Add a brand-new vertex at the center-crosshair hit location and let the actor extend the current n-gon.
-    const int32 NewIndex = CurrentEditableActor->AddVertexWorld(Location);
-
-    // Pull the actor's new source index back into manager state; this normally becomes the newly added vertex.
-    ConnectedEditableVertexSourceIndex = CurrentEditableActor->GetConnectedVertexSourceIndex();
-
-    // Highlight the new point so feedback follows the actual chain end.
-    HighlightedEditableVertexIndex = NewIndex;
-
-    // Adding a vertex is not a drag operation.
-    bMovingHighlightedEditableVertex = false;
-
-    // A committed click ends any click-vs-hold classification that may have been active.
-    bPrimaryVertexPressActive = false;
-
-    // A committed click also cancels drag mode.
-    bPrimaryVertexDragActive = false;
-
-    // No vertex is currently being pressed after a committed add.
-    PressedEditableVertexIndex = INDEX_NONE;
-
-    // Read topology after the actor has rebuilt its fan triangles.
-    const bool bTopologyValid = CurrentEditableActor->IsTopologyValid();
-
-    // Connected-source messages are more useful when the user is extending from an existing point.
-    if (PreviousConnectedSourceIndex != INDEX_NONE)
-    {
-        // Tell the user that the new point continued the chain from a specific source vertex.
-        LastSaveMessage = FString::Printf(TEXT("정점 %d 추가: 정점 %d에서 이어지는 n-gon 선분입니다. 현재 위상: %s."), NewIndex, PreviousConnectedSourceIndex, bTopologyValid ? TEXT("정상(초록)") : TEXT("미완성/이상(빨강)"));
-    }
-    else
-    {
-        // Ensure the actor highlight matches the new vertex instead of clearing all feedback.
-        CurrentEditableActor->SetHighlightedVertexIndex(NewIndex, false);
-
-        // Tell the user that the polygon remains open for additional points beyond triangles/quads.
-        LastSaveMessage = FString::Printf(TEXT("정점 %d 추가. 계속 좌클릭하면 삼각형/사각형 이후에도 같은 면에 정점이 이어집니다. 현재 위상: %s."), NewIndex, bTopologyValid ? TEXT("정상(초록)") : TEXT("미완성/이상(빨강)"));
-    }
-}
-
-bool UGameManagerSubSystem::AddExistingVertexToEditableObject(int32 ExistingVertexIndex)
-{
-    // Guard against merge clicks when no editable mesh is active.
-    if (!IsValid(CurrentEditableActor) || CurrentEditableActor->IsFinalized())
-    {
-        // Store a clear message for Blueprint UI status text.
-        LastSaveMessage = TEXT("병합할 편집 중 오브젝트가 없습니다.");
-
-        // Stop because the merge target has nowhere to go.
-        return false;
-    }
-
-    // Remember the source before merging so the status message can describe the new segment.
-    const int32 PreviousConnectedSourceIndex = ConnectedEditableVertexSourceIndex;
-
-    // Ask the actor to append the existing vertex index to the active polygon without duplicating the vertex.
-    if (!CurrentEditableActor->AddExistingVertexToCurrentFace(ExistingVertexIndex))
-    {
-        // Invalid merges include same-vertex edges or repeated non-first vertices inside the active n-gon.
-        LastSaveMessage = FString::Printf(TEXT("정점 %d 병합 실패: 같은 선분 또는 중복 정점으로 인해 위상이 꼬일 수 있습니다."), ExistingVertexIndex);
-
-        // Keep current highlights unchanged so the user can see the rejected target.
-        return false;
-    }
-
-    // Mirror the actor's connected source; after a merge this becomes the merged target vertex.
-    ConnectedEditableVertexSourceIndex = CurrentEditableActor->GetConnectedVertexSourceIndex();
-
-    // Keep manager selection state aligned with the merged target.
-    HighlightedEditableVertexIndex = ExistingVertexIndex;
-
-    // A merge click is a short click, not a drag move.
-    bMovingHighlightedEditableVertex = false;
-
-    // The press classification has completed by the time this merge is called.
-    bPrimaryVertexPressActive = false;
-
-    // A successful merge cannot simultaneously be a drag.
-    bPrimaryVertexDragActive = false;
-
-    // Clear the pressed vertex because no button is currently held.
-    PressedEditableVertexIndex = INDEX_NONE;
-
-    // Check the rebuilt face fan so the message matches the red/green preview.
-    const bool bTopologyValid = CurrentEditableActor->IsTopologyValid();
-
-    // Use a source-aware message when the segment came from a previously selected vertex.
-    if (PreviousConnectedSourceIndex != INDEX_NONE && PreviousConnectedSourceIndex != ExistingVertexIndex)
-    {
-        // Tell the user that no duplicate point was created; the existing target was reused.
-        LastSaveMessage = FString::Printf(TEXT("정점 %d → 정점 %d 병합 연결 완료. 기존 정점을 재사용했습니다. 현재 위상: %s."), PreviousConnectedSourceIndex, ExistingVertexIndex, bTopologyValid ? TEXT("정상(초록)") : TEXT("미완성/이상(빨강)"));
-    }
-    else
-    {
-        // Cover the case where the first vertex is selected as the starting/closing vertex.
-        LastSaveMessage = FString::Printf(TEXT("정점 %d을 현재 n-gon 체인에 병합했습니다. 현재 위상: %s."), ExistingVertexIndex, bTopologyValid ? TEXT("정상(초록)") : TEXT("미완성/이상(빨강)"));
-    }
-
-    // True lets the release handler know that it does not need to fall back to source-selection mode.
-    return true;
-}
-
-void UGameManagerSubSystem::BeginEditableVertexPrimaryPress(int32 VertexIndex)
-{
-    if (!IsValid(CurrentEditableActor) || CurrentEditableActor->IsFinalized())
-    {
-        return;
-    }
-
-    bPrimaryVertexPressActive = true;
-    bPrimaryVertexDragActive = false;
-    bMovingHighlightedEditableVertex = false;
-    PressedEditableVertexIndex = VertexIndex;
-    HighlightedEditableVertexIndex = VertexIndex;
-    PrimaryVertexPressStartTime = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
-    PrimaryVertexPressStartLocation = CurrentEditableActor->GetVertexWorldLocation(VertexIndex);
-    CurrentEditableActor->SetHighlightedVertexIndex(VertexIndex, false);
-    CurrentEditableActor->ClearPreviewVertex();
-    LastSaveMessage = FString::Printf(TEXT("정점 %d 선택: 짧게 떼면 연결 정점 생성 모드, 누른 채 중앙 십자가를 움직이면 정점 위치 편집."), VertexIndex);
-}
-
-void UGameManagerSubSystem::UpdateEditableVertexPrimaryPressDrag()
-{
-    if (!bPrimaryVertexPressActive || !IsValid(CurrentEditableActor) || CurrentEditableActor->IsFinalized() || PressedEditableVertexIndex == INDEX_NONE)
-    {
-        return;
-    }
-
-    const double NowSeconds = GetWorld() ? GetWorld()->GetTimeSeconds() : PrimaryVertexPressStartTime;
-    const double HeldSeconds = NowSeconds - PrimaryVertexPressStartTime;
-    const float MoveDistance = bLastTraceHasPlacementLocation ? FVector::Dist(LastPreviewLocation, PrimaryVertexPressStartLocation) : 0.0f;
-
-    if (!bPrimaryVertexDragActive && HeldSeconds >= FMath::Max(0.0f, VertexDragHoldSeconds) && MoveDistance >= FMath::Max(1.0f, VertexDragStartDistance))
-    {
-        bPrimaryVertexDragActive = true;
-        bMovingHighlightedEditableVertex = true;
-        ClearConnectedVertexCreationState();
-        LastSaveMessage = FString::Printf(TEXT("정점 %d 위치 편집 중: 버튼을 떼면 현재 위치로 확정됩니다."), PressedEditableVertexIndex);
-        NotifyStateChanged();
-    }
-
-    if (bPrimaryVertexDragActive)
-    {
-        if (bLastTraceHasPlacementLocation)
-        {
-            CurrentEditableActor->MoveVertexWorld(PressedEditableVertexIndex, LastPreviewLocation);
-        }
-        CurrentEditableActor->SetHighlightedVertexIndex(PressedEditableVertexIndex, true);
-    }
-    else
-    {
-        CurrentEditableActor->SetHighlightedVertexIndex(PressedEditableVertexIndex, false);
-        CurrentEditableActor->ClearPreviewVertex();
-    }
-}
-
-void UGameManagerSubSystem::EndEditableVertexPrimaryPress()
-{
-    if (!bPrimaryVertexPressActive)
-    {
-        return;
-    }
-
-    const int32 ReleasedVertexIndex = PressedEditableVertexIndex;
-    const bool bWasDragging = bPrimaryVertexDragActive;
-    bPrimaryVertexPressActive = false;
-    bPrimaryVertexDragActive = false;
-    bMovingHighlightedEditableVertex = false;
-    PressedEditableVertexIndex = INDEX_NONE;
-
-    if (!IsValid(CurrentEditableActor) || CurrentEditableActor->IsFinalized() || ReleasedVertexIndex == INDEX_NONE)
-    {
-        ClearEditableVertexMoveState();
-        return;
-    }
-
-    if (bWasDragging)
-    {
-        // A hold-and-move gesture edits the selected vertex position.
-        if (bLastTraceHasPlacementLocation)
-        {
-            // Commit the dragged vertex to the current center-crosshair location, which can be a surface hit or a 10m air point.
-            CurrentEditableActor->MoveVertexWorld(ReleasedVertexIndex, LastPreviewLocation);
-        }
-
-        // Return the vertex highlight to the normal selected color after release.
-        CurrentEditableActor->SetHighlightedVertexIndex(ReleasedVertexIndex, false);
-
-        // Keep the moved vertex selected for immediate visual confirmation.
-        HighlightedEditableVertexIndex = ReleasedVertexIndex;
-
-        // Moving a vertex does not change the edge source unless the actor had already set one.
-        ConnectedEditableVertexSourceIndex = CurrentEditableActor->GetConnectedVertexSourceIndex();
-
-        // Store a user-visible status message for Blueprint UI.
-        LastSaveMessage = FString::Printf(TEXT("정점 %d 위치 변경 완료"), ReleasedVertexIndex);
-    }
-    else if (ConnectedEditableVertexSourceIndex != INDEX_NONE && CurrentEditableActor->GetCurrentFaceVertexCount() > 0)
-    {
-        // A short click on an existing vertex while a chain is active first attempts to merge/connect to that existing vertex.
-        if (!AddExistingVertexToEditableObject(ReleasedVertexIndex))
-        {
-            // If the vertex was already part of the active face, reinterpret the click as choosing a new source vertex.
-            BeginConnectedVertexCreationFromIndex(ReleasedVertexIndex);
-        }
-    }
-    else
-    {
-        // A short click with no active chain means this vertex becomes the source for a new connected segment.
-        BeginConnectedVertexCreationFromIndex(ReleasedVertexIndex);
-    }
-}
-
-void UGameManagerSubSystem::BeginConnectedVertexCreationFromIndex(int32 VertexIndex)
-{
-    if (!IsValid(CurrentEditableActor) || CurrentEditableActor->IsFinalized())
-    {
-        return;
-    }
-
-    // Ask the mesh actor to reset its active polygon chain so this vertex becomes the first point.
-    if (CurrentEditableActor->StartConnectedVertexFromIndex(VertexIndex))
-    {
-        // Mirror the source index in manager state for input decisions and status text.
-        ConnectedEditableVertexSourceIndex = VertexIndex;
-
-        // Keep the clicked vertex selected.
-        HighlightedEditableVertexIndex = VertexIndex;
-
-        // Short-click source selection is not a move operation.
-        bMovingHighlightedEditableVertex = false;
-
-        // Tell the user they can either add a new point in space or merge into another highlighted vertex.
-        LastSaveMessage = FString::Printf(TEXT("정점 %d 연결 생성 모드: 빈 곳 좌클릭=새 정점, 기존 정점에 맞춰 좌클릭=병합 연결."), VertexIndex);
-    }
-}
-
-void UGameManagerSubSystem::ClearConnectedVertexCreationState()
-{
-    ConnectedEditableVertexSourceIndex = INDEX_NONE;
-    if (IsValid(CurrentEditableActor))
-    {
-        CurrentEditableActor->ClearConnectedVertexSource();
-    }
-}
-
-bool UGameManagerSubSystem::FinishOrCancelCurrentVertexEditing()
-{
-    return FinishCurrentEditableMesh();
-}
-
-bool UGameManagerSubSystem::FinishCurrentEditableMesh()
-{
-    if (!IsValid(CurrentEditableActor) || CurrentEditableActor->IsFinalized())
-    {
-        LastSaveMessage = TEXT("완성할 편집 중 메시가 없습니다.");
-        NotifyStateChanged();
-        return false;
-    }
-
-    // Track whether the failure is specifically the user-requested point/line cancellation case before optional cleanup.
-    const bool bPointOrLineOnly = CurrentEditableActor->GetVertices().Num() > 0 && CurrentEditableActor->GetVertices().Num() <= 2;
-
-    // Track unfinished connected edits such as "existing vertex + one new vertex" that would otherwise leave an unusable cursor/line.
-    const bool bDanglingPointOrLineEdit = CurrentEditableActor->HasDanglingPointOrLineEdit();
-
-    // If a valid mesh already exists but the user leaves a one/two-vertex branch unfinished, discard only that branch.
-    if (bDanglingPointOrLineEdit && CurrentEditableActor->HasAnyTriangle() && CurrentEditableActor->IsTopologyValid())
-    {
-        // This keeps completed faces while preventing orphan vertices from becoming part of the finalized object.
-        CurrentEditableActor->DiscardDanglingPointOrLineEdit();
-    }
-
-    // A real finalized object needs at least one triangle, valid triangle topology, and no remaining dangling one/two-vertex edit chain.
-    const bool bHasValidFace = CurrentEditableActor->CanFinalizeAsObject();
-
-    if (!bHasValidFace)
-    {
-        // Give a clearer message when the edit contains only one/two vertices or an unfinished one/two-vertex branch.
-        const bool bCanceledBecausePointOrLine = bPointOrLineOnly || bDanglingPointOrLineEdit;
-
-        if (bCurrentEditableActorWasExisting && bHasOriginalEditableMeshRecord)
-        {
-            CurrentEditableActor->LoadFromGeneratedMeshRecord(OriginalEditableMeshRecord);
-            CurrentEditableActor->SetActorHiddenInGame(false);
-            SpawnedGeneratedMeshes.AddUnique(CurrentEditableActor);
-            LastSaveMessage = bCanceledBecausePointOrLine
-                ? TEXT("정점 1~2개짜리 미완성 편집이어서 기존 메시 편집을 되돌렸습니다.")
-                : TEXT("면이 형성되지 않았거나 위상이 올바르지 않아 기존 메시 편집을 되돌렸습니다.");
-            CurrentEditableActor = nullptr;
-        }
-        else
-        {
-            AEditableMeshActor* ActorToDestroy = CurrentEditableActor.Get();
-            CurrentEditableActor = nullptr;
-            if (IsValid(ActorToDestroy))
-            {
-                ActorToDestroy->Destroy();
-            }
-            LastSaveMessage = bCanceledBecausePointOrLine
-                ? TEXT("정점 1~2개만 있는 오브젝트는 생성하지 않고 취소했습니다.")
-                : TEXT("면이 형성되지 않았거나 위상이 올바르지 않아 오브젝트 생성을 취소했습니다.");
-        }
-
-        CurrentMode = IsSelectedToolbarItemObjectCreation() ? EToolMode::PlaceEmptyObject : EToolMode::None;
-        ClearEditableVertexMoveState();
-        bCurrentEditableActorWasExisting = false;
-        bHasOriginalEditableMeshRecord = false;
-        NotifyStateChanged();
-        return false;
-    }
-
-    CurrentEditableActor->ClearPreviewVertex();
-    CurrentEditableActor->SetHighlightedVertexIndex(INDEX_NONE, false);
-    CurrentEditableActor->FinalizeObject();
-    CurrentEditableActor->SetActorHiddenInGame(false);
-    SpawnedGeneratedMeshes.AddUnique(CurrentEditableActor);
-    CurrentEditableActor = nullptr;
-    CurrentMode = IsSelectedToolbarItemObjectCreation() ? EToolMode::PlaceEmptyObject : EToolMode::None;
-    ClearEditableVertexMoveState();
-    bCurrentEditableActorWasExisting = false;
-    bHasOriginalEditableMeshRecord = false;
-    LastSaveMessage = TEXT("메시 편집 완료: 완성된 메시가 월드에 노출됩니다. 오브젝트 만들기 아이템으로 다시 좌클릭하면 편집할 수 있습니다.");
-    NotifyStateChanged();
-    return true;
-}
-
-void UGameManagerSubSystem::CancelCurrentEditableMesh(bool bDestroyActor)
-{
-    DestroyPendingEmptyObjectPreview();
-    if (IsValid(CurrentEditableActor))
-    {
-        if (bCurrentEditableActorWasExisting && bHasOriginalEditableMeshRecord)
-        {
-            CurrentEditableActor->LoadFromGeneratedMeshRecord(OriginalEditableMeshRecord);
-            SpawnedGeneratedMeshes.AddUnique(CurrentEditableActor);
-        }
-        else if (bDestroyActor)
-        {
-            CurrentEditableActor->Destroy();
-        }
-        CurrentEditableActor = nullptr;
-    }
-    CurrentMode = IsSelectedToolbarItemObjectCreation() ? EToolMode::PlaceEmptyObject : EToolMode::None;
-    ClearEditableVertexMoveState();
-    bCurrentEditableActorWasExisting = false;
-    bHasOriginalEditableMeshRecord = false;
-    LastSaveMessage = bDestroyActor ? TEXT("편집 중 메시를 취소했습니다.") : TEXT("편집 중 메시를 종료했습니다.");
-    NotifyStateChanged();
-}
-
 void UGameManagerSubSystem::PlaceVehicle(const FVector& Location, const FString& SourceFile)
 {
+    const FString NormalizedSourceFile = GlbValidation::NormalizePath(SourceFile);
+    if (NormalizedSourceFile.IsEmpty() || !IFileManager::Get().FileExists(*NormalizedSourceFile))
+    {
+        LastSaveMessage = TEXT("차량 에셋 파일이 없어 설치하지 않았습니다.");
+        return;
+    }
+
+    FString ValidationReason;
+    if (!GlbValidation::ValidateRuntimeModelFile(NormalizedSourceFile, ValidationReason))
+    {
+        LastSaveMessage = FString::Printf(TEXT("차량 에셋이 유효하지 않아 설치하지 않았습니다: %s"), *ValidationReason);
+        return;
+    }
+
     FActorSpawnParameters Params;
     Params.Owner = ConfigActor.Get();
-    // User placement can legitimately touch terrain or nearby geometry. Adjust first, but never
-    // discard the requested vehicle solely because its initial collision bounds overlap.
     Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
-    const FRotator SpawnRot = FRotator(0.0f, GetWorld()->GetFirstPlayerController() ? GetWorld()->GetFirstPlayerController()->GetControlRotation().Yaw : 0.0f, 0.0f);
+    const FRotator SpawnRot = FRotator(
+        0.0f,
+        GetWorld()->GetFirstPlayerController() ? GetWorld()->GetFirstPlayerController()->GetControlRotation().Yaw : 0.0f,
+        0.0f);
     UClass* VehicleSpawnClass = VehiclePawnClass ? VehiclePawnClass.Get() : AVehiclePawn::StaticClass();
     const FVector SpawnLocation = Location + FVector(0.0f, 0.0f, 220.0f);
-    AVehiclePawn* Vehicle = GetWorld()->SpawnActor<AVehiclePawn>(VehicleSpawnClass, FTransform(SpawnRot, SpawnLocation), Params);
-    if (IsValid(Vehicle))
+    AVehiclePawn* Vehicle = GetWorld()->SpawnActor<AVehiclePawn>(
+        VehicleSpawnClass,
+        FTransform(SpawnRot, SpawnLocation),
+        Params);
+    if (!IsValid(Vehicle) && VehicleSpawnClass != AVehiclePawn::StaticClass())
     {
-        if (!SourceFile.IsEmpty())
-        {
-            Vehicle->LoadVehicleModel(SourceFile, FPaths::GetBaseFilename(SourceFile));
-        }
-        Vehicle->ResetVehiclePoseAboveGround();
-        SpawnedVehicles.Add(Vehicle);
-        LastSaveMessage = SourceFile.IsEmpty() ? TEXT("기본 자동차 설치됨. F키로 탑승하세요.") : TEXT("glTF 자동차 설치됨. F키로 탑승하세요.");
+        UE_LOG(LogTemp, Warning,
+            TEXT("Configured vehicle actor class failed to spawn; retrying with native AVehiclePawn. Class=%s"),
+            *GetNameSafe(VehicleSpawnClass));
+        Vehicle = GetWorld()->SpawnActor<AVehiclePawn>(
+            AVehiclePawn::StaticClass(),
+            FTransform(SpawnRot, SpawnLocation),
+            Params);
     }
+    if (!IsValid(Vehicle))
+    {
+        LastSaveMessage = TEXT("차량 액터를 생성하지 못했습니다.");
+        return;
+    }
+
+    const FString VehicleBaseName = FPaths::GetBaseFilename(NormalizedSourceFile);
+    const FString VehicleObjectName = MakeObjectName(VehicleBaseName, EPlacedObjectKind::Vehicle);
+    if (!Vehicle->LoadVehicleModel(NormalizedSourceFile, VehicleObjectName))
+    {
+        Vehicle->Destroy();
+        LastSaveMessage = TEXT("차량 모델을 로드하지 못해 액터를 제거했습니다.");
+        return;
+    }
+
+    SpawnedVehicles.Add(TWeakObjectPtr<AVehiclePawn>(Vehicle));
+    LastSaveMessage = TEXT("glTF 자동차 설치됨. F키로 탑승하세요.");
+    SaveScene();
 }
+
 
 void UGameManagerSubSystem::TryEnterOrExitVehicle()
 {
@@ -4148,8 +4262,10 @@ void UGameManagerSubSystem::TryEnterOrExitVehicle()
     AVehiclePawn* BestVehicle = nullptr;
     float BestDistSq = FMath::Square(VehicleEnterDistance);
 
-    for (AVehiclePawn* Vehicle : SpawnedVehicles)
+    CompactTrackedEntityReferences();
+    for (const TWeakObjectPtr<AVehiclePawn>& VehicleReference : SpawnedVehicles)
     {
+        AVehiclePawn* Vehicle = VehicleReference.Get();
         if (!IsValid(Vehicle) || Vehicle->IsOccupied())
         {
             continue;
@@ -4169,46 +4285,102 @@ void UGameManagerSubSystem::TryEnterOrExitVehicle()
     }
 }
 
-void UGameManagerSubSystem::CollectSceneRecords(TArray<FPlacedObjectRecord>& OutPlaced, TArray<FGeneratedMeshRecord>& OutMeshes) const
+void UGameManagerSubSystem::CollectSceneRecords(TArray<FPlacedObjectRecord>& OutPlaced) const
 {
-    OutPlaced.Empty();
-    OutMeshes.Empty();
-
-    for (const APrefabActor* Prefab : SpawnedPrefabs)
+    // Start from the last fully validated snapshot. During level teardown Unreal may call actor
+    // EndPlay before the manager actor, so rebuilding only from live pointers can otherwise publish
+    // a valid but empty entities.dat over a non-empty world.
+    OutPlaced = LastKnownSceneRecords;
+    OutPlaced.RemoveAll([](const FPlacedObjectRecord& Record)
     {
-        if (IsValid(Prefab))
+        return Record.ObjectName.IsEmpty()
+            || Record.SourceFile.IsEmpty()
+            || (Record.Kind != EPlacedObjectKind::Prefab && Record.Kind != EPlacedObjectKind::Vehicle);
+    });
+
+    TSet<int32> ReplacedRecordIndices;
+    auto UpsertLiveRecord = [this, &OutPlaced, &ReplacedRecordIndices](FPlacedObjectRecord&& Record)
+    {
+        Record.SourceFile = MakePlacementSourcePathForSave(Record.SourceFile);
+        if (Record.ObjectName.IsEmpty() || Record.SourceFile.IsEmpty())
         {
-            OutPlaced.Add(Prefab->ToPlacementRecord());
+            return;
+        }
+
+        int32 ExistingIndex = INDEX_NONE;
+        for (int32 Index = 0; Index < OutPlaced.Num(); ++Index)
+        {
+            if (ReplacedRecordIndices.Contains(Index))
+            {
+                continue;
+            }
+
+            const FPlacedObjectRecord& Existing = OutPlaced[Index];
+            if (Existing.Kind == Record.Kind
+                && Existing.ObjectName.Equals(Record.ObjectName, ESearchCase::IgnoreCase))
+            {
+                ExistingIndex = Index;
+                break;
+            }
+        }
+
+        if (ExistingIndex != INDEX_NONE)
+        {
+            OutPlaced[ExistingIndex] = MoveTemp(Record);
+            ReplacedRecordIndices.Add(ExistingIndex);
+        }
+        else
+        {
+            const int32 AddedIndex = OutPlaced.Add(MoveTemp(Record));
+            ReplacedRecordIndices.Add(AddedIndex);
+        }
+    };
+
+    for (const TWeakObjectPtr<APrefabActor>& PrefabReference : SpawnedPrefabs)
+    {
+        const APrefabActor* Prefab = PrefabReference.Get();
+        if (IsValid(Prefab) && !Prefab->IsActorBeingDestroyed())
+        {
+            UpsertLiveRecord(Prefab->ToPlacementRecord());
         }
     }
 
     int32 VehicleRecordIndex = 0;
-    for (const AVehiclePawn* Vehicle : SpawnedVehicles)
+    for (const TWeakObjectPtr<AVehiclePawn>& VehicleReference : SpawnedVehicles)
     {
-        if (IsValid(Vehicle))
+        const AVehiclePawn* Vehicle = VehicleReference.Get();
+        if (IsValid(Vehicle) && !Vehicle->IsActorBeingDestroyed())
         {
-            OutPlaced.Add(Vehicle->ToPlacementRecord(VehicleRecordIndex));
-            VehicleRecordIndex++;
-        }
-    }
-
-    if (IsValid(CurrentEditableActor) && CurrentEditableActor->IsFinalized())
-    {
-        OutMeshes.Add(CurrentEditableActor->ToGeneratedMeshRecord());
-    }
-    for (const AEditableMeshActor* Mesh : SpawnedGeneratedMeshes)
-    {
-        if (IsValid(Mesh) && Mesh->IsFinalized())
-        {
-            OutMeshes.Add(Mesh->ToGeneratedMeshRecord());
+            UpsertLiveRecord(Vehicle->ToPlacementRecord(VehicleRecordIndex));
+            ++VehicleRecordIndex;
         }
     }
 }
 
 bool UGameManagerSubSystem::SaveScene()
 {
+    CompactTrackedEntityReferences();
+
     if (const UWorld* World = GetWorld(); World && World->GetNetMode() == NM_Client)
     {
+        return false;
+    }
+
+    // Never publish an empty snapshot over a DAT generation that has not yet been validated/applied.
+    // This covers autosave, EndPlay, and world-travel save paths. A missing DAT becomes a valid empty
+    // scene only after LoadSavedScene() explicitly marks it as loaded.
+    if (!bSavedSceneLoaded || bSavedSceneLoadInProgress || bSavedSceneLoadFailed)
+    {
+        LastSaveMessage = bSavedSceneLoadFailed
+            ? TEXT("entities.dat 복원 실패 상태이므로 기존 데이터를 보호하기 위해 저장을 건너뜁니다.")
+            : TEXT("entities.dat 복원이 끝나기 전에는 엔티티 저장을 시작하지 않습니다.");
+        UE_LOG(LogTemp, Warning,
+            TEXT("Runtime entity save skipped until DAT restore is safe. Loaded=%s InProgress=%s Failed=%s Path=%s"),
+            bSavedSceneLoaded ? TEXT("true") : TEXT("false"),
+            bSavedSceneLoadInProgress ? TEXT("true") : TEXT("false"),
+            bSavedSceneLoadFailed ? TEXT("true") : TEXT("false"),
+            *GetManifestPath());
+        NotifyStateChanged();
         return false;
     }
 
@@ -4218,145 +4390,788 @@ bool UGameManagerSubSystem::SaveScene()
     }
     bIsSavingScene = true;
 
-    bool bSkippedIncompleteEditableMesh = false;
-    if (IsValid(CurrentEditableActor) && !CurrentEditableActor->IsFinalized())
+    EnsureAssetFolders();
+    TArray<FPlacedObjectRecord> Placed;
+    CollectSceneRecords(Placed);
+    const FString EntitiesDatPath = GetManifestPath();
+    const FSafeFileWriteResult SaveResult = FBinaryDataStore::SaveEntitiesBlocking(EntitiesDatPath, Placed);
+
+    bool bSaved = SaveResult.IsSuccess();
+    FString FailureReason = SaveResult.Error;
+    if (bSaved)
     {
-        // Saving uses the same one/two-vertex cleanup rule as right-click completion.
-        if (CurrentEditableActor->HasDanglingPointOrLineEdit() && CurrentEditableActor->HasAnyTriangle() && CurrentEditableActor->IsTopologyValid())
+        // Do not trust a successful rename alone. Read the committed generation through the same
+        // schema/CRC parser used at startup and compare every record before publishing the snapshot.
+        TArray<FPlacedObjectRecord> VerifiedRecords;
+        FString VerifyError;
+        if (!FBinaryDataStore::LoadEntities(EntitiesDatPath, VerifiedRecords, VerifyError))
         {
-            // Keep completed faces but drop an unfinished dangling point/line before finalizing for save.
-            CurrentEditableActor->DiscardDanglingPointOrLineEdit();
+            bSaved = false;
+            FailureReason = FString::Printf(TEXT("read-after-write validation failed: %s"), *VerifyError);
         }
-
-        // Only meshes that can become real world objects are finalized and exported.
-        if (CurrentEditableActor->CanFinalizeAsObject())
+        else if (!ArePlacedObjectRecordsEquivalent(Placed, VerifiedRecords))
         {
-            // Remove edit-only preview geometry.
-            CurrentEditableActor->ClearPreviewVertex();
-
-            // Convert the procedural mesh into its finalized/collidable state.
-            CurrentEditableActor->FinalizeObject();
-
-            // Make sure the finalized mesh remains visible in the world.
-            CurrentEditableActor->SetActorHiddenInGame(false);
-
-            // Track the generated mesh for future save/export passes.
-            SpawnedGeneratedMeshes.AddUnique(CurrentEditableActor);
-
-            // Clear the active edit pointer because the mesh is now a finalized world object.
-            CurrentEditableActor = nullptr;
-
-            // Return to object-placement mode only when the object-creation item is still selected.
-            CurrentMode = IsSelectedToolbarItemObjectCreation() ? EToolMode::PlaceEmptyObject : EToolMode::None;
+            bSaved = false;
+            FailureReason = TEXT("read-after-write validation returned different entity records");
         }
         else
         {
-            // Leave the active actor out of the save when it is still just a point/line or invalid topology.
-            bSkippedIncompleteEditableMesh = true;
+            LastKnownSceneRecords = MoveTemp(VerifiedRecords);
         }
     }
 
-    TArray<FPlacedObjectRecord> Placed;
-    TArray<FGeneratedMeshRecord> Meshes;
-    CollectSceneRecords(Placed, Meshes);
-    const FString ManifestPath = GetManifestPath();
-    const bool bSaved = UGLTFSaveLibrary::SaveScene(this, Placed, Meshes, ManifestPath, FString());
+    LastSaveMessage = bSaved
+        ? FString::Printf(TEXT("엔티티 저장 및 재검증 완료: %d개"), Placed.Num())
+        : FString::Printf(TEXT("엔티티 저장/검증 실패: %s"), *FailureReason);
+
     if (bSaved)
     {
-        UE_LOG(LogTemp, Verbose, TEXT("scene saved: %s%s"), *ManifestPath, bSkippedIncompleteEditableMesh ? TEXT(" (skipped incomplete editable mesh)") : TEXT(""));
+        UE_LOG(LogTemp, Display,
+            TEXT("Runtime entities saved and verified. World=%s Path=%s Records=%d"),
+            *GetWorldRootPath(),
+            *EntitiesDatPath,
+            Placed.Num());
     }
     else
     {
-        UE_LOG(LogTemp, Warning, TEXT("scene save failed."));
+        UE_LOG(LogTemp, Error,
+            TEXT("Runtime entities save/verification failed. World=%s Path=%s Records=%d Reason=%s"),
+            *GetWorldRootPath(),
+            *EntitiesDatPath,
+            Placed.Num(),
+            *FailureReason);
     }
-    NotifyStateChanged();
+
     bIsSavingScene = false;
+    NotifyStateChanged();
     return bSaved;
+}
+
+void UGameManagerSubSystem::BakeWorldData()
+{
+    UWorld* World = GetWorld();
+    if (!World || World->GetNetMode() == NM_Client)
+    {
+        const FString Message = TEXT("월드 Bake는 권한이 있는 서버/싱글플레이 월드에서만 실행할 수 있습니다.");
+        LastSaveMessage = Message;
+        OnWorldBakeCompleted.Broadcast(false, Message);
+        NotifyStateChanged();
+        return;
+    }
+
+    if (bWorldBakeInProgress)
+    {
+        LastSaveMessage = TEXT("월드 DAT/SCZ Bake가 이미 진행 중입니다.");
+        NotifyStateChanged();
+        return;
+    }
+
+    EnsureAssetFolders();
+    bWorldBakeInProgress = true;
+    bWorldBakeStateFilesSaved = true;
+    WorldBakeProgressValue = 0.0f;
+    WorldBakeTotalModels = 0;
+    WorldBakeCompletedModels = 0;
+    WorldBakeFailedModels = 0;
+    WorldBakeNextModelIndex = 0;
+    PendingWorldBakeModels.Empty();
+    ActiveWorldBakeActor = nullptr;
+    OnWorldBakeProgress.Broadcast(0.0f);
+
+    const bool bEntitiesSaved = SaveScene();
+    bWorldBakeStateFilesSaved &= bEntitiesSaved;
+    if (!bEntitiesSaved)
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("World bake failed to write and verify entities.dat. Path=%s"),
+            *GetManifestPath());
+    }
+
+    FWorldRuntimeData RuntimeData;
+    const UWorldData* RuntimeWorldData = IsValid(ActiveWorldData) ? ActiveWorldData.Get() : CurrentWorldData.Get();
+    RuntimeData.WorldTime = RuntimeWorldData && FMath::IsFinite(RuntimeWorldData->WorldTime)
+        ? RuntimeWorldData->WorldTime
+        : 0.0f;
+    RuntimeData.SelectedPlayer = RuntimeWorldData && !RuntimeWorldData->Player.IsEmpty()
+        ? FPaths::GetCleanFilename(RuntimeWorldData->Player)
+        : FPaths::GetCleanFilename(ActivePlayerId);
+    const FSafeFileWriteResult WorldResult = FBinaryDataStore::SaveWorldRuntimeBlocking(
+        GetWorldDatPath(),
+        RuntimeData);
+    bWorldBakeStateFilesSaved &= WorldResult.IsSuccess();
+    if (!WorldResult.IsSuccess())
+    {
+        UE_LOG(LogTemp, Error, TEXT("World bake failed to write world.dat: %s"), *WorldResult.Error);
+    }
+
+    UPlayerData* PlayersToSave = ActivePlayerData.Get();
+    if (!IsValid(PlayersToSave))
+    {
+        PlayersToSave = NewObject<UPlayerData>(this);
+    }
+    const FSafeFileWriteResult PlayersResult = FBinaryDataStore::SavePlayersBlocking(
+        GetPlayersDatPath(),
+        PlayersToSave);
+    bWorldBakeStateFilesSaved &= PlayersResult.IsSuccess();
+    if (!PlayersResult.IsSuccess())
+    {
+        UE_LOG(LogTemp, Error, TEXT("World bake failed to write players.dat: %s"), *PlayersResult.Error);
+    }
+
+    IFileManager& FileManager = IFileManager::Get();
+    const FString WorldRoot = GetWorldRootPath();
+    TArray<FString> GlbFiles;
+    TArray<FString> GltfFiles;
+    FileManager.FindFilesRecursive(GlbFiles, *WorldRoot, TEXT("*.glb"), true, false, false);
+    FileManager.FindFilesRecursive(GltfFiles, *WorldRoot, TEXT("*.gltf"), true, false, false);
+    PendingWorldBakeModels.Reserve(GlbFiles.Num() + GltfFiles.Num());
+    for (FString& ModelPath : GlbFiles)
+    {
+        ModelPath = GlbValidation::NormalizePath(ModelPath);
+        if (!ModelPath.IsEmpty())
+        {
+            PendingWorldBakeModels.AddUnique(ModelPath);
+        }
+    }
+    for (FString& ModelPath : GltfFiles)
+    {
+        ModelPath = GlbValidation::NormalizePath(ModelPath);
+        if (!ModelPath.IsEmpty())
+        {
+            PendingWorldBakeModels.AddUnique(ModelPath);
+        }
+    }
+    PendingWorldBakeModels.Sort([](const FString& A, const FString& B)
+    {
+        return A.Compare(B, ESearchCase::IgnoreCase) < 0;
+    });
+
+    WorldBakeTotalModels = PendingWorldBakeModels.Num();
+
+    // The three world-state DAT transactions are complete. Reserve five percent for them and use
+    // the remaining range for per-model metadata work, including cache-hit and skipped nodes.
+    WorldBakeProgressValue = FMath::Max(WorldBakeProgressValue, 0.05f);
+    OnWorldBakeProgress.Broadcast(WorldBakeProgressValue);
+
+    LastSaveMessage = FString::Printf(
+        TEXT("월드 DAT/SCZ Bake 시작: 상태 DAT 3개, 모델 SCZ %d개"),
+        WorldBakeTotalModels);
+    NotifyStateChanged();
+
+    if (WorldBakeTotalModels > 0)
+    {
+        World->GetTimerManager().SetTimer(
+            WorldBakeProgressTimerHandle,
+            this,
+            &UGameManagerSubSystem::RefreshWorldBakeProgress,
+            0.05f,
+            true);
+    }
+    StartNextWorldBakeModel();
+}
+
+void UGameManagerSubSystem::StartNextWorldBakeModel()
+{
+    if (!bWorldBakeInProgress)
+    {
+        return;
+    }
+
+    UWorld* World = GetWorld();
+    if (!World)
+    {
+        bWorldBakeStateFilesSaved = false;
+        FinishWorldBake();
+        return;
+    }
+
+    while (WorldBakeNextModelIndex < PendingWorldBakeModels.Num())
+    {
+        const FString ModelPath = PendingWorldBakeModels[WorldBakeNextModelIndex++];
+        if (ModelPath.IsEmpty() || !IFileManager::Get().FileExists(*ModelPath))
+        {
+            ++WorldBakeCompletedModels;
+            ++WorldBakeFailedModels;
+            RefreshWorldBakeProgress();
+            continue;
+        }
+
+        FActorSpawnParameters Params;
+        Params.Owner = ConfigActor.Get();
+        Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+        UClass* BakeClass = SpawnActorClass ? SpawnActorClass.Get() : AglTFStreamActor::StaticClass();
+        AglTFStreamActor* BakeActor = FActorHelper::SpawnActorDeferred<AglTFStreamActor>(
+            World,
+            BakeClass,
+            FTransform::Identity,
+            Params);
+        if (!IsValid(BakeActor))
+        {
+            ++WorldBakeCompletedModels;
+            ++WorldBakeFailedModels;
+            RefreshWorldBakeProgress();
+            continue;
+        }
+
+        ActiveWorldBakeActor = BakeActor;
+        BakeActor->InitMetadataBake(ModelPath);
+        BakeActor->OnModelSizeCacheBakeFinished.AddUObject(
+            this,
+            &UGameManagerSubSystem::HandleWorldBakeModelFinished);
+        BakeActor->FinishSpawning(FTransform::Identity);
+        return;
+    }
+
+    FinishWorldBake();
+}
+
+void UGameManagerSubSystem::RefreshWorldBakeProgress()
+{
+    if (!bWorldBakeInProgress)
+    {
+        return;
+    }
+
+    const float ActiveModelProgress = IsValid(ActiveWorldBakeActor)
+        ? FMath::Clamp(ActiveWorldBakeActor->GetLoadingStatus(), 0.0f, 1.0f)
+        : 0.0f;
+    const float ModelProgress = WorldBakeTotalModels > 0
+        ? FMath::Clamp(
+            (static_cast<float>(WorldBakeCompletedModels) + ActiveModelProgress) /
+                static_cast<float>(WorldBakeTotalModels),
+            0.0f,
+            1.0f)
+        : 1.0f;
+
+    // Keep 100 percent reserved for FinishWorldBake, after the final DAT has been committed and
+    // the active actor has released its parser and temporary mesh references.
+    const float CalculatedProgress = FMath::Min(0.05f + ModelProgress * 0.95f, 0.999f);
+    const float SafeProgress = FMath::Max(WorldBakeProgressValue, CalculatedProgress);
+    if (!FMath::IsNearlyEqual(SafeProgress, WorldBakeProgressValue, KINDA_SMALL_NUMBER))
+    {
+        WorldBakeProgressValue = SafeProgress;
+        OnWorldBakeProgress.Broadcast(WorldBakeProgressValue);
+    }
+}
+
+void UGameManagerSubSystem::HandleWorldBakeModelFinished(AglTFStreamActor* BakeActor, bool bSuccess)
+{
+    if (!bWorldBakeInProgress || !IsValid(BakeActor) || BakeActor != ActiveWorldBakeActor.Get())
+    {
+        return;
+    }
+
+    BakeActor->OnModelSizeCacheBakeFinished.RemoveAll(this);
+    ActiveWorldBakeActor = nullptr;
+    BakeActor->ReleaseRuntimeResourcesForWorldExit();
+    BakeActor->Destroy();
+
+    ++WorldBakeCompletedModels;
+    if (!bSuccess)
+    {
+        ++WorldBakeFailedModels;
+    }
+
+    RefreshWorldBakeProgress();
+    StartNextWorldBakeModel();
+}
+
+void UGameManagerSubSystem::FinishWorldBake()
+{
+    if (!bWorldBakeInProgress)
+    {
+        return;
+    }
+
+    if (UWorld* World = GetWorld())
+    {
+        World->GetTimerManager().ClearTimer(WorldBakeProgressTimerHandle);
+    }
+
+    const bool bSuccess = bWorldBakeStateFilesSaved && WorldBakeFailedModels == 0;
+    WorldBakeProgressValue = 1.0f;
+    const FString Message = bSuccess
+        ? FString::Printf(TEXT("월드 DAT/SCZ Bake 완료: 상태 DAT 3개, 모델 SCZ %d개"), WorldBakeTotalModels)
+        : FString::Printf(
+            TEXT("월드 DAT/SCZ Bake 완료(오류 있음): 상태 DAT=%s, 모델 SCZ 실패=%d/%d"),
+            bWorldBakeStateFilesSaved ? TEXT("정상") : TEXT("실패"),
+            WorldBakeFailedModels,
+            WorldBakeTotalModels);
+
+    bWorldBakeInProgress = false;
+    PendingWorldBakeModels.Empty();
+    ActiveWorldBakeActor = nullptr;
+    WorldBakeNextModelIndex = 0;
+    LastSaveMessage = Message;
+    OnWorldBakeProgress.Broadcast(1.0f);
+    OnWorldBakeCompleted.Broadcast(bSuccess, Message);
+    NotifyStateChanged();
+}
+
+void UGameManagerSubSystem::CancelWorldBake()
+{
+    if (UWorld* World = GetWorld())
+    {
+        World->GetTimerManager().ClearTimer(WorldBakeProgressTimerHandle);
+    }
+
+    if (IsValid(ActiveWorldBakeActor))
+    {
+        ActiveWorldBakeActor->OnModelSizeCacheBakeFinished.RemoveAll(this);
+        ActiveWorldBakeActor->ReleaseRuntimeResourcesForWorldExit();
+        ActiveWorldBakeActor->Destroy();
+    }
+
+    ActiveWorldBakeActor = nullptr;
+    PendingWorldBakeModels.Empty();
+    bWorldBakeInProgress = false;
+    bWorldBakeStateFilesSaved = false;
+    WorldBakeTotalModels = 0;
+    WorldBakeCompletedModels = 0;
+    WorldBakeFailedModels = 0;
+    WorldBakeNextModelIndex = 0;
+    WorldBakeProgressValue = 0.0f;
 }
 
 bool UGameManagerSubSystem::LoadSavedScene()
 {
-    if (bSavedSceneLoaded)
+    if (bSavedSceneLoaded || bSavedSceneLoadInProgress)
     {
         return false;
     }
-    bSavedSceneLoaded = true;
 
-    if (const UWorld* World = GetWorld())
+    UWorld* World = GetWorld();
+    if (World && World->GetNetMode() == NM_Client)
     {
-        if (World->GetNetMode() == NM_Client)
-        {
-            // Clients receive gameplay actors from the authoritative server.
-            // They still stream the selected GLB world render-only through StartMainWorldStreaming(),
-            // but must not spawn a second local gameplay/collision scene from the manifest.
-            return false;
-        }
+        // Clients receive authoritative gameplay actors from the server.
+        LastKnownSceneRecords.Empty();
+        bSavedSceneLoaded = true;
+        bSavedSceneLoadFailed = false;
+        SavedSceneReadinessAttemptCount = 0;
+        SavedSceneDataAttemptCount = 0;
+        return true;
     }
+
+    if (!World || !ConfigActor.IsValid() || GetWorldRootPath().IsEmpty()
+        || !IsValid(UInstancedEntitySubsystem::Get(this)))
+    {
+        ++SavedSceneReadinessAttemptCount;
+        ScheduleSavedSceneLoadRetry(
+            TEXT("world or entity-instancing subsystem is not ready"),
+            true);
+        return false;
+    }
+
+    // The startup next-tick callback can run before world-model streaming has registered its shared
+    // ISM assets. A synchronous prefab load at that point can fail even though both DAT and model are
+    // valid. Leave the restoration node pending; LoadWorldAsync calls this again once streaming is ready.
+    UglTFStreamSubSystem* ActiveStreamSubsystem = IsValid(StreamSubSystem)
+        ? StreamSubSystem.Get()
+        : UglTFStreamSubSystem::Get(this);
+    if (IsValid(ActiveStreamSubsystem)
+        && ActiveStreamSubsystem->IsActiveForWorld(World)
+        && !ActiveStreamSubsystem->IsInitialWorldReady())
+    {
+        UE_LOG(LogTemp, VeryVerbose,
+            TEXT("Entity DAT restore is waiting for initial world streaming. World=%s Path=%s"),
+            *GetWorldRootPath(),
+            *GetManifestPath());
+        return false;
+    }
+
+    bSavedSceneLoadInProgress = true;
+    SavedSceneReadinessAttemptCount = 0;
+    World->GetTimerManager().ClearTimer(SavedSceneLoadRetryTimerHandle);
+
+    const FString EntitiesDatPath = GetManifestPath();
+    const FString EntitiesBackupPath = EntitiesDatPath + TEXT(".bak");
+    const bool bPrimaryDatExists = IFileManager::Get().FileExists(*EntitiesDatPath);
+    const bool bBackupDatExists = IFileManager::Get().FileExists(*EntitiesBackupPath);
+    const bool bHadDatGeneration = bPrimaryDatExists || bBackupDatExists;
 
     TArray<FPlacedObjectRecord> Placed;
-    TArray<FGeneratedMeshRecord> Meshes;
-    FString LoadedManifestPath = GetManifestPath();
-    if (!UGLTFSaveLibrary::LoadScene(LoadedManifestPath, Placed, Meshes))
+    FString LoadError;
+    bool bLoaded = FBinaryDataStore::LoadEntities(EntitiesDatPath, Placed, LoadError);
+    bool bRecoveredNonEmptyBackup = false;
+    bool bMigratedLegacyJson = false;
+    bool bHadLegacySource = false;
+
+    // Older builds could commit an empty but structurally valid primary during EndPlay after the
+    // entity actors had already been destroyed. Normal CRC fallback cannot identify that semantic
+    // data loss, so recover a valid non-empty backup when the primary is empty.
+    if (bLoaded && Placed.IsEmpty() && bPrimaryDatExists && bBackupDatExists)
     {
-        LoadedManifestPath = GetLegacyManifestPath();
-        if (!UGLTFSaveLibrary::LoadScene(LoadedManifestPath, Placed, Meshes))
+        TArray<FPlacedObjectRecord> BackupRecords;
+        FString BackupError;
+        if (FBinaryDataStore::LoadEntities(EntitiesBackupPath, BackupRecords, BackupError)
+            && !BackupRecords.IsEmpty())
         {
-            return false;
+            UE_LOG(LogTemp, Warning,
+                TEXT("Recovered non-empty entities.dat.bak over an empty primary. Path=%s Records=%d"),
+                *EntitiesDatPath,
+                BackupRecords.Num());
+            Placed = MoveTemp(BackupRecords);
+            bRecoveredNonEmptyBackup = true;
+        }
+        else if (!BackupError.IsEmpty())
+        {
+            UE_LOG(LogTemp, Warning,
+                TEXT("Empty primary entity DAT had no usable non-empty backup. Path=%s Reason=%s"),
+                *EntitiesDatPath,
+                *BackupError);
         }
     }
+
+    // One-way compatibility migration. Legacy JSON is read-only and is never rewritten or backed up.
+    // It may also rescue a non-empty legacy scene after an older build committed an empty DAT and
+    // no usable non-empty DAT backup remains.
+    if (!bLoaded || (Placed.IsEmpty() && !bRecoveredNonEmptyBackup))
+    {
+        const TArray<FString> LegacyPaths =
+        {
+            FPaths::Combine(GetWorldRootPath(), TEXT("entities.json")),
+            FPaths::Combine(GetWorldRootPath(), TEXT("runtime_installed.json"))
+        };
+        FSafeJsonLimits Limits;
+        Limits.MaxFileBytes = 64ll * 1024ll * 1024ll;
+        Limits.MaxDepth = 32;
+        Limits.MaxValues = 1000000;
+        Limits.MaxContainerEntries = 100000;
+        Limits.MaxStringCharacters = 32768;
+        Limits.MaxPrimitiveCharacters = 128;
+        Limits.bAllowBackupRecovery = false;
+
+        for (const FString& LegacyPath : LegacyPaths)
+        {
+            bHadLegacySource |= IFileManager::Get().FileExists(*LegacyPath);
+            const FSafeJsonLoadResult Legacy = FSafeFileIO::LoadJsonBlocking(LegacyPath, Limits);
+            if (!Legacy.IsSuccess() || !Legacy.JsonObject.IsValid())
+            {
+                continue;
+            }
+
+            const TArray<TSharedPtr<FJsonValue>>* Values = nullptr;
+            if (!Legacy.JsonObject->TryGetArrayField(TEXT("Objects"), Values) || !Values
+                || Values->Num() > Limits.MaxContainerEntries)
+            {
+                continue;
+            }
+
+            TArray<FPlacedObjectRecord> Parsed;
+            Parsed.Reserve(Values->Num());
+            bool bAllValid = true;
+            for (const TSharedPtr<FJsonValue>& Value : *Values)
+            {
+                FPlacedObjectRecord Record;
+                if (!Value.IsValid() || Value->Type != EJson::Object
+                    || !Record.FromJson(Value->AsObject()))
+                {
+                    bAllValid = false;
+                    break;
+                }
+
+                // Value 1 was the removed generated-mesh format; only supported runtime entities migrate.
+                if (Record.Kind == EPlacedObjectKind::Prefab || Record.Kind == EPlacedObjectKind::Vehicle)
+                {
+                    Parsed.Add(MoveTemp(Record));
+                }
+            }
+            if (bAllValid && (!bLoaded || !Parsed.IsEmpty()))
+            {
+                Placed = MoveTemp(Parsed);
+                bLoaded = true;
+                bMigratedLegacyJson = true;
+                UE_LOG(LogTemp, Log,
+                    TEXT("Migrating legacy entity JSON to data/entities.dat. Source=%s Records=%d"),
+                    *LegacyPath,
+                    Placed.Num());
+                break;
+            }
+        }
+    }
+
+    if (!bLoaded)
+    {
+        if (!bHadDatGeneration && !bHadLegacySource)
+        {
+            // A world with no saved entities is a valid empty scene, not a load failure.
+            LastKnownSceneRecords.Empty();
+            bSavedSceneLoadInProgress = false;
+            bSavedSceneLoaded = true;
+            bSavedSceneLoadFailed = false;
+            SavedSceneReadinessAttemptCount = 0;
+            SavedSceneDataAttemptCount = 0;
+            UE_LOG(LogTemp, Display,
+                TEXT("No entities.dat exists; continuing with an empty scene. World=%s Path=%s"),
+                *GetWorldRootPath(),
+                *EntitiesDatPath);
+            NotifyStateChanged();
+            return true;
+        }
+
+        const FString RetryReason = LoadError.IsEmpty()
+            ? TEXT("entities.dat or legacy entity data could not be validated")
+            : LoadError;
+        ++SavedSceneDataAttemptCount;
+        ScheduleSavedSceneLoadRetry(RetryReason, false);
+        return false;
+    }
+
+    UE_LOG(LogTemp, Display,
+        TEXT("Validated entity DAT for restoration. World=%s Path=%s Records=%d Attempt=%d/%d"),
+        *GetWorldRootPath(),
+        *EntitiesDatPath,
+        Placed.Num(),
+        SavedSceneDataAttemptCount + 1,
+        MaxSavedSceneDataAttempts);
 
     FActorSpawnParameters Params;
     Params.Owner = ConfigActor.Get();
-    for (const FGeneratedMeshRecord& MeshRecord : Meshes)
-    {
-        UClass* EditableSpawnClass = EditableMeshActorClass ? EditableMeshActorClass.Get() : AEditableMeshActor::StaticClass();
-        AEditableMeshActor* MeshActor = GetWorld()->SpawnActor<AEditableMeshActor>(EditableSpawnClass, MeshRecord.Transform, Params);
-        if (IsValid(MeshActor))
-        {
-            MeshActor->LoadFromGeneratedMeshRecord(MeshRecord);
-            SpawnedGeneratedMeshes.Add(MeshActor);
-        }
-    }
+    Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
 
-    for (const FPlacedObjectRecord& Record : Placed)
+    int32 SpawnedCount = 0;
+    int32 MissingSourceCount = 0;
+    int32 InvalidSourceCount = 0;
+    int32 TransientSpawnFailureCount = 0;
+    bool bNormalizedRecordChanged = bMigratedLegacyJson || bRecoveredNonEmptyBackup;
+    TArray<FPlacedObjectRecord> NormalizedRecords = Placed;
+    TArray<APrefabActor*> AttemptPrefabs;
+    TArray<AVehiclePawn*> AttemptVehicles;
+    AttemptPrefabs.Reserve(Placed.Num());
+    AttemptVehicles.Reserve(Placed.Num());
+
+    for (int32 RecordIndex = 0; RecordIndex < Placed.Num(); ++RecordIndex)
     {
+        const FPlacedObjectRecord& Record = Placed[RecordIndex];
+        const FString ResolvedSourceFile = ResolvePlacementSourcePath(Record.SourceFile, Record.Kind);
+        if (ResolvedSourceFile.IsEmpty())
+        {
+            ++MissingSourceCount;
+            UE_LOG(LogTemp, Error,
+                TEXT("Saved entity source could not be resolved. Index=%d Kind=%d Name=%s Source=%s World=%s"),
+                RecordIndex,
+                static_cast<int32>(Record.Kind),
+                *Record.ObjectName,
+                *Record.SourceFile,
+                *GetWorldRootPath());
+            continue;
+        }
+
+        FString ValidationReason;
+        if (!GlbValidation::ValidateRuntimeModelFile(ResolvedSourceFile, ValidationReason))
+        {
+            ++InvalidSourceCount;
+            UE_LOG(LogTemp, Error,
+                TEXT("Saved entity model failed validation. Index=%d Name=%s Source=%s Reason=%s"),
+                RecordIndex,
+                *Record.ObjectName,
+                *ResolvedSourceFile,
+                *ValidationReason);
+            continue;
+        }
+
+        const FString PortableSource = MakePlacementSourcePathForSave(ResolvedSourceFile);
+        if (NormalizedRecords.IsValidIndex(RecordIndex) && !PortableSource.IsEmpty()
+            && !NormalizedRecords[RecordIndex].SourceFile.Equals(PortableSource, ESearchCase::CaseSensitive))
+        {
+            NormalizedRecords[RecordIndex].SourceFile = PortableSource;
+            bNormalizedRecordChanged = true;
+        }
+
         if (Record.Kind == EPlacedObjectKind::Prefab)
         {
             UClass* PrefabSpawnClass = PrefabActorClass ? PrefabActorClass.Get() : APrefabActor::StaticClass();
-            APrefabActor* Prefab = GetWorld()->SpawnActor<APrefabActor>(PrefabSpawnClass, Record.Transform, Params);
+            APrefabActor* Prefab = World->SpawnActor<APrefabActor>(PrefabSpawnClass, Record.Transform, Params);
+            if (!IsValid(Prefab) && PrefabSpawnClass != APrefabActor::StaticClass())
+            {
+                UE_LOG(LogTemp, Warning,
+                    TEXT("Configured prefab restore class failed; retrying native class. Class=%s Name=%s"),
+                    *GetNameSafe(PrefabSpawnClass),
+                    *Record.ObjectName);
+                Prefab = World->SpawnActor<APrefabActor>(APrefabActor::StaticClass(), Record.Transform, Params);
+            }
             if (IsValid(Prefab))
             {
                 Prefab->SetRenderOnlyMode(UMultiplayerWorldSubSystem::ShouldUseClientRenderOnlyStreaming(this));
             }
-            if (IsValid(Prefab) && Prefab->LoadPrefab(Record.SourceFile, Record.ObjectName))
+            if (IsValid(Prefab) && Prefab->LoadPrefab(ResolvedSourceFile, Record.ObjectName))
             {
-                SpawnedPrefabs.Add(Prefab);
+                AttemptPrefabs.Add(Prefab);
+                ++SpawnedCount;
+                UE_LOG(LogTemp, Display,
+                    TEXT("Restored prefab entity. Index=%d Name=%s Source=%s"),
+                    RecordIndex,
+                    *Record.ObjectName,
+                    *ResolvedSourceFile);
             }
-            else if (IsValid(Prefab))
+            else
             {
-                Prefab->Destroy();
+                ++TransientSpawnFailureCount;
+                UE_LOG(LogTemp, Warning,
+                    TEXT("Prefab restoration attempt failed. Index=%d Name=%s Source=%s"),
+                    RecordIndex,
+                    *Record.ObjectName,
+                    *ResolvedSourceFile);
+                if (IsValid(Prefab))
+                {
+                    Prefab->Destroy();
+                }
             }
         }
         else if (Record.Kind == EPlacedObjectKind::Vehicle)
         {
             UClass* VehicleSpawnClass = VehiclePawnClass ? VehiclePawnClass.Get() : AVehiclePawn::StaticClass();
-            FActorSpawnParameters VehicleParams = Params;
-            // Saved transforms often rest exactly on terrain. Let Unreal make a small adjustment
-            // instead of failing the entire vehicle restore because the initial bounds overlap.
-            VehicleParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
-            AVehiclePawn* Vehicle = GetWorld()->SpawnActor<AVehiclePawn>(VehicleSpawnClass, Record.Transform, VehicleParams);
-            if (IsValid(Vehicle))
+            AVehiclePawn* Vehicle = World->SpawnActor<AVehiclePawn>(VehicleSpawnClass, Record.Transform, Params);
+            if (!IsValid(Vehicle) && VehicleSpawnClass != AVehiclePawn::StaticClass())
             {
-                if (!Record.SourceFile.IsEmpty())
+                UE_LOG(LogTemp, Warning,
+                    TEXT("Configured vehicle restore class failed; retrying native class. Class=%s Name=%s"),
+                    *GetNameSafe(VehicleSpawnClass),
+                    *Record.ObjectName);
+                Vehicle = World->SpawnActor<AVehiclePawn>(AVehiclePawn::StaticClass(), Record.Transform, Params);
+            }
+            if (IsValid(Vehicle) && Vehicle->LoadVehicleModel(ResolvedSourceFile, Record.ObjectName))
+            {
+                AttemptVehicles.Add(Vehicle);
+                ++SpawnedCount;
+                UE_LOG(LogTemp, Display,
+                    TEXT("Restored vehicle entity. Index=%d Name=%s Source=%s"),
+                    RecordIndex,
+                    *Record.ObjectName,
+                    *ResolvedSourceFile);
+            }
+            else
+            {
+                ++TransientSpawnFailureCount;
+                UE_LOG(LogTemp, Warning,
+                    TEXT("Vehicle restoration attempt failed. Index=%d Name=%s Source=%s"),
+                    RecordIndex,
+                    *Record.ObjectName,
+                    *ResolvedSourceFile);
+                if (IsValid(Vehicle))
                 {
-                    Vehicle->LoadVehicleModel(Record.SourceFile, Record.ObjectName);
+                    Vehicle->Destroy();
                 }
-                Vehicle->ResetVehiclePoseAboveGround();
-                SpawnedVehicles.Add(Vehicle);
+            }
+        }
+        else
+        {
+            ++InvalidSourceCount;
+            UE_LOG(LogTemp, Error,
+                TEXT("Unsupported entity kind in validated DAT. Index=%d Kind=%d"),
+                RecordIndex,
+                static_cast<int32>(Record.Kind));
+        }
+    }
+
+    if (TransientSpawnFailureCount > 0)
+    {
+        ++SavedSceneDataAttemptCount;
+        if (SavedSceneDataAttemptCount < MaxSavedSceneDataAttempts)
+        {
+            for (APrefabActor* Prefab : AttemptPrefabs)
+            {
+                if (IsValid(Prefab))
+                {
+                    Prefab->Destroy();
+                }
+            }
+            for (AVehiclePawn* Vehicle : AttemptVehicles)
+            {
+                if (IsValid(Vehicle))
+                {
+                    Vehicle->Destroy();
+                }
+            }
+
+            const FString RetryReason = FString::Printf(
+                TEXT("%d entity model(s) failed to register after DAT validation"),
+                TransientSpawnFailureCount);
+            ScheduleSavedSceneLoadRetry(RetryReason, false);
+            return false;
+        }
+    }
+
+    for (APrefabActor* Prefab : AttemptPrefabs)
+    {
+        if (IsValid(Prefab))
+        {
+            SpawnedPrefabs.Add(TWeakObjectPtr<APrefabActor>(Prefab));
+        }
+    }
+    for (AVehiclePawn* Vehicle : AttemptVehicles)
+    {
+        if (IsValid(Vehicle))
+        {
+            SpawnedVehicles.Add(TWeakObjectPtr<AVehiclePawn>(Vehicle));
+        }
+    }
+
+    // Preserve every validated record, including temporarily unresolved records. This prevents any
+    // later teardown save from deleting data that was present in the committed DAT generation.
+    LastKnownSceneRecords = NormalizedRecords;
+
+    // Normalize successfully resolved legacy/absolute paths and recommit a recovered non-empty
+    // backup. The DAT transaction creates and validates its own .bak generation.
+    if (bNormalizedRecordChanged)
+    {
+        const FSafeFileWriteResult NormalizeResult =
+            FBinaryDataStore::SaveEntitiesBlocking(EntitiesDatPath, NormalizedRecords);
+        if (!NormalizeResult.IsSuccess())
+        {
+            UE_LOG(LogTemp, Warning,
+                TEXT("Loaded entities but could not normalize/recover entities.dat: %s"),
+                *NormalizeResult.Error);
+        }
+        else
+        {
+            TArray<FPlacedObjectRecord> VerifiedNormalizedRecords;
+            FString VerifyError;
+            if (!FBinaryDataStore::LoadEntities(EntitiesDatPath, VerifiedNormalizedRecords, VerifyError)
+                || !ArePlacedObjectRecordsEquivalent(NormalizedRecords, VerifiedNormalizedRecords))
+            {
+                UE_LOG(LogTemp, Error,
+                    TEXT("Normalized entity DAT failed read-after-write verification. Path=%s Reason=%s"),
+                    *EntitiesDatPath,
+                    *VerifyError);
+            }
+            else
+            {
+                LastKnownSceneRecords = MoveTemp(VerifiedNormalizedRecords);
             }
         }
     }
-    UE_LOG(LogTemp, Verbose, TEXT("Loaded runtime entity manifest: %s"), *LoadedManifestPath);
+
+    const bool bPartialApplyFailure = MissingSourceCount > 0
+        || InvalidSourceCount > 0
+        || TransientSpawnFailureCount > 0;
+    bSavedSceneLoadInProgress = false;
+    bSavedSceneLoaded = true;
+    bSavedSceneLoadFailed = bPartialApplyFailure;
+    SavedSceneReadinessAttemptCount = 0;
+    SavedSceneDataAttemptCount = 0;
+    if (bPartialApplyFailure)
+    {
+        LastSaveMessage = TEXT("entities.dat은 로드했지만 일부 엔티티를 복원하지 못해 기존 DAT 보호를 위해 자동 저장을 잠갔습니다.");
+        UE_LOG(LogTemp, Error,
+            TEXT("Entity DAT was only partially applied; scene saving is locked. Path=%s Records=%d Spawned=%d Missing=%d Invalid=%d SpawnFailed=%d"),
+            *EntitiesDatPath,
+            Placed.Num(),
+            SpawnedCount,
+            MissingSourceCount,
+            InvalidSourceCount,
+            TransientSpawnFailureCount);
+    }
+    else
+    {
+        LastSaveMessage = FString::Printf(TEXT("엔티티 복원 완료: %d개"), SpawnedCount);
+        UE_LOG(LogTemp, Display,
+            TEXT("Entity DAT fully applied. World=%s Path=%s Records=%d Spawned=%d"),
+            *GetWorldRootPath(),
+            *EntitiesDatPath,
+            Placed.Num(),
+            SpawnedCount);
+    }
     NotifyStateChanged();
     return true;
 }
@@ -4378,12 +5193,6 @@ void UGameManagerSubSystem::SetCurrentToolMode(EToolMode NewMode)
     case EToolMode::PlacePrefab:
         SelectPrefabPlacementTool();
         break;
-    case EToolMode::PlaceEmptyObject:
-        SelectEmptyObjectTool();
-        break;
-    case EToolMode::EditVertices:
-        SelectVertexTool();
-        break;
     case EToolMode::PlaceVehicle:
         SelectVehicleTool();
         break;
@@ -4393,8 +5202,8 @@ void UGameManagerSubSystem::SetCurrentToolMode(EToolMode NewMode)
     case EToolMode::None:
     default:
         CurrentMode = EToolMode::None;
-        DestroyPendingEmptyObjectPreview();
         LastSaveMessage = TEXT("Tool cleared.");
+        ClearPlacementGridMesh();
         NotifyStateChanged();
         break;
     }
@@ -4460,191 +5269,26 @@ FString UGameManagerSubSystem::GetWeaponPathAtIndex(int32 Index) const
     return WeaponFiles.IsValidIndex(Index) ? WeaponFiles[Index] : FString();
 }
 
-bool UGameManagerSubSystem::IsEditingGeneratedMesh() const
-{
-    return IsValid(CurrentEditableActor) && !CurrentEditableActor->IsFinalized();
-}
-
-int32 UGameManagerSubSystem::GetCurrentEditableMeshVertexCount() const
-{
-    return IsValid(CurrentEditableActor) ? CurrentEditableActor->GetVertices().Num() : 0;
-}
-
-int32 UGameManagerSubSystem::GetCurrentEditableMeshTriangleCount() const
-{
-    return IsValid(CurrentEditableActor) ? CurrentEditableActor->GetTriangles().Num() / 3 : 0;
-}
-
-bool UGameManagerSubSystem::IsCurrentEditableMeshTopologyValid() const
-{
-    return IsValid(CurrentEditableActor) && CurrentEditableActor->IsTopologyValid();
-}
-
-void UGameManagerSubSystem::GetSpawnedGeneratedMeshActors(TArray<AEditableMeshActor*>& OutActors) const
-{
-    OutActors.Empty();
-    for (AEditableMeshActor* Actor : SpawnedGeneratedMeshes)
-    {
-        if (IsValid(Actor))
-        {
-            OutActors.Add(Actor);
-        }
-    }
-}
-
-void UGameManagerSubSystem::UpdatePendingEmptyObjectPreview(const FVector& Location)
-{
-    if (!IsValid(PendingEmptyObjectPreviewActor))
-    {
-        FActorSpawnParameters Params;
-        Params.Owner = ConfigActor.Get();
-        Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-        UClass* EditableSpawnClass = EditableMeshActorClass ? EditableMeshActorClass.Get() : AEditableMeshActor::StaticClass();
-        PendingEmptyObjectPreviewActor = GetWorld()->SpawnActor<AEditableMeshActor>(EditableSpawnClass, FTransform(Location), Params);
-        if (IsValid(PendingEmptyObjectPreviewActor))
-        {
-            PendingEmptyObjectPreviewActor->BeginObject(TEXT("GeneratedMesh_Pending"));
-            PendingEmptyObjectPreviewActor->SetActorEnableCollision(false);
-        }
-    }
-
-    if (IsValid(PendingEmptyObjectPreviewActor))
-    {
-        PendingEmptyObjectPreviewActor->SetActorLocation(Location);
-        PendingEmptyObjectPreviewActor->SetActorHiddenInGame(false);
-        PendingEmptyObjectPreviewActor->SetActorEnableCollision(false);
-    }
-}
-
-void UGameManagerSubSystem::DestroyPendingEmptyObjectPreview()
-{
-    if (IsValid(PendingEmptyObjectPreviewActor))
-    {
-        PendingEmptyObjectPreviewActor->Destroy();
-    }
-    PendingEmptyObjectPreviewActor = nullptr;
-}
-
-void UGameManagerSubSystem::UpdateObjectCreationPreview()
-{
-    if (IsEditingGeneratedMesh())
-    {
-        DestroyPendingEmptyObjectPreview();
-        return;
-    }
-
-    if (IsSelectedToolbarItemObjectCreation() && CurrentMode == EToolMode::PlaceEmptyObject)
-    {
-        if (!bLastTraceHasPlacementLocation || GetEditableMeshFromHit(LastTraceHit))
-        {
-            DestroyPendingEmptyObjectPreview();
-        }
-        else
-        {
-            UpdatePendingEmptyObjectPreview(LastPreviewLocation);
-        }
-    }
-    else
-    {
-        DestroyPendingEmptyObjectPreview();
-    }
-}
-
-void UGameManagerSubSystem::ClearEditableVertexMoveState()
-{
-    HighlightedEditableVertexIndex = INDEX_NONE;
-    bMovingHighlightedEditableVertex = false;
-    bPrimaryVertexPressActive = false;
-    bPrimaryVertexDragActive = false;
-    PressedEditableVertexIndex = INDEX_NONE;
-    ConnectedEditableVertexSourceIndex = INDEX_NONE;
-    PrimaryVertexPressStartTime = 0.0;
-    PrimaryVertexPressStartLocation = FVector::ZeroVector;
-    LastVertexDistance = 0.0f;
-    if (IsValid(CurrentEditableActor))
-    {
-        CurrentEditableActor->SetHighlightedVertexIndex(INDEX_NONE, false);
-        CurrentEditableActor->ClearConnectedVertexSource();
-    }
-}
-
-void UGameManagerSubSystem::UpdateEditableVertexPreviewAndSelection()
-{
-    LastVertexDistance = 0.0f;
-    if (!IsValid(CurrentEditableActor) || CurrentEditableActor->IsFinalized() || CurrentMode != EToolMode::EditVertices)
-    {
-        HighlightedEditableVertexIndex = INDEX_NONE;
-        bMovingHighlightedEditableVertex = false;
-        bPrimaryVertexPressActive = false;
-        bPrimaryVertexDragActive = false;
-        PressedEditableVertexIndex = INDEX_NONE;
-        return;
-    }
-
-    if (bPrimaryVertexPressActive)
-    {
-        UpdateEditableVertexPrimaryPressDrag();
-        return;
-    }
-
-    int32 NearestIndex = INDEX_NONE;
-    FVector NearestWorld = FVector::ZeroVector;
-    float Distance = 0.0f;
-    if (CurrentEditableActor->FindNearestVertexToRay(LastTraceStart, LastTraceDirection, VertexSelectionRayDistance, NearestIndex, NearestWorld, Distance))
-    {
-        HighlightedEditableVertexIndex = NearestIndex;
-        LastVertexDistance = Distance;
-        CurrentEditableActor->SetHighlightedVertexIndex(NearestIndex, false);
-        CurrentEditableActor->ClearPreviewVertex();
-    }
-    else
-    {
-        HighlightedEditableVertexIndex = INDEX_NONE;
-        CurrentEditableActor->SetHighlightedVertexIndex(INDEX_NONE, false);
-        if (bLastTraceHasPlacementLocation)
-        {
-            CurrentEditableActor->SetPreviewVertexWorld(LastPreviewLocation);
-            if (CurrentEditableActor->HasAnyVertex())
-            {
-                const int32 ConnectedSource = CurrentEditableActor->GetConnectedVertexSourceIndex();
-                const FVector ReferenceVertex = ConnectedSource != INDEX_NONE ? CurrentEditableActor->GetVertexWorldLocation(ConnectedSource) : CurrentEditableActor->GetLastVertexWorld();
-                LastVertexDistance = FVector::Dist(ReferenceVertex, LastPreviewLocation);
-            }
-        }
-        else
-        {
-            CurrentEditableActor->ClearPreviewVertex();
-        }
-    }
-}
-
 FString UGameManagerSubSystem::BuildStatusText() const
 {
-    const FString ModeString = StaticEnum<EToolMode>()->GetDisplayNameTextByValue(static_cast<int64>(CurrentMode)).ToString();
+    const FString ModeString = StaticEnum<EToolMode>()->GetDisplayNameTextByValue(
+        static_cast<int64>(CurrentMode)).ToString();
     const FToolbarItem SelectedItem = GetSelectedToolbarItem();
-    const FString SelectedItemName = SelectedItem.DisplayName.IsEmpty() ? TEXT("비어 있음") : SelectedItem.DisplayName;
-    const FString ItemListText = bItemListWindowOpen ? TEXT("OPEN") : TEXT("CLOSED");
-    const FString TopologyText = IsEditingGeneratedMesh()
-        ? (IsCurrentEditableMeshTopologyValid() ? TEXT("VALID / GREEN") : TEXT("INVALID OR INCOMPLETE / RED"))
-        : TEXT("NONE");
-    const FString VertexSelectText = HighlightedEditableVertexIndex != INDEX_NONE
-        ? FString::Printf(TEXT("Selected Vertex: %d %s"), HighlightedEditableVertexIndex, bMovingHighlightedEditableVertex ? TEXT("(DRAG MOVING)") : (bPrimaryVertexPressActive ? TEXT("(PRESSED)") : TEXT("")))
-        : TEXT("Selected Vertex: none");
-    const FString ConnectedSourceText = ConnectedEditableVertexSourceIndex != INDEX_NONE
-        ? FString::Printf(TEXT("Connected Source: %d"), ConnectedEditableVertexSourceIndex)
-        : TEXT("Connected Source: none");
+    const FString SelectedItemName = SelectedItem.DisplayName.IsEmpty()
+        ? TEXT("비어 있음")
+        : SelectedItem.DisplayName;
     const FString CrosshairPlacementText = !bLastTraceHasPlacementLocation
         ? TEXT("NONE")
         : (bLastTraceBlockingHit ? TEXT("SURFACE") : TEXT("AIR / FREE-SPACE"));
 
     return FString::Printf(
-        TEXT("[Creator Toolbar]\nMode: %s | PlayMode: %s\nToolbar Slot: %d / 7 | Item: %s (%s)\nInventory Window: %s | Available Items: %d\nSnap: %s / Grid %.0f cm\nCrosshair: X %.0f Y %.0f Z %.0f | Placement: %s | Collision %.0f cm / Max %.0f cm\nMesh Edit: V=%d T=%d | Topology: %s | %s | %s | RayDist %.1f cm\nControls: MouseWheel=toolbar slot, E=full item list, LMB empty=add vertex, LMB tap vertex=linked-vertex source, LMB hold+move vertex=move vertex, RMB=finish vertex editing, SnapAction/G=toggle snap\nFolder: %s\n%s"),
+        TEXT("[Creator Toolbar]\nMode: %s | PlayMode: %s\nToolbar Slot: %d / 7 | Item: %s (%s)\nInventory Window: %s | Available Items: %d\nSnap: %s / Grid %.0f cm\nCrosshair: X %.0f Y %.0f Z %.0f | Placement: %s | Collision %.0f cm / Max %.0f cm\nControls: MouseWheel=toolbar slot, E=item list, LMB=place/fire, F=enter/exit vehicle, SnapAction/G=toggle snap\nWorld: %s\nData: %s\n%s"),
         *ModeString,
         PlayMode == EPlayMode::Creator ? TEXT("Creator") : TEXT("RealLife"),
         SelectedToolbarSlotIndex + 1,
         *SelectedItemName,
         *StaticEnum<EToolbarItemKind>()->GetDisplayNameTextByValue(static_cast<int64>(SelectedItem.Kind)).ToString(),
-        *ItemListText,
+        bItemListWindowOpen ? TEXT("OPEN") : TEXT("CLOSED"),
         AvailableItems.Num(),
         bSnapToGrid ? TEXT("ON") : TEXT("OFF"),
         GridSize,
@@ -4654,13 +5298,8 @@ FString UGameManagerSubSystem::BuildStatusText() const
         *CrosshairPlacementText,
         CrosshairCollisionTraceDistance,
         FreeSpacePlacementDistance,
-        GetCurrentEditableMeshVertexCount(),
-        GetCurrentEditableMeshTriangleCount(),
-        *TopologyText,
-        *VertexSelectText,
-        *ConnectedSourceText,
-        LastVertexDistance,
         *GetWorldRootPath(),
+        *GetDataDirectory(),
         *LastSaveMessage);
 }
 

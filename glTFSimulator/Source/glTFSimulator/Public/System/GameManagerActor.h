@@ -8,13 +8,13 @@
 #include "GameManagerActor.generated.h"
 
 class APrefabActor;
-class AEditableMeshActor;
 class AVehiclePawn;
 class AWeaponActor;
-class AWorldManager;
+class AWorldEnvManager;
 class AWeatherActor;
 class AglTFStreamActor;
 class UMaterialInterface;
+class UMaterialDefaultAsset;
 class UUserWidget;
 class UGameUpdateSubSystem;
 
@@ -31,6 +31,7 @@ public:
     AGameManagerActor();
 
 protected:
+    virtual void PostLoad() override;
     virtual void BeginPlay() override;
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
@@ -57,16 +58,22 @@ public:
     TSubclassOf<APrefabActor> PrefabActorClass;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|Classes")
-    TSubclassOf<AEditableMeshActor> EditableMeshActorClass;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|Classes")
     TSubclassOf<AVehiclePawn> VehiclePawnClass;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|Classes")
     TSubclassOf<AWeaponActor> WeaponActorClass;
 
+    /**
+     * Data-only Blueprint class containing the project-wide glTF material defaults. The game
+     * subsystem creates one transient instance on the game thread when this manager starts, then
+     * owns the resolved material references for the active world.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="Game|Assets", meta=(AllowAbstract="false"))
+    TSubclassOf<UMaterialDefaultAsset> MaterialDefaultAssetClass;
+
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|World")
-    TSubclassOf<AWorldManager> WorldManagerClass;
+    TSubclassOf<AWorldEnvManager> WorldEnvManagerClass;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|World")
     TSubclassOf<AglTFStreamActor> SpawnActorClass;
@@ -101,20 +108,8 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|Placement")
     float SurfacePlacementOffset = 2.0f;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|Placement")
-    float VertexSelectionRayDistance = 28.0f;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|Placement")
-    float VertexDragHoldSeconds = 0.18f;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|Placement")
-    float VertexDragStartDistance = 18.0f;
-
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|Vehicle")
     float VehicleEnterDistance = 450.0f;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|Object Creation")
-    bool bEnableObjectVertexCreation = false;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|Save")
     bool bAutoSaveScene = true;

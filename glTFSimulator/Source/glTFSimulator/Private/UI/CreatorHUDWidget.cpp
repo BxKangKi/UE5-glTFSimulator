@@ -6,15 +6,12 @@
 #include "Components/ScrollBox.h"
 #include "Components/TextBlock.h"
 #include "Components/UniformGridPanel.h"
-#include "Model/EditableMeshActor.h"
 #include "System/GameUpdateSubSystem.h"
 
 static FString MakeKindLabel(EToolbarItemKind Kind)
 {
     switch (Kind)
     {
-    case EToolbarItemKind::CreateObject:
-        return TEXT("Object");
     case EToolbarItemKind::Prefab:
         return TEXT("Prefab");
     case EToolbarItemKind::Weapon:
@@ -83,9 +80,12 @@ void UCreatorHUDWidget::NativeConstruct()
         {
             GameUpdateTickHandle = GameUpdate->RegisterUpdate(
                 this,
-                [this](const float DeltaSeconds)
+                [WeakThis = TWeakObjectPtr<UCreatorHUDWidget>(this)](const float DeltaSeconds)
                 {
-                    UpdateFromGameUpdate(DeltaSeconds);
+                    if (UCreatorHUDWidget* StrongThis = WeakThis.Get())
+                    {
+                        StrongThis->UpdateFromGameUpdate(DeltaSeconds);
+                    }
                 },
                 60);
         }
@@ -204,27 +204,19 @@ void UCreatorHUDWidget::ToggleItemListFromUI()
     }
 }
 
-void UCreatorHUDWidget::FinishEditFromUI()
-{
-    if (UGameManagerSubSystem* Manager = GetGameManager())
-    {
-        Manager->FinishCurrentEditableMesh();
-    }
-}
-
-void UCreatorHUDWidget::CancelEditFromUI()
-{
-    if (UGameManagerSubSystem* Manager = GetGameManager())
-    {
-        Manager->CancelCurrentEditableMesh(true);
-    }
-}
-
 void UCreatorHUDWidget::SaveSceneFromUI()
 {
     if (UGameManagerSubSystem* Manager = GetGameManager())
     {
         Manager->SaveScene();
+    }
+}
+
+void UCreatorHUDWidget::BakeWorldDataFromUI()
+{
+    if (UGameManagerSubSystem* Manager = GetGameManager())
+    {
+        Manager->BakeWorldData();
     }
 }
 
@@ -267,22 +259,18 @@ FText UCreatorHUDWidget::GetStatusText() const
     }
 
     const FToolbarItem SelectedItem = Manager->GetSelectedToolbarItem();
-    const FString ModeText = Manager->GetPlayMode() == EPlayMode::Creator ? TEXT("Creator") : TEXT("RealLife");
-    const FString EditText = Manager->IsEditingGeneratedMesh()
-        ? FString::Printf(TEXT("Editing: V%d / T%d / %s"), Manager->GetCurrentEditableMeshVertexCount(), Manager->GetCurrentEditableMeshTriangleCount(), Manager->IsCurrentEditableMeshTopologyValid() ? TEXT("VALID") : TEXT("INVALID"))
-        : TEXT("Editing: None");
+    const FString ModeText = Manager->GetPlayMode() == EPlayMode::Creator
+        ? TEXT("Creator")
+        : TEXT("RealLife");
 
-    const FString Text = FString::Printf(
-        TEXT("%s MODE\nSlot %d / %d\nItem: %s\nKind: %s\nTool: %d\n%s"),
+    return FText::FromString(FString::Printf(
+        TEXT("%s MODE\nSlot %d / %d\nItem: %s\nKind: %s\nTool: %d"),
         *ModeText,
         Manager->GetSelectedToolbarSlotIndex() + 1,
         Manager->GetToolbarSlotCount(),
         *SelectedItem.DisplayName,
         *MakeKindLabel(SelectedItem.Kind),
-        static_cast<int32>(Manager->GetCurrentToolMode()),
-        *EditText);
-
-    return FText::FromString(Text);
+        static_cast<int32>(Manager->GetCurrentToolMode())));
 }
 
 FText UCreatorHUDWidget::GetPlacementInfoText() const
@@ -298,22 +286,15 @@ FText UCreatorHUDWidget::GetPlacementInfoText() const
         ? (Manager->IsCrosshairFreeSpacePlacement() ? TEXT("AIR") : TEXT("SURFACE"))
         : TEXT("NONE");
     const FString SnapText = Manager->IsSnapEnabled() ? TEXT("ON") : TEXT("OFF");
-    const FString ValidText = Manager->IsEditingGeneratedMesh()
-        ? (Manager->IsCurrentEditableMeshTopologyValid() ? TEXT("VALID") : TEXT("INVALID"))
-        : TEXT("READY");
 
-    const FString Text = FString::Printf(
-        TEXT("X %.0f  Y %.0f  Z %.0f\nPlacement: %s\nSnap: %s (%.0f cm)\nTopology: %s\nHighlighted Vertex: %d"),
+    return FText::FromString(FString::Printf(
+        TEXT("X %.0f  Y %.0f  Z %.0f\nPlacement: %s\nSnap: %s (%.0f cm)"),
         Location.X,
         Location.Y,
         Location.Z,
         *PlacementMode,
         *SnapText,
-        Manager->GetGridSize(),
-        *ValidText,
-        Manager->GetHighlightedEditableVertexIndex());
-
-    return FText::FromString(Text);
+        Manager->GetGridSize()));
 }
 
 FText UCreatorHUDWidget::GetMessageText() const

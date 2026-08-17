@@ -37,5 +37,7 @@ private:
     TArray<TWeakObjectPtr<AVehiclePawn>> Vehicles;
     int32 GameUpdateHandle = INDEX_NONE;
 
+    void RegisterGameUpdate();
+    void UnregisterGameUpdate();
     void CompactVehicles();
 };

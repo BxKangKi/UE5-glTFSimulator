@@ -3,7 +3,7 @@
 
 /**
  * @file glTFRuntimeSafety.cpp
- * @brief Bounded per-asset scheduling, cache lifetime barriers, and session quarantine.
+ * @brief Serialized native scheduling, cache lifetime barriers, and session quarantine.
  */
 #include "System/glTFRuntimeSafety.h"
 
@@ -82,8 +82,8 @@ namespace glTFRuntimeSafetyPrivate
 
     struct FState
     {
-        // Parser construction is worker-thread-only. This small gate permits useful GLB parallelism
-        // while preventing dozens of large parser allocations from starting at the same instant.
+        // Parser construction is worker-thread-only and globally serialized. This avoids overlapping
+        // third-party parser allocations while several model files are discovered during map entry.
         FCriticalSection ParserGateLock;
         int32 ActiveParserCreations = 0;
 
@@ -114,8 +114,8 @@ namespace glTFRuntimeSafetyPrivate
     }
 
     constexpr int32 MaximumQueuedOperations = 4096;
-    constexpr int32 MaximumConcurrentNativeOperations = 3;
-    constexpr int32 MaximumConcurrentParserCreations = 3;
+    constexpr int32 MaximumConcurrentNativeOperations = 1;
+    constexpr int32 MaximumConcurrentParserCreations = 1;
 
     bool IsShuttingDown()
     {
@@ -229,7 +229,7 @@ namespace glTFRuntimeSafetyPrivate
         return Removed;
     }
 
-    /** Worker-thread RAII token for the bounded parser-construction gate. */
+    /** Worker-thread RAII token for the serialized parser-construction gate. */
     class FParserCreationSlot
     {
     public:
@@ -308,9 +308,8 @@ TSharedPtr<FglTFRuntimeParser> FglTFRuntimeSafety::CreateParserSafely(
         return nullptr;
     }
 
-    // Each request creates a distinct parser and therefore a distinct mutable cache. The bounded
-    // slot above replaces the old process-wide lock: independent GLBs can parse concurrently, but
-    // parser construction remains capped to protect peak memory in large worlds.
+    // Each request creates a distinct parser and mutable cache. The single construction slot avoids
+    // overlapping large native allocations while map startup discovers several independent GLBs.
     if (glTFRuntimeSafetyPrivate::IsShuttingDown() ||
         glTFRuntimeSafetyPrivate::IsCircuitOpen(&CoordinatorReason))
     {
@@ -413,6 +412,22 @@ void FglTFRuntimeSafety::CompleteOperation(const uint64 Ticket)
     // A release requested during the callback is finalized before another job can reuse that parser.
     ProcessPendingAssetReleases_GameThread();
     PumpQueue_GameThread();
+}
+
+void FglTFRuntimeSafety::CompleteOperationAfterCallback(const uint64 Ticket)
+{
+    if (Ticket == 0)
+    {
+        return;
+    }
+
+    // Always enqueue, even when already on the game thread. glTFRuntime executes the project
+    // delegate before its async context calls UnregisterGCObject(); releasing the ticket inline
+    // could therefore run ClearCache against a callback wrapper that has not finished unwinding.
+    AsyncTask(ENamedThreads::GameThread, [Ticket]()
+    {
+        FglTFRuntimeSafety::CompleteOperation(Ticket);
+    });
 }
 
 void FglTFRuntimeSafety::CancelQueuedOperations(UObject* Owner)
@@ -699,8 +714,8 @@ void FglTFRuntimeSafety::PumpQueue_GameThread()
         glTFRuntimeSafetyPrivate::FQueuedOperation Operation;
         bool bHasSelectedOperation = false;
 
-        // Preserve queue order where possible, but skip entries whose asset already owns a slot.
-        // This avoids head-of-line blocking: another GLB can proceed while one parser is busy.
+        // Preserve queue order and reject stale entries before selecting the next globally
+        // serialized native operation. The per-asset test remains as a defensive invariant.
         for (int32 Index = 0; Index < State.Queue.Num(); ++Index)
         {
             glTFRuntimeSafetyPrivate::FQueuedOperation& Candidate = State.Queue[Index];
@@ -761,7 +776,7 @@ void FglTFRuntimeSafety::PumpQueue_GameThread()
         }
 
         UE_LOG(LogTemp, Verbose,
-            TEXT("Starting bounded glTFRuntime operation [%llu] %s (active=%d/%d)"),
+            TEXT("Starting serialized glTFRuntime operation [%llu] %s (active=%d/%d)"),
             Operation.Ticket,
             *Operation.Label,
             State.ActiveOperations.Num(),

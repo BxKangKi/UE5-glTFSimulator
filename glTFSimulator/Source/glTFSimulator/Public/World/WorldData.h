@@ -7,7 +7,6 @@
 #include "WorldData.generated.h"
 
 #define LEVELNAME TEXT("WorldName")
-#define LEVELTIME TEXT("WorldTime")
 #define LATITUDE TEXT("Latitude")
 #define LONGITUDE TEXT("Longitude")
 #define AXIAL_TILT TEXT("AxialTilt")
@@ -18,7 +17,6 @@
 #define PLAYER_X TEXT("X")
 #define PLAYER_Y TEXT("Y")
 #define PLAYER_Z TEXT("Z")
-#define PLAYER_NAME TEXT("Player")
 #define LEVEL_FILE_NAME TEXT("/level.json")
 
 USTRUCT(BlueprintType)
@@ -82,6 +80,24 @@ struct GLTFSIMULATOR_API FLevelGameplaySettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level|Gameplay")
     bool bCheatsEnabled = false;
 
+    /** Map-author setting. Current player health is mutable state stored in data/players.dat. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level|Gameplay", meta=(ClampMin="1.0"))
+    float PlayerMaxHealth = 100.0f;
+
+    /**
+     * Map-authored non-ragdoll character mass in kilograms. CharacterMovement uses this value for
+     * momentum, standing weight, object impacts, and the mass-aware push-force calculation.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level|Gameplay", meta=(ClampMin="1.0", ClampMax="10000.0"))
+    float PlayerMassKg = 80.0f;
+
+    /**
+     * Effective horizontal traction used while a walking character pushes a simulated body.
+     * The sustained push-force limit is PlayerMassKg * gravity * this coefficient.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level|Gameplay", meta=(ClampMin="0.0", ClampMax="2.0"))
+    float PlayerPushTractionCoefficient = 0.30f;
+
     TSharedRef<FJsonObject> ToJson() const;
     bool FromJson(const TSharedPtr<FJsonObject>& Json);
 };
@@ -100,7 +116,8 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level")
     FString WorldName;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level")
+    /** Mutable runtime time. Persisted only in data/world.dat, never in level.json. */
+    UPROPERTY(Transient, BlueprintReadWrite, Category="Level|Runtime")
     float WorldTime;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level")
@@ -124,12 +141,12 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level")
     bool bOcean;
 
-    /** Legacy field kept for old level.json files. New saves use player.json. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level|Legacy")
+    /** Runtime compatibility value. Player transforms persist in data/players.dat. */
+    UPROPERTY(Transient, BlueprintReadWrite, Category="Level|Runtime")
     FVector PlayerLocation;
 
-    /** Legacy field kept for old level.json files. New saves use player.json. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level|Legacy")
+    /** Selected external player asset. Persisted only in data/world.dat. */
+    UPROPERTY(Transient, BlueprintReadWrite, Category="Level|Runtime")
     FString Player;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level|Cloud")

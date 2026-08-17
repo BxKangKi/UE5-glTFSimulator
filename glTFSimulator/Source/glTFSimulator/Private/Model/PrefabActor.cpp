@@ -1,32 +1,48 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
 #include "World/PrefabActor.h"
-#include "Components/StaticMeshComponent.h"
+
+#include "Components/BoxComponent.h"
+#include "Dom/JsonObject.h"
 #include "Engine/StaticMesh.h"
-#include "Model/glTFMaterialOverrideUtils.h"
 #include "glTFRuntimeAsset.h"
 #include "glTFRuntimeFunctionLibrary.h"
-#include "glTFRuntimeParser.h"
 #include "HAL/FileManager.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
-#include "Setting/GameSettings.h"
-#include "System/MultiplayerWorldSubSystem.h"
-#include "System/GlbValidation.h"
-#include "System/MacroLibrary.h"
-#include "System/glTFRuntimeSafety.h"
+#include "Materials/MaterialInterface.h"
+#include "Model/InstancedEntitySubsystem.h"
+#include "Model/glTFMaterialOverrideUtils.h"
 #include "Net/UnrealNetwork.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
+#include "Setting/GameSettings.h"
+#include "System/GameManagerSubSystem.h"
+#include "System/GlbValidation.h"
+#include "System/MacroLibrary.h"
+#include "System/MultiplayerWorldSubSystem.h"
+#include "System/glTFRuntimeSafety.h"
 
 namespace
 {
     constexpr int32 MaxRuntimePrefabNodeCount = 500000;
 
+    static FVector MakeSafeOriginCenteredBoxExtent(const FBox& Bounds)
+    {
+        if (!Bounds.IsValid)
+        {
+            return FVector(1.0f);
+        }
+
+        return FVector(
+            FMath::Max(1.0f, FMath::Max(FMath::Abs(Bounds.Min.X), FMath::Abs(Bounds.Max.X))),
+            FMath::Max(1.0f, FMath::Max(FMath::Abs(Bounds.Min.Y), FMath::Abs(Bounds.Max.Y))),
+            FMath::Max(1.0f, FMath::Max(FMath::Abs(Bounds.Min.Z), FMath::Abs(Bounds.Max.Z))));
+    }
+
     static FString ResolveReplicatedGltfPathForCurrentWorld(const UObject* WorldContextObject, const FString& InPath)
     {
-        FString NormalizedPath = InPath;
-        FPaths::NormalizeFilename(NormalizedPath);
+        FString NormalizedPath = GlbValidation::NormalizePath(InPath);
         if (FPaths::FileExists(NormalizedPath))
         {
             return NormalizedPath;
@@ -44,16 +60,16 @@ namespace
             const FString WorldFolderName = Multiplayer->GetSelectedWorldFolderName();
             if (!WorldFolderName.IsEmpty())
             {
-                const FString Candidate = FPaths::Combine(PATH_ROOT, WorldFolderName, TEXT("model"), RelativeModelPath);
+                const FString Candidate = GlbValidation::NormalizePath(
+                    FPaths::Combine(PATH_ROOT, WorldFolderName, TEXT("model"), RelativeModelPath));
                 if (FPaths::FileExists(Candidate))
                 {
                     return Candidate;
                 }
-                return Candidate;
             }
         }
 
-        return NormalizedPath;
+        return FString();
     }
 
     static bool ReadTransformObject(const TSharedPtr<FJsonObject>& Object, FTransform& OutTransform)
@@ -91,7 +107,57 @@ namespace
         Object->TryGetNumberField(TEXT("ScaleZ"), ScaleZ);
 
         OutTransform = FTransform(FRotator(Pitch, Yaw, Roll), FVector(X, Y, Z), FVector(ScaleX, ScaleY, ScaleZ));
-        return true;
+        return !OutTransform.ContainsNaN();
+    }
+
+    static FTransform GetPrefabNodeWorldTransform(
+        const TMap<int32, FglTFRuntimeNode>& NodeMap,
+        const FglTFRuntimeNode& Node)
+    {
+        FTransform WorldTransform = Node.Transform;
+        int32 ParentIndex = Node.ParentIndex;
+        TSet<int32> VisitedParents;
+
+        while (const FglTFRuntimeNode* Parent = NodeMap.Find(ParentIndex))
+        {
+            if (VisitedParents.Contains(ParentIndex) || Parent->Transform.ContainsNaN())
+            {
+                break;
+            }
+            VisitedParents.Add(ParentIndex);
+            WorldTransform = WorldTransform * Parent->Transform;
+            ParentIndex = Parent->ParentIndex;
+        }
+        return WorldTransform.ContainsNaN() ? FTransform::Identity : WorldTransform;
+    }
+
+    static FBox TransformBounds(const FBox& LocalBounds, const FTransform& Transform)
+    {
+        FBox Result(ForceInit);
+        if (!LocalBounds.IsValid || Transform.ContainsNaN())
+        {
+            return Result;
+        }
+
+        const FVector Min = LocalBounds.Min;
+        const FVector Max = LocalBounds.Max;
+        const FVector Corners[8] =
+        {
+            FVector(Min.X, Min.Y, Min.Z),
+            FVector(Min.X, Min.Y, Max.Z),
+            FVector(Min.X, Max.Y, Min.Z),
+            FVector(Min.X, Max.Y, Max.Z),
+            FVector(Max.X, Min.Y, Min.Z),
+            FVector(Max.X, Min.Y, Max.Z),
+            FVector(Max.X, Max.Y, Min.Z),
+            FVector(Max.X, Max.Y, Max.Z)
+        };
+
+        for (const FVector& Corner : Corners)
+        {
+            Result += Transform.TransformPosition(Corner);
+        }
+        return Result;
     }
 }
 
@@ -103,8 +169,12 @@ APrefabActor::APrefabActor()
     SetNetUpdateFrequency(10.0f);
     SetMinNetUpdateFrequency(2.0f);
 
-    Root = CreateDefaultSubobject<USceneComponent>(TEXT("Root"));
+    Root = CreateDefaultSubobject<UBoxComponent>(TEXT("PhysicsProxy"));
     SetRootComponent(Root);
+    Root->InitBoxExtent(FVector(50.0f));
+    Root->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+    Root->SetGenerateOverlapEvents(false);
+    Root->SetSimulatePhysics(false);
 }
 
 void APrefabActor::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
@@ -129,21 +199,27 @@ void APrefabActor::Destroyed()
 void APrefabActor::SetRenderOnlyMode(bool bInRenderOnlyMode)
 {
     bRenderOnlyMode = bInRenderOnlyMode;
-    for (TObjectPtr<UStaticMeshComponent>& MeshComponent : MeshComponents)
-    {
-        ApplyConfigToMeshComponent(MeshComponent.Get());
-    }
+    ApplyConfigToPhysicsProxy();
 }
 
 void APrefabActor::OnRep_PrefabReplicationData()
 {
     if (ReplicatedSourceFilePath.IsEmpty())
     {
+        ClearLoadedComponents();
+        return;
+    }
+
+    const FString ResolvedPath = ResolveReplicatedGltfPathForCurrentWorld(this, ReplicatedSourceFilePath);
+    if (ResolvedPath.IsEmpty())
+    {
+        UE_LOG(LogTemp, Warning, TEXT("PrefabActor: replicated source file is missing; load skipped. Source=%s"), *ReplicatedSourceFilePath);
+        ClearLoadedComponents();
         return;
     }
 
     SetRenderOnlyMode(UMultiplayerWorldSubSystem::ShouldUseClientRenderOnlyStreaming(this));
-    LoadPrefab(ResolveReplicatedGltfPathForCurrentWorld(this, ReplicatedSourceFilePath), ReplicatedObjectName);
+    LoadPrefab(ResolvedPath, ReplicatedObjectName);
 }
 
 void APrefabActor::ReleaseRuntimeResources()
@@ -154,57 +230,54 @@ void APrefabActor::ReleaseRuntimeResources()
     }
 
     ClearLoadedComponents();
-    if (IsValid(GltfAsset))
-    {
-        // Centralized release makes this path safe if prefab loading becomes asynchronous later.
-        // It also keeps parser-cache teardown consistent with streamed world assets.
-        FglTFRuntimeSafety::RequestAssetRelease(GltfAsset);
-        GltfAsset = nullptr;
-    }
 }
 
 void APrefabActor::ClearLoadedComponents()
 {
-    TSet<UStaticMesh*> MeshesToRelease;
-
-    for (UStaticMeshComponent* Component : MeshComponents)
+    if (InstancedRegistrationId != INDEX_NONE)
     {
-        if (IsValid(Component))
+        if (UInstancedEntitySubsystem* InstancedEntities = UInstancedEntitySubsystem::Get(this))
         {
-            if (UStaticMesh* Mesh = Component->GetStaticMesh())
-            {
-                MeshesToRelease.Add(Mesh);
-            }
-            Component->SetStaticMesh(nullptr);
-            Component->UnregisterComponent();
-            Component->DestroyComponent();
+            InstancedEntities->UnregisterEntity(InstancedRegistrationId);
         }
+        InstancedRegistrationId = INDEX_NONE;
     }
 
-    for (const TPair<int32, TObjectPtr<UStaticMesh>>& Pair : MeshCache)
-    {
-        if (UStaticMesh* Mesh = Pair.Value.Get())
-        {
-            MeshesToRelease.Add(Mesh);
-        }
-    }
-
-    for (UStaticMesh* Mesh : MeshesToRelease)
-    {
-        if (IsValid(Mesh) && !Mesh->IsAsset())
-        {
-            Mesh->ClearFlags(RF_Public | RF_Standalone);
-        }
-    }
-
-    MeshComponents.Empty();
     MeshCache.Empty();
+    LoadedLocalBounds.Init();
     bLoaded = false;
+    SourceFilePath.Reset();
+    ObjectName.Reset();
+    BaseName.Reset();
+    Config = FPrefabActorConfig();
+    if (HasAuthority())
+    {
+        ReplicatedSourceFilePath.Reset();
+        ReplicatedObjectName.Reset();
+    }
+
+    if (IsValid(GltfAsset))
+    {
+        FglTFRuntimeSafety::RequestAssetRelease(GltfAsset);
+        GltfAsset = nullptr;
+    }
+
+    if (IsValid(Root))
+    {
+        Root->SetSimulatePhysics(false);
+        Root->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+        Root->SetGenerateOverlapEvents(false);
+    }
 }
 
 bool APrefabActor::LoadConfigJson(const FString& JsonPath)
 {
     Config = FPrefabActorConfig();
+
+    if (JsonPath.IsEmpty() || !IFileManager::Get().FileExists(*JsonPath))
+    {
+        return false;
+    }
 
     constexpr int64 MaxPrefabConfigBytes = 16ll * 1024ll * 1024ll;
     const int64 JsonFileSize = IFileManager::Get().FileSize(*JsonPath);
@@ -236,6 +309,13 @@ bool APrefabActor::LoadConfigJson(const FString& JsonPath)
     RootObject->TryGetBoolField(TEXT("bEnableCollision"), Config.bEnableCollision);
     RootObject->TryGetBoolField(TEXT("SimulatePhysics"), Config.bSimulatePhysics);
     RootObject->TryGetBoolField(TEXT("bSimulatePhysics"), Config.bSimulatePhysics);
+    double LoadedMassKg = Config.MassKg;
+    if ((RootObject->TryGetNumberField(TEXT("MassKg"), LoadedMassKg)
+            || RootObject->TryGetNumberField(TEXT("PhysicsMassKg"), LoadedMassKg))
+        && FMath::IsFinite(LoadedMassKg))
+    {
+        Config.MassKg = FMath::Clamp(static_cast<float>(LoadedMassKg), 0.0f, 1000000000.0f);
+    }
     RootObject->TryGetStringField(TEXT("CollisionProfile"), Config.CollisionProfileName);
     RootObject->TryGetStringField(TEXT("CollisionProfileName"), Config.CollisionProfileName);
 
@@ -252,18 +332,41 @@ bool APrefabActor::LoadConfigJson(const FString& JsonPath)
     return true;
 }
 
-void APrefabActor::ApplyConfigToMeshComponent(UStaticMeshComponent* MeshComponent) const
+void APrefabActor::ApplyConfigToPhysicsProxy()
 {
-    if (!IsValid(MeshComponent))
+    if (!IsValid(Root))
     {
         return;
     }
 
-    const bool bEnablePhysicsCollision = !bRenderOnlyMode && Config.bEnableCollision;
-    MeshComponent->SetCollisionEnabled(bEnablePhysicsCollision ? ECollisionEnabled::QueryAndPhysics : ECollisionEnabled::NoCollision);
-    MeshComponent->SetCollisionProfileName(Config.CollisionProfileName.IsEmpty() ? TEXT("BlockAll") : FName(*Config.CollisionProfileName));
-    MeshComponent->SetGenerateOverlapEvents(bEnablePhysicsCollision);
-    MeshComponent->SetSimulatePhysics(!bRenderOnlyMode && Config.bSimulatePhysics);
+    const bool bEnablePhysicsCollision = bLoaded && !bRenderOnlyMode && Config.bEnableCollision;
+    if (Root->IsSimulatingPhysics() && (!bEnablePhysicsCollision || !Config.bSimulatePhysics))
+    {
+        Root->SetSimulatePhysics(false);
+    }
+
+    const FName CollisionProfileName = Config.CollisionProfileName.IsEmpty()
+        ? FName(TEXT("BlockAll"))
+        : FName(*Config.CollisionProfileName);
+    Root->SetCollisionProfileName(CollisionProfileName);
+    Root->SetCollisionEnabled(bEnablePhysicsCollision ? ECollisionEnabled::QueryAndPhysics : ECollisionEnabled::NoCollision);
+    Root->SetGenerateOverlapEvents(bEnablePhysicsCollision);
+    if (bEnablePhysicsCollision && Config.bSimulatePhysics)
+    {
+        if (!Root->IsSimulatingPhysics())
+        {
+            Root->SetSimulatePhysics(true);
+        }
+
+        if (Config.MassKg > 0.0f)
+        {
+            Root->SetMassOverrideInKg(NAME_None, Config.MassKg, true);
+        }
+        else
+        {
+            Root->SetMassOverrideInKg(NAME_None, 0.0f, false);
+        }
+    }
 }
 
 UStaticMesh* APrefabActor::LoadMeshByIndex(int32 MeshIndex)
@@ -278,8 +381,18 @@ UStaticMesh* APrefabActor::LoadMeshByIndex(int32 MeshIndex)
         return Existing->Get();
     }
 
+    UInstancedEntitySubsystem* InstancedEntities = UInstancedEntitySubsystem::Get(this);
+    if (InstancedEntities)
+    {
+        if (UStaticMesh* SharedMesh = InstancedEntities->FindSharedMesh(SourceFilePath, MeshIndex))
+        {
+            MeshCache.Add(MeshIndex, SharedMesh);
+            return SharedMesh;
+        }
+    }
+
     FglTFRuntimeStaticMeshConfig MeshConfig;
-    MeshConfig.Outer = this;
+    MeshConfig.Outer = InstancedEntities ? InstancedEntities->GetRuntimeMeshOuter() : this;
     MeshConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
     MeshConfig.MaterialsConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
     MeshConfig.MaterialsConfig.bGeneratesMipMaps = false;
@@ -289,22 +402,18 @@ UStaticMesh* APrefabActor::LoadMeshByIndex(int32 MeshIndex)
     MeshConfig.MaterialsConfig.ImagesConfig.bCompressMips = false;
     MeshConfig.MaterialsConfig.ImagesConfig.bStreaming = false;
     MeshConfig.MaterialsConfig.bLoadMipMaps = false;
+    if (UGameManagerSubSystem* GameManager = UGameManagerSubSystem::GetSubSystem(this))
     {
-        const TMap<EglTFRuntimeMaterialType, UMaterialInterface*> LitOverrides =
-            glTFMaterialOverrideUtils::BuildOverrideMap(MaterialAssets);
-        if (LitOverrides.Num() > 0)
-        {
-            MeshConfig.MaterialsConfig.UberMaterialsOverrideMap = LitOverrides;
-            MeshConfig.MaterialsConfig.UnlitOverrideMap = LitOverrides;
-        }
+        glTFMaterialOverrideUtils::ApplyOverrides(
+            GameManager->GetMaterialDefaultReferences(),
+            MeshConfig.MaterialsConfig);
     }
-    glTFMaterialOverrideUtils::ApplyNamedOverrides(MaterialAssets, MeshConfig.MaterialsConfig);
-    MeshConfig.bAllowCPUAccess = true;
-    MeshConfig.bBuildLumenCards = !bRenderOnlyMode;
-    MeshConfig.bBuildSimpleCollision = !bRenderOnlyMode;
-    MeshConfig.bBuildComplexCollision = !bRenderOnlyMode;
-    MeshConfig.bBuildNavCollision = !bRenderOnlyMode;
-    MeshConfig.CollisionComplexity = bRenderOnlyMode ? ECollisionTraceFlag::CTF_UseDefault : ECollisionTraceFlag::CTF_UseComplexAsSimple;
+    MeshConfig.bAllowCPUAccess = false;
+    MeshConfig.bBuildLumenCards = true;
+    MeshConfig.bBuildSimpleCollision = false;
+    MeshConfig.bBuildComplexCollision = false;
+    MeshConfig.bBuildNavCollision = false;
+    MeshConfig.CollisionComplexity = ECollisionTraceFlag::CTF_UseDefault;
 
     UStaticMesh* Mesh = GltfAsset->LoadStaticMesh(MeshIndex, MeshConfig);
     if (IsValid(Mesh))
@@ -321,43 +430,102 @@ bool APrefabActor::LoadPrefab(const FString& InFilePath, const FString& InObject
         return false;
     }
 
-    ClearLoadedComponents();
-
-    SourceFilePath = GlbValidation::NormalizePath(InFilePath);
-    BaseName = FPaths::GetBaseFilename(SourceFilePath);
-    ObjectName = InObjectName.IsEmpty() ? BaseName : InObjectName;
-
-    FString ValidationReason;
-    if (!GlbValidation::ValidateRuntimeMeshFile(SourceFilePath, ValidationReason))
+    const FString NormalizedPath = GlbValidation::NormalizePath(InFilePath);
+    if (NormalizedPath.IsEmpty() || !IFileManager::Get().FileExists(*NormalizedPath))
     {
-        UE_LOG(LogTemp, Warning, TEXT("PrefabActor: invalid GLB skipped. Path=%s Reason=%s"), *SourceFilePath, *ValidationReason);
-        SourceFilePath.Reset();
-        BaseName.Reset();
-        ObjectName.Reset();
+        UE_LOG(LogTemp, Warning, TEXT("PrefabActor: source file is missing; load skipped. Path=%s"), *NormalizedPath);
         return false;
     }
 
+    FString ValidationReason;
+    if (!GlbValidation::ValidateRuntimeModelFile(NormalizedPath, ValidationReason))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("PrefabActor: invalid glTF model skipped. Path=%s Reason=%s"), *NormalizedPath, *ValidationReason);
+        return false;
+    }
+
+    ClearLoadedComponents();
+    SourceFilePath = NormalizedPath;
+    BaseName = FPaths::GetBaseFilename(SourceFilePath);
+    ObjectName = InObjectName.IsEmpty() ? BaseName : InObjectName;
     LoadConfigJson(FPaths::ChangeExtension(SourceFilePath, TEXT("json")));
+
+    UInstancedEntitySubsystem* InstancedEntities = UInstancedEntitySubsystem::Get(this);
+    if (!InstancedEntities)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("PrefabActor: instanced entity subsystem is unavailable."));
+        ClearLoadedComponents();
+        return false;
+    }
+
+    FInstancedEntityRegistrationOptions RegistrationOptions;
+    RegistrationOptions.bDynamic = Config.bSimulatePhysics && !bRenderOnlyMode;
+    RegistrationOptions.bAllowPhysicsDistanceDeactivation = RegistrationOptions.bDynamic;
+    RegistrationOptions.bStoreAsPrefabTemplate = true;
+    RegistrationOptions.InterpolationSpeed = RegistrationOptions.bDynamic ? 18.0f : 0.0f;
+
+    // Configure the per-entity physics proxy before registration so the distance manager captures
+    // the real collision/simulation state that must be restored after far-distance suspension.
+    bLoaded = true;
+    ApplyConfigToPhysicsProxy();
+
+    FBox TemplateBounds(ForceInit);
+    InstancedRegistrationId = InstancedEntities->RegisterEntityFromPrefabTemplate(
+        SourceFilePath,
+        this,
+        Root,
+        RegistrationOptions,
+        TemplateBounds);
+    if (InstancedRegistrationId != INDEX_NONE)
+    {
+        LoadedLocalBounds = TemplateBounds;
+        if (LoadedLocalBounds.IsValid)
+        {
+            Root->SetBoxExtent(MakeSafeOriginCenteredBoxExtent(LoadedLocalBounds), true);
+        }
+        ApplyConfigToPhysicsProxy();
+
+        if (HasAuthority())
+        {
+            ReplicatedSourceFilePath = SourceFilePath;
+            ReplicatedObjectName = ObjectName;
+            ForceNetUpdate();
+        }
+        return true;
+    }
 
     FglTFRuntimeConfig LoaderConfig;
     LoaderConfig.bAllowExternalFiles = true;
     GltfAsset = UglTFRuntimeFunctionLibrary::glTFLoadAssetFromFilename(SourceFilePath, false, LoaderConfig);
     if (!IsValid(GltfAsset))
     {
-        UE_LOG(LogTemp, Warning, TEXT("PrefabActor: failed to load %s"), *SourceFilePath);
+        const FString FailedPath = SourceFilePath;
+        UE_LOG(LogTemp, Warning, TEXT("PrefabActor: failed to load %s"), *FailedPath);
+        ClearLoadedComponents();
         return false;
     }
 
     const TArray<FglTFRuntimeNode> Nodes = GltfAsset->GetNodes();
     if (Nodes.Num() > MaxRuntimePrefabNodeCount)
     {
-        UE_LOG(LogTemp, Warning, TEXT("PrefabActor: GLB node count exceeds the runtime safety limit. Path=%s Nodes=%d"),
+        UE_LOG(LogTemp, Warning, TEXT("PrefabActor: glTF node count exceeds the runtime safety limit. Path=%s Nodes=%d"),
             *SourceFilePath, Nodes.Num());
-        ReleaseRuntimeResources();
+        ClearLoadedComponents();
         return false;
     }
+
+    TMap<int32, FglTFRuntimeNode> NodeMap;
+    for (const FglTFRuntimeNode& Node : Nodes)
+    {
+        if (Node.Index >= 0 && Node.Index < Nodes.Num() && !Node.Transform.ContainsNaN())
+        {
+            NodeMap.Add(Node.Index, Node);
+        }
+    }
+
     const int32 MeshCount = GltfAsset->GetNumMeshes();
-    int32 ComponentIndex = 0;
+    TArray<FInstancedEntityMeshPart> MeshParts;
+    FBox LocalBounds(ForceInit);
     for (const FglTFRuntimeNode& Node : Nodes)
     {
         if (Node.MeshIndex < 0 || Node.MeshIndex >= MeshCount || Node.Transform.ContainsNaN())
@@ -371,35 +539,73 @@ bool APrefabActor::LoadPrefab(const FString& InFilePath, const FString& InObject
             continue;
         }
 
-        UStaticMeshComponent* MeshComponent = NewObject<UStaticMeshComponent>(this, *FString::Printf(TEXT("PrefabMesh_%d"), ComponentIndex++));
-        if (!IsValid(MeshComponent))
+        FTransform PartTransform = GetPrefabNodeWorldTransform(NodeMap, Node);
+        if (Config.bOverrideLocalTransform)
+        {
+            PartTransform = PartTransform * Config.LocalTransform;
+        }
+        if (PartTransform.ContainsNaN())
         {
             continue;
         }
 
-        AddInstanceComponent(MeshComponent);
-        MeshComponent->SetMobility(EComponentMobility::Movable);
-        MeshComponent->SetupAttachment(Root);
-        MeshComponent->SetStaticMesh(Mesh);
-        FTransform ComponentTransform = Node.Transform;
-        if (Config.bOverrideLocalTransform)
+        FInstancedEntityMeshPart& Part = MeshParts.AddDefaulted_GetRef();
+        Part.MeshKey = Node.MeshIndex;
+        Part.Mesh = Mesh;
+        Part.LocalTransform = PartTransform;
+
+        const FBox PartBounds = TransformBounds(Mesh->GetBoundingBox(), PartTransform);
+        if (PartBounds.IsValid)
         {
-            ComponentTransform = ComponentTransform * Config.LocalTransform;
+            LocalBounds += PartBounds.Min;
+            LocalBounds += PartBounds.Max;
         }
-        MeshComponent->SetRelativeTransform(ComponentTransform);
-        ApplyConfigToMeshComponent(MeshComponent);
-        MeshComponent->RegisterComponent();
-        MeshComponents.Add(MeshComponent);
     }
 
-    bLoaded = MeshComponents.Num() > 0;
-    if (bLoaded && HasAuthority())
+    if (MeshParts.Num() == 0)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("PrefabActor: no renderable mesh nodes were found: %s"), *SourceFilePath);
+        ClearLoadedComponents();
+        return false;
+    }
+
+    if (LocalBounds.IsValid)
+    {
+        Root->SetBoxExtent(MakeSafeOriginCenteredBoxExtent(LocalBounds), true);
+    }
+
+    InstancedRegistrationId = InstancedEntities->RegisterEntity(
+        SourceFilePath,
+        this,
+        Root,
+        MeshParts,
+        RegistrationOptions,
+        LocalBounds);
+    bLoaded = InstancedRegistrationId != INDEX_NONE;
+    LoadedLocalBounds = LocalBounds;
+
+    // The shared ISM actor now owns the generated meshes. The parser and per-entity cache can be released.
+    MeshCache.Empty();
+    if (IsValid(GltfAsset))
+    {
+        FglTFRuntimeSafety::RequestAssetRelease(GltfAsset);
+        GltfAsset = nullptr;
+    }
+
+    if (!bLoaded)
+    {
+        ClearLoadedComponents();
+        return false;
+    }
+
+    ApplyConfigToPhysicsProxy();
+    if (HasAuthority())
     {
         ReplicatedSourceFilePath = SourceFilePath;
         ReplicatedObjectName = ObjectName;
         ForceNetUpdate();
     }
-    return bLoaded;
+    return true;
 }
 
 FPlacedObjectRecord APrefabActor::ToPlacementRecord() const

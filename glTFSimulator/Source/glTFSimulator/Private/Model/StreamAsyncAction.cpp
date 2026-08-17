@@ -2,6 +2,7 @@
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
 #include "Model/StreamAsyncAction.h"
+#include "System/GameManagerSubSystem.h"
 #include "System/ActorHelper.h"
 #include "System/MacroLibrary.h"
 #include "Components/InstancedStaticMeshComponent.h"
@@ -12,19 +13,94 @@
 #include "Engine/World.h"
 #include "Engine/Texture.h"
 #include "Engine/StaticMesh.h"
+#include "HAL/IConsoleManager.h"
 #include "Model/glTFStreamActor.h"
 #include "Misc/ScopeExit.h"
 #include "System/glTFRuntimeSafety.h"
 #include "TimerManager.h"
+#include "UObject/UObjectGlobals.h"
 #include "World/WaterActor.h"
 
 namespace
 {
+    // glTFRuntime has an unresolved startup crash path in LoadStaticMeshLODs. Runtime streaming
+    // therefore uses the stable single-mesh API unless a project explicitly opts back in.
+    constexpr int32 DefaultRuntimeMultiLOD = 0;
+
+    TAutoConsoleVariable<int32> CVarEnableRuntimeMultiLOD(
+        TEXT("gltf.Streaming.EnableRuntimeMultiLOD"),
+        DefaultRuntimeMultiLOD,
+        TEXT("Enables glTFRuntime multi-LOD mesh assembly. 0 loads one validated LOD (prefers LOD0); 1 enables LOD1-LOD3."),
+        ECVF_Default);
+
     /** Every UObject/component mutation in this action is intentionally game-thread-only. */
     bool EnsureStreamActionGameThread(const TCHAR* FunctionName)
     {
         return ensureMsgf(IsInGameThread(), TEXT("%s must run on the game thread"), FunctionName);
     }
+
+    bool ConfigureGeneratedMeshCollision(
+        UInstancedStaticMeshComponent* Component,
+        const FMeshData* MeshData,
+        const bool bRenderOnly)
+    {
+        if (!IsValid(Component))
+        {
+            return false;
+        }
+
+        const bool bEnableCollision =
+            !bRenderOnly && MeshData && (MeshData->bComplexCollision || MeshData->bSimpleCollision);
+
+        Component->SetGenerateOverlapEvents(false);
+        Component->SetCanEverAffectNavigation(bEnableCollision);
+        if (!bEnableCollision)
+        {
+            Component->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+            Component->SetCollisionResponseToAllChannels(ECR_Ignore);
+            return false;
+        }
+
+        Component->SetCollisionProfileName(TEXT("BlockAll"));
+        Component->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+        Component->SetCollisionObjectType(ECC_WorldStatic);
+        Component->SetCollisionResponseToAllChannels(ECR_Block);
+        return true;
+    }
+}
+
+void UglTFGeneratedStaticMeshWorldContext::Initialize(UWorld* InWorld)
+{
+    PinnedWorld = nullptr;
+    World = InWorld;
+}
+
+bool UglTFGeneratedStaticMeshWorldContext::PinWorldForBuild()
+{
+    UWorld* RuntimeWorld = World.Get();
+    if (!IsValid(RuntimeWorld) || !RuntimeWorld->IsGameWorld())
+    {
+        PinnedWorld = nullptr;
+        return false;
+    }
+
+    PinnedWorld = RuntimeWorld;
+    return true;
+}
+
+void UglTFGeneratedStaticMeshWorldContext::ReleaseWorldPin()
+{
+    PinnedWorld = nullptr;
+}
+
+UWorld* UglTFGeneratedStaticMeshWorldContext::GetWorld() const
+{
+    if (UWorld* ActiveWorld = PinnedWorld.Get())
+    {
+        return ActiveWorld;
+    }
+
+    return World.Get();
 }
 
 UStreamAsyncAction *UStreamAsyncAction::StreamAsync(
@@ -43,6 +119,20 @@ UStreamAsyncAction *UStreamAsyncAction::StreamAsync(
 
     auto *Action = NewObject<UStreamAsyncAction>();
     Action->WorldContextObject = WorldContextObject;
+    UWorld* RuntimeWorld = IsValid(Actor)
+        ? Actor->GetWorld()
+        : (IsValid(WorldContextObject) ? WorldContextObject->GetWorld() : nullptr);
+    if (IsValid(RuntimeWorld) && RuntimeWorld->IsGameWorld())
+    {
+        UglTFGeneratedStaticMeshWorldContext* MeshWorldContext =
+            NewObject<UglTFGeneratedStaticMeshWorldContext>(GetTransientPackage(), NAME_None, RF_Transient);
+        if (IsValid(MeshWorldContext))
+        {
+            MeshWorldContext->Initialize(RuntimeWorld);
+            Action->GeneratedMeshWorldContext = MeshWorldContext;
+        }
+    }
+
     if (IsValid(Actor))
     {
         Action->OwnerActor = Actor;
@@ -63,6 +153,10 @@ UStreamAsyncAction *UStreamAsyncAction::StreamAsync(
     Action->Distance = InDistance;
     Action->ChunkSize = InChunkSize;
     Action->StaticMeshConfig = StaticMeshConfig;
+    if (UGameManagerSubSystem* GameManager = UGameManagerSubSystem::GetSubSystem(WorldContextObject))
+    {
+        Action->MaterialReferenceGuard = GameManager->AcquireMaterialDefaultReferenceGuard();
+    }
     Action->bRenderOnly = bInRenderOnly;
     Action->RegisterWithGameInstance(WorldContextObject);
     return Action;
@@ -146,10 +240,20 @@ void UStreamAsyncAction::AbortAndRelease(UStaticMesh* OrphanedMesh)
     PendingUnloadNodes.Empty();
     PendingLoadWaterNodes.Empty();
     PendingUnloadWaterNodes.Empty();
+    TotalOperationCount = 0;
+    TotalSkippedOperationCount = 0;
+    CurrentSkippedOperationIndex = 0;
+    SkippedProgressChunkSize = 1;
 
     Asset = nullptr;
     OwnerActor = nullptr;
     WorldContextObject = nullptr;
+    MaterialReferenceGuard = nullptr;
+    if (IsValid(GeneratedMeshWorldContext))
+    {
+        GeneratedMeshWorldContext->ReleaseWorldPin();
+    }
+    GeneratedMeshWorldContext = nullptr;
     DecalLight = nullptr;
     CurrentLoadingNode = NAME_None;
     CurrentLoadingMesh = NAME_None;
@@ -175,6 +279,9 @@ void UStreamAsyncAction::Activate()
         return;
     }
 
+    // Preserve the original node count before sanitization. Invalid, already-correct, and
+    // distance-skipped nodes are still completed loading work and remain in the denominator.
+    const int32 OriginalNodeWorkCount = NodeMap.Num() + WaterNodeMap.Num();
     SanitizeRuntimeMaps();
     ChunkSize = FMath::Max(1, FMath::Min(FMath::Max(1, NodeMap.Num() + WaterNodeMap.Num()), ChunkSize));
 
@@ -244,7 +351,21 @@ void UStreamAsyncAction::Activate()
     CurrentUnloadIndex = 0;
     CurrentLoadWaterIndex = 0;
     CurrentUnloadWaterIndex = 0;
-    TotalOperationCount = PendingLoadNodes.Num() + PendingUnloadNodes.Num() + PendingLoadWaterNodes.Num() + PendingUnloadWaterNodes.Num();
+    const int32 PendingOperationCount = PendingLoadNodes.Num() + PendingUnloadNodes.Num() +
+        PendingLoadWaterNodes.Num() + PendingUnloadWaterNodes.Num();
+    TotalOperationCount = OriginalNodeWorkCount;
+    TotalSkippedOperationCount = FMath::Max(0, TotalOperationCount - PendingOperationCount);
+    CurrentSkippedOperationIndex = 0;
+
+    // No-op, invalid, already-correct, and distance-skipped nodes remain visible loading work.
+    // Advancing them in a bounded number of next-tick steps lets the UI actually render progress
+    // instead of receiving a single jump from the initial value to 100 percent.
+    constexpr int32 DesiredSkippedProgressUpdates = 16;
+    const int32 SkippedNodesPerUpdate = TotalSkippedOperationCount > 0
+        ? (TotalSkippedOperationCount + DesiredSkippedProgressUpdates - 1) / DesiredSkippedProgressUpdates
+        : 1;
+    SkippedProgressChunkSize = FMath::Max(1, SkippedNodesPerUpdate);
+
     bIsLoading = false;
     BroadcastProgress();
 
@@ -347,10 +468,20 @@ void UStreamAsyncAction::ReleaseActionReferences()
     Asset = nullptr;
     OwnerActor = nullptr;
     WorldContextObject = nullptr;
+    MaterialReferenceGuard = nullptr;
+    if (IsValid(GeneratedMeshWorldContext))
+    {
+        GeneratedMeshWorldContext->ReleaseWorldPin();
+    }
+    GeneratedMeshWorldContext = nullptr;
     PendingLoadNodes.Empty();
     PendingUnloadNodes.Empty();
     PendingLoadWaterNodes.Empty();
     PendingUnloadWaterNodes.Empty();
+    TotalOperationCount = 0;
+    TotalSkippedOperationCount = 0;
+    CurrentSkippedOperationIndex = 0;
+    SkippedProgressChunkSize = 1;
     NodeMap.Empty();
     WaterNodeMap.Empty();
     MeshMap.Empty();
@@ -382,52 +513,62 @@ void UStreamAsyncAction::ProcessChunk()
         return;
     }
 
+    if (CurrentSkippedOperationIndex < TotalSkippedOperationCount)
+    {
+        CurrentSkippedOperationIndex = FMath::Min(
+            CurrentSkippedOperationIndex + SkippedProgressChunkSize,
+            TotalSkippedOperationCount);
+        BroadcastProgress();
+    }
+
     const int32 WaterUnloadEnd = FMath::Min(CurrentUnloadWaterIndex + ChunkSize, PendingUnloadWaterNodes.Num());
     for (int32 i = CurrentUnloadWaterIndex; i < WaterUnloadEnd; ++i)
     {
         ProcessUnloadWaterNode(PendingUnloadWaterNodes[i]);
+        CurrentUnloadWaterIndex = i + 1;
         BroadcastProgress();
     }
-    CurrentUnloadWaterIndex = WaterUnloadEnd;
 
-    int32 UnloadEnd = FMath::Min(CurrentUnloadIndex + ChunkSize, PendingUnloadNodes.Num());
+    const int32 UnloadEnd = FMath::Min(CurrentUnloadIndex + ChunkSize, PendingUnloadNodes.Num());
     for (int32 i = CurrentUnloadIndex; i < UnloadEnd; ++i)
     {
         ProcessUnloadNode(PendingUnloadNodes[i]);
+        CurrentUnloadIndex = i + 1;
         BroadcastProgress();
     }
-    CurrentUnloadIndex = UnloadEnd;
 
     const int32 WaterLoadEnd = FMath::Min(CurrentLoadWaterIndex + ChunkSize, PendingLoadWaterNodes.Num());
     for (int32 i = CurrentLoadWaterIndex; i < WaterLoadEnd; ++i)
     {
         ProcessLoadWaterNode(PendingLoadWaterNodes[i]);
+        CurrentLoadWaterIndex = i + 1;
         BroadcastProgress();
     }
-    CurrentLoadWaterIndex = WaterLoadEnd;
-
-    BroadcastProgress();
 
     if (!bIsLoading && CurrentLoadIndex < PendingLoadNodes.Num())
     {
-        int32 EndIndex = FMath::Min(CurrentLoadIndex + ChunkSize, PendingLoadNodes.Num());
+        const int32 EndIndex = FMath::Min(CurrentLoadIndex + ChunkSize, PendingLoadNodes.Num());
         for (int32 i = CurrentLoadIndex; i < EndIndex; ++i)
         {
-            FName TargetNode = PendingLoadNodes[i];
+            const FName TargetNode = PendingLoadNodes[i];
+            CurrentLoadIndex = i + 1;
             if (LoadedNodes.Contains(TargetNode))
             {
-                CurrentLoadIndex++;
+                BroadcastProgress();
                 continue;
             }
             if (ProcessLoadNode(TargetNode))
             {
+                // The active node is subtracted by BroadcastProgress until its terminal callback.
+                BroadcastProgress();
                 break;
             }
-            CurrentLoadIndex++;
+            BroadcastProgress();
         }
     }
 
-    if (CurrentLoadIndex >= PendingLoadNodes.Num() &&
+    if (CurrentSkippedOperationIndex >= TotalSkippedOperationCount &&
+        CurrentLoadIndex >= PendingLoadNodes.Num() &&
         CurrentUnloadIndex >= PendingUnloadNodes.Num() &&
         CurrentLoadWaterIndex >= PendingLoadWaterNodes.Num() &&
         CurrentUnloadWaterIndex >= PendingUnloadWaterNodes.Num() &&
@@ -650,8 +791,14 @@ void UStreamAsyncAction::SetStaticMesh(UStaticMesh *StaticMesh)
     bStaticMeshLoadInFlight = false;
     ON_SCOPE_EXIT
     {
-        // Keep the parser slot active until component creation/abort cleanup has finished.
-        FglTFRuntimeSafety::CompleteOperation(CompletedTicket);
+        // Collision finalization happens before glTFRuntime invokes this delegate. Drop the strong
+        // world pin only after all callback-side component work is complete, and release the parser
+        // ticket on the next game-thread task so the plugin can finish unregistering its GC guard.
+        if (IsValid(GeneratedMeshWorldContext))
+        {
+            GeneratedMeshWorldContext->ReleaseWorldPin();
+        }
+        FglTFRuntimeSafety::CompleteOperationAfterCallback(CompletedTicket);
     };
     if (bAbortRequested || !IsValid(OwnerActor))
     {
@@ -677,33 +824,36 @@ void UStreamAsyncAction::SetStaticMesh(UStaticMesh *StaticMesh)
     // ReadWrite caching is owned by this UglTFRuntimeAsset. No second root-managed mesh registry
     // is needed, and all components for this actor receive the exact cached mesh instance.
     UStaticMesh* MeshToUse = StaticMesh;
+    const FModelMeshData* ModelMeshData = MeshMap.Find(CurrentLoadingMesh);
+    const bool bWantsCollision = !bRenderOnly && ModelMeshData &&
+        (ModelMeshData->Data.bComplexCollision || ModelMeshData->Data.bSimpleCollision);
 
     UInstancedStaticMeshComponent *ISMC = InstanceMap.FindRef(CurrentLoadingMesh);
     if (!IsValid(ISMC))
     {
         ISMC = FActorHelper::AddStaticMeshComponent<UInstancedStaticMeshComponent>(
-            OwnerActor, OwnerActor->GetTransform(), MeshToUse);
+            OwnerActor,
+            OwnerActor->GetTransform(),
+            MeshToUse,
+            bWantsCollision ? ECollisionEnabled::QueryAndPhysics : ECollisionEnabled::NoCollision,
+            bWantsCollision ? ECR_Block : ECR_Ignore);
         if (IsValid(ISMC))
         {
             ISMC->SetRenderCustomDepth(true);
             ISMC->SetCustomDepthStencilValue(1);
-            if (bRenderOnly)
-            {
-                ISMC->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-                ISMC->SetGenerateOverlapEvents(false);
-            }
             InstanceMap.Emplace(CurrentLoadingMesh, ISMC);
         }
     }
 
-    if (IsValid(ISMC) && bRenderOnly)
-    {
-        ISMC->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-        ISMC->SetGenerateOverlapEvents(false);
-    }
+    ConfigureGeneratedMeshCollision(
+        ISMC,
+        ModelMeshData ? &ModelMeshData->Data : nullptr,
+        bRenderOnly);
 
     if (IsValid(ISMC))
     {
+        // SetStaticMesh happened before registration, and AddInstance creates the per-instance body.
+        // A second RecreatePhysicsState here can overlap Chaos scene insertion in packaged builds.
         AddTrasnform(CurrentLoadingNode, ISMC);
     }
     else
@@ -735,115 +885,226 @@ void UStreamAsyncAction::LoadStaticMeshAsync(const FName &MeshName)
         return;
     }
 
-    if (FModelMeshData *Mesh = MeshMap.Find(MeshName))
+    FModelMeshData* Mesh = MeshMap.Find(MeshName);
+    if (!Mesh)
     {
-        TArray<int32> LocalIndices;
-        if (Mesh->LOD0 != INDEX_NONE)
-            LocalIndices.Add(Mesh->LOD0);
-        if (Mesh->LOD1 != INDEX_NONE)
-            LocalIndices.Add(Mesh->LOD1);
-        if (Mesh->LOD2 != INDEX_NONE)
-            LocalIndices.Add(Mesh->LOD2);
-        if (Mesh->LOD3 != INDEX_NONE)
-            LocalIndices.Add(Mesh->LOD3);
+        ResetLoadState();
+        return;
+    }
 
-        const int32 Count = LocalIndices.Num();
-        if (Count <= 0)
+    const int32 RuntimeMeshCount = Asset->GetNumMeshes();
+    TArray<int32> LocalIndices;
+    LocalIndices.Reserve(4);
+
+    const auto AddValidLOD = [this, &LocalIndices, RuntimeMeshCount, MeshName](
+        const int32 MeshIndex,
+        const TCHAR* LODLabel)
+    {
+        if (MeshIndex == INDEX_NONE)
         {
-            LoadedNodes.Remove(CurrentLoadingNode);
-            NodeMap.Remove(CurrentLoadingNode);
-            ResetLoadState();
             return;
         }
-        TMap<int32, float> LODScreenSize;
-        for (int32 i = 0; i < Count; i++)
+        if (MeshIndex < 0 || MeshIndex >= RuntimeMeshCount)
         {
-            LODScreenSize.Add(i, CalculateLODScreenSize(i, Count));
+            UE_LOG(LogTemp, Warning,
+                TEXT("Ignoring invalid runtime mesh index. Mesh=%s Node=%s LOD=%s Index=%d MeshCount=%d"),
+                *MeshName.ToString(),
+                *CurrentLoadingNode.ToString(),
+                LODLabel,
+                MeshIndex,
+                RuntimeMeshCount);
+            return;
         }
+        LocalIndices.AddUnique(MeshIndex);
+    };
 
-        FglTFRuntimeStaticMeshConfig Config = StaticMeshConfig;
-        Config.bBuildComplexCollision = !bRenderOnly && Mesh->Data.bComplexCollision;
-        Config.bBuildSimpleCollision = !bRenderOnly && Mesh->Data.bSimpleCollision;
-        Config.bBuildNavCollision = !bRenderOnly && Config.bBuildNavCollision;
-        if (bRenderOnly)
-        {
-            Config.CollisionComplexity = ECollisionTraceFlag::CTF_UseDefault;
-        }
-        Config.LODScreenSize = LODScreenSize;
-        Config.LODScreenSizeMultiplier = 1.0f;
-
-        // This is the crash-sensitive native entry point. The coordinator permits bounded
-        // cross-GLB parallelism but never overlaps two cache-mutating builds on this Asset.
-        const TArray<int32> RequestedIndices = LocalIndices;
-        const FglTFRuntimeStaticMeshConfig RequestedConfig = Config;
-        const FName RequestedNode = CurrentLoadingNode;
-        const FName RequestedMesh = CurrentLoadingMesh;
-        TWeakObjectPtr<UStreamAsyncAction> WeakThis(this);
-        bStaticMeshLoadInFlight = true;
-        const uint64 SubmittedTicket = FglTFRuntimeSafety::EnqueueOperation(
-            this,
-            Asset,
-            FString::Printf(TEXT("Stream mesh %s for node %s"), *RequestedMesh.ToString(), *RequestedNode.ToString()),
-            [WeakThis, RequestedIndices, RequestedConfig](const uint64 Ticket)
-            {
-                UStreamAsyncAction* StrongThis = WeakThis.Get();
-                if (!IsValid(StrongThis) || StrongThis->bAbortRequested || !IsValid(StrongThis->Asset))
-                {
-                    if (IsValid(StrongThis))
-                    {
-                        StrongThis->GlTFRuntimeOperationTicket = 0;
-                        StrongThis->bStaticMeshLoadInFlight = false;
-                        StrongThis->AbortAndRelease();
-                    }
-                    // Request teardown while the active slot still protects this parser, then
-                    // return the ticket so the pending cache release becomes executable.
-                    FglTFRuntimeSafety::CompleteOperation(Ticket);
-                    return;
-                }
-
-                StrongThis->GlTFRuntimeOperationTicket = Ticket;
-                FglTFRuntimeStaticMeshAsync Callback;
-                Callback.BindDynamic(StrongThis, &UStreamAsyncAction::SetStaticMesh);
-                StrongThis->Asset->LoadStaticMeshLODsAsync(RequestedIndices, Callback, RequestedConfig);
-            },
-            [WeakThis, RequestedNode](const FString& Reason)
-            {
-                UStreamAsyncAction* StrongThis = WeakThis.Get();
-                if (!IsValid(StrongThis))
-                {
-                    return;
-                }
-
-                StrongThis->GlTFRuntimeOperationTicket = 0;
-                StrongThis->bStaticMeshLoadInFlight = false;
-                if (StrongThis->bAbortRequested)
-                {
-                    // A queued request can be cancelled before the native callback ever runs.
-                    // Finish the deferred release here; otherwise the action and parser asset
-                    // remain rooted by each other after world teardown.
-                    StrongThis->AbortAndRelease();
-                    return;
-                }
-
-                UE_LOG(LogTemp, Warning,
-                    TEXT("Stream mesh request rejected. Node=%s Reason=%s"),
-                    *RequestedNode.ToString(),
-                    *Reason);
-                StrongThis->LoadedNodes.Remove(RequestedNode);
-                StrongThis->NodeMap.Remove(RequestedNode);
-                StrongThis->ResetLoadState();
-            });
-
-        // A ReadWrite cache hit may invoke the plugin callback before EnqueueOperation returns.
-        // Preserve the callback's completed state instead of restoring a stale ticket afterwards.
-        if (bStaticMeshLoadInFlight && GlTFRuntimeOperationTicket == 0)
-        {
-            GlTFRuntimeOperationTicket = SubmittedTicket;
-        }
+    const bool bEnableRuntimeMultiLOD = CVarEnableRuntimeMultiLOD.GetValueOnGameThread() != 0;
+    if (bEnableRuntimeMultiLOD)
+    {
+        AddValidLOD(Mesh->LOD0, TEXT("LOD0"));
+        AddValidLOD(Mesh->LOD1, TEXT("LOD1"));
+        AddValidLOD(Mesh->LOD2, TEXT("LOD2"));
+        AddValidLOD(Mesh->LOD3, TEXT("LOD3"));
     }
     else
     {
+        // Prefer LOD0, but tolerate malformed/legacy metadata by selecting the first valid fallback.
+        AddValidLOD(Mesh->LOD0, TEXT("LOD0"));
+        if (LocalIndices.IsEmpty())
+        {
+            AddValidLOD(Mesh->LOD1, TEXT("LOD1"));
+        }
+        if (LocalIndices.IsEmpty())
+        {
+            AddValidLOD(Mesh->LOD2, TEXT("LOD2"));
+        }
+        if (LocalIndices.IsEmpty())
+        {
+            AddValidLOD(Mesh->LOD3, TEXT("LOD3"));
+        }
+
+        if (Mesh->LOD1 != INDEX_NONE || Mesh->LOD2 != INDEX_NONE || Mesh->LOD3 != INDEX_NONE)
+        {
+            UE_LOG(LogTemp, VeryVerbose,
+                TEXT("Runtime multi-LOD assembly disabled; loading one validated LOD only. Mesh=%s Node=%s"),
+                *MeshName.ToString(),
+                *CurrentLoadingNode.ToString());
+        }
+    }
+
+    const int32 Count = LocalIndices.Num();
+    if (Count <= 0)
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("Runtime mesh request skipped because no valid mesh index remains. Mesh=%s Node=%s MeshCount=%d"),
+            *MeshName.ToString(),
+            *CurrentLoadingNode.ToString(),
+            RuntimeMeshCount);
+        LoadedNodes.Remove(CurrentLoadingNode);
+        NodeMap.Remove(CurrentLoadingNode);
         ResetLoadState();
+        return;
+    }
+
+    TMap<int32, float> LODScreenSize;
+    for (int32 Index = 0; Index < Count; ++Index)
+    {
+        LODScreenSize.Add(Index, CalculateLODScreenSize(Index, Count));
+    }
+
+    const bool bBuildComplexCollision = !bRenderOnly && Mesh->Data.bComplexCollision;
+    const bool bBuildSimpleCollision = !bRenderOnly && Mesh->Data.bSimpleCollision;
+    const bool bNeedsCollision = bBuildComplexCollision || bBuildSimpleCollision;
+    UWorld* CollisionWorld = IsValid(GeneratedMeshWorldContext)
+        ? GeneratedMeshWorldContext->GetWorld()
+        : nullptr;
+    if (bNeedsCollision && (!IsValid(CollisionWorld) || !CollisionWorld->IsGameWorld()))
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("Runtime mesh collision build rejected because no active game-world outer is available. Mesh=%s Node=%s"),
+            *MeshName.ToString(),
+            *CurrentLoadingNode.ToString());
+        LoadedNodes.Remove(CurrentLoadingNode);
+        NodeMap.Remove(CurrentLoadingNode);
+        ResetLoadState();
+        return;
+    }
+
+    FglTFRuntimeStaticMeshConfig Config = StaticMeshConfig;
+    Config.Outer = GeneratedMeshWorldContext.Get();
+    Config.bBuildComplexCollision = bBuildComplexCollision;
+    Config.bBuildSimpleCollision = bBuildSimpleCollision;
+    Config.bBuildNavCollision = !bRenderOnly && Config.bBuildNavCollision;
+    Config.bAllowCPUAccess = !bRenderOnly && (Config.bAllowCPUAccess || bBuildComplexCollision);
+    Config.CollisionComplexity = bBuildComplexCollision
+        ? ECollisionTraceFlag::CTF_UseComplexAsSimple
+        : ECollisionTraceFlag::CTF_UseDefault;
+    Config.LODScreenSize = LODScreenSize;
+    Config.LODScreenSizeMultiplier = 1.0f;
+
+    const TArray<int32> RequestedIndices = LocalIndices;
+    const FglTFRuntimeStaticMeshConfig RequestedConfig = Config;
+    const FName RequestedNode = CurrentLoadingNode;
+    const FName RequestedMesh = CurrentLoadingMesh;
+    TWeakObjectPtr<UStreamAsyncAction> WeakThis(this);
+    bStaticMeshLoadInFlight = true;
+    const uint64 SubmittedTicket = FglTFRuntimeSafety::EnqueueOperation(
+        this,
+        Asset,
+        FString::Printf(TEXT("Stream mesh %s for node %s"), *RequestedMesh.ToString(), *RequestedNode.ToString()),
+        [WeakThis, RequestedIndices, RequestedConfig, RequestedNode, RequestedMesh](const uint64 Ticket)
+        {
+            UStreamAsyncAction* StrongThis = WeakThis.Get();
+            if (!IsValid(StrongThis) || StrongThis->bAbortRequested || !IsValid(StrongThis->Asset))
+            {
+                if (IsValid(StrongThis))
+                {
+                    StrongThis->GlTFRuntimeOperationTicket = 0;
+                    StrongThis->bStaticMeshLoadInFlight = false;
+                    StrongThis->AbortAndRelease();
+                }
+                // Native mesh construction has not started in this branch, so immediate ticket
+                // completion is safe and allows a pending asset release to proceed.
+                FglTFRuntimeSafety::CompleteOperation(Ticket);
+                return;
+            }
+
+            const bool bRequestedCollision =
+                RequestedConfig.bBuildComplexCollision || RequestedConfig.bBuildSimpleCollision;
+            if (bRequestedCollision &&
+                (!IsValid(StrongThis->GeneratedMeshWorldContext) ||
+                 !StrongThis->GeneratedMeshWorldContext->PinWorldForBuild()))
+            {
+                UE_LOG(LogTemp, Error,
+                    TEXT("Runtime collision build lost its game world before native execution. Mesh=%s Node=%s"),
+                    *RequestedMesh.ToString(),
+                    *RequestedNode.ToString());
+                StrongThis->GlTFRuntimeOperationTicket = 0;
+                StrongThis->bStaticMeshLoadInFlight = false;
+                StrongThis->LoadedNodes.Remove(RequestedNode);
+                StrongThis->NodeMap.Remove(RequestedNode);
+                StrongThis->ResetLoadState();
+                FglTFRuntimeSafety::CompleteOperation(Ticket);
+                return;
+            }
+
+            StrongThis->GlTFRuntimeOperationTicket = Ticket;
+            FglTFRuntimeStaticMeshAsync Callback;
+            Callback.BindDynamic(StrongThis, &UStreamAsyncAction::SetStaticMesh);
+
+            UE_LOG(LogTemp, Verbose,
+                TEXT("Submitting runtime mesh build. Mesh=%s Node=%s LODCount=%d ComplexCollision=%s SimpleCollision=%s"),
+                *RequestedMesh.ToString(),
+                *RequestedNode.ToString(),
+                RequestedIndices.Num(),
+                RequestedConfig.bBuildComplexCollision ? TEXT("true") : TEXT("false"),
+                RequestedConfig.bBuildSimpleCollision ? TEXT("true") : TEXT("false"));
+
+            if (RequestedIndices.Num() == 1)
+            {
+                // The single-mesh API avoids the plugin's separate multi-LOD assembly path.
+                StrongThis->Asset->LoadStaticMeshAsync(RequestedIndices[0], Callback, RequestedConfig);
+            }
+            else
+            {
+                StrongThis->Asset->LoadStaticMeshLODsAsync(RequestedIndices, Callback, RequestedConfig);
+            }
+        },
+        [WeakThis, RequestedNode](const FString& Reason)
+        {
+            UStreamAsyncAction* StrongThis = WeakThis.Get();
+            if (!IsValid(StrongThis))
+            {
+                return;
+            }
+
+            StrongThis->GlTFRuntimeOperationTicket = 0;
+            StrongThis->bStaticMeshLoadInFlight = false;
+            if (IsValid(StrongThis->GeneratedMeshWorldContext))
+            {
+                StrongThis->GeneratedMeshWorldContext->ReleaseWorldPin();
+            }
+            if (StrongThis->bAbortRequested)
+            {
+                // A queued request can be cancelled before the native callback ever runs.
+                StrongThis->AbortAndRelease();
+                return;
+            }
+
+            UE_LOG(LogTemp, Warning,
+                TEXT("Stream mesh request rejected. Node=%s Reason=%s"),
+                *RequestedNode.ToString(),
+                *Reason);
+            StrongThis->LoadedNodes.Remove(RequestedNode);
+            StrongThis->NodeMap.Remove(RequestedNode);
+            StrongThis->ResetLoadState();
+        });
+
+    // A cache hit may invoke the plugin callback before EnqueueOperation returns. Preserve the
+    // callback's terminal state instead of restoring a stale ticket afterwards.
+    if (bStaticMeshLoadInFlight && GlTFRuntimeOperationTicket == 0)
+    {
+        GlTFRuntimeOperationTicket = SubmittedTicket;
     }
 }
 
@@ -1048,6 +1309,17 @@ void UStreamAsyncAction::BroadcastProgress()
         return;
     }
 
-    const int32 CompletedOperations = FMath::Clamp(CurrentUnloadIndex + CurrentLoadIndex + CurrentUnloadWaterIndex + CurrentLoadWaterIndex, 0, TotalOperationCount);
-    Progress.Broadcast(FMath::Clamp(static_cast<float>(CompletedOperations) / static_cast<float>(TotalOperationCount), 0.0f, 1.0f));
+    const int32 CompletedLoadNodes = FMath::Max(0, CurrentLoadIndex - (bIsLoading ? 1 : 0));
+    const int32 CompletedOperations = FMath::Clamp(
+        CurrentSkippedOperationIndex +
+        CurrentUnloadIndex +
+        CompletedLoadNodes +
+        CurrentUnloadWaterIndex +
+        CurrentLoadWaterIndex,
+        0,
+        TotalOperationCount);
+    Progress.Broadcast(FMath::Clamp(
+        static_cast<float>(CompletedOperations) / static_cast<float>(TotalOperationCount),
+        0.0f,
+        1.0f));
 }

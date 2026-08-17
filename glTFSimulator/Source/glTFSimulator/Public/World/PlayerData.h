@@ -6,9 +6,10 @@
 #include "Dom/JsonObject.h"
 #include "PlayerData.generated.h"
 
-#define PLAYER_FILE_NAME TEXT("/player.json")
+#define LEGACY_PLAYER_FILE_NAME TEXT("/player.json")
+#define LEGACY_PLAYERS_FILE_NAME TEXT("/players.json")
 
-/** Persistent per-player save record stored in the selected world folder. */
+/** Persistent per-player runtime record stored in data/players.dat. */
 USTRUCT(BlueprintType)
 struct GLTFSIMULATOR_API FWorldPlayerRecord
 {
@@ -63,6 +64,7 @@ public:
     const FWorldPlayerRecord* FindPlayer(const FString& PlayerId) const;
     FWorldPlayerRecord& FindOrAddPlayer(const FString& PlayerId);
 
+    /** Legacy migration helpers. Runtime saves never write player JSON. */
     static TSharedRef<FJsonObject> SerializeData(const UPlayerData* Data);
     static bool DeserializeData(UPlayerData* Data, const TSharedPtr<FJsonObject>& Json);
 };

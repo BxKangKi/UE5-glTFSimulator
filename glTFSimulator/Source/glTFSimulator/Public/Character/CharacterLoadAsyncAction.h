@@ -23,6 +23,7 @@ class UglTFRuntimeAsset;
 class USkeleton;
 class USkeletalMesh;
 class UPhysicsAsset;
+class UMaterialInterface;
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FCharacterLoadCallback, bool, Result);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FCharacterLoadProgress, float, Progress);
@@ -54,6 +55,13 @@ private:
     TObjectPtr<UglTFRuntimeAsset> CurrentLoadedAsset = nullptr;
     UPROPERTY(Transient)
     TObjectPtr<USkeleton> CurrentRuntimeSkeleton = nullptr;
+
+    /** Source assets referenced by the copied native async config; retained until its callback drains. */
+    UPROPERTY(Transient)
+    TObjectPtr<USkeleton> SourceSkeletonReferenceGuard = nullptr;
+
+    UPROPERTY(Transient)
+    TObjectPtr<UMaterialInterface> SourceMaterialReferenceGuard = nullptr;
 
     UPROPERTY(Transient)
     TObjectPtr<USkeletalMesh> PendingSkeletalMesh = nullptr;

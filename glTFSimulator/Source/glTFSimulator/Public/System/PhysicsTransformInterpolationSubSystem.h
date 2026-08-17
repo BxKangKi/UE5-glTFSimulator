@@ -66,4 +66,5 @@ private:
 
     bool ShouldSkipComponent(const USceneComponent* Component, bool bCanMoveSimulatingPrimitive) const;
     void RegisterGameUpdate();
+    void UnregisterGameUpdate();
 };

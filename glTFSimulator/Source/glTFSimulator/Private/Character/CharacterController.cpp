@@ -20,6 +20,7 @@
 #include "Character/CharacterLoadAsyncAction.h"
 #include "World/WaterActor.h"
 #include "World/BuoyancyComponent.h"
+#include "World/WorldData.h"
 #include "System/MacroLibrary.h"
 #include "Components/PrimitiveComponent.h"
 #include "Animation/Skeleton.h"
@@ -33,6 +34,17 @@ namespace CharacterControllerTuning
 
     constexpr float DefaultThirdPersonArmLength = 350.0f;
     constexpr float WaterLevelChangeToleranceCm = 1.0f;
+
+    constexpr float DefaultCharacterMassKg = 80.0f;
+    constexpr float MinCharacterMassKg = 1.0f;
+    constexpr float MaxCharacterMassKg = 10000.0f;
+    constexpr float DefaultPushTractionCoefficient = 0.30f;
+    constexpr float MaxPushTractionCoefficient = 2.0f;
+    constexpr float DefaultGravityAccelerationCm = 980.0f;
+    constexpr float InitialPushMomentumTransferRatio = 0.01f;
+    constexpr float PushForcePointZOffsetFactor = -0.75f;
+    constexpr float PhysicsInteractionRefreshIntervalSeconds = 0.25f;
+
     constexpr float MinPhysicsObjectImpactSpeed = 90.0f;
     constexpr float PhysicsObjectImpactVelocityScale = 0.65f;
     constexpr float MaxPhysicsObjectImpactVelocityChange = 1400.0f;
@@ -134,18 +146,15 @@ void ACharacterController::BeginPlay()
     SavedThirdPersonArmLength = SpringArm->TargetArmLength > 1.0f ? SpringArm->TargetArmLength : CharacterControllerTuning::DefaultThirdPersonArmLength;
     SavedThirdPersonSocketOffset = SpringArm->SocketOffset;
     // Initialize Component
+    SubSystem = UGameManagerSubSystem::GetSubSystem(this);
     Movement = GetCharacterMovement();
-    if (IsValid(Movement))
-    {
-        Movement->bEnablePhysicsInteraction = true;
-    }
+    RefreshMassAwarePhysicsInteraction(true);
     if (UCapsuleComponent* Capsule = GetCapsuleComponent())
     {
         Capsule->SetNotifyRigidBodyCollision(true);
         Capsule->OnComponentHit.RemoveDynamic(this, &ACharacterController::HandleCapsulePhysicsHit);
         Capsule->OnComponentHit.AddDynamic(this, &ACharacterController::HandleCapsulePhysicsHit);
     }
-    SubSystem = UGameManagerSubSystem::GetSubSystem(this);
     // PlayerCharacterController::OnPossess performs primary-player registration. BeginPlay can run
     // before possession, when this Pawn cannot yet be distinguished from remote or secondary Pawns.
     Activate(false);
@@ -154,9 +163,12 @@ void ACharacterController::BeginPlay()
     {
         GameUpdateTickHandle = GameUpdate->RegisterUpdate(
             this,
-            [this](const float DeltaSeconds)
+            [WeakThis = TWeakObjectPtr<ACharacterController>(this)](const float DeltaSeconds)
             {
-                UpdateFromGameUpdate(DeltaSeconds);
+                if (ACharacterController* StrongThis = WeakThis.Get())
+                {
+                    StrongThis->UpdateFromGameUpdate(DeltaSeconds);
+                }
             },
             0);
     }
@@ -637,6 +649,90 @@ void ACharacterController::RestoreControlAfterRagdollRecovery()
     }
 }
 
+void ACharacterController::RefreshMassAwarePhysicsInteraction(bool bForce)
+{
+    if (!IsValid(Movement))
+    {
+        Movement = GetCharacterMovement();
+    }
+    if (!IsValid(Movement))
+    {
+        return;
+    }
+
+    if (!IsValid(SubSystem))
+    {
+        SubSystem = UGameManagerSubSystem::GetSubSystem(this);
+    }
+
+    float NewMassKg = CharacterControllerTuning::DefaultCharacterMassKg;
+    float NewTractionCoefficient = CharacterControllerTuning::DefaultPushTractionCoefficient;
+    if (const UWorldData* WorldData = IsValid(SubSystem) ? SubSystem->GetActiveWorldData() : nullptr)
+    {
+        NewMassKg = WorldData->Gameplay.PlayerMassKg;
+        NewTractionCoefficient = WorldData->Gameplay.PlayerPushTractionCoefficient;
+    }
+
+    NewMassKg = FMath::Clamp(
+        FMath::IsFinite(NewMassKg) ? NewMassKg : CharacterControllerTuning::DefaultCharacterMassKg,
+        CharacterControllerTuning::MinCharacterMassKg,
+        CharacterControllerTuning::MaxCharacterMassKg);
+    NewTractionCoefficient = FMath::Clamp(
+        FMath::IsFinite(NewTractionCoefficient) ? NewTractionCoefficient : CharacterControllerTuning::DefaultPushTractionCoefficient,
+        0.0f,
+        CharacterControllerTuning::MaxPushTractionCoefficient);
+
+    const bool bSettingsChanged = !FMath::IsNearlyEqual(CharacterMassKg, NewMassKg, 0.01f)
+        || !FMath::IsNearlyEqual(CharacterPushTractionCoefficient, NewTractionCoefficient, 0.001f);
+    if (!bForce && !bSettingsChanged)
+    {
+        return;
+    }
+
+    CharacterMassKg = NewMassKg;
+    CharacterPushTractionCoefficient = NewTractionCoefficient;
+    const UWorld* World = GetWorld();
+    const float GravityAcceleration = World && FMath::IsFinite(World->GetGravityZ())
+        ? FMath::Max(1.0f, FMath::Abs(World->GetGravityZ()))
+        : CharacterControllerTuning::DefaultGravityAccelerationCm;
+
+    // A walking character is a kinematic controller, so the stock 750,000 push force is not tied
+    // to body mass and can accelerate a one-ton vehicle far too easily. Derive the sustained force
+    // from the character's available horizontal traction instead: F = mass * gravity * coefficient.
+    CharacterPushForceLimit = CharacterMassKg * GravityAcceleration * CharacterPushTractionCoefficient;
+
+    Movement->Mass = CharacterMassKg;
+    Movement->bEnablePhysicsInteraction = true;
+    // Never multiply push/touch force by the target body mass. A fixed applied force naturally
+    // gives a heavy body less acceleration through F = m*a.
+    Movement->bPushForceScaledToMass = false;
+    Movement->bTouchForceScaledToMass = false;
+    Movement->bScalePushForceToVelocity = true;
+    Movement->bPushForceUsingZOffset = true;
+    Movement->PushForcePointZOffsetFactor = CharacterControllerTuning::PushForcePointZOffsetFactor;
+
+    const float ReferencePushSpeed = FMath::Max(0.0f, Movement->MaxWalkSpeed);
+    Movement->InitialPushForceFactor = CharacterMassKg * ReferencePushSpeed
+        * CharacterControllerTuning::InitialPushMomentumTransferRatio;
+    Movement->PushForceFactor = CharacterPushForceLimit;
+
+    // Touch and overlap forces are non-directional and can keep creeping a parked heavy body even
+    // when the character is not actively walking into it. Blocking contact and the directional
+    // push force remain enabled; incidental touch/repulsion forces are disabled.
+    Movement->TouchForceFactor = 0.0f;
+    Movement->MinTouchForce = 0.0f;
+    Movement->MaxTouchForce = 0.0f;
+    Movement->RepulsionForce = 0.0f;
+    Movement->StandingDownwardForceScale = 1.0f;
+
+    UE_LOG(LogTemp, Log,
+        TEXT("Character physics interaction configured. MassKg=%.2f Traction=%.3f PushForce=%.2f InitialPushImpulse=%.2f"),
+        CharacterMassKg,
+        CharacterPushTractionCoefficient,
+        CharacterPushForceLimit,
+        Movement->InitialPushForceFactor);
+}
+
 void ACharacterController::HandleCapsulePhysicsHit(UPrimitiveComponent* HitComponent, AActor* OtherActor, UPrimitiveComponent* OtherComp, FVector NormalImpulse, const FHitResult& Hit)
 {
     if (!bReceivePhysicsObjectImpacts || !IsValid(OtherActor) || OtherActor == this || !IsValid(OtherComp) || !IsValid(Movement) || !IsValid(Component.Get()))
@@ -682,12 +778,42 @@ void ACharacterController::HandleCapsulePhysicsHit(UPrimitiveComponent* HitCompo
 
     const FVector ImpactPoint = HitImpactPoint.IsNearlyZero() ? OtherComp->GetComponentLocation() : HitImpactPoint;
     const FVector OtherVelocity = OtherComp->GetPhysicsLinearVelocityAtPoint(ImpactPoint);
-    const FVector RelativeVelocity = OtherVelocity - GetVelocity();
-    const float RelativeImpactSpeed = FVector::DotProduct(RelativeVelocity, HorizontalDirection);
+    const FVector CharacterVelocity = GetVelocity();
 
-    constexpr float ReferenceCharacterMassKg = 80.0f;
-    const float ImpulseSpeed = NormalImpulse.Size() / ReferenceCharacterMassKg;
-    float ImpactSpeed = FMath::Max(RelativeImpactSpeed, ImpulseSpeed);
+    // Only treat this as an incoming-object impact when the simulated body itself is moving into
+    // the character. Previously a stationary car also knocked the player backwards simply because
+    // the player walked into it, which mixed the push and impact responses.
+    const float ObjectTowardCharacterSpeed = FMath::Max(
+        0.0f,
+        FVector::DotProduct(OtherVelocity, HorizontalDirection));
+    if (ObjectTowardCharacterSpeed < CharacterControllerTuning::MinPhysicsObjectImpactSpeed)
+    {
+        return;
+    }
+
+    const float CharacterTowardObjectSpeed = FMath::Max(
+        0.0f,
+        FVector::DotProduct(CharacterVelocity, -HorizontalDirection));
+    const float ClosingSpeedDrivenByObject = ObjectTowardCharacterSpeed
+        + FMath::Min(ObjectTowardCharacterSpeed, CharacterTowardObjectSpeed);
+
+    const float SafeCharacterMassKg = FMath::Clamp(
+        CharacterMassKg,
+        CharacterControllerTuning::MinCharacterMassKg,
+        CharacterControllerTuning::MaxCharacterMassKg);
+    const float RawOtherMassKg = OtherComp->GetMass();
+    const float OtherMassKg = FMath::IsFinite(RawOtherMassKg) && RawOtherMassKg > UE_SMALL_NUMBER
+        ? RawOtherMassKg
+        : 1.0f;
+    // One-dimensional two-body momentum transfer. Light props impart only a small velocity change;
+    // a vehicle much heavier than the character transfers most of its incoming contact speed.
+    const float TwoBodyMassTransfer = OtherMassKg / (OtherMassKg + SafeCharacterMassKg);
+    const float RelativeImpactSpeed = ClosingSpeedDrivenByObject * TwoBodyMassTransfer;
+    const float ImpulseSpeed = NormalImpulse.Size() / SafeCharacterMassKg;
+    const float BoundedImpulseSpeed = FMath::Min(
+        ImpulseSpeed,
+        RelativeImpactSpeed * 1.5f + CharacterControllerTuning::MinPhysicsObjectImpactSpeed);
+    float ImpactSpeed = FMath::Max(RelativeImpactSpeed, BoundedImpulseSpeed);
 
     if (ImpactSpeed < CharacterControllerTuning::MinPhysicsObjectImpactSpeed)
     {
@@ -720,6 +846,13 @@ void ACharacterController::UpdateFromGameUpdate(float DeltaSeconds)
     if (!IsValid(SubSystem))
     {
         SubSystem = UGameManagerSubSystem::GetSubSystem(this);
+    }
+
+    PhysicsInteractionRefreshAccumulator += FMath::Max(0.0f, DeltaSeconds);
+    if (PhysicsInteractionRefreshAccumulator >= CharacterControllerTuning::PhysicsInteractionRefreshIntervalSeconds)
+    {
+        PhysicsInteractionRefreshAccumulator = 0.0f;
+        RefreshMassAwarePhysicsInteraction(false);
     }
 
     if (GetVelocity().Z <= 0.0f)
@@ -1398,13 +1531,13 @@ void ACharacterController::TriggerFootstepTrace(EControllerHand FootSide)
     // 1. Pick the foot bone that should be traced.
     FName BoneName = (FootSide == EControllerHand::Left) ? BONE_LEFT_FOOT : BONE_RIGHT_FOOT;
     FVector Start = GetMesh()->GetBoneLocation(BoneName) + FVector(0.0f, 0.0f, 10.0f);
-    FVector End = Start - FVector(0.0f, 0.0f, 50.0f); 
+    FVector End = Start - FVector(0.0f, 0.0f, 50.0f);
 
     FCollisionQueryParams Params;
     // Use complex tracing so the hit result can return the physical material.
-    Params.bTraceComplex = true; 
+    Params.bTraceComplex = true;
     Params.bReturnPhysicalMaterial = true; // Required: ask the trace to return the physical material.
-    Params.AddIgnoredActor(this); 
+    Params.AddIgnoredActor(this);
 
     FTraceDelegate TraceDelegate;
     TraceDelegate.BindUObject(this, &ACharacterController::OnFootstepTraceCompleted);
@@ -1427,7 +1560,7 @@ void ACharacterController::OnFootstepTraceCompleted(const FTraceHandle& TraceHan
     if (TraceDatum.OutHits.Num() == 0) return;
 
     const FHitResult& HitResult = TraceDatum.OutHits[0];
-    
+
     // 2. Resolve the physical material weak pointer from the hit result.
     if (HitResult.PhysMaterial.IsValid())
     {

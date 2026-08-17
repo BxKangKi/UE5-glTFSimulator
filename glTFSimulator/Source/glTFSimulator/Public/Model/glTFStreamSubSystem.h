@@ -48,6 +48,9 @@ public:
     /** Reads GT-owned streaming state. Calls from worker threads return false. */
     bool IsRenderOnlyStreaming() const;
 
+    /** True only when this persistent subsystem currently owns streaming actors in World. */
+    bool IsActiveForWorld(const UWorld* World) const;
+
 private:
     UPROPERTY()
     TObjectPtr<AActor> OwnerActor;
@@ -66,6 +69,11 @@ private:
     TMap<FString, FFailedPlayerFileState> FailedPlayerPaths;
     TSet<FString> MetadataUnavailablePaths;
     TMap<FString, FModelData> ModelMetadataMap;
+    /** Monotonic preflight/actor progress for every discovered model path. */
+    TMap<FString, float> InitialPathProgress;
+    /** UI-facing progress is rate-limited once per frame so cached/skipped work remains visible. */
+    mutable float LastReportedLoadingStatus = 0.0f;
+    mutable uint64 LastLoadingProgressFrame = ~uint64(0);
 
     FString ModelDirectory;
     FString PlayerDirectory;
@@ -129,6 +137,7 @@ private:
     AglTFStreamActor* EnsureSpawnActor(const FString& GlbPath);
     void DestroySpawnActor(const FString& GlbPath);
     void CacheActorMetadata(const FString& GlbPath, const AglTFStreamActor* Actor);
+    void SetInitialPathProgress(const FString& GlbPath, float ProgressValue);
 
     void ScheduleProcessNextPath();
     void ScheduleWaitForInitialActors();

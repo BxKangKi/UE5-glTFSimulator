@@ -4,14 +4,12 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
-#include "Model/glTFMaterialAssetReferences.h"
 #include "World/PlacementTypes.h"
 #include "PrefabActor.generated.h"
 
+class UBoxComponent;
 class UglTFRuntimeAsset;
-class UStaticMeshComponent;
 class UStaticMesh;
-class USceneComponent;
 
 
 USTRUCT(BlueprintType)
@@ -36,6 +34,10 @@ struct GLTFSIMULATOR_API FPrefabActorConfig
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Prefab")
     bool bSimulatePhysics = false;
+
+    /** Optional authored rigid-body mass. A value <= 0 keeps Chaos auto-calculated mass. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Prefab", meta=(ClampMin="0.0"))
+    float MassKg = 0.0f;
 };
 
 UCLASS(BlueprintType)
@@ -82,18 +84,14 @@ protected:
     virtual void Destroyed() override;
 
 private:
-    /** glTFRuntime material assets assigned directly in the owning Blueprint/class defaults. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Prefab|Assets", meta=(AllowPrivateAccess="true"))
-    FglTFMaterialAssetReferences MaterialAssets;
 
+    /** Lightweight per-entity physics/collision proxy. Rendering is owned by UInstancedEntitySubsystem. */
     UPROPERTY(VisibleAnywhere)
-    TObjectPtr<USceneComponent> Root;
+    TObjectPtr<UBoxComponent> Root;
 
     UPROPERTY()
     TObjectPtr<UglTFRuntimeAsset> GltfAsset;
 
-    UPROPERTY()
-    TArray<TObjectPtr<UStaticMeshComponent>> MeshComponents;
 
     UPROPERTY()
     TMap<int32, TObjectPtr<UStaticMesh>> MeshCache;
@@ -120,11 +118,13 @@ private:
     UPROPERTY()
     FPrefabActorConfig Config;
 
+    int32 InstancedRegistrationId = INDEX_NONE;
+    FBox LoadedLocalBounds = FBox(ForceInit);
     bool bLoaded = false;
     bool bRenderOnlyMode = false;
 
     bool LoadConfigJson(const FString& JsonPath);
-    void ApplyConfigToMeshComponent(UStaticMeshComponent* MeshComponent) const;
+    void ApplyConfigToPhysicsProxy();
     UStaticMesh* LoadMeshByIndex(int32 MeshIndex);
     void ClearLoadedComponents();
     void ReleaseRuntimeResources();

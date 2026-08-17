@@ -14,9 +14,9 @@ class UGameUpdateSubSystem;
 /** Compact state used to batch distance culling and avoid redundant render-state changes. */
 struct FLightOptimizationData
 {
-    FVector Position;
-    float CullingDistanceSq;
-    float DecalTransitionDistanceSq;
+    FVector Position = FVector::ZeroVector;
+    float CullingDistanceSq = 0.0f;
+    float DecalTransitionDistanceSq = 0.0f;
 
     TWeakObjectPtr<UDynamicPointLightComponent> LightComponent;
     TWeakObjectPtr<UDecalComponent> DecalComponent;
@@ -47,6 +47,9 @@ private:
     TArray<FLightOptimizationData> ManagedLights;
     int32 GameUpdateHandle = INDEX_NONE;
 
+    void RegisterGameUpdate();
+    void UnregisterGameUpdate();
+    void CompactManagedLights();
     void UpdateLightsFromGameUpdate(float DeltaTime);
 
     // Internal helper for lazy decal component creation.

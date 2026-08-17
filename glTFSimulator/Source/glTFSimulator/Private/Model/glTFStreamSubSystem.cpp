@@ -4,6 +4,7 @@
 #include "Model/glTFStreamSubSystem.h"
 
 #include "Character/CharacterController.h"
+#include "CoreGlobals.h"
 #include "Camera/CameraComponent.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Engine/GameInstance.h"
@@ -14,13 +15,13 @@
 #include "Misc/Paths.h"
 #include "Model/glTFStreamActor.h"
 #include "System/ActorHelper.h"
+#include "System/BinaryDataStore.h"
 #include "System/FileFunctionLibrary.h"
 #include "System/GameManagerSubSystem.h"
 #include "System/GlbValidation.h"
 #include "System/MacroLibrary.h"
 #include "System/SafeFileIO.h"
 #include "TimerManager.h"
-#include "World/WorldData.h"
 
 namespace
 {
@@ -29,14 +30,13 @@ namespace
     constexpr double PLAYER_ACTOR_WAIT_TIMEOUT_SECONDS = 30.0;
     constexpr double PLAYER_LOAD_TIMEOUT_SECONDS = 120.0;
     constexpr double MODEL_LOAD_TIMEOUT_SECONDS = 180.0;
-    constexpr int64 MAX_MODEL_METADATA_JSON_BYTES = 64ll * 1024ll * 1024ll;
-    constexpr int32 MAX_CONCURRENT_INITIAL_MODEL_LOADS = 3;
+    constexpr int32 MAX_CONCURRENT_INITIAL_MODEL_LOADS = 1;
 
     /** Pure-data result produced off the game thread for one initial model path. */
     struct FInitialModelPreflightResult
     {
         bool bGlbValid = false;
-        bool bJsonExists = false;
+        bool bSizeCacheExists = false;
         bool bMetadataValid = false;
         FString Reason;
         FModelData Metadata;
@@ -140,6 +140,16 @@ bool UglTFStreamSubSystem::IsRenderOnlyStreaming() const
     return bRenderOnlyStreaming;
 }
 
+bool UglTFStreamSubSystem::IsActiveForWorld(const UWorld* World) const
+{
+    if (!EnsureStreamSubsystemGameThread(TEXT("UglTFStreamSubSystem::IsActiveForWorld")))
+    {
+        return false;
+    }
+
+    return bActive && World && IsValid(OwnerActor) && OwnerActor->GetWorld() == World;
+}
+
 void UglTFStreamSubSystem::StartMainWorldStreaming(AActor* InOwnerActor, TSubclassOf<AglTFStreamActor> InSpawnActorClass, const FString& InModelDirectory, const FString& InPlayerDirectory, const FString& InInitialPlayerName, bool bInRenderOnlyStreaming)
 {
     if (!IsInGameThread())
@@ -197,6 +207,9 @@ void UglTFStreamSubSystem::StartMainWorldStreaming(AActor* InOwnerActor, TSubcla
     ActiveInitialPreflightCount = 0;
     ActiveInitialActorScans.Empty();
     ActivePlayerCharacter.Reset();
+    InitialPathProgress.Empty();
+    LastReportedLoadingStatus = 0.0f;
+    LastLoadingProgressFrame = ~uint64(0);
     CompletedInitialPaths.Empty();
     MissingFilePaths.Empty();
     ValidatedModelPaths.Empty();
@@ -207,6 +220,11 @@ void UglTFStreamSubSystem::StartMainWorldStreaming(AActor* InOwnerActor, TSubcla
 
     GlbFilePaths = UFileFunctionLibrary::GetFileNamesWithExtension(ModelDirectory, TEXT("glb"));
     NormalizeAndDeduplicatePaths(GlbFilePaths);
+    InitialPathProgress.Reserve(GlbFilePaths.Num());
+    for (const FString& GlbPath : GlbFilePaths)
+    {
+        InitialPathProgress.Add(GlbPath, 0.0f);
+    }
     DiscoverPlayerPaths();
 
     WriteLogAsync(FString::Printf(TEXT("glTFStreamSubSystem started. ModelDirectory=%s GLBCount=%d PlayerDirectory=%s PlayerCount=%d InitialPlayer=%s RenderOnly=%s"),
@@ -217,8 +235,8 @@ void UglTFStreamSubSystem::StartMainWorldStreaming(AActor* InOwnerActor, TSubcla
         *InitialPlayerName,
         bRenderOnlyStreaming ? TEXT("true") : TEXT("false")));
 
-    // Initial GLB validation/metadata parsing and metadata-less bounds calculation run in a
-    // bounded three-file pipeline. UObject/component work is still marshalled to the game thread.
+    // Initial GLB validation/metadata parsing and metadata-less bounds calculation run one model
+    // at a time. This keeps parser, LOD, texture, and collision peaks from overlapping at map entry.
     ScheduleProcessNextPath();
 }
 
@@ -254,11 +272,12 @@ void UglTFStreamSubSystem::StopMainWorldStreaming()
     }
     SpawnActorMap.Empty();
 
+    // Only touch the pawn explicitly captured by this streaming session. StartMainWorldStreaming()
+    // begins by resetting stale GameInstance state; resolving through GameManager here could find and
+    // destroy the destination world's newly spawned default pawn before world entry completes.
     DeactivatePlayerCharacter();
 
-    // Character streaming now owns only one gameplay pawn. Cancel its in-flight loader,
-    // detach the current runtime mesh, and destroy the pawn once during world shutdown.
-    if (ACharacterController* Character = GetPlayerCharacter())
+    if (ACharacterController* Character = ActivePlayerCharacter.Get())
     {
         Character->PrepareForPawnReplacement();
         Character->Destroy();
@@ -266,6 +285,7 @@ void UglTFStreamSubSystem::StopMainWorldStreaming()
 
     GlbFilePaths.Empty();
     PlayerGlbFilePaths.Empty();
+    ModelDirectory.Reset();
     CurrentPlayerPath.Reset();
     PendingPlayerPath.Reset();
     PlayerDirectory.Reset();
@@ -276,6 +296,9 @@ void UglTFStreamSubSystem::StopMainWorldStreaming()
     FailedPlayerPaths.Empty();
     MetadataUnavailablePaths.Empty();
     ModelMetadataMap.Empty();
+    InitialPathProgress.Empty();
+    LastReportedLoadingStatus = 0.0f;
+    LastLoadingProgressFrame = ~uint64(0);
     ActivePlayerCharacter.Reset();
     CurrentPathIndex = 0;
     CurrentPlayerPathIndex = INDEX_NONE;
@@ -384,47 +407,93 @@ float UglTFStreamSubSystem::GetLoadingStatus() const
 
     if (!bActive)
     {
-        return 1.0f;
+        // GameInstance subsystems exist before the selected world starts streaming. Returning one here
+        // makes a directly bound progress bar display 100 percent during that startup window.
+        return FMath::Clamp(LastReportedLoadingStatus, 0.0f, 1.0f);
     }
 
-    float Total = 0.0f;
-    int32 WorkItemCount = 0;
+    double WeightedProgress = 0.0;
+    double TotalWeight = 0.0;
 
     for (const FString& Path : GlbFilePaths)
     {
-        ++WorkItemCount;
+        float PathProgress = FMath::Clamp(InitialPathProgress.FindRef(Path), 0.0f, 1.0f);
+
         if (const TObjectPtr<AglTFStreamActor>* ActorPtr = SpawnActorMap.Find(Path))
         {
-            Total += IsValid(ActorPtr->Get()) ? ActorPtr->Get()->GetLoadingStatus() : 1.0f;
-        }
-        else if (CompletedInitialPaths.Contains(Path) || MissingFilePaths.Contains(Path))
-        {
-            Total += 1.0f;
-        }
-    }
-
-    const bool bHasPlayerLoadWork = PlayerGlbFilePaths.Num() > 0;
-    if (bHasPlayerLoadWork)
-    {
-        ++WorkItemCount;
-        float PlayerLoadProgress = IsPlayerLoaded() ? 1.0f : 0.0f;
-        if (PlayerLoadProgress < 1.0f)
-        {
-            const ACharacterController* Ctrl = GetPlayerCharacter();
-            if (IsValid(Ctrl))
+            if (const AglTFStreamActor* Actor = ActorPtr->Get())
             {
-                PlayerLoadProgress = Ctrl->GetLoadProgress();
+                // Preflight owns the first 10 percent. The actor then reports a node-normalized size
+                // scan and stream pass; cached, invalid, no-op, and range-skipped nodes are included.
+                PathProgress = FMath::Max(
+                    PathProgress,
+                    0.10f + FMath::Clamp(Actor->GetLoadingStatus(), 0.0f, 1.0f) * 0.90f);
             }
         }
-        Total += FMath::Clamp(PlayerLoadProgress, 0.0f, 1.0f);
+
+        if (CompletedInitialPaths.Contains(Path) || MissingFilePaths.Contains(Path))
+        {
+            PathProgress = 1.0f;
+        }
+
+        // Keep each model's global weight stable for the whole bootstrap. Dynamically switching from
+        // a one-unit preflight weight to a parsed-node weight can make the mathematical percentage
+        // move backwards and leave a monotonic UI bar frozen near 100 percent.
+        WeightedProgress += static_cast<double>(PathProgress);
+        TotalWeight += 1.0;
     }
 
-    if (WorkItemCount <= 0)
+    // Player/bootstrap readiness is always a work item, even when no custom character GLB exists.
+    // This prevents an empty or cache-only world from displaying 100 percent before its pawn exists.
+    float PlayerProgress = 0.0f;
+    if (bInitialPlayerLoadComplete && !bWaitingForPlayerLoad)
     {
-        return 1.0f;
+        PlayerProgress = 1.0f;
+    }
+    else if (bInitialPathScanComplete && bInitialPlayerLoadStarted)
+    {
+        PlayerProgress = 0.10f;
+        if (bWaitingForPlayerLoad)
+        {
+            if (const ACharacterController* Ctrl = GetPlayerCharacter())
+            {
+                PlayerProgress = 0.10f + FMath::Clamp(Ctrl->GetLoadProgress(), 0.0f, 1.0f) * 0.90f;
+            }
+        }
+        else if (IsValid(GetPlayerCharacter()))
+        {
+            PlayerProgress = 0.25f;
+        }
     }
 
-    return FMath::Clamp(Total / static_cast<float>(WorkItemCount), 0.0f, 1.0f);
+    WeightedProgress += static_cast<double>(FMath::Clamp(PlayerProgress, 0.0f, 1.0f));
+    TotalWeight += 1.0;
+
+    float Result = TotalWeight > 0.0
+        ? static_cast<float>(WeightedProgress / TotalWeight)
+        : 0.0f;
+
+    const bool bReady = AreInitialModelsReady() && IsPlayerLoaded();
+    const float TargetProgress = bReady
+        ? 1.0f
+        : FMath::Min(FMath::Clamp(Result, 0.0f, 1.0f), 0.99f);
+
+    // A cache hit, distance skip, or tiny model can finish between two Slate paints. Limit only the
+    // UI-facing value once per game frame; the underlying node work and readiness are not delayed.
+    // This preserves node-derived progress while ensuring a skipped path does not appear as 100%
+    // from the first frame in which the loading widget becomes visible.
+    if (LastLoadingProgressFrame != GFrameCounter)
+    {
+        constexpr float MaxVisibleAdvancePerFrame = 0.08f;
+        if (TargetProgress > LastReportedLoadingStatus)
+        {
+            LastReportedLoadingStatus = FMath::Min(
+                TargetProgress,
+                LastReportedLoadingStatus + MaxVisibleAdvancePerFrame);
+        }
+        LastLoadingProgressFrame = GFrameCounter;
+    }
+    return FMath::Clamp(LastReportedLoadingStatus, 0.0f, 1.0f);
 }
 
 void UglTFStreamSubSystem::ProcessNextPathAsync()
@@ -439,7 +508,7 @@ void UglTFStreamSubSystem::ProcessNextPathAsync()
         return;
     }
 
-    // Keep at most three GLBs in the combined preflight/bounds-calculation pipeline. A path whose
+    // Keep one GLB in the combined preflight/bounds-calculation pipeline. A path whose
     // metadata already proves it is outside the streaming range releases its slot immediately;
     // an in-range path retains the slot until its stream actor finishes loading.
     while (CurrentPathIndex < GlbFilePaths.Num() &&
@@ -448,9 +517,11 @@ void UglTFStreamSubSystem::ProcessNextPathAsync()
         const FString GlbPath = GlbFilePaths[CurrentPathIndex++];
         if (CompletedInitialPaths.Contains(GlbPath))
         {
+            SetInitialPathProgress(GlbPath, 1.0f);
             continue;
         }
 
+        SetInitialPathProgress(GlbPath, 0.02f);
         ++ActiveInitialPreflightCount;
         StartInitialPathPreflight(GlbPath, InitialScanGeneration);
     }
@@ -469,43 +540,70 @@ void UglTFStreamSubSystem::StartInitialPathPreflight(
     const bool bQueued = FSafeFileIO::RunTrackedWorker(
         [WeakThis, GlbPath, ScanGeneration]()
         {
-            // WORKER THREAD ONLY: file validation and bounded JSON parsing are pure-data work.
-            // Actor/UObject creation is deliberately deferred to the game-thread continuation.
+            // WORKER THREAD ONLY: model validation, hashing, and SCZ parsing are pure-data work.
+            // User-authored JSON never participates in the streaming-bounds cache.
             FInitialModelPreflightResult Result;
             Result.bGlbValid = GlbValidation::ValidateFile(GlbPath, Result.Reason);
 
             if (Result.bGlbValid)
             {
-                const FString JsonPath = FPaths::ChangeExtension(GlbPath, TEXT("json"));
-                Result.bJsonExists = IFileManager::Get().FileExists(*JsonPath);
-                if (Result.bJsonExists)
-                {
-                    FSafeJsonLimits Limits;
-                    Limits.MaxFileBytes = MAX_MODEL_METADATA_JSON_BYTES;
-                    Limits.bAllowBackupRecovery = false;
-                    const FSafeJsonLoadResult JsonResult =
-                        FSafeFileIO::LoadJsonBlocking(JsonPath, Limits);
+                const FString SizeCachePath = FPaths::ChangeExtension(GlbPath, TEXT("scz"));
+                Result.bSizeCacheExists = IFileManager::Get().FileExists(*SizeCachePath) ||
+                    IFileManager::Get().FileExists(*(SizeCachePath + TEXT(".bak")));
 
-                    if (JsonResult.IsSuccess())
+                FString ModelHash;
+                FString HashError;
+                if (!FBinaryDataStore::ComputeFileSha1(GlbPath, ModelHash, HashError))
+                {
+                    Result.Reason = HashError.IsEmpty()
+                        ? TEXT("Model hash could not be calculated")
+                        : HashError;
+                }
+                else if (Result.bSizeCacheExists)
+                {
+                    FModelCacheData Cache;
+                    FString CacheError;
+                    bool bHashMismatch = false;
+                    if (FBinaryDataStore::LoadModelCache(
+                        SizeCachePath,
+                        ModelHash,
+                        Cache,
+                        CacheError,
+                        bHashMismatch))
                     {
-                        Result.bMetadataValid =
-                            Result.Metadata.Deserialization(JsonResult.JsonObject) &&
-                            IsUsableModelMetadata(Result.Metadata);
+                        Result.Metadata.Center = Cache.Center;
+                        Result.Metadata.Size = Cache.Extent * 2.0;
+                        Result.bMetadataValid = IsUsableModelMetadata(Result.Metadata);
                         if (!Result.bMetadataValid)
                         {
-                            Result.Reason = TEXT("Metadata JSON contains default, non-finite, or invalid bounds");
+                            Result.Reason = TEXT("Model SCZ contains invalid or empty bounds");
                         }
                     }
                     else
                     {
-                        Result.Reason = JsonResult.Error.IsEmpty()
-                            ? TEXT("Metadata JSON could not be loaded safely")
-                            : JsonResult.Error;
+                        Result.Reason = CacheError.IsEmpty()
+                            ? TEXT("Model SCZ could not be loaded safely")
+                            : CacheError;
+
+                        // A source hash change makes every cached extent stale. Remove all DAT
+                        // generations now so the stream actor can rebuild one clean cache.
+                        if (bHashMismatch)
+                        {
+                            FString InvalidateError;
+                            if (!FBinaryDataStore::InvalidateCacheFile(SizeCachePath, InvalidateError) &&
+                                !InvalidateError.IsEmpty())
+                            {
+                                Result.Reason += FString::Printf(
+                                    TEXT("; stale SCZ cleanup failed: %s"),
+                                    *InvalidateError);
+                            }
+                            Result.bSizeCacheExists = false;
+                        }
                     }
                 }
                 else
                 {
-                    Result.Reason = TEXT("Metadata JSON does not exist");
+                    Result.Reason = TEXT("Model SCZ does not exist");
                 }
             }
 
@@ -522,6 +620,7 @@ void UglTFStreamSubSystem::StartInitialPathPreflight(
                     check(IsInGameThread());
                     StrongThis->ActiveInitialPreflightCount =
                         FMath::Max(0, StrongThis->ActiveInitialPreflightCount - 1);
+                    StrongThis->SetInitialPathProgress(GlbPath, 0.10f);
 
                     if (!StrongThis->bActive || !IsValid(StrongThis->OwnerActor))
                     {
@@ -533,6 +632,7 @@ void UglTFStreamSubSystem::StartInitialPathPreflight(
                         StrongThis->ValidatedModelPaths.Remove(GlbPath);
                         StrongThis->MissingFilePaths.Add(GlbPath);
                         StrongThis->CompletedInitialPaths.Add(GlbPath);
+                        StrongThis->SetInitialPathProgress(GlbPath, 1.0f);
                         StrongThis->WriteLogAsync(FString::Printf(
                             TEXT("Invalid model GLB skipped. Path=%s Reason=%s"),
                             *GlbPath,
@@ -549,7 +649,7 @@ void UglTFStreamSubSystem::StartInitialPathPreflight(
                             StrongThis->MetadataUnavailablePaths.Remove(GlbPath);
                             StrongThis->ModelMetadataMap.Add(GlbPath, Result.Metadata);
                             StrongThis->WriteLogAsync(FString::Printf(
-                                TEXT("Valid model metadata loaded in parallel. GLB=%s Center=%s Size=%s"),
+                                TEXT("Valid model SCZ loaded safely. GLB=%s Center=%s Size=%s"),
                                 *GlbPath,
                                 *Result.Metadata.Center.ToCompactString(),
                                 *Result.Metadata.Size.ToCompactString()));
@@ -559,6 +659,7 @@ void UglTFStreamSubSystem::StartInitialPathPreflight(
                                 bNeedsActorLoad = false;
                                 StrongThis->DestroySpawnActor(GlbPath);
                                 StrongThis->CompletedInitialPaths.Add(GlbPath);
+                                StrongThis->SetInitialPathProgress(GlbPath, 1.0f);
                                 StrongThis->WriteLogAsync(FString::Printf(
                                     TEXT("Initial GLB load skipped by metadata range: %s"),
                                     *GlbPath));
@@ -568,9 +669,9 @@ void UglTFStreamSubSystem::StartInitialPathPreflight(
                         {
                             StrongThis->MetadataUnavailablePaths.Add(GlbPath);
                             StrongThis->WriteLogAsync(FString::Printf(
-                                TEXT("Model metadata unavailable; bounds will be calculated by a parallel stream actor. GLB=%s JsonExists=%s Reason=%s"),
+                                TEXT("Model SCZ unavailable; bounds will be calculated by a dedicated stream actor. GLB=%s SczExists=%s Reason=%s"),
                                 *GlbPath,
-                                Result.bJsonExists ? TEXT("true") : TEXT("false"),
+                                Result.bSizeCacheExists ? TEXT("true") : TEXT("false"),
                                 *Result.Reason));
                         }
 
@@ -590,6 +691,7 @@ void UglTFStreamSubSystem::StartInitialPathPreflight(
                             {
                                 StrongThis->MissingFilePaths.Add(GlbPath);
                                 StrongThis->CompletedInitialPaths.Add(GlbPath);
+                                StrongThis->SetInitialPathProgress(GlbPath, 1.0f);
                                 StrongThis->WriteLogAsync(FString::Printf(
                                     TEXT("Initial stream actor could not be created: %s"),
                                     *GlbPath));
@@ -610,6 +712,7 @@ void UglTFStreamSubSystem::StartInitialPathPreflight(
         ActiveInitialPreflightCount = FMath::Max(0, ActiveInitialPreflightCount - 1);
         MissingFilePaths.Add(GlbPath);
         CompletedInitialPaths.Add(GlbPath);
+        SetInitialPathProgress(GlbPath, 1.0f);
         WriteLogAsync(FString::Printf(
             TEXT("Initial model preflight could not be queued: %s"),
             *GlbPath));
@@ -650,9 +753,14 @@ void UglTFStreamSubSystem::WaitForCurrentActorAsync()
         {
             MissingFilePaths.Add(GlbPath);
             CompletedInitialPaths.Add(GlbPath);
+            SetInitialPathProgress(GlbPath, 1.0f);
             ActiveInitialActorScans.Remove(GlbPath);
             continue;
         }
+
+        SetInitialPathProgress(
+            GlbPath,
+            0.10f + FMath::Clamp(Actor->GetLoadingStatus(), 0.0f, 1.0f) * 0.90f);
 
         if (!Actor->GetIsLoaded())
         {
@@ -664,6 +772,7 @@ void UglTFStreamSubSystem::WaitForCurrentActorAsync()
                 DestroySpawnActor(GlbPath);
                 MissingFilePaths.Add(GlbPath);
                 CompletedInitialPaths.Add(GlbPath);
+                SetInitialPathProgress(GlbPath, 1.0f);
                 ActiveInitialActorScans.Remove(GlbPath);
             }
             continue;
@@ -683,6 +792,7 @@ void UglTFStreamSubSystem::WaitForCurrentActorAsync()
         }
 
         CompletedInitialPaths.Add(GlbPath);
+        SetInitialPathProgress(GlbPath, 1.0f);
         ActiveInitialActorScans.Remove(GlbPath);
     }
 
@@ -1294,7 +1404,7 @@ void UglTFStreamSubSystem::DeactivatePlayerCharacter()
         return;
     }
 
-    ACharacterController* Ctrl = GetPlayerCharacter();
+    ACharacterController* Ctrl = ActivePlayerCharacter.Get();
     if (!IsValid(Ctrl))
     {
         return;
@@ -1357,30 +1467,13 @@ void UglTFStreamSubSystem::PersistCurrentPlayerSelection()
         return;
     }
 
-    UGameManagerSubSystem* GameSystem = UGameManagerSubSystem::GetSubSystem(OwnerActor);
-    if (!GameSystem)
+    if (UGameManagerSubSystem* GameSystem = UGameManagerSubSystem::GetSubSystem(OwnerActor))
     {
-        return;
-    }
-
-    UWorldData* WorldData = GameSystem->GetWorldData();
-    if (!IsValid(WorldData))
-    {
-        return;
-    }
-
-    WorldData->Player = FPaths::GetCleanFilename(CurrentPlayerPath);
-
-    const FString WorldName = GameSystem->GetCurrentWorldName();
-    if (!WorldName.IsEmpty())
-    {
-        FString LevelJsonPath = FPaths::Combine(PATH_ROOT, WorldName);
-        LevelJsonPath.Append(LEVEL_FILE_NAME);
-        UFileFunctionLibrary::ToJsonAsync(UWorldData::SerializeData(WorldData), LevelJsonPath);
+        const FString SelectedPlayer = FPaths::GetCleanFilename(CurrentPlayerPath);
+        GameSystem->SetSelectedPlayerForRuntime(SelectedPlayer);
         WriteLogAsync(FString::Printf(
-            TEXT("Current player selection saved to level.json. Player=%s Path=%s"),
-            *WorldData->Player,
-            *LevelJsonPath));
+            TEXT("Current player selection saved to data/world.dat. Player=%s"),
+            *SelectedPlayer));
     }
 }
 
@@ -1487,6 +1580,7 @@ AglTFStreamActor* UglTFStreamSubSystem::EnsureSpawnActor(const FString& GlbPath)
         NewActor->Init(GlbPath);
         NewActor->FinishSpawning(OwnerActor->GetActorTransform());
         SpawnActorMap.Add(GlbPath, NewActor);
+        SetInitialPathProgress(GlbPath, 0.10f);
         WriteLogAsync(FString::Printf(TEXT("SpawnActor created for GLB: %s"), *GlbPath));
     }
 
@@ -1536,6 +1630,20 @@ void UglTFStreamSubSystem::CacheActorMetadata(const FString& GlbPath, const AglT
             *Metadata.Center.ToCompactString(),
             *Metadata.Size.ToCompactString()));
     }
+}
+
+void UglTFStreamSubSystem::SetInitialPathProgress(const FString& GlbPath, float ProgressValue)
+{
+    if (!EnsureStreamSubsystemGameThread(TEXT("UglTFStreamSubSystem::SetInitialPathProgress")) || GlbPath.IsEmpty())
+    {
+        return;
+    }
+
+    float& StoredProgress = InitialPathProgress.FindOrAdd(GlbPath);
+    const float SafeProgress = FMath::IsFinite(ProgressValue)
+        ? FMath::Clamp(ProgressValue, 0.0f, 1.0f)
+        : StoredProgress;
+    StoredProgress = FMath::Max(StoredProgress, SafeProgress);
 }
 
 void UglTFStreamSubSystem::ScheduleProcessNextPath()
@@ -1589,8 +1697,12 @@ void UglTFStreamSubSystem::FinalizeInitialPathScanIfReady()
     }
 
     bInitialPathScanComplete = true;
+    for (const FString& GlbPath : GlbFilePaths)
+    {
+        SetInitialPathProgress(GlbPath, 1.0f);
+    }
     WriteLogAsync(FString::Printf(
-        TEXT("Initial GLB scan completed with bounded parallelism. Paths=%d"),
+        TEXT("Initial GLB scan completed with serialized runtime loading. Paths=%d"),
         GlbFilePaths.Num()));
     BeginInitialPlayerStreamingIfNeeded();
     ScheduleUpdateStreaming();

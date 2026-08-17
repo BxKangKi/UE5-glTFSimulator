@@ -20,6 +20,14 @@ namespace GlbValidation
      */
     GLTFSIMULATOR_API bool ValidateRuntimeMeshFile(const FString& FilePath, FString& OutReason);
 
+    /**
+     * Validates a runtime entity model while preserving both supported container types.
+     * Binary .glb files receive the full allocation/range preflight above. JSON .gltf files are
+     * parsed with bounded JSON limits and every local external buffer/image URI is checked before
+     * glTFRuntime is allowed to open the model.
+     */
+    GLTFSIMULATOR_API bool ValidateRuntimeModelFile(const FString& FilePath, FString& OutReason);
+
     /** Validates a runtime mesh file and the additional node/skin requirements for a character GLB. */
     GLTFSIMULATOR_API bool ValidateCharacterFile(const FString& FilePath, FString& OutReason);
 }

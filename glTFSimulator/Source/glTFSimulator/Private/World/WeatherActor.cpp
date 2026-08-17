@@ -60,9 +60,12 @@ void AWeatherActor::BeginPlay()
     {
         GameUpdateTickHandle = GameUpdate->RegisterUpdate(
             this,
-            [this](const float DeltaSeconds)
+            [WeakThis = TWeakObjectPtr<AWeatherActor>(this)](const float DeltaSeconds)
             {
-                UpdateFromGameUpdate(DeltaSeconds);
+                if (AWeatherActor* StrongThis = WeakThis.Get())
+                {
+                    StrongThis->UpdateFromGameUpdate(DeltaSeconds);
+                }
             },
             30);
     }

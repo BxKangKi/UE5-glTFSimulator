@@ -166,6 +166,15 @@ public:
         const FString& Path,
         int64 MaxOutputBytes = 64ll * 1024ll * 1024ll);
 
+    /**
+     * Creates a missing user-authored JSON template through a verified temporary file. Existing
+     * JSON is never overwritten and no .bak is produced because JSON is application read-only.
+     */
+    static FSafeFileWriteResult CreateJsonIfMissingBlocking(
+        const TSharedRef<FJsonObject>& JsonObject,
+        const FString& Path,
+        int64 MaxOutputBytes = 64ll * 1024ll * 1024ll);
+
     /** Keeps an immutable JSON snapshot alive, then serializes and atomically commits it on a worker. */
     static void SaveJsonAsync(
         const TSharedRef<FJsonObject>& JsonObject,

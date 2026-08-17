@@ -558,9 +558,12 @@ void UBuoyancyComponent::RegisterGameUpdate()
     {
         GameUpdateTickHandle = GameUpdate->RegisterUpdate(
             this,
-            [this](const float DeltaSeconds)
+            [WeakThis = TWeakObjectPtr<UBuoyancyComponent>(this)](const float DeltaSeconds)
             {
-                UpdateBuoyancyFromGameUpdate(DeltaSeconds);
+                if (UBuoyancyComponent* StrongThis = WeakThis.Get())
+                {
+                    StrongThis->UpdateBuoyancyFromGameUpdate(DeltaSeconds);
+                }
             },
             10);
     }

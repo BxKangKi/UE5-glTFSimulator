@@ -1,5 +1,5 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
-// Placement, generated mesh and save data structures.
+// Runtime prefab/vehicle placement records and legacy JSON migration helpers.
 
 #pragma once
 
@@ -7,20 +7,12 @@
 #include "Dom/JsonObject.h"
 #include "PlacementTypes.generated.h"
 
-/** Shared limits for user-authored procedural mesh data across parse, save, and render paths. */
-namespace PlacementSafetyLimits
-{
-    inline constexpr int32 MaxGeneratedMeshVertices = 250000;
-    inline constexpr int32 MaxGeneratedMeshTriangles = 250000;
-    inline constexpr int32 MaxGeneratedMeshTriangleIndices = MaxGeneratedMeshTriangles * 3;
-}
-
 UENUM(BlueprintType)
 enum class EPlacedObjectKind : uint8
 {
-    Prefab UMETA(DisplayName = "Prefab"),
-    GeneratedMesh UMETA(DisplayName = "Generated Mesh"),
-    Vehicle UMETA(DisplayName = "Vehicle")
+    Prefab = 0 UMETA(DisplayName = "Prefab"),
+    // Value 1 is intentionally reserved for the removed generated-mesh format.
+    Vehicle = 2 UMETA(DisplayName = "Vehicle")
 };
 
 USTRUCT(BlueprintType)
@@ -42,30 +34,6 @@ struct FPlacedObjectRecord
 
     UPROPERTY(BlueprintReadWrite)
     FTransform Transform = FTransform::Identity;
-
-    TSharedRef<FJsonObject> ToJson() const;
-    bool FromJson(const TSharedPtr<FJsonObject>& Json);
-};
-
-USTRUCT(BlueprintType)
-struct FGeneratedMeshRecord
-{
-    GENERATED_BODY()
-
-    UPROPERTY(BlueprintReadWrite)
-    FString ObjectName;
-
-    UPROPERTY(BlueprintReadWrite)
-    FString BaseName;
-
-    UPROPERTY(BlueprintReadWrite)
-    FTransform Transform = FTransform::Identity;
-
-    UPROPERTY(BlueprintReadWrite)
-    TArray<FVector> Vertices;
-
-    UPROPERTY(BlueprintReadWrite)
-    TArray<int32> Triangles;
 
     TSharedRef<FJsonObject> ToJson() const;
     bool FromJson(const TSharedPtr<FJsonObject>& Json);

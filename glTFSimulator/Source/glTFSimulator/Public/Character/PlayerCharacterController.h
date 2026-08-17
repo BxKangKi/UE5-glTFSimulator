@@ -43,8 +43,8 @@ public:
  * Character movement, camera input, vehicle input, and pause can be received from
  * Enhanced Input InputAction assets. Gameplay tool selection, prefab/weapon selection,
  * snap, and scene saving are intentionally handled by a Blueprint UserWidget
- * instead of separate InputAction fields. World placement uses mouse
- * input: left pressed/released drives click-vs-hold editing, right click finishes vertex editing.
+ * instead of separate InputAction fields. World placement uses the primary mouse press. The
+ * release and secondary endpoints remain only for existing Blueprint/input-map compatibility.
  */
 UCLASS(Blueprintable, BlueprintType)
 class GLTFSIMULATOR_API APlayerCharacterController : public APlayerController
@@ -90,7 +90,7 @@ public:
     UFUNCTION(BlueprintCallable, Category="Input|Mouse")
     void Input_PrimaryPressed();
 
-    /** LeftMouseButton released. Required for click-vs-hold vertex editing. */
+    /** LeftMouseButton released. Compatibility endpoint; runtime placement is press-triggered. */
     UFUNCTION(BlueprintCallable, Category="Input|Mouse")
     void Input_PrimaryReleased();
 

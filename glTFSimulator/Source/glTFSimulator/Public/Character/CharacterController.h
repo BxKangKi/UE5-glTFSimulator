@@ -108,6 +108,12 @@ public:
     float GetLoadProgress() const { return LoadProgress; }
     UFUNCTION(BlueprintPure, Category="Character|Loading")
     bool WasLastMeshLoadSuccessful() const { return bLastMeshLoadSucceeded; }
+    /** Current non-ragdoll body mass loaded from level.json Gameplay.PlayerMassKg. */
+    UFUNCTION(BlueprintPure, Category="Character|Physics")
+    float GetCharacterMassKg() const { return CharacterMassKg; }
+    /** Sustained horizontal push-force limit derived from mass, gravity, and authored traction. */
+    UFUNCTION(BlueprintPure, Category="Character|Physics")
+    float GetCharacterPushForceLimit() const { return CharacterPushForceLimit; }
     UPROPERTY(BlueprintReadOnly)
     bool bIsMoveable; // Current glTF file path.
     UPROPERTY(EditAnywhere, BlueprintReadWrite)
@@ -178,6 +184,7 @@ private:
     bool FindDirectWaterLevel(float& OutLevel) const;
     void ClearDryWaterState(float Level, bool bUpdateMovementMode);
     void SyncRagdollWaterStateFromPhysics();
+    void RefreshMassAwarePhysicsInteraction(bool bForce = false);
     void UpdateFromGameUpdate(float DeltaSeconds);
     int32 GameUpdateTickHandle = INDEX_NONE;
     int32 CharacterStateBit = 0;
@@ -187,6 +194,16 @@ private:
     float LoadProgress = 0.0f;
     UPROPERTY(Transient)
     bool bLastMeshLoadSucceeded = false;
+    /** Cached map-authored mass used by CharacterMovement and two-body impact calculations. */
+    UPROPERTY(Transient)
+    float CharacterMassKg = 80.0f;
+    /** Cached authored traction coefficient used to derive CharacterPushForceLimit. */
+    UPROPERTY(Transient)
+    float CharacterPushTractionCoefficient = 0.30f;
+    /** Sustained horizontal force limit in Unreal force units (kg*cm/s^2). */
+    UPROPERTY(Transient)
+    float CharacterPushForceLimit = 0.0f;
+    float PhysicsInteractionRefreshAccumulator = 0.0f;
     double LastPhysicsObjectImpactTime = -1.0;
     bool bFirstPersonMode = false;
     bool bWaterStateFromOverlap = false;

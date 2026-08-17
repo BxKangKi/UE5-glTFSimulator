@@ -46,26 +46,13 @@ void UVehicleSubSystem::Initialize(FSubsystemCollectionBase& Collection)
 {
     check(IsInGameThread());
     Super::Initialize(Collection);
-    if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
-    {
-        GameUpdateHandle = GameUpdate->RegisterUpdate(
-            this,
-            [this](const float DeltaSeconds)
-            {
-                UpdateVehiclesFromGameUpdate(DeltaSeconds);
-            },
-            20);
-    }
+    // Register lazily when the first vehicle appears. Empty worlds should not pay a callback cost.
 }
 
 void UVehicleSubSystem::Deinitialize()
 {
     check(IsInGameThread());
-    if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
-    {
-        GameUpdate->UnregisterUpdate(GameUpdateHandle);
-    }
-    GameUpdateHandle = INDEX_NONE;
+    UnregisterGameUpdate();
     Vehicles.Empty();
 
     Super::Deinitialize();
@@ -83,20 +70,7 @@ void UVehicleSubSystem::RegisterVehicle(AVehiclePawn* VehiclePawn)
         return;
     }
 
-    if (GameUpdateHandle == INDEX_NONE)
-    {
-        if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
-        {
-            GameUpdateHandle = GameUpdate->RegisterUpdate(
-                this,
-                [this](const float DeltaSeconds)
-                {
-                    UpdateVehiclesFromGameUpdate(DeltaSeconds);
-                },
-                20);
-        }
-    }
-
+    RegisterGameUpdate();
     CompactVehicles();
     for (const TWeakObjectPtr<AVehiclePawn>& ExistingVehicle : Vehicles)
     {
@@ -125,6 +99,12 @@ void UVehicleSubSystem::UnregisterVehicle(AVehiclePawn* VehiclePawn)
     {
         return !ExistingVehicle.IsValid() || ExistingVehicle.Get() == VehiclePawn;
     }, EAllowShrinking::No);
+
+    if (Vehicles.Num() == 0)
+    {
+        Vehicles.Empty();
+        UnregisterGameUpdate();
+    }
 }
 
 void UVehicleSubSystem::UpdateVehiclesFromGameUpdate(float DeltaSeconds)
@@ -145,6 +125,8 @@ void UVehicleSubSystem::UpdateVehiclesFromGameUpdate(float DeltaSeconds)
     const int32 VehicleCount = Vehicles.Num();
     if (VehicleCount == 0)
     {
+        Vehicles.Empty();
+        UnregisterGameUpdate();
         return;
     }
 
@@ -157,6 +139,10 @@ void UVehicleSubSystem::UpdateVehiclesFromGameUpdate(float DeltaSeconds)
     {
         if (AVehiclePawn* VehiclePawn = Vehicle.Get())
         {
+            if (!VehiclePawn->ShouldUpdateVehicleSimulation())
+            {
+                continue;
+            }
             VehiclePtrs.Add(VehiclePawn);
             Inputs.Add(VehiclePawn->BuildParallelControlInput(SafeDeltaSeconds));
         }
@@ -203,11 +189,59 @@ void UVehicleSubSystem::UpdateVehiclesFromGameUpdate(float DeltaSeconds)
     }
 }
 
+void UVehicleSubSystem::RegisterGameUpdate()
+{
+    check(IsInGameThread());
+    if (GameUpdateHandle != INDEX_NONE)
+    {
+        return;
+    }
+
+    if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
+    {
+        TWeakObjectPtr<UVehicleSubSystem> WeakThis(this);
+        GameUpdateHandle = GameUpdate->RegisterUpdate(
+            this,
+            [WeakThis](const float DeltaSeconds)
+            {
+                if (UVehicleSubSystem* StrongThis = WeakThis.Get())
+                {
+                    StrongThis->UpdateVehiclesFromGameUpdate(DeltaSeconds);
+                }
+            },
+            20);
+    }
+}
+
+void UVehicleSubSystem::UnregisterGameUpdate()
+{
+    check(IsInGameThread());
+    if (GameUpdateHandle == INDEX_NONE)
+    {
+        return;
+    }
+
+    if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
+    {
+        GameUpdate->UnregisterUpdate(GameUpdateHandle);
+    }
+    GameUpdateHandle = INDEX_NONE;
+}
+
 void UVehicleSubSystem::CompactVehicles()
 {
     check(IsInGameThread());
-    Vehicles.RemoveAllSwap([](const TWeakObjectPtr<AVehiclePawn>& Vehicle)
+    const int32 RemovedCount = Vehicles.RemoveAllSwap([](const TWeakObjectPtr<AVehiclePawn>& Vehicle)
     {
         return !Vehicle.IsValid();
     }, EAllowShrinking::No);
+
+    if (Vehicles.Num() == 0)
+    {
+        Vehicles.Empty();
+    }
+    else if (RemovedCount > 0 && Vehicles.Max() > FMath::Max(32, Vehicles.Num() * 2))
+    {
+        Vehicles.Shrink();
+    }
 }

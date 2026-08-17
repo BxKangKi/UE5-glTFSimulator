@@ -114,9 +114,12 @@ TSharedRef<FJsonObject> FModelData::Serialization() const
 {
     TSharedRef<FJsonObject> Json = MakeShared<FJsonObject>();
     Json->SetStringField(JSON_VERSION_FIELD, JSON_SCHEMA_VERSION);
-    FJsonHelper::SetVector(Json, Center);
-    FJsonHelper::SetVector(Json, Size, TEXT("Size"));
+    // A generic model template is a plain placed entity unless the map author explicitly changes it
+    // to Vehicle or Weapon. Existing JSON is never rewritten, so this default cannot override input.
+    Json->SetStringField(TEXT("AssetType"), TEXT("Entity"));
 
+    // JSON is external, user-authored, and read-only at runtime. Program-owned bounds are stored
+    // only in the sibling .scz cache and must never be mixed into this settings document.
     // Automates TMap struct serialization without duplicate loops.
     FJsonHelper::SetMap<FMeshData>(Json, TEXT("MeshData"), MeshData, [](const FMeshData &Item)
                                           { return Item.Serialization(); });
@@ -129,9 +132,9 @@ bool FModelData::Deserialization(const TSharedPtr<FJsonObject> &Json)
     if (!Json.IsValid())
         return false;
 
+    Center = FVector::ZeroVector;
+    Size = FVector::ZeroVector;
     MeshData.Empty();
-    FJsonHelper::TryGetVector(Json, Center);
-    FJsonHelper::TryGetVector(Json, Size, TEXT("Size"));
 
     // Automates TMap struct deserialization while safely restoring JSON keys as FName values.
     FJsonHelper::TryGetMap<FMeshData>(Json, TEXT("MeshData"), MeshData, [](const TSharedPtr<FJsonObject> &Obj, FMeshData &OutItem)

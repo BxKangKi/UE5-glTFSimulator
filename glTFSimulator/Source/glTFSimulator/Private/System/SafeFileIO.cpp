@@ -1223,6 +1223,66 @@ FSafeFileWriteResult FSafeFileIO::SaveJsonBlocking(
     return SafeFileIOPrivate::CommitBytesUnlocked(Bytes, NormalizedPath, MaxOutputBytes, WriteSequence);
 }
 
+FSafeFileWriteResult FSafeFileIO::CreateJsonIfMissingBlocking(
+    const TSharedRef<FJsonObject>& JsonObject,
+    const FString& Path,
+    const int64 MaxOutputBytes)
+{
+    FSafeFileWriteResult Result;
+    const FString NormalizedPath = NormalizeFilePath(Path);
+    Result.Path = NormalizedPath;
+
+    if (!SafeFileIOPrivate::IsPathUsable(NormalizedPath) || MaxOutputBytes < 0)
+    {
+        Result.Status = ESafeFileIOStatus::InvalidPath;
+        Result.Error = TEXT("The JSON template path or maximum output size is invalid");
+        return Result;
+    }
+
+    FString ValidationError;
+    if (!SafeFileIOPrivate::ValidateJsonObjectForSave(JsonObject, MaxOutputBytes, ValidationError))
+    {
+        Result.Status = ESafeFileIOStatus::ValidationFailed;
+        Result.Error = MoveTemp(ValidationError);
+        return Result;
+    }
+
+    FString OutputString;
+    TSharedRef<TJsonWriter<TCHAR>> Writer = TJsonWriterFactory<TCHAR>::Create(&OutputString);
+    if (!FJsonSerializer::Serialize(JsonObject, Writer))
+    {
+        Result.Status = ESafeFileIOStatus::SerializeFailed;
+        Result.Error = TEXT("The JSON template DOM could not be serialized");
+        return Result;
+    }
+
+    FTCHARToUTF8 Utf8(*OutputString);
+    TArray<uint8> Bytes;
+    if (Utf8.Length() > 0)
+    {
+        Bytes.Append(reinterpret_cast<const uint8*>(Utf8.Get()), Utf8.Length());
+    }
+
+    const uint64 WriteSequence = SafeFileIOPrivate::ReserveWriteSequence(NormalizedPath);
+    const TSharedRef<FCriticalSection, ESPMode::ThreadSafe> PathLock =
+        SafeFileIOPrivate::GetPathLock(NormalizedPath);
+    FScopeLock ScopeLock(&PathLock.Get());
+
+    IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+    if (PlatformFile.FileExists(*NormalizedPath))
+    {
+        Result.Status = ESafeFileIOStatus::Success;
+        Result.BytesWritten = 0;
+        return Result;
+    }
+
+    // CommitBytesUnlocked only rotates a backup when a target existed before this transaction.
+    // The existence check is protected by the same per-path lock, so template creation never
+    // overwrites external JSON and therefore never creates a JSON .bak generation.
+    return SafeFileIOPrivate::CommitBytesUnlocked(
+        Bytes, NormalizedPath, MaxOutputBytes, WriteSequence);
+}
+
 void FSafeFileIO::SaveJsonAsync(
     const TSharedRef<FJsonObject>& JsonObject,
     const FString& Path,

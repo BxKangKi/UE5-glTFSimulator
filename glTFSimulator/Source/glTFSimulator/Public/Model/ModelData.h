@@ -93,12 +93,15 @@ struct FModelData
 {
     GENERATED_BODY()
 
+    /** Runtime/cache-derived model center. This value is never read from or written to JSON. */
     UPROPERTY()
     FVector Center = FVector::ZeroVector;
 
+    /** Runtime/cache-derived full model size. This value is never read from or written to JSON. */
     UPROPERTY()
     FVector Size = FVector::ZeroVector;
 
+    /** User-authored read-only JSON settings, keyed by base mesh name. */
     UPROPERTY()
     TMap<FName, FMeshData> MeshData;
 
@@ -126,6 +129,11 @@ struct FModelMeshData
     UPROPERTY()
     FMeshData Data;
 
+    /** Unscaled local-space mesh half size loaded from or written to <model>.scz. */
+    UPROPERTY()
+    FVector Extent = FVector::ZeroVector;
+
+    /** Full local-space mesh size retained for existing streaming calculations. */
     UPROPERTY()
     FVector Size = FVector::ZeroVector;
 #if WITH_EDITOR

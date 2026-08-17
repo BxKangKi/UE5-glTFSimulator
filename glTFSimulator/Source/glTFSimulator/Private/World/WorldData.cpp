@@ -90,6 +90,9 @@ TSharedRef<FJsonObject> FLevelGameplaySettings::ToJson() const
     TSharedRef<FJsonObject> Json = MakeShared<FJsonObject>();
     Json->SetStringField(TEXT("WorldGameMode"), WorldGameMode);
     Json->SetBoolField(TEXT("bCheatsEnabled"), bCheatsEnabled);
+    Json->SetNumberField(TEXT("PlayerMaxHealth"), FMath::Max(1.0f, PlayerMaxHealth));
+    Json->SetNumberField(TEXT("PlayerMassKg"), FMath::Clamp(PlayerMassKg, 1.0f, 10000.0f));
+    Json->SetNumberField(TEXT("PlayerPushTractionCoefficient"), FMath::Clamp(PlayerPushTractionCoefficient, 0.0f, 2.0f));
     return Json;
 }
 
@@ -102,6 +105,28 @@ bool FLevelGameplaySettings::FromJson(const TSharedPtr<FJsonObject>& Json)
 
     Json->TryGetStringField(TEXT("WorldGameMode"), WorldGameMode);
     Json->TryGetBoolField(TEXT("bCheatsEnabled"), bCheatsEnabled);
+    double LoadedMaxHealth = PlayerMaxHealth;
+    if (Json->TryGetNumberField(TEXT("PlayerMaxHealth"), LoadedMaxHealth) && FMath::IsFinite(LoadedMaxHealth))
+    {
+        PlayerMaxHealth = FMath::Clamp(static_cast<float>(LoadedMaxHealth), 1.0f, 1000000000.0f);
+    }
+
+    double LoadedMassKg = PlayerMassKg;
+    const bool bHasPlayerMass = Json->TryGetNumberField(TEXT("PlayerMassKg"), LoadedMassKg)
+        || Json->TryGetNumberField(TEXT("CharacterMassKg"), LoadedMassKg)
+        || Json->TryGetNumberField(TEXT("PlayerWeightKg"), LoadedMassKg);
+    if (bHasPlayerMass && FMath::IsFinite(LoadedMassKg))
+    {
+        PlayerMassKg = FMath::Clamp(static_cast<float>(LoadedMassKg), 1.0f, 10000.0f);
+    }
+
+    double LoadedTraction = PlayerPushTractionCoefficient;
+    const bool bHasPushTraction = Json->TryGetNumberField(TEXT("PlayerPushTractionCoefficient"), LoadedTraction)
+        || Json->TryGetNumberField(TEXT("CharacterPushTractionCoefficient"), LoadedTraction);
+    if (bHasPushTraction && FMath::IsFinite(LoadedTraction))
+    {
+        PlayerPushTractionCoefficient = FMath::Clamp(static_cast<float>(LoadedTraction), 0.0f, 2.0f);
+    }
     return true;
 }
 
@@ -133,7 +158,6 @@ TSharedRef<FJsonObject> UWorldData::SerializeData(UWorldData *Data)
     TSharedRef<FJsonObject> Json = MakeShared<FJsonObject>();
     Json->SetStringField(JSON_VERSION_FIELD, !Data->Version.IsEmpty() ? Data->Version : FString(JSON_SCHEMA_VERSION));
     Json->SetStringField(LEVELNAME, Data->WorldName);
-    Json->SetNumberField(LEVELTIME, Data->WorldTime);
     Json->SetNumberField(LATITUDE, Data->Latitude);
     Json->SetNumberField(LONGITUDE, Data->Longitude);
     Json->SetNumberField(AXIAL_TILT, Data->AxialTilt);
@@ -142,11 +166,8 @@ TSharedRef<FJsonObject> UWorldData::SerializeData(UWorldData *Data)
     Json->SetNumberField(TIME_SPEED, Data->TimeSpeed);
     Json->SetBoolField(OCEAN, Data->bOcean);
 
-    // Deprecated legacy fields remain readable, but player state is now saved in player.json.
-    Json->SetNumberField(PLAYER_X, Data->PlayerLocation.X);
-    Json->SetNumberField(PLAYER_Y, Data->PlayerLocation.Y);
-    Json->SetNumberField(PLAYER_Z, Data->PlayerLocation.Z);
-    Json->SetStringField(PLAYER_NAME, Data->Player);
+    // Runtime time, selected player, and player transforms are intentionally omitted. level.json
+    // is map-author-owned read-only configuration; mutable state lives under data/*.dat.
 
     Json->SetObjectField(TEXT("Cloud"), Data->Cloud.ToJson());
     Json->SetObjectField(TEXT("Weather"), Data->Weather.ToJson());
@@ -161,18 +182,13 @@ bool UWorldData::DeserializeData(UWorldData *Data, TSharedPtr<FJsonObject> Json)
         Data->Version = JSON_SCHEMA_VERSION;
         Json->TryGetStringField(JSON_VERSION_FIELD, Data->Version);
         Json->TryGetStringField(LEVELNAME, Data->WorldName);
-        Json->TryGetNumberField(LEVELTIME, Data->WorldTime);
         Json->TryGetNumberField(LATITUDE, Data->Latitude);
         Json->TryGetNumberField(LONGITUDE, Data->Longitude);
         Json->TryGetNumberField(AXIAL_TILT, Data->AxialTilt);
         Json->TryGetNumberField(ONE_YEAR_DAYS, Data->OneYearDays);
         Json->TryGetNumberField(ONE_DAY_TIME, Data->OneDayTime);
         Json->TryGetNumberField(TIME_SPEED, Data->TimeSpeed);
-        Json->TryGetNumberField(PLAYER_X, Data->PlayerLocation.X);
-        Json->TryGetNumberField(PLAYER_Y, Data->PlayerLocation.Y);
-        Json->TryGetNumberField(PLAYER_Z, Data->PlayerLocation.Z);
         Json->TryGetBoolField(OCEAN, Data->bOcean);
-        Json->TryGetStringField(PLAYER_NAME, Data->Player);
 
         const TSharedPtr<FJsonObject>* CloudObject = nullptr;
         if (Json->TryGetObjectField(TEXT("Cloud"), CloudObject) && CloudObject && CloudObject->IsValid())

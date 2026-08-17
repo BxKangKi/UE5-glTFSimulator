@@ -11,18 +11,15 @@
 #include "Engine/World.h"
 #include "GameFramework/Controller.h"
 #include "GameFramework/Pawn.h"
-#include "HAL/FileManager.h"
 #include "Kismet/GameplayStatics.h"
 #include "Model/glTFMaterialOverrideUtils.h"
-#include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
-#include "Serialization/JsonReader.h"
-#include "Serialization/JsonSerializer.h"
-#include "Serialization/JsonWriter.h"
 #include "Setting/GameSettings.h"
+#include "System/GameManagerSubSystem.h"
 #include "System/GlbValidation.h"
 #include "System/glTFRuntimeSafety.h"
 #include "System/MacroLibrary.h"
+#include "System/SafeFileIO.h"
 #include "Weapon/WeaponProjectileActor.h"
 #include "glTFRuntimeAsset.h"
 #include "glTFRuntimeFunctionLibrary.h"
@@ -214,23 +211,31 @@ bool AWeaponActor::EquipDefault(USceneComponent* AttachTarget)
 
 bool AWeaponActor::LoadConfigJson(const FString& JsonPath)
 {
-    const int64 JsonFileSize = IFileManager::Get().FileSize(*JsonPath);
-    if (JsonFileSize > MaxWeaponConfigBytes)
+    FSafeJsonLimits Limits;
+    Limits.MaxFileBytes = MaxWeaponConfigBytes;
+    Limits.MaxDepth = 32;
+    Limits.MaxValues = 100000;
+    Limits.MaxContainerEntries = 50000;
+    Limits.MaxStringCharacters = 1024 * 1024;
+    Limits.bAllowBackupRecovery = false;
+
+    const FSafeJsonLoadResult LoadResult = FSafeFileIO::LoadJsonBlocking(JsonPath, Limits);
+    if (!LoadResult.IsSuccess())
     {
-        UE_LOG(LogTemp, Warning, TEXT("WeaponActor: config JSON exceeds the safety limit: %s"), *JsonPath);
+        if (LoadResult.Status == ESafeFileIOStatus::Missing)
+        {
+            SaveDefaultConfigJson(JsonPath);
+        }
+
+        UE_LOG(LogTemp, Warning,
+            TEXT("WeaponActor: read-only config JSON was not loaded. Path=%s Reason=%s"),
+            *JsonPath,
+            *LoadResult.Error);
         return false;
     }
 
-    FString JsonString;
-    if (!FFileHelper::LoadFileToString(JsonString, *JsonPath))
-    {
-        SaveDefaultConfigJson(JsonPath);
-        return false;
-    }
-
-    TSharedPtr<FJsonObject> RootObject;
-    const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonString);
-    if (!FJsonSerializer::Deserialize(Reader, RootObject) || !RootObject.IsValid())
+    const TSharedPtr<FJsonObject>& RootObject = LoadResult.JsonObject;
+    if (!RootObject.IsValid())
     {
         return false;
     }
@@ -280,10 +285,9 @@ bool AWeaponActor::SaveDefaultConfigJson(const FString& JsonPath) const
         return false;
     }
 
-    IFileManager::Get().MakeDirectory(*FPaths::GetPath(JsonPath), true);
-
     TSharedRef<FJsonObject> RootObject = MakeShared<FJsonObject>();
     RootObject->SetStringField(JSON_VERSION_FIELD, JSON_SCHEMA_VERSION);
+    RootObject->SetStringField(TEXT("AssetType"), TEXT("Weapon"));
     RootObject->SetStringField(TEXT("AttachSocketName"), Config.AttachSocketName.ToString());
     RootObject->SetObjectField(TEXT("HoldTransform"), MakeTransformJson(Config.HoldTransform));
     RootObject->SetObjectField(TEXT("RightHandIK"), MakeTransformJson(Config.RightHandIK));
@@ -298,10 +302,16 @@ bool AWeaponActor::SaveDefaultConfigJson(const FString& JsonPath) const
     RootObject->SetNumberField(TEXT("ProjectileSpeed"), Config.ProjectileSpeed);
     RootObject->SetNumberField(TEXT("ProjectileLifeSeconds"), Config.ProjectileLifeSeconds);
 
-    FString OutputString;
-    const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutputString);
-    return FJsonSerializer::Serialize(RootObject, Writer)
-        && FFileHelper::SaveStringToFile(OutputString, *JsonPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+    const FSafeFileWriteResult WriteResult =
+        FSafeFileIO::CreateJsonIfMissingBlocking(RootObject, JsonPath, MaxWeaponConfigBytes);
+    if (!WriteResult.IsSuccess())
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("WeaponActor: missing config template could not be created. Path=%s Reason=%s"),
+            *JsonPath,
+            *WriteResult.Error);
+    }
+    return WriteResult.IsSuccess();
 }
 
 void AWeaponActor::ReleaseRuntimeResources()
@@ -332,6 +342,7 @@ void AWeaponActor::ClearLoadedComponents()
                 MeshesToRelease.Add(Mesh);
             }
             Component->SetStaticMesh(nullptr);
+            RemoveInstanceComponent(Component);
             Component->UnregisterComponent();
             Component->DestroyComponent();
         }
@@ -380,14 +391,12 @@ UStaticMesh* AWeaponActor::LoadMeshByIndex(int32 MeshIndex)
     MeshConfig.MaterialsConfig.ImagesConfig.bCompressMips = false;
     MeshConfig.MaterialsConfig.ImagesConfig.bStreaming = false;
     MeshConfig.MaterialsConfig.bLoadMipMaps = false;
-    const TMap<EglTFRuntimeMaterialType, UMaterialInterface*> MaterialOverrides =
-        glTFMaterialOverrideUtils::BuildOverrideMap(MaterialAssets);
-    if (MaterialOverrides.Num() > 0)
+    if (UGameManagerSubSystem* GameManager = UGameManagerSubSystem::GetSubSystem(this))
     {
-        MeshConfig.MaterialsConfig.UberMaterialsOverrideMap = MaterialOverrides;
-        MeshConfig.MaterialsConfig.UnlitOverrideMap = MaterialOverrides;
+        glTFMaterialOverrideUtils::ApplyOverrides(
+            GameManager->GetMaterialDefaultReferences(),
+            MeshConfig.MaterialsConfig);
     }
-    glTFMaterialOverrideUtils::ApplyNamedOverrides(MaterialAssets, MeshConfig.MaterialsConfig);
     MeshConfig.bAllowCPUAccess = false;
     MeshConfig.bBuildLumenCards = true;
     MeshConfig.bBuildSimpleCollision = false;

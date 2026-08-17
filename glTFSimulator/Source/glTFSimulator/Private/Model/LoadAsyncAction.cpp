@@ -2,6 +2,7 @@
 // Copyright © 2025 Epic Games, Inc. All rights reserved.
 
 #include "Model/LoadAsyncAction.h"
+#include "System/GameManagerSubSystem.h"
 
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
@@ -25,6 +26,14 @@ namespace
 
     constexpr int64 MAX_MODEL_JSON_BYTES = 64ll * 1024ll * 1024ll;
     constexpr int32 MAX_MODEL_NODE_COUNT = 500000;
+
+    // Loading progress is staged so parsing, cache validation, every parsed node, bounds assembly,
+    // and the verified SCZ commit all occupy visible portions of the loading bar.
+    constexpr float MODEL_PROGRESS_METADATA_STARTED = 0.02f;
+    constexpr float MODEL_PROGRESS_NODE_SCAN_STARTED = 0.10f;
+    constexpr float MODEL_PROGRESS_NODE_SCAN_FINISHED = 0.90f;
+    constexpr float MODEL_PROGRESS_BOUNDS_READY = 0.94f;
+    constexpr float MODEL_PROGRESS_CACHE_COMMIT = 0.98f;
 
     // Keep file-local helper names unique even under Unreal Unity Build, where anonymous
     // namespaces from several .cpp files are merged into the same translation unit.
@@ -64,10 +73,14 @@ namespace
         return ensureMsgf(IsInGameThread(), TEXT("%s must run on the game thread"), FunctionName);
     }
 
-    /** Pure-data payload transferred from the JSON worker back to the game thread. */
-    struct FModelJsonWorkerResult
+    /** Pure-data payload transferred from the settings/cache worker back to the game thread. */
+    struct FModelMetadataWorkerResult
     {
         FModelData ModelData;
+        FModelCacheData ModelCache;
+        FString ModelHash;
+        bool bCacheValid = false;
+        bool bCacheDirty = false;
         TArray<FString> Warnings;
     };
 }
@@ -78,7 +91,10 @@ ULoadAsyncAction *ULoadAsyncAction::LoadAsync(
     UglTFRuntimeAsset *Asset,
     const FglTFRuntimeStaticMeshConfig &StaticMeshConfig,
     const int32 ChunkSize,
-    const FString& InJsonFilePath)
+    const FString& InSourceFilePath,
+    const FString& InJsonFilePath,
+    const FString& InSizeCacheFilePath,
+    const bool bInCreateMissingJsonTemplate)
 {
     if (!EnsureLoadActionGameThread(TEXT("ULoadAsyncAction::LoadAsync")))
     {
@@ -89,8 +105,15 @@ ULoadAsyncAction *ULoadAsyncAction::LoadAsync(
     Action->WorldContextObject = WorldContextObject;
     Action->Asset = Asset;
     Action->StaticMeshConfig = StaticMeshConfig;
+    if (UGameManagerSubSystem* GameManager = UGameManagerSubSystem::GetSubSystem(WorldContextObject))
+    {
+        Action->MaterialReferenceGuard = GameManager->AcquireMaterialDefaultReferenceGuard();
+    }
     Action->ChunkSize = FMath::Max(1, ChunkSize);
-    Action->JsonFilePath = InJsonFilePath;
+    Action->SourceFilePath = FSafeFileIO::NormalizeFilePath(InSourceFilePath);
+    Action->JsonFilePath = FSafeFileIO::NormalizeFilePath(InJsonFilePath);
+    Action->SizeCacheFilePath = FSafeFileIO::NormalizeFilePath(InSizeCacheFilePath);
+    Action->bCreateMissingJsonTemplate = bInCreateMissingJsonTemplate;
     Action->RegisterWithGameInstance(WorldContextObject);
     return Action;
 }
@@ -104,6 +127,9 @@ void ULoadAsyncAction::Activate()
 
     bCancelled = false;
     bStaticMeshLoadInFlight = false;
+    bCacheSaveInFlight = false;
+    LastProgressValue = 0.0f;
+    PendingCompletionWrapper = FLoadAsyncWrapper();
     GlTFRuntimeOperationTicket = 0;
 
     if (!IsValid(WorldContextObject) || !IsValid(Asset))
@@ -120,15 +146,15 @@ void ULoadAsyncAction::Activate()
     if (ParsedNodes.Num() > MAX_MODEL_NODE_COUNT)
     {
         WriteLogAsync(FString::Printf(TEXT("Model node count exceeds the safety limit. Count=%d Limit=%d"), ParsedNodes.Num(), MAX_MODEL_NODE_COUNT));
-        FLoadAsyncWrapper Wrapper;
-        Completed.Broadcast(Wrapper);
-        ReleaseActionReferences();
-        SetReadyToDestroy();
+        PendingCompletionWrapper = FLoadAsyncWrapper();
+        FinalizeCompletion();
         return;
     }
 
     Nodes.Reset();
+    NodeWorkValidity.Reset();
     Nodes.Reserve(ParsedNodes.Num());
+    NodeWorkValidity.Reserve(ParsedNodes.Num());
     TSet<FName> SeenNodeNames;
     for (const FglTFRuntimeNode& Node : ParsedNodes)
     {
@@ -136,109 +162,154 @@ void ULoadAsyncAction::Activate()
         const FName NodeName(*TrimmedName);
         const bool bWaterNode = IsWaterNodeName(TrimmedName);
         const bool bHasValidMesh = Node.MeshIndex >= 0 && Node.MeshIndex < MeshCount;
-        if (TrimmedName.IsEmpty() || NodeName.IsNone() || !IsFiniteModelLoadTransform(Node.Transform) ||
-            (!bWaterNode && !bHasValidMesh) || SeenNodeNames.Contains(NodeName))
-        {
-            continue;
-        }
+        const bool bValidWorkNode = !TrimmedName.IsEmpty() && !NodeName.IsNone() &&
+            IsFiniteModelLoadTransform(Node.Transform) &&
+            (bWaterNode || bHasValidMesh) &&
+            !SeenNodeNames.Contains(NodeName);
 
-        FglTFRuntimeNode SafeNode = Node;
-        SafeNode.Name = TrimmedName;
-        Nodes.Add(MoveTemp(SafeNode));
-        SeenNodeNames.Add(NodeName);
+        // Keep every parsed node in the work list. Skipped nodes still advance progress instead of
+        // disappearing from the denominator and making the bar jump directly to completion.
+        FglTFRuntimeNode WorkNode = Node;
+        WorkNode.Name = TrimmedName;
+        Nodes.Add(MoveTemp(WorkNode));
+        NodeWorkValidity.Add(bValidWorkNode ? 1 : 0);
+        if (bValidWorkNode)
+        {
+            SeenNodeNames.Add(NodeName);
+        }
     }
 
     MaxCount = Nodes.Num();
     CurrentIndex = 0;
     NodeMap.Reserve(MaxCount);
     WaterNodeMap.Reserve(FMath::Max(1, MaxCount / 16));
-    Progress.Broadcast(0.0f);
+    BroadcastProgressValue(0.0f);
 
-    LoadJsonAsync();
+    LoadSettingsAndCacheAsync();
 }
 
-void ULoadAsyncAction::LoadJsonAsync()
+void ULoadAsyncAction::LoadSettingsAndCacheAsync()
 {
-    if (!EnsureLoadActionGameThread(TEXT("ULoadAsyncAction::LoadJsonAsync")))
+    if (!EnsureLoadActionGameThread(TEXT("ULoadAsyncAction::LoadSettingsAndCacheAsync")))
     {
         return;
     }
 
+    BroadcastProgressValue(MODEL_PROGRESS_METADATA_STARTED);
+
+    const FString LocalSourcePath = SourceFilePath;
     const FString LocalJsonPath = JsonFilePath;
+    const FString LocalCachePath = SizeCacheFilePath;
+    const bool bLocalCreateMissingJsonTemplate = bCreateMissingJsonTemplate;
     TWeakObjectPtr<ULoadAsyncAction> WeakThis(this);
 
-    const bool bWorkerQueued = FSafeFileIO::RunTrackedWorker([WeakThis, LocalJsonPath]()
+    const bool bWorkerQueued = FSafeFileIO::RunTrackedWorker(
+        [WeakThis, LocalSourcePath, LocalJsonPath, LocalCachePath, bLocalCreateMissingJsonTemplate]()
     {
-        // Worker code is intentionally limited to POD/container data and the non-UObject file
-        // service. Calling a UBlueprintFunctionLibrary from this thread would make its future
-        // implementation changes an accidental game-thread violation.
-        FModelJsonWorkerResult WorkerResult;
+        FModelMetadataWorkerResult WorkerResult;
 
-        if (!FPaths::FileExists(LocalJsonPath))
+        // The editable JSON document is application read-only. A missing skeleton is created once,
+        // but an existing file is never rewritten and JSON backup recovery is intentionally disabled.
+        if (bLocalCreateMissingJsonTemplate && !FPaths::FileExists(LocalJsonPath))
         {
-            WorkerResult.Warnings.Add(FString::Printf(
-                TEXT("JSON file not found. Creating default JSON: %s"),
-                *LocalJsonPath));
-
             FModelData EmptyData;
-            const FSafeFileWriteResult SaveResult = FSafeFileIO::SaveJsonBlocking(
+            const FSafeFileWriteResult TemplateResult = FSafeFileIO::CreateJsonIfMissingBlocking(
                 EmptyData.Serialization(),
                 LocalJsonPath,
                 MAX_MODEL_JSON_BYTES);
-            if (!SaveResult.IsSuccess())
+            if (!TemplateResult.IsSuccess())
             {
                 WorkerResult.Warnings.Add(FString::Printf(
-                    TEXT("Failed to create default JSON. Path=%s Reason=%s"),
+                    TEXT("Failed to create the read-only model settings template. Path=%s Reason=%s"),
                     *LocalJsonPath,
-                    *SaveResult.Error));
+                    *TemplateResult.Error));
             }
         }
 
-        FSafeJsonLimits JsonLimits;
-        JsonLimits.MaxFileBytes = MAX_MODEL_JSON_BYTES;
-        JsonLimits.MaxContainerEntries = MAX_MODEL_NODE_COUNT;
-        JsonLimits.bAllowBackupRecovery = true;
-        const FSafeJsonLoadResult LoadResult = FSafeFileIO::LoadJsonBlocking(LocalJsonPath, JsonLimits);
-        if (LoadResult.IsSuccess())
+        if (FPaths::FileExists(LocalJsonPath))
         {
-            const TSharedPtr<FJsonObject>& JsonObject = LoadResult.JsonObject;
-            WorkerResult.ModelData.Deserialization(JsonObject);
-
-            if (WorkerResult.ModelData.MeshData.Num() == 0)
+            FSafeJsonLimits JsonLimits;
+            JsonLimits.MaxFileBytes = MAX_MODEL_JSON_BYTES;
+            JsonLimits.MaxContainerEntries = MAX_MODEL_NODE_COUNT;
+            JsonLimits.bAllowBackupRecovery = false;
+            const FSafeJsonLoadResult LoadResult = FSafeFileIO::LoadJsonBlocking(LocalJsonPath, JsonLimits);
+            if (LoadResult.IsSuccess())
             {
-                // Backward compatibility: also read the old MeshData array format. This remains
-                // bounded by FSafeFileIO's depth/value/container limits before this loop is entered.
-                const TArray<TSharedPtr<FJsonValue>>* JsonArrayPtr = nullptr;
-                if (JsonObject->TryGetArrayField(TEXT("MeshData"), JsonArrayPtr) && JsonArrayPtr)
+                const TSharedPtr<FJsonObject>& JsonObject = LoadResult.JsonObject;
+                WorkerResult.ModelData.Deserialization(JsonObject);
+
+                if (WorkerResult.ModelData.MeshData.Num() == 0)
                 {
-                    for (const TSharedPtr<FJsonValue>& Value : *JsonArrayPtr)
+                    // Read-only compatibility for the old MeshData array format. Runtime never writes it back.
+                    const TArray<TSharedPtr<FJsonValue>>* JsonArrayPtr = nullptr;
+                    if (JsonObject->TryGetArrayField(TEXT("MeshData"), JsonArrayPtr) && JsonArrayPtr)
                     {
-                        if (Value.IsValid() && Value->Type == EJson::Object)
+                        for (const TSharedPtr<FJsonValue>& Value : *JsonArrayPtr)
                         {
-                            const TSharedPtr<FJsonObject> MeshObj = Value->AsObject();
-                            FMeshData MeshData;
-                            if (MeshData.Deserialization(MeshObj))
+                            if (Value.IsValid() && Value->Type == EJson::Object)
                             {
-                                WorkerResult.ModelData.MeshData.Add(NAME_None, MeshData);
+                                FMeshData MeshData;
+                                if (MeshData.Deserialization(Value->AsObject()))
+                                {
+                                    WorkerResult.ModelData.MeshData.Add(NAME_None, MeshData);
+                                }
                             }
                         }
                     }
                 }
             }
-
-            if (LoadResult.bRecoveredFromBackup)
+            else
             {
                 WorkerResult.Warnings.Add(FString::Printf(
-                    TEXT("Recovered model metadata from the backup copy: %s"),
-                    *LocalJsonPath));
+                    TEXT("Failed to read bounded read-only model JSON. Path=%s Reason=%s"),
+                    *LocalJsonPath,
+                    *LoadResult.Error));
             }
+        }
+
+        FString HashError;
+        if (!FBinaryDataStore::ComputeFileSha1(LocalSourcePath, WorkerResult.ModelHash, HashError))
+        {
+            WorkerResult.Warnings.Add(FString::Printf(
+                TEXT("Model SCZ cache disabled because hashing failed. Path=%s Reason=%s"),
+                *LocalSourcePath,
+                *HashError));
         }
         else
         {
-            WorkerResult.Warnings.Add(FString::Printf(
-                TEXT("Failed to read bounded model JSON. Path=%s Reason=%s"),
-                *LocalJsonPath,
-                *LoadResult.Error));
+            bool bHashMismatch = false;
+            FString CacheError;
+            if (FBinaryDataStore::LoadModelCache(
+                    LocalCachePath,
+                    WorkerResult.ModelHash,
+                    WorkerResult.ModelCache,
+                    CacheError,
+                    bHashMismatch))
+            {
+                WorkerResult.bCacheValid = true;
+            }
+            else
+            {
+                WorkerResult.bCacheDirty = true;
+                const bool bHadCacheGeneration = FPaths::FileExists(LocalCachePath) ||
+                    FPaths::FileExists(LocalCachePath + TEXT(".bak"));
+                if (bHadCacheGeneration)
+                {
+                    FString DeleteError;
+                    if (!FBinaryDataStore::InvalidateCacheFile(LocalCachePath, DeleteError))
+                    {
+                        WorkerResult.Warnings.Add(FString::Printf(
+                            TEXT("Failed to remove stale/corrupt model SCZ. Path=%s Reason=%s"),
+                            *LocalCachePath,
+                            *DeleteError));
+                    }
+                    WorkerResult.Warnings.Add(FString::Printf(
+                        TEXT("Model SCZ invalidated (%s). Extents will be recalculated. Path=%s Reason=%s"),
+                        bHashMismatch ? TEXT("source hash changed") : TEXT("cache validation failed"),
+                        *LocalCachePath,
+                        *CacheError));
+                }
+            }
         }
 
         if (!FSafeFileIO::DispatchTrackedGameThread(
@@ -263,20 +334,23 @@ void ULoadAsyncAction::LoadJsonAsync()
             }
 
             StrongThis->LoadedJsonModelData = MoveTemp(WorkerResult.ModelData);
+            StrongThis->LoadedModelCache = MoveTemp(WorkerResult.ModelCache);
+            StrongThis->CurrentModelHash = MoveTemp(WorkerResult.ModelHash);
+            StrongThis->bUseCachedMeshExtents = WorkerResult.bCacheValid;
+            StrongThis->bModelCacheDirty = WorkerResult.bCacheDirty;
+            StrongThis->BroadcastProgressValue(MODEL_PROGRESS_NODE_SCAN_STARTED);
             StrongThis->ProcessChunk();
         }))
         {
-            // Shutdown rejected the continuation; UObject cleanup remains on the shutdown path.
             return;
         }
     });
 
     if (!bWorkerQueued)
     {
-        // LoadJsonAsync originates on the game thread, so a rejected worker can be released here.
-        bCancelled = true;
-        ReleaseActionReferences();
-        SetReadyToDestroy();
+        WriteLogAsync(TEXT("Model metadata worker could not be queued; completing with an empty result"));
+        PendingCompletionWrapper = FLoadAsyncWrapper();
+        FinalizeCompletion();
     }
 }
 
@@ -306,23 +380,28 @@ void ULoadAsyncAction::ProcessChunk()
     if (CurrentIndex < MaxCount)
     {
         CurrentNode = Nodes[CurrentIndex];
+        if (!NodeWorkValidity.IsValidIndex(CurrentIndex) || NodeWorkValidity[CurrentIndex] == 0)
+        {
+            UpdateNext();
+            return;
+        }
         CalculateSize();
     }
     else
     {
         SanitizeParsedData();
         RefreshGeneratedModelData();
-        SaveGeneratedJsonAsync();
 
-        FLoadAsyncWrapper Wrapper;
-        Wrapper.NodeMap = MoveTemp(NodeMap);
-        Wrapper.WaterNodeMap = MoveTemp(WaterNodeMap);
-        Wrapper.MeshMap = MoveTemp(MeshMap);
-        Wrapper.ModelData = GeneratedModelData;
-        Progress.Broadcast(1.0f);
-        Completed.Broadcast(Wrapper);
-        ReleaseActionReferences();
-        SetReadyToDestroy();
+        PendingCompletionWrapper = FLoadAsyncWrapper();
+        PendingCompletionWrapper.NodeMap = MoveTemp(NodeMap);
+        PendingCompletionWrapper.WaterNodeMap = MoveTemp(WaterNodeMap);
+        PendingCompletionWrapper.MeshMap = MoveTemp(MeshMap);
+        PendingCompletionWrapper.ModelData = GeneratedModelData;
+        BroadcastProgressValue(MODEL_PROGRESS_BOUNDS_READY);
+
+        // Completion is intentionally delayed until a newly generated SCZ has been durably committed.
+        // This lets the world-bake UI treat the completion event as a real on-disk cache guarantee.
+        SaveGeneratedCacheThenComplete();
     }
 }
 
@@ -348,7 +427,7 @@ void ULoadAsyncAction::CancelAndRelease()
 
     // glTFRuntime can still be generating a mesh on a worker thread. Keep the action and
     // parser asset alive until its callback returns; the cancel flag prevents any owner mutation.
-    if (!bStaticMeshLoadInFlight)
+    if (!bStaticMeshLoadInFlight && !bCacheSaveInFlight)
     {
         ReleaseActionReferences();
         SetReadyToDestroy();
@@ -366,13 +445,14 @@ void ULoadAsyncAction::ReleaseActionReferences()
 
     // Never clear an active ticket or parser while glTFRuntime still owns native work. The terminal
     // callback is responsible for releasing the queue slot and then re-entering this cleanup path.
-    if (bStaticMeshLoadInFlight && GlTFRuntimeOperationTicket != 0)
+    if ((bStaticMeshLoadInFlight && GlTFRuntimeOperationTicket != 0) || bCacheSaveInFlight)
     {
         FglTFRuntimeSafety::CancelQueuedOperations(this);
         return;
     }
 
     bStaticMeshLoadInFlight = false;
+    bCacheSaveInFlight = false;
     GlTFRuntimeOperationTicket = 0;
     FglTFRuntimeSafety::CancelQueuedOperations(this);
 
@@ -392,16 +472,28 @@ void ULoadAsyncAction::ReleaseActionReferences()
     Progress.Clear();
     Asset = nullptr;
     WorldContextObject = nullptr;
+    MaterialReferenceGuard = nullptr;
     Nodes.Empty();
+    NodeWorkValidity.Empty();
     MeshMap.Empty();
     NodeMap.Empty();
     WaterNodeMap.Empty();
     LoadedJsonModelData = FModelData();
     GeneratedModelData = FModelData();
+    LoadedModelCache = FModelCacheData();
+    GeneratedModelCache = FModelCacheData();
+    PendingCompletionWrapper = FLoadAsyncWrapper();
+    CurrentModelHash.Reset();
+    bUseCachedMeshExtents = false;
+    bModelCacheDirty = false;
+    bCreateMissingJsonTemplate = true;
     CurrentMeshName = NAME_None;
     CurrentIndex = 0;
     MaxCount = 0;
+    LastProgressValue = 0.0f;
+    SourceFilePath.Reset();
     JsonFilePath.Reset();
+    SizeCacheFilePath.Reset();
 }
 
 void ULoadAsyncAction::SanitizeParsedData()
@@ -414,7 +506,8 @@ void ULoadAsyncAction::SanitizeParsedData()
     for (auto It = MeshMap.CreateIterator(); It; ++It)
     {
         FModelMeshData& RuntimeMeshData = It.Value();
-        if (RuntimeMeshData.LOD0 == INDEX_NONE || RuntimeMeshData.Size.ContainsNaN())
+        if (RuntimeMeshData.LOD0 == INDEX_NONE || RuntimeMeshData.Extent.ContainsNaN() ||
+            RuntimeMeshData.Size.ContainsNaN() || RuntimeMeshData.Extent.GetMin() < 0.0)
         {
             It.RemoveCurrent();
             continue;
@@ -423,6 +516,10 @@ void ULoadAsyncAction::SanitizeParsedData()
         if (const FMeshData* ParsedMeshData = LoadedJsonModelData.MeshData.Find(It.Key()))
         {
             RuntimeMeshData.Data = *ParsedMeshData;
+        }
+        else if (const FMeshData* LegacyDefault = LoadedJsonModelData.MeshData.Find(NAME_None))
+        {
+            RuntimeMeshData.Data = *LegacyDefault;
         }
     }
 
@@ -468,27 +565,33 @@ void ULoadAsyncAction::RefreshGeneratedModelData()
     }
 
     GeneratedModelData = LoadedJsonModelData;
-    // Mesh customization is optional user-authored data. Never auto-generate one entry per glTF node/mesh.
-    GeneratedModelData.MeshData.Empty();
+    GeneratedModelCache = FModelCacheData();
+    GeneratedModelCache.ModelHash = CurrentModelHash;
 
     FBox Bounds(ForceInit);
     for (const TPair<FName, FModelNodeData>& Pair : NodeMap)
     {
         const FModelNodeData& NodeData = Pair.Value;
         const FModelMeshData* MeshData = MeshMap.Find(NodeData.MeshName);
-        if (!MeshData || MeshData->Size.IsNearlyZero(0.001f))
+        if (!MeshData || MeshData->Extent.IsNearlyZero(0.001f))
         {
             continue;
         }
 
-        const FVector Extent = MeshData->Size.GetAbs() * 0.5f;
-        Bounds += FBox::BuildAABB(NodeData.Transform.GetLocation(), Extent);
+        const FVector SafeExtent = MeshData->Extent.GetAbs();
+        const FBox LocalBounds(-SafeExtent, SafeExtent);
+        Bounds += LocalBounds.TransformBy(NodeData.Transform);
     }
 
     for (const TPair<FName, FWaterStreamNodeData>& Pair : WaterNodeMap)
     {
         const FVector WaterExtent = Pair.Value.Transform.GetScale3D().GetAbs() * 50.0f;
-        Bounds += FBox::BuildAABB(Pair.Value.Transform.GetLocation(), FVector(FMath::Max(WaterExtent.X, 100.0f), FMath::Max(WaterExtent.Y, 100.0f), FMath::Max(WaterExtent.Z, 100.0f)));
+        Bounds += FBox::BuildAABB(
+            Pair.Value.Transform.GetLocation(),
+            FVector(
+                FMath::Max(WaterExtent.X, 100.0f),
+                FMath::Max(WaterExtent.Y, 100.0f),
+                FMath::Max(WaterExtent.Z, 100.0f)));
     }
 
     if (Bounds.IsValid)
@@ -496,27 +599,115 @@ void ULoadAsyncAction::RefreshGeneratedModelData()
         GeneratedModelData.Center = Bounds.GetCenter();
         GeneratedModelData.Size = Bounds.GetSize();
     }
-    else if (!IsValidModelBounds(GeneratedModelData))
+    else
     {
-        GeneratedModelData.Center = FVector::ZeroVector;
-        GeneratedModelData.Size = FVector::ZeroVector;
+        GeneratedModelData.Center = bUseCachedMeshExtents ? LoadedModelCache.Center : FVector::ZeroVector;
+        GeneratedModelData.Size = bUseCachedMeshExtents ? LoadedModelCache.Extent * 2.0f : FVector::ZeroVector;
     }
 
-    WriteLogAsync(FString::Printf(TEXT("Model bounds refreshed. JSON=%s Center=%s Size=%s"),
-        *JsonFilePath,
-        *GeneratedModelData.Center.ToCompactString(),
-        *GeneratedModelData.Size.ToCompactString()));
+    GeneratedModelCache.Center = GeneratedModelData.Center;
+    GeneratedModelCache.Extent = GeneratedModelData.Size.GetAbs() * 0.5f;
+    for (const TPair<FName, FModelMeshData>& Pair : MeshMap)
+    {
+        if (!Pair.Key.IsNone() && !Pair.Value.Extent.ContainsNaN())
+        {
+            GeneratedModelCache.MeshExtents.Add(Pair.Key, Pair.Value.Extent.GetAbs());
+        }
+    }
+
+    WriteLogAsync(FString::Printf(
+        TEXT("Model bounds ready. SCZ=%s Cache=%s Center=%s Extent=%s"),
+        *SizeCacheFilePath,
+        bUseCachedMeshExtents && !bModelCacheDirty ? TEXT("hit") : TEXT("rebuilt"),
+        *GeneratedModelCache.Center.ToCompactString(),
+        *GeneratedModelCache.Extent.ToCompactString()));
 }
 
-void ULoadAsyncAction::SaveGeneratedJsonAsync() const
+void ULoadAsyncAction::SaveGeneratedCacheThenComplete()
 {
-    if (JsonFilePath.IsEmpty())
+    if (!EnsureLoadActionGameThread(TEXT("ULoadAsyncAction::SaveGeneratedCacheThenComplete")))
     {
         return;
     }
 
-    const TSharedRef<FJsonObject> Json = GeneratedModelData.Serialization();
-    UFileFunctionLibrary::ToJsonAsync(Json, JsonFilePath);
+    if (!bModelCacheDirty || SizeCacheFilePath.IsEmpty() || CurrentModelHash.IsEmpty() ||
+        !GeneratedModelCache.IsSane())
+    {
+        FinalizeCompletion();
+        return;
+    }
+
+    BroadcastProgressValue(MODEL_PROGRESS_CACHE_COMMIT);
+
+    const FString LocalCachePath = SizeCacheFilePath;
+    const FModelCacheData CacheSnapshot = GeneratedModelCache;
+    TWeakObjectPtr<ULoadAsyncAction> WeakThis(this);
+    bCacheSaveInFlight = true;
+
+    const bool bWorkerQueued = FSafeFileIO::RunTrackedWorker(
+        [WeakThis, LocalCachePath, CacheSnapshot]()
+    {
+        const FSafeFileWriteResult Result = FBinaryDataStore::SaveModelCacheBlocking(
+            LocalCachePath,
+            CacheSnapshot);
+
+        FSafeFileIO::DispatchTrackedGameThread([WeakThis, LocalCachePath, Result]() mutable
+        {
+            ULoadAsyncAction* StrongThis = WeakThis.Get();
+            if (!StrongThis)
+            {
+                return;
+            }
+
+            StrongThis->bCacheSaveInFlight = false;
+            if (!Result.IsSuccess())
+            {
+                StrongThis->WriteLogAsync(FString::Printf(
+                    TEXT("Failed to save model SCZ cache. Path=%s Reason=%s"),
+                    *LocalCachePath,
+                    *Result.Error));
+            }
+
+            if (StrongThis->bCancelled)
+            {
+                StrongThis->ReleaseActionReferences();
+                StrongThis->SetReadyToDestroy();
+                return;
+            }
+
+            StrongThis->FinalizeCompletion();
+        });
+    });
+
+    if (!bWorkerQueued)
+    {
+        bCacheSaveInFlight = false;
+        WriteLogAsync(FString::Printf(
+            TEXT("Model SCZ save worker could not be queued. Path=%s"),
+            *LocalCachePath));
+        FinalizeCompletion();
+    }
+}
+
+void ULoadAsyncAction::FinalizeCompletion()
+{
+    if (!EnsureLoadActionGameThread(TEXT("ULoadAsyncAction::FinalizeCompletion")))
+    {
+        return;
+    }
+
+    if (bCancelled)
+    {
+        ReleaseActionReferences();
+        SetReadyToDestroy();
+        return;
+    }
+
+    BroadcastProgressValue(1.0f);
+    FLoadAsyncWrapper Wrapper = MoveTemp(PendingCompletionWrapper);
+    Completed.Broadcast(Wrapper);
+    ReleaseActionReferences();
+    SetReadyToDestroy();
 }
 
 void ULoadAsyncAction::CalculateSize()
@@ -592,8 +783,34 @@ void ULoadAsyncAction::CalculateSize()
     }
     else
     {
-        // The coordinator serializes this parser's mutable cache, while allowing other GLB
-        // assets to calculate bounds concurrently under the global memory cap.
+        if (bUseCachedMeshExtents)
+        {
+            if (const FVector* CachedExtent = LoadedModelCache.MeshExtents.Find(CurrentMeshName))
+            {
+                if (!CachedExtent->ContainsNaN() && CachedExtent->GetMin() >= 0.0)
+                {
+                    Info.LOD0 = CurrentNode.MeshIndex;
+                    Info.Extent = CachedExtent->GetAbs();
+                    Info.Size = Info.Extent * 2.0f;
+                    UpdateModelNodeData();
+                    return;
+                }
+            }
+        }
+
+        // Multiple nodes can reference the same base mesh. Once its local bounds were calculated in
+        // this run, reuse them instead of scheduling another temporary UStaticMesh build.
+        if (Info.LOD0 == CurrentNode.MeshIndex && !Info.Extent.IsNearlyZero(0.001f) &&
+            !Info.Extent.ContainsNaN())
+        {
+            UpdateModelNodeData();
+            return;
+        }
+
+        // A missing, stale, or invalid SCZ loads each unique base mesh once and calculates its
+        // unscaled local extent from UStaticMesh::GetBoundingBox(). The generated cache is committed
+        // only after every parsed node (including skipped nodes) has advanced the loading progress.
+        bModelCacheDirty = !CurrentModelHash.IsEmpty();
         const int32 RequestedMeshIndex = CurrentNode.MeshIndex;
         const FglTFRuntimeStaticMeshConfig RequestedConfig = StaticMeshConfig;
         TWeakObjectPtr<ULoadAsyncAction> WeakThis(this);
@@ -723,7 +940,7 @@ void ULoadAsyncAction::GetStaticMesh(UStaticMesh *StaticMesh)
     bStaticMeshLoadInFlight = false;
     ON_SCOPE_EXIT
     {
-        FglTFRuntimeSafety::CompleteOperation(CompletedTicket);
+        FglTFRuntimeSafety::CompleteOperationAfterCallback(CompletedTicket);
     };
     if (bCancelled)
     {
@@ -743,8 +960,9 @@ void ULoadAsyncAction::GetStaticMesh(UStaticMesh *StaticMesh)
         if (FModelMeshData *Info = MeshMap.Find(CurrentMeshName))
         {
             Info->LOD0 = CurrentNode.MeshIndex;
-            const FVector NodeScale = CurrentNode.Transform.GetScale3D().GetAbs();
-            Info->Size = StaticMesh->GetBoundingBox().GetSize() * NodeScale;
+            Info->Extent = StaticMesh->GetBoundingBox().GetExtent().GetAbs();
+            Info->Size = Info->Extent * 2.0f;
+            bModelCacheDirty = !CurrentModelHash.IsEmpty();
         }
     }
     else
@@ -784,10 +1002,7 @@ void ULoadAsyncAction::UpdateNext()
     ++CurrentIndex;
     CurrentMeshName = NAME_None;
 
-    if (MaxCount > 0)
-    {
-        Progress.Broadcast(FMath::Clamp(static_cast<float>(CurrentIndex) / static_cast<float>(MaxCount), 0.0f, 1.0f));
-    }
+    BroadcastNodeProgress();
 
     if (CurrentIndex % ChunkSize == 0)
     {
@@ -807,6 +1022,34 @@ void ULoadAsyncAction::UpdateNext()
     {
         ProcessChunk();
     }
+}
+
+void ULoadAsyncAction::BroadcastProgressValue(float Value)
+{
+    if (!EnsureLoadActionGameThread(TEXT("ULoadAsyncAction::BroadcastProgressValue")))
+    {
+        return;
+    }
+
+    const float SafeValue = FMath::IsFinite(Value) ? FMath::Clamp(Value, 0.0f, 1.0f) : LastProgressValue;
+    LastProgressValue = FMath::Max(LastProgressValue, SafeValue);
+    Progress.Broadcast(LastProgressValue);
+}
+
+void ULoadAsyncAction::BroadcastNodeProgress()
+{
+    if (!EnsureLoadActionGameThread(TEXT("ULoadAsyncAction::BroadcastNodeProgress")))
+    {
+        return;
+    }
+
+    const float NodeFraction = MaxCount > 0
+        ? FMath::Clamp(static_cast<float>(CurrentIndex) / static_cast<float>(MaxCount), 0.0f, 1.0f)
+        : 1.0f;
+    BroadcastProgressValue(FMath::Lerp(
+        MODEL_PROGRESS_NODE_SCAN_STARTED,
+        MODEL_PROGRESS_NODE_SCAN_FINISHED,
+        NodeFraction));
 }
 
 void ULoadAsyncAction::WriteLogAsync(const FString& Message) const
