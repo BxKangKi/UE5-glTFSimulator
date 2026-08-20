@@ -29,6 +29,10 @@ public:
     UPROPERTY(BlueprintReadOnly, Category = "Character|Animation")
     float UpSpeed = 0.0f;
 
+    /** Signed actor yaw angular velocity in degrees per second. */
+    UPROPERTY(BlueprintReadOnly, Category = "Character|Animation")
+    float RotationSpeed = 0.0f;
+
     UPROPERTY(BlueprintReadOnly, Category = "Character|Animation")
     bool bShouldMove = false;
 
@@ -113,6 +117,8 @@ public:
     UPROPERTY(BlueprintReadOnly, Category = "Character|Animation|Weapon")
     FVector WeaponMuzzleLocationWS = FVector::ZeroVector;
 
+
+
     /** Immediately mirrors native character/ragdoll state into AnimBP-readable variables. */
     void RefreshCharacterAnimationState(float DeltaSeconds = 0.0f);
 
@@ -129,4 +135,8 @@ private:
 
     UPROPERTY()
     TObjectPtr<UCharacterComponent> Component;
+
+    float PreviousActorYaw = 0.0f;
+    bool bHasPreviousActorYaw = false;
+    float YawAngularVelocity = 0.0f;
 };

@@ -4,12 +4,14 @@
 #include "Character/CharacterAnimInstance.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "System/PhysicsHelper.h"
+#include "System/MathHelper.h"
 #include "System/MacroLibrary.h"
 #include "Character/CharacterController.h"
 #include "Character/CharacterComponent.h"
 #include "System/GameManagerSubSystem.h"
 #include "Weapon/WeaponActor.h"
 #include "Components/SkeletalMeshComponent.h"
+
 
 namespace CharacterAnimTuning
 {
@@ -26,6 +28,9 @@ void UCharacterAnimInstance::ResetRuntimeAnimationState()
     Speed = 0.0f;
     MoveSpeed = 0.0f;
     UpSpeed = 0.0f;
+    YawAngularVelocity = 0.0f;
+    PreviousActorYaw = 0.0f;
+    bHasPreviousActorYaw = false;
     bShouldMove = false;
     bIsFlying = false;
     bIsSwimming = false;
@@ -121,10 +126,28 @@ void UCharacterAnimInstance::RefreshCharacterAnimationState(float DeltaSeconds)
         return;
     }
 
-    // 2. Refresh the filtered ragdoll water snapshot before animation variables are read.
+    // 2. Calculate signed yaw angular velocity for turn animation blending.
+    if (const AActor* Owner = GetOwningActor())
+    {
+        const float CurrentActorYaw = Owner->GetActorRotation().Yaw;
+        YawAngularVelocity = (bHasPreviousActorYaw && DeltaSeconds > SMALL_NUMBER)
+            ? FMath::FindDeltaAngleDegrees(PreviousActorYaw, CurrentActorYaw) / DeltaSeconds
+            : 0.0f;
+        PreviousActorYaw = CurrentActorYaw;
+        bHasPreviousActorYaw = true;
+    }
+    else
+    {
+        YawAngularVelocity = 0.0f;
+        bHasPreviousActorYaw = false;
+    }
+
+    RotationSpeed = FMath::Clamp(YawAngularVelocity * 0.00556f, -1.0f, 1.0f);
+
+    // 3. Refresh the filtered ragdoll water snapshot before animation variables are read.
     Component->RefreshRagdollWaterStateForAnimation();
 
-    // 3. Cache physics data once to avoid duplicate movement queries.
+    // 4. Cache physics data once to avoid duplicate movement queries.
     const FVector CurrentVelocity = Movement->Velocity;
     const FVector CurrentAccel = Movement->GetCurrentAcceleration();
 
