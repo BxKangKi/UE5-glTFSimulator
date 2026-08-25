@@ -522,9 +522,10 @@ namespace SafeFileIOPrivate
                 OutError = TEXT("A JSON object exceeds the configured entry limit");
                 return false;
             }
-            for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : Object->Values)
+            for (const auto& Pair : Object->Values)
             {
-                if (Pair.Key.IsEmpty() || Pair.Key.Len() > Limits.MaxStringCharacters)
+                const FString Key(Pair.Key);
+                if (Key.IsEmpty() || Key.Len() > Limits.MaxStringCharacters)
                 {
                     OutError = TEXT("A JSON object key is empty or exceeds the configured character limit");
                     return false;

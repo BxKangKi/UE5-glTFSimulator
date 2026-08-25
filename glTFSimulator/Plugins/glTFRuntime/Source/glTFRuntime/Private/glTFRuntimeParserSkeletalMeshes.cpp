@@ -242,7 +242,7 @@ bool glTFRuntime::FillSkeletalMeshRenderData(FSkeletalMeshRenderData* RenderData
 		int32 NumLODPositions = 0;
 		for (int32 PrimitiveIndex = 0; PrimitiveIndex < LOD->Primitives.Num(); PrimitiveIndex++)
 		{
-			NumLODIndices += LOD->Primitives[PrimitiveIndex].bHasIndices ? LOD->Primitives[PrimitiveIndex].Indices.Num() : LOD->Primitives[PrimitiveIndex].Positions.Num();
+			NumLODIndices += LOD->Primitives[PrimitiveIndex].Indices.Num();
 			NumLODPositions += LOD->Primitives[PrimitiveIndex].Positions.Num();
 
 			if (LOD->Primitives[PrimitiveIndex].bHighPrecisionUVs)
@@ -292,9 +292,22 @@ bool glTFRuntime::FillSkeletalMeshRenderData(FSkeletalMeshRenderData* RenderData
 
 			MeshSection.MaterialIndex = PrimitiveIndex;
 			MeshSection.BaseIndex = BaseIndex;
-			MeshSection.NumTriangles = (Primitive.bHasIndices ? Primitive.Indices.Num() : Primitive.Positions.Num()) / 3;
+			MeshSection.NumTriangles = Primitive.Indices.Num() / 3;
 			MeshSection.BaseVertexIndex = BaseVertexIndex;
-			MeshSection.MaxBoneInfluences = FMath::Min(Primitive.Joints.Num() * 4, MAX_TOTAL_INFLUENCES);
+			// JOINTS_n and WEIGHTS_n come from independent accessors and a malformed asset can very
+			// well declare one without the other: only the sets that have both are usable.
+			const int32 UsableJointsSets = FMath::Min(Primitive.Joints.Num(), Primitive.Weights.Num());
+			MeshSection.MaxBoneInfluences = FMath::Min(UsableJointsSets * 4, MAX_TOTAL_INFLUENCES);
+
+			// Nothing guarantees those accessors hold as many elements as the POSITION one either.
+			// The usable vertex count per set is loop invariant, so it is resolved once here instead
+			// of re-reading both array lengths for every vertex of every influence set.
+			TArray<int32, TInlineAllocator<4>> JointsSetVertexLimits;
+			JointsSetVertexLimits.Reserve(UsableJointsSets);
+			for (int32 JointsSetIndex = 0; JointsSetIndex < UsableJointsSets; JointsSetIndex++)
+			{
+				JointsSetVertexLimits.Add(FMath::Min(Primitive.Joints[JointsSetIndex].Num(), Primitive.Weights[JointsSetIndex].Num()));
+			}
 
 			if (MeshSection.MaxBoneInfluences > MaxBoneInfluences)
 			{
@@ -303,7 +316,7 @@ bool glTFRuntime::FillSkeletalMeshRenderData(FSkeletalMeshRenderData* RenderData
 
 			MeshSection.NumVertices = Primitive.Positions.Num();
 
-			BaseIndex += Primitive.bHasIndices ? Primitive.Indices.Num() : Primitive.Positions.Num();
+			BaseIndex += Primitive.Indices.Num();
 
 			TMap<int32, TArray<int32>> OverlappingVertices;
 			MeshSection.DuplicatedVerticesBuffer.Init(MeshSection.NumVertices, OverlappingVertices);
@@ -400,9 +413,15 @@ bool glTFRuntime::FillSkeletalMeshRenderData(FSkeletalMeshRenderData* RenderData
 				if ((!SkeletalMeshConfig.bIgnoreSkin && SkinIndex > INDEX_NONE) || LOD->Skeleton.Num() > 0)
 				{
 					uint32 TotalWeight = 0;
-					const int32 JointsNum = FMath::Min(Primitive.Joints.Num(), MeshSection.MaxBoneInfluences / 4);
+					const int32 JointsNum = FMath::Min(UsableJointsSets, MeshSection.MaxBoneInfluences / 4);
 					for (int32 JointsIndex = 0; JointsIndex < JointsNum; JointsIndex++)
 					{
+						// skip the vertices this set does not cover (see JointsSetVertexLimits above)
+						if (VertexIndex >= JointsSetVertexLimits[JointsIndex])
+						{
+							continue;
+						}
+
 						const FglTFRuntimeUInt16Vector4& Joints = Primitive.Joints[JointsIndex][VertexIndex];
 						const FVector4& Weights = Primitive.Weights[JointsIndex][VertexIndex];
 						for (int32 j = 0; j < 4; j++)
@@ -520,33 +539,23 @@ bool glTFRuntime::FillSkeletalMeshRenderData(FSkeletalMeshRenderData* RenderData
 		}
 
 		// generate indices (and eventually normals/tangents)
-		LodRenderData->MultiSizeIndexContainer.CreateIndexBuffer(NumLODIndices > MAX_uint16 ? sizeof(uint32) : sizeof(uint16));
+		// The index buffer stores *vertex* indices, so its width has to cover the vertex count as
+		// well: a LOD with few indices pointing at a big vertex buffer would otherwise truncate them.
+		LodRenderData->MultiSizeIndexContainer.CreateIndexBuffer((NumLODIndices > MAX_uint16 || NumLODPositions > MAX_uint16) ? sizeof(uint32) : sizeof(uint16));
 
 		for (int32 PrimitiveIndex = 0; PrimitiveIndex < LOD->Primitives.Num(); PrimitiveIndex++)
 		{
 			FglTFRuntimePrimitive& Primitive = LOD->Primitives[PrimitiveIndex];
-			const int32 NumVertexInstancesPerSection = Primitive.bHasIndices ? Primitive.Indices.Num() : Primitive.Positions.Num();
+			const int32 NumVertexInstancesPerSection = Primitive.Indices.Num();
 
 			TArray<uint32> CurrentIndices;
 			CurrentIndices.Reserve(NumVertexInstancesPerSection);
 
-			if (Primitive.bHasIndices)
+			for (const uint32 Index : Primitive.Indices)
 			{
-				for (const uint32 Index : Primitive.Indices)
-				{
-					LodRenderData->MultiSizeIndexContainer.GetIndexBuffer()->AddItem(LodRenderData->RenderSections[PrimitiveIndex].BaseVertexIndex + Index);
-					CurrentIndices.Add(LodRenderData->RenderSections[PrimitiveIndex].BaseVertexIndex + Index);
-				}
+				LodRenderData->MultiSizeIndexContainer.GetIndexBuffer()->AddItem(LodRenderData->RenderSections[PrimitiveIndex].BaseVertexIndex + Index);
+				CurrentIndices.Add(LodRenderData->RenderSections[PrimitiveIndex].BaseVertexIndex + Index);
 			}
-			else
-			{
-				for (int32 Index = 0; Index < Primitive.Positions.Num(); Index++)
-				{
-					LodRenderData->MultiSizeIndexContainer.GetIndexBuffer()->AddItem(LodRenderData->RenderSections[PrimitiveIndex].BaseVertexIndex + Index);
-					CurrentIndices.Add(LodRenderData->RenderSections[PrimitiveIndex].BaseVertexIndex + Index);
-				}
-			}
-
 
 			if ((!LOD->bHasTangents || !LOD->bHasNormals) && ((NumVertexInstancesPerSection % 3) == 0))
 			{
@@ -1299,14 +1308,14 @@ USkeletalMesh* FglTFRuntimeParser::FinalizeSkeletalMeshWithLODs(TSharedRef<FglTF
 				SkeletalMeshAttributes.RegisterMorphTargetAttribute(*MorphTarget->GetName(), false);
 			}
 		}
-		}
+	}
 #endif
 
 
 	OnSkeletalMeshCreated.Broadcast(SkeletalMeshContext->SkeletalMesh);
 
 	return SkeletalMeshContext->SkeletalMesh;
-	}
+}
 
 void FglTFRuntimeParser::GeneratePhysicsAsset_Internal(FglTFRuntimeSkeletalMeshContextRef SkeletalMeshContext)
 {
@@ -1547,6 +1556,7 @@ void FglTFRuntimeParser::GeneratePhysicsAsset_Internal(FglTFRuntimeSkeletalMeshC
 			BoxElem.X = BoxExtent.X * 2.0f * PhysicsBody.Value.CollisionScale;
 			BoxElem.Y = BoxExtent.Y * 2.0f * PhysicsBody.Value.CollisionScale;
 			BoxElem.Z = BoxExtent.Z * 2.0f * PhysicsBody.Value.CollisionScale;
+
 			NewBodySetup->AggGeom.BoxElems.Add(BoxElem);
 		}
 
@@ -1593,6 +1603,8 @@ void FglTFRuntimeParser::GeneratePhysicsAsset_Internal(FglTFRuntimeSkeletalMeshC
 
 			NewBodySetup->AggGeom.SphylElems.Add(Capsule);
 		}
+
+		NewBodySetup->CollisionReponse = PhysicsBody.Value.CollisionResponse;
 
 		const int32 NewBodyIndex = PhysicsAsset->SkeletalBodySetups.Add(NewBodySetup);
 		if (PhysicsBody.Value.bDisableCollision)
@@ -2972,7 +2984,7 @@ UAnimSequence* FglTFRuntimeParser::CreateSkeletalAnimationFromPath(USkeletalMesh
 		const TSharedPtr<FJsonObject>* JsonFrameObject = nullptr;
 		if (JsonFrame->TryGetObject(JsonFrameObject))
 		{
-			for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : (*JsonFrameObject)->Values)
+			for (const auto& Pair : (*JsonFrameObject)->Values)
 			{
 				if (!MorphTargetCurves.Contains(*Pair.Key))
 				{
@@ -3008,10 +3020,18 @@ UAnimSequence* FglTFRuntimeParser::CreateSkeletalAnimationFromPath(USkeletalMesh
 
 		for (const FName& KeyName : MorphTargetKeys)
 		{
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8
+			if (JsonFrameObject->Values.Contains(UE::FSharedString(KeyName.ToString())))
+#else
 			if (JsonFrameObject->Values.Contains(KeyName.ToString()))
+#endif
 			{
 				double Value = 0;
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8
+				if (!JsonFrameObject->Values[UE::FSharedString(KeyName.ToString())]->TryGetNumber(Value))
+#else
 				if (!JsonFrameObject->Values[KeyName.ToString()]->TryGetNumber(Value))
+#endif
 				{
 					Value = 0;
 				}
@@ -4584,4 +4604,194 @@ bool FglTFRuntimeParser::SanitizeBoneTrack(const FReferenceSkeleton& RefSkeleton
 	}
 
 	return true;
+}
+
+bool FglTFRuntimeParser::SkinHasJoint(const int32 SkinIndex, const FString& JointName)
+{
+	TSharedPtr<FJsonObject>	JsonSkinObject = GetJsonObjectFromRootIndex("skins", SkinIndex);
+	if (!JsonSkinObject)
+	{
+		AddError("SkinHasJoint()", "Unable to find skin.");
+		return false;
+	}
+
+	// get and check the list of valid joints	
+	const TArray<TSharedPtr<FJsonValue>>* JsonJoints;
+	if (JsonSkinObject->TryGetArrayField(TEXT("joints"), JsonJoints))
+	{
+		for (TSharedPtr<FJsonValue> JsonJoint : *JsonJoints)
+		{
+			int64 NodeIndex;
+			if (!JsonJoint->TryGetNumber(NodeIndex))
+			{
+				return false;
+			}
+
+			FglTFRuntimeNode JointNode;
+			if (!LoadNode(NodeIndex, JointNode))
+			{
+				return false;
+			}
+
+			if (JointNode.Name == JointName)
+			{
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
+int32 FglTFRuntimeParser::GetSkinJointIndexFromName(const int32 SkinIndex, const FString& JointName)
+{
+	TSharedPtr<FJsonObject>	JsonSkinObject = GetJsonObjectFromRootIndex("skins", SkinIndex);
+	if (!JsonSkinObject)
+	{
+		AddError("GetSkinJointIndexFromName()", "Unable to find skin.");
+		return false;
+	}
+
+	// get and check the list of valid joints	
+	const TArray<TSharedPtr<FJsonValue>>* JsonJoints;
+	if (JsonSkinObject->TryGetArrayField(TEXT("joints"), JsonJoints))
+	{
+		for (int32 JointIndex = 0; JointIndex < JsonJoints->Num(); JointIndex++)
+		{
+			TSharedPtr<FJsonValue> JsonJoint = (*JsonJoints)[JointIndex];
+
+			int64 NodeIndex;
+			if (!JsonJoint->TryGetNumber(NodeIndex))
+			{
+				return INDEX_NONE;
+			}
+
+			FglTFRuntimeNode JointNode;
+			if (!LoadNode(NodeIndex, JointNode))
+			{
+				return INDEX_NONE;
+			}
+
+			if (JointNode.Name == JointName)
+			{
+				return JointIndex;
+			}
+		}
+	}
+
+	return INDEX_NONE;
+}
+
+FString FglTFRuntimeParser::GetSkinJointNameFromJointIndex(const int32 SkinIndex, const int32 JointIndex)
+{
+	TSharedPtr<FJsonObject>	JsonSkinObject = GetJsonObjectFromRootIndex("skins", SkinIndex);
+	if (!JsonSkinObject)
+	{
+		AddError("GetSkinJointNameFromJointIndex()", "Unable to find skin.");
+		return "";
+	}
+
+	// get and check the list of valid joints	
+	const TArray<TSharedPtr<FJsonValue>>* JsonJoints;
+	if (JsonSkinObject->TryGetArrayField(TEXT("joints"), JsonJoints))
+	{
+		if (JsonJoints->IsValidIndex(JointIndex))
+		{
+			TSharedPtr<FJsonValue> JsonJoint = (*JsonJoints)[JointIndex];
+
+			int64 NodeIndex;
+			if (!JsonJoint->TryGetNumber(NodeIndex))
+			{
+				return "";
+			}
+
+			FglTFRuntimeNode JointNode;
+			if (!LoadNode(NodeIndex, JointNode))
+			{
+				return "";
+			}
+
+			return JointNode.Name;
+		}
+	}
+
+	return "";
+}
+
+int32 FglTFRuntimeParser::GetSkinNodeIndexFromName(const int32 SkinIndex, const FString& JointName)
+{
+	TSharedPtr<FJsonObject>	JsonSkinObject = GetJsonObjectFromRootIndex("skins", SkinIndex);
+	if (!JsonSkinObject)
+	{
+		AddError("GetSkinNodeIndexFromName()", "Unable to find skin.");
+		return false;
+	}
+
+	// get and check the list of valid joints	
+	const TArray<TSharedPtr<FJsonValue>>* JsonJoints;
+	if (JsonSkinObject->TryGetArrayField(TEXT("joints"), JsonJoints))
+	{
+		for (int32 JointIndex = 0; JointIndex < JsonJoints->Num(); JointIndex++)
+		{
+			TSharedPtr<FJsonValue> JsonJoint = (*JsonJoints)[JointIndex];
+
+			int64 NodeIndex;
+			if (!JsonJoint->TryGetNumber(NodeIndex))
+			{
+				return INDEX_NONE;
+			}
+
+			FglTFRuntimeNode JointNode;
+			if (!LoadNode(NodeIndex, JointNode))
+			{
+				return INDEX_NONE;
+			}
+
+			if (JointNode.Name == JointName)
+			{
+				return NodeIndex;
+			}
+		}
+	}
+
+	return INDEX_NONE;
+}
+
+FString FglTFRuntimeParser::GetSkinJointNameFromNodeIndex(const int32 SkinIndex, const int32 NodeIndex)
+{
+	TSharedPtr<FJsonObject>	JsonSkinObject = GetJsonObjectFromRootIndex("skins", SkinIndex);
+	if (!JsonSkinObject)
+	{
+		AddError("GetSkinJointNameFromNodeIndex()", "Unable to find skin.");
+		return "";
+	}
+
+	// get and check the list of valid joints	
+	const TArray<TSharedPtr<FJsonValue>>* JsonJoints;
+	if (JsonSkinObject->TryGetArrayField(TEXT("joints"), JsonJoints))
+	{
+		for (int32 JointIndex = 0; JointIndex < JsonJoints->Num(); JointIndex++)
+		{
+			TSharedPtr<FJsonValue> JsonJoint = (*JsonJoints)[JointIndex];
+
+			int64 CurrentNodeIndex;
+			if (!JsonJoint->TryGetNumber(CurrentNodeIndex))
+			{
+				return "";
+			}
+
+			FglTFRuntimeNode JointNode;
+			if (!LoadNode(NodeIndex, JointNode))
+			{
+				return "";
+			}
+
+			if (CurrentNodeIndex == NodeIndex)
+			{
+				return JointNode.Name;
+			}
+		}
+	}
+
+	return "";
 }

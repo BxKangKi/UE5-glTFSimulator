@@ -79,16 +79,17 @@ struct FJsonHelper
         {
             OutMap.Empty((*MapJsonObjPtr)->Values.Num()); // Reserve map storage for efficiency.
             
-            // Iterate over every key-value pair in the JSON object.
-            for (const TPair<FString, TSharedPtr<FJsonValue>>& KVP : (*MapJsonObjPtr)->Values)
+            // UE 5.8 stores JSON object keys as UE::FSharedString. Type inference keeps
+            // this code compatible with both the old FString map and the new shared-key map.
+            for (const auto& KVP : (*MapJsonObjPtr)->Values)
             {
                 if (KVP.Value.IsValid() && KVP.Value->Type == EJson::Object)
                 {
                     T Item;
                     if (DeserializeFunc(KVP.Value->AsObject(), Item))
                     {
-                        // Convert the string key back to FName before adding it to the map.
-                        OutMap.Add(FName(*KVP.Key), Item);
+                        const FString JsonKey(KVP.Key);
+                        OutMap.Add(FName(*JsonKey), Item);
                     }
                 }
             }

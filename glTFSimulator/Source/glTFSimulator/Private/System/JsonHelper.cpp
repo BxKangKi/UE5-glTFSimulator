@@ -35,7 +35,11 @@ TArray<FString> FJsonHelper::GetAllKeysFromJsonObject(const TSharedPtr<FJsonObje
     TArray<FString> Keys;
     if (JsonObject.IsValid())
     {
-        JsonObject->Values.GetKeys(Keys);
+        Keys.Reserve(JsonObject->Values.Num());
+        for (const auto& Pair : JsonObject->Values)
+        {
+            Keys.Add(FString(Pair.Key));
+        }
     }
     return Keys;
 }

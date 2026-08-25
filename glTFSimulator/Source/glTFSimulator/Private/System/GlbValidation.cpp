@@ -195,14 +195,14 @@ namespace
             return false;
         }
 
-        const TSharedPtr<FJsonValue>* ValuePtr = Object->Values.Find(FieldName);
-        if (!ValuePtr)
+        const TSharedPtr<FJsonValue> Value = Object->TryGetField(FieldName);
+        if (!Value.IsValid())
         {
             return !bRequired;
         }
 
         double NumberValue = 0.0;
-        if (!ValuePtr->IsValid() || !(*ValuePtr)->TryGetNumber(NumberValue) || !FMath::IsFinite(NumberValue) ||
+        if (!Value->TryGetNumber(NumberValue) || !FMath::IsFinite(NumberValue) ||
             NumberValue < static_cast<double>(Minimum) || NumberValue > static_cast<double>(Maximum))
         {
             return false;
@@ -250,17 +250,17 @@ namespace
             return false;
         }
 
-        const TSharedPtr<FJsonValue>* ValuePtr = Object->Values.Find(FieldName);
-        if (!ValuePtr)
+        const TSharedPtr<FJsonValue> Value = Object->TryGetField(FieldName);
+        if (!Value.IsValid())
         {
             return !bRequired;
         }
-        if (!ValuePtr->IsValid() || (*ValuePtr)->Type != EJson::Object)
+        if (Value->Type != EJson::Object)
         {
             return false;
         }
 
-        OutObject = (*ValuePtr)->AsObject();
+        OutObject = Value->AsObject();
         return OutObject.IsValid();
     }
 
@@ -277,17 +277,17 @@ namespace
             return false;
         }
 
-        const TSharedPtr<FJsonValue>* ValuePtr = Object->Values.Find(FieldName);
-        if (!ValuePtr)
+        const TSharedPtr<FJsonValue> Value = Object->TryGetField(FieldName);
+        if (!Value.IsValid())
         {
             return !bRequired;
         }
-        if (!ValuePtr->IsValid() || (*ValuePtr)->Type != EJson::Array)
+        if (Value->Type != EJson::Array)
         {
             return false;
         }
 
-        OutArray = &(*ValuePtr)->AsArray();
+        OutArray = &Value->AsArray();
         return OutArray && (!bRequireNonEmpty || OutArray->Num() > 0);
     }
 
@@ -1217,9 +1217,9 @@ namespace
                     return false;
                 }
 
-                const TSharedPtr<FJsonValue>* PositionValue = AttributesObject->Values.Find(TEXT("POSITION"));
+                const TSharedPtr<FJsonValue> PositionValue = AttributesObject->TryGetField(TEXT("POSITION"));
                 int32 PositionAccessorIndex = INDEX_NONE;
-                if (!PositionValue || !TryGetAccessorIndexFromValue(*PositionValue, Accessors, PositionAccessorIndex))
+                if (!PositionValue.IsValid() || !TryGetAccessorIndexFromValue(PositionValue, Accessors, PositionAccessorIndex))
                 {
                     OutReason = FString::Printf(TEXT("mesh %d primitive %d has no valid POSITION accessor"), MeshIndex, PrimitiveIndex);
                     return false;
@@ -1235,26 +1235,27 @@ namespace
                 }
 
                 int32 UVChannelCount = 0;
-                for (const TPair<FString, TSharedPtr<FJsonValue>>& AttributePair : AttributesObject->Values)
+                for (const auto& AttributePair : AttributesObject->Values)
                 {
+                    const FString AttributeName(AttributePair.Key);
                     int32 AttributeAccessorIndex = INDEX_NONE;
                     if (!TryGetAccessorIndexFromValue(AttributePair.Value, Accessors, AttributeAccessorIndex) ||
                         Accessors[AttributeAccessorIndex].Count != PositionAccessor.Count)
                     {
                         OutReason = FString::Printf(TEXT("mesh %d primitive %d attribute '%s' is invalid or has a mismatched count"),
-                            MeshIndex, PrimitiveIndex, *AttributePair.Key);
+                            MeshIndex, PrimitiveIndex, *AttributeName);
                         return false;
                     }
 
-                    if (AttributePair.Key.StartsWith(TEXT("TEXCOORD_"), ESearchCase::CaseSensitive))
+                    if (AttributeName.StartsWith(TEXT("TEXCOORD_"), ESearchCase::CaseSensitive))
                     {
                         ++UVChannelCount;
-                        const FString ChannelText = AttributePair.Key.RightChop(9);
+                        const FString ChannelText = AttributeName.RightChop(9);
                         int32 ChannelIndex = INDEX_NONE;
                         if (!LexTryParseString(ChannelIndex, *ChannelText) || ChannelIndex < 0 || ChannelIndex >= MAX_RUNTIME_UV_CHANNELS)
                         {
                             OutReason = FString::Printf(TEXT("mesh %d primitive %d uses unsupported UV channel '%s'"),
-                                MeshIndex, PrimitiveIndex, *AttributePair.Key);
+                                MeshIndex, PrimitiveIndex, *AttributeName);
                             return false;
                         }
                     }
@@ -1341,14 +1342,15 @@ namespace
                             OutReason = FString::Printf(TEXT("mesh %d primitive %d has a non-object morph target"), MeshIndex, PrimitiveIndex);
                             return false;
                         }
-                        for (const TPair<FString, TSharedPtr<FJsonValue>>& TargetPair : TargetObject->Values)
+                        for (const auto& TargetPair : TargetObject->Values)
                         {
+                            const FString TargetName(TargetPair.Key);
                             int32 TargetAccessorIndex = INDEX_NONE;
                             if (!TryGetAccessorIndexFromValue(TargetPair.Value, Accessors, TargetAccessorIndex) ||
                                 Accessors[TargetAccessorIndex].Count != PositionAccessor.Count)
                             {
                                 OutReason = FString::Printf(TEXT("mesh %d primitive %d morph target '%s' has a mismatched count"),
-                                    MeshIndex, PrimitiveIndex, *TargetPair.Key);
+                                    MeshIndex, PrimitiveIndex, *TargetName);
                                 return false;
                             }
                         }

@@ -356,10 +356,10 @@ void UCharacterLoadAsyncAction::LoadBoneMapAsync()
 
         if (Json.IsValid())
         {
-            for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : Json->Values)
+            for (const auto& Pair : Json->Values)
             {
                 FString BoneValue;
-                const FString BoneKey = Pair.Key.TrimStartAndEnd();
+                const FString BoneKey = FString(Pair.Key).TrimStartAndEnd();
                 if (Pair.Value.IsValid() && Pair.Value->TryGetString(BoneValue))
                 {
                     BoneValue = BoneValue.TrimStartAndEnd();

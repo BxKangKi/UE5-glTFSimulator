@@ -40,7 +40,7 @@
 #include "System/glTFRuntimeSafety.h"
 #include "Net/UnrealNetwork.h"
 #include "Vehicle/VehicleSubSystem.h"
-#include "World/BuoyancyComponent.h"
+#include "World/SimulatorBuoyancyComponent.h"
 #include "World/WaterActor.h"
 
 static bool IsVehicleWheelTaggedName(const FString& Name)
@@ -307,7 +307,7 @@ AVehiclePawn::AVehiclePawn()
         }
     }
 
-    BuoyancyComponent = CreateDefaultSubobject<UBuoyancyComponent>(TEXT("Buoyancy"));
+    BuoyancyComponent = CreateDefaultSubobject<USimulatorBuoyancyComponent>(TEXT("Buoyancy"));
 
     bUseControllerRotationPitch = false;
     bUseControllerRotationYaw = false;
@@ -2960,141 +2960,9 @@ void AVehiclePawn::UpdateStableWheelVehicle(float DeltaSeconds)
 
 void AVehiclePawn::ApplyStableVehicleGrounding(float DeltaSeconds)
 {
-    // Disabled: snap-grounding can inject artificial vertical motion. Runtime driving uses UpdateStableWheelVehicle.
-    return;
-
-    if (!bUseStableGroundRideHeight || !IsValid(Body))
-    {
-        return;
-    }
-
-    UWorld* World = GetWorld();
-    if (!World)
-    {
-        return;
-    }
-
-    const float SafeDeltaSeconds = FMath::Max(0.0f, DeltaSeconds);
-    const float StableSpringLength = GetStableWheelVisualSpringLength();
-    const float SafeWheelRadius = GetEffectiveWheelRadius();
-    const FVector PreservedLinearVelocity = Body->IsSimulatingPhysics() ? Body->GetPhysicsLinearVelocity() : FVector::ZeroVector;
-    const float PreservedYawAngularVelocity = Body->IsSimulatingPhysics()
-        ? FVector::DotProduct(Body->GetPhysicsAngularVelocityInRadians(), FVector::UpVector)
-        : 0.0f;
-
-    if (bLockBodyPitchAndRoll)
-    {
-        const FRotator CurrentRotation = GetActorRotation();
-        if (!FMath::IsNearlyZero(CurrentRotation.Pitch, 0.01f) || !FMath::IsNearlyZero(CurrentRotation.Roll, 0.01f))
-        {
-            SetActorRotation(FRotator(0.0f, CurrentRotation.Yaw, 0.0f), ETeleportType::TeleportPhysics);
-        }
-    }
-
-    FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(VehicleStableGroundingTrace), false, this);
-    QueryParams.AddIgnoredActor(this);
-
-    const FTransform BodyTransform = Body->GetComponentTransform();
-    const float TraceUp = FMath::Max(FMath::Max(20.0f, StableGroundTraceUp), SafeWheelRadius + 80.0f);
-    const float TraceDown = FMath::Max(FMath::Max(120.0f, StableGroundTraceDown), StableSpringLength + SafeWheelRadius + SuspensionTraceExtra + 220.0f);
-    const float RequiredNormalZ = FMath::Clamp(MinSuspensionHitNormalDot, 0.0f, 1.0f);
-    const float GroundBuffer = FMath::Max(0.0f, StableRideHeightGroundBuffer);
-
-    bool bHasTargetHeight = false;
-    float TargetActorZ = GetActorLocation().Z;
-    auto AddTargetHeight = [&](float CandidateZ)
-    {
-        TargetActorZ = bHasTargetHeight ? FMath::Max(TargetActorZ, CandidateZ) : CandidateZ;
-        bHasTargetHeight = true;
-    };
-
-    for (const FVector& LocalWheelOffset : WheelOffsets)
-    {
-        const FVector MountWorld = BodyTransform.TransformPosition(LocalWheelOffset);
-        const FVector TraceStart = MountWorld + FVector::UpVector * TraceUp;
-        const FVector TraceEnd = MountWorld - FVector::UpVector * TraceDown;
-
-        FHitResult Hit;
-        if (!FPhysicsHelper::Raycast(this, TraceStart, TraceEnd, QueryParams, Hit) || !Hit.bBlockingHit)
-        {
-            continue;
-        }
-
-        if (Hit.ImpactNormal.Z < RequiredNormalZ)
-        {
-            continue;
-        }
-
-        // With pitch/roll locked, local Z is stable. Place the actor so the wheel visual center
-        // stays one radius above the floor at the fixed visual suspension length.
-        AddTargetHeight(Hit.ImpactPoint.Z + GroundBuffer + StableSpringLength + SafeWheelRadius - LocalWheelOffset.Z);
-        if (!LoadedWheelVisualRestBounds.IsValid)
-        {
-            AddTargetHeight(Hit.ImpactPoint.Z + GroundBuffer + BodyExtent.Z
-                + FMath::Clamp(GetPhysicsBodyGroundClearance(), 1.0f, 8.0f));
-        }
-    }
-
-    if (!bHasTargetHeight)
-    {
-        const FVector ActorLocation = GetActorLocation();
-        const FVector TraceStart = ActorLocation + FVector::UpVector * TraceUp;
-        const FVector TraceEnd = ActorLocation - FVector::UpVector * TraceDown;
-        FHitResult Hit;
-        if (FPhysicsHelper::Raycast(this, TraceStart, TraceEnd, QueryParams, Hit) && Hit.bBlockingHit && Hit.ImpactNormal.Z >= RequiredNormalZ)
-        {
-            AddTargetHeight(Hit.ImpactPoint.Z + GroundBuffer + GetDesiredCenterHeightAboveGround());
-        }
-    }
-
-    if (bHasTargetHeight)
-    {
-        const FVector CurrentLocation = GetActorLocation();
-        const float SnapTolerance = FMath::Max(0.1f, GroundBuffer * 0.25f + SafeDeltaSeconds * 0.0f);
-        const FRotator CurrentRotation = GetActorRotation();
-        const FRotator StableRotation = bLockBodyPitchAndRoll
-            ? FRotator(0.0f, CurrentRotation.Yaw, 0.0f)
-            : CurrentRotation;
-        if (!FMath::IsNearlyEqual(CurrentLocation.Z, TargetActorZ, SnapTolerance)
-            || (bLockBodyPitchAndRoll && (!FMath::IsNearlyZero(CurrentRotation.Pitch, 0.01f) || !FMath::IsNearlyZero(CurrentRotation.Roll, 0.01f))))
-        {
-            SetActorLocationAndRotation(FVector(CurrentLocation.X, CurrentLocation.Y, TargetActorZ), StableRotation, false, nullptr, ETeleportType::TeleportPhysics);
-        }
-    }
-
-    if (Body->IsSimulatingPhysics())
-    {
-        Body->SetEnableGravity(false);
-
-        FVector LinearVelocity = Body->GetPhysicsLinearVelocity();
-        LinearVelocity.X = PreservedLinearVelocity.X;
-        LinearVelocity.Y = PreservedLinearVelocity.Y;
-        LinearVelocity.Z = 0.0f;
-        Body->SetPhysicsLinearVelocity(LinearVelocity);
-
-        if (bLockBodyPitchAndRoll)
-        {
-            // Kill only pitch/roll angular velocity. Preserve yaw so steering can keep rotating the vehicle.
-            Body->SetPhysicsAngularVelocityInRadians(FVector::UpVector * PreservedYawAngularVelocity);
-        }
-    }
-
-    WheelSpringLengths.SetNum(WheelOffsets.Num());
-    WheelVisualSpringLengths.SetNum(WheelOffsets.Num());
-    for (int32 WheelIndex = 0; WheelIndex < WheelSpringLengths.Num(); ++WheelIndex)
-    {
-        WheelSpringLengths[WheelIndex] = StableSpringLength;
-        WheelVisualSpringLengths[WheelIndex] = StableSpringLength;
-    }
-
-    const float StaticSupportForce = WheelOffsets.Num() > 0
-        ? FMath::Max(1.0f, VehicleMassKg) * FMath::Max(1.0f, FMath::Abs(World->GetGravityZ())) / static_cast<float>(WheelOffsets.Num())
-        : 0.0f;
-    WheelSuspensionForces.SetNum(WheelOffsets.Num());
-    for (float& WheelSuspensionForce : WheelSuspensionForces)
-    {
-        WheelSuspensionForce = StaticSupportForce;
-    }
+    // Intentionally disabled. Snap-grounding injected artificial vertical motion;
+    // runtime driving is handled by UpdateStableWheelVehicle instead.
+    (void)DeltaSeconds;
 }
 
 FPlacedObjectRecord AVehiclePawn::ToPlacementRecord(int32 VehicleRecordIndex) const

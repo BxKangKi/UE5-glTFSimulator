@@ -19,6 +19,7 @@
 #include "Misc/Compression.h"
 #include "Misc/Crc.h"
 #include "Misc/Paths.h"
+#include "Templates/Atomic.h"
 #include "Interfaces/IPluginManager.h"
 #if ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 2
 #include "RenderMath.h"
@@ -42,6 +43,7 @@ FglTFRuntimeOnLoadedTexturePixels FglTFRuntimeParser::OnLoadedTexturePixels;
 FglTFRuntimeOnFinalizedStaticMesh FglTFRuntimeParser::OnFinalizedStaticMesh;
 FglTFRuntimeOnPreCreatedStaticMesh FglTFRuntimeParser::OnPreCreatedStaticMesh;
 FglTFRuntimeOnPostCreatedStaticMesh FglTFRuntimeParser::OnPostCreatedStaticMesh;
+FglTFRuntimeOnPreInitStaticMeshResources FglTFRuntimeParser::OnPreInitStaticMeshResources;
 FglTFRuntimeOnPreCreatedSkeletalMesh FglTFRuntimeParser::OnPreCreatedSkeletalMesh;
 
 TSharedPtr<FglTFRuntimeParser> FglTFRuntimeParser::FromFilename(const FString& Filename, const FglTFRuntimeConfig& LoaderConfig)
@@ -92,8 +94,11 @@ TSharedPtr<FglTFRuntimeParser> FglTFRuntimeParser::FromFilename(const FString& F
 	{
 		if (LoaderConfig.bAllowExternalFiles)
 		{
-			// allows to load external files
-			Parser->BaseDirectory = FPaths::GetPath(TruePath);
+			if (!(Parser->IsArchive() && LoaderConfig.bBaseDirectoryFromArchiveEntryPoint))
+			{
+				// allows to load external files
+				Parser->BaseDirectory = FPaths::GetPath(TruePath);
+			}
 		}
 		Parser->BaseFilename = FPaths::GetBaseFilename(TruePath);
 	}
@@ -126,7 +131,7 @@ TSharedPtr<FglTFRuntimeParser> FglTFRuntimeParser::FromRawDataAndArchive(const u
 
 		if (!LoaderConfig.bAsBlob && Filename.IsEmpty())
 		{
-			UE_LOG(LogGLTFRuntime, Error, TEXT("Unable to find entry point from Archive."), *Filename);
+			UE_LOG(LogGLTFRuntime, Error, TEXT("Unable to find entry point from Archive."));
 			return nullptr;
 		}
 
@@ -134,6 +139,11 @@ TSharedPtr<FglTFRuntimeParser> FglTFRuntimeParser::FromRawDataAndArchive(const u
 		{
 			UE_LOG(LogGLTFRuntime, Error, TEXT("Unable to get %s from Archive."), *Filename);
 			return nullptr;
+		}
+
+		if (LoaderConfig.bBaseDirectoryFromArchiveEntryPoint)
+		{
+			InArchive->BaseDirectory = FPaths::GetPath(Filename);
 		}
 
 		if (ArchiveEntryPointData.Num() > 0)
@@ -155,8 +165,43 @@ TSharedPtr<FglTFRuntimeParser> FglTFRuntimeParser::FromRawDataAndArchive(const u
 		{
 			NewParser->AsBlob.Append(DataPtr, DataNum);
 			NewParser->Archive = InArchive;
+			if (NewParser->Archive.IsValid() && LoaderConfig.ArchiveUriRewriterHook.IsBound())
+			{
+				TArray<FString> ArchiveKeys;
+				NewParser->Archive->GetItems(ArchiveKeys);
+				for (const FString& ArchiveKey : ArchiveKeys)
+				{
+					if (IsInGameThread())
+					{
+						if (LoaderConfig.ArchiveUriRewriterHook.UriRewriter.IsBound())
+						{
+							NewParser->Archive->Remap(ArchiveKey, LoaderConfig.ArchiveUriRewriterHook.UriRewriter.Execute(ArchiveKey, LoaderConfig.ArchiveUriRewriterHook.Context));
+						}
+						else if (LoaderConfig.ArchiveUriRewriterHook.NativeUriRewriter.IsBound())
+						{
+							NewParser->Archive->Remap(ArchiveKey, LoaderConfig.ArchiveUriRewriterHook.NativeUriRewriter.Execute(ArchiveKey, LoaderConfig.ArchiveUriRewriterHook.Context));
+						}
+					}
+					else
+					{
+						FGraphEventRef Task = FFunctionGraphTask::CreateAndDispatchWhenReady([&]()
+							{
+								if (LoaderConfig.ArchiveUriRewriterHook.UriRewriter.IsBound())
+								{
+									NewParser->Archive->Remap(ArchiveKey, LoaderConfig.ArchiveUriRewriterHook.UriRewriter.Execute(ArchiveKey, LoaderConfig.ArchiveUriRewriterHook.Context));
+								}
+								else if (LoaderConfig.ArchiveUriRewriterHook.NativeUriRewriter.IsBound())
+								{
+									NewParser->Archive->Remap(ArchiveKey, LoaderConfig.ArchiveUriRewriterHook.NativeUriRewriter.Execute(ArchiveKey, LoaderConfig.ArchiveUriRewriterHook.Context));
+								}
+							}, TStatId(), nullptr, ENamedThreads::GameThread);
+						FTaskGraphInterface::Get().WaitUntilTaskCompletes(Task);
+					}
+				}
+			}
 			NewParser->AssetUserDataClasses = LoaderConfig.AssetUserDataClasses;
 		}
+
 		return NewParser;
 	}
 
@@ -260,6 +305,18 @@ TSharedPtr<FglTFRuntimeParser> FglTFRuntimeParser::FromData(const uint8* DataPtr
 			StartOfBuffer += 2;
 		}
 
+		// Decompression-bomb guard (untrusted input): gzip wraps DEFLATE (RFC 1952 / RFC 1951),
+		// whose maximum expansion is 1032:1, so a declared size larger than the compressed payload
+		// could produce is malformed/malicious. (ISIZE is only size mod 2^32, so this is a floor of
+		// protection, but it still stops the classic bomb.)
+		const int64 GzipCompressedSize = DataNum - StartOfBuffer - 8;
+		constexpr uint64 MaxDeflateExpansion = 1032;
+		if (GzipCompressedSize < 0 || static_cast<uint64>(*GzipOriginalSize) > static_cast<uint64>(GzipCompressedSize) * MaxDeflateExpansion)
+		{
+			UE_LOG(LogGLTFRuntime, Error, TEXT("Refusing Gzip data: declared uncompressed size %u is implausible for %lld compressed bytes (possible decompression bomb)."), *GzipOriginalSize, static_cast<long long>(GzipCompressedSize));
+			return nullptr;
+		}
+
 		UncompressedData.AddUninitialized(*GzipOriginalSize);
 		if (!FCompression::UncompressMemory(NAME_Zlib, UncompressedData.GetData(), *GzipOriginalSize, &DataPtr[StartOfBuffer], DataNum - StartOfBuffer - 8, COMPRESS_NoFlags, -15))
 		{
@@ -332,11 +389,20 @@ TSharedPtr<FglTFRuntimeParser> FglTFRuntimeParser::FromData(const uint8* DataPtr
 
 		}
 
+		// Decompression-bomb guard (untrusted input): in the LZ4 block format one length byte of
+		// 0xFF encodes 255 output bytes, so the maximum expansion is 255:1. Bound the pre-reservation
+		// and (below, in the decoder and after each block) the running output to that ratio.
+		constexpr int64 MaxLZ4Expansion = 255;
+		const int64 LZ4MaxPlausibleOutput = DataNum * MaxLZ4Expansion;
 		if (bLZ4BlockHasContentSize)
 		{
 			const uint64* LZ4ContentSize = reinterpret_cast<const uint64*>(DataPtr + 4 + 2);
-			// 64GB seems a pretty reasonable limit...
-			UncompressedData.Reserve(FMath::Min<int64>(*LZ4ContentSize, 64LLU * 1024 * 1024 * 1024));
+			if (static_cast<int64>(*LZ4ContentSize) < 0 || static_cast<int64>(*LZ4ContentSize) > LZ4MaxPlausibleOutput)
+			{
+				UE_LOG(LogGLTFRuntime, Error, TEXT("Refusing LZ4 data: declared content size %llu is implausible for %lld compressed bytes (possible decompression bomb)."), static_cast<unsigned long long>(*LZ4ContentSize), static_cast<long long>(DataNum));
+				return nullptr;
+			}
+			UncompressedData.Reserve(FMath::Min<int64>(static_cast<int64>(*LZ4ContentSize), LZ4MaxPlausibleOutput));
 		}
 		else
 		{
@@ -344,7 +410,7 @@ TSharedPtr<FglTFRuntimeParser> FglTFRuntimeParser::FromData(const uint8* DataPtr
 			UncompressedData.Reserve(ReserveBlockSize * LZ4Blocks.Num() * 2);
 		}
 
-		auto LZ4Decompress = [](const uint8* BlockData, const int64 BlockSize, TArray64<uint8>& Output) -> bool
+		auto LZ4Decompress = [LZ4MaxPlausibleOutput](const uint8* BlockData, const int64 BlockSize, TArray64<uint8>& Output) -> bool
 			{
 				const uint32 TrueBlockSize = BlockSize & 0x7FFFFFFF;
 				// uncompressed block?
@@ -425,6 +491,12 @@ TSharedPtr<FglTFRuntimeParser> FglTFRuntimeParser::FromData(const uint8* DataPtr
 
 					while (MatchLength > 0)
 					{
+						// running decompression-bomb cap: matches copy from already-decoded output, so
+						// this is the amplification point; stop if it exceeds the 255:1 plausibility bound.
+						if (Output.Num() > LZ4MaxPlausibleOutput)
+						{
+							return false;
+						}
 						if (!Output.IsValidIndex(MatchOffset))
 						{
 							return false;
@@ -461,6 +533,11 @@ TSharedPtr<FglTFRuntimeParser> FglTFRuntimeParser::FromData(const uint8* DataPtr
 				}
 
 				UncompressedData.Append(BlockState.Key);
+				if (UncompressedData.Num() > LZ4MaxPlausibleOutput)
+				{
+					UE_LOG(LogGLTFRuntime, Error, TEXT("Refusing LZ4 data: decompressed output exceeded the %lld-byte plausibility bound (possible decompression bomb)."), static_cast<long long>(LZ4MaxPlausibleOutput));
+					return nullptr;
+				}
 			}
 		}
 		else
@@ -537,7 +614,6 @@ TSharedPtr<FglTFRuntimeParser> FglTFRuntimeParser::FromData(const uint8* DataPtr
 		// given the block nature of tar files, it is more memory efficient to extract the files directly
 		int64 ByteIndex = 0;
 		bool bTarParsingFailed = false;
-		int64 TarPrefixLen = 0;
 		while (ByteIndex < DataNum)
 		{
 			const uint8* Block = DataPtr + ByteIndex;
@@ -576,22 +652,10 @@ TSharedPtr<FglTFRuntimeParser> FglTFRuntimeParser::FromData(const uint8* DataPtr
 				break;
 			}
 
-			// first entry ?
-			if (ByteIndex == 512)
-			{
-				const FString TarPrefix = GetTarString(Block, 100);
-				TarPrefixLen = TarPrefix.Len();
-			}
-
-			if (Block[156] == 0 || Block[156] == '0' || Block[156] == '7')
+			if (Block[156] == 0 || Block[156] == '0' || Block[156] == '5' || Block[156] == '7')
 			{
 				const FString TarFilename = GetTarString(Block, 100);
-				if (TarFilename.Len() <= TarPrefixLen)
-				{
-					bTarParsingFailed = true;
-					break;
-				}
-				TArray64<uint8>& TarFileContent = TarMap.Add(TarFilename.RightChop(TarPrefixLen));
+				TArray64<uint8>& TarFileContent = TarMap.Add(TarFilename);
 				TarFileContent.AddUninitialized(FileSize);
 				FMemory::Memcpy(TarFileContent.GetData(), DataPtr + ByteIndex, FileSize);
 			}
@@ -653,7 +717,45 @@ TSharedPtr<FglTFRuntimeParser> FglTFRuntimeParser::FromString(const FString& Jso
 		}
 		Parser->DefaultPrefixForUnnamedNodes = LoaderConfig.PrefixForUnnamedNodes;
 		Parser->Archive = InArchive;
+		if (Parser->Archive.IsValid())
+		{
+			if (LoaderConfig.ArchiveUriRewriterHook.IsBound())
+			{
+				TArray<FString> ArchiveKeys;
+				Parser->Archive->GetItems(ArchiveKeys);
+				for (const FString& ArchiveKey : ArchiveKeys)
+				{
+					if (IsInGameThread())
+					{
+						if (LoaderConfig.ArchiveUriRewriterHook.UriRewriter.IsBound())
+						{
+							Parser->Archive->Remap(ArchiveKey, LoaderConfig.ArchiveUriRewriterHook.UriRewriter.Execute(ArchiveKey, LoaderConfig.ArchiveUriRewriterHook.Context));
+						}
+						else if (LoaderConfig.ArchiveUriRewriterHook.NativeUriRewriter.IsBound())
+						{
+							Parser->Archive->Remap(ArchiveKey, LoaderConfig.ArchiveUriRewriterHook.NativeUriRewriter.Execute(ArchiveKey, LoaderConfig.ArchiveUriRewriterHook.Context));
+						}
+					}
+					else
+					{
+						FGraphEventRef Task = FFunctionGraphTask::CreateAndDispatchWhenReady([&]()
+							{
+								if (LoaderConfig.ArchiveUriRewriterHook.UriRewriter.IsBound())
+								{
+									Parser->Archive->Remap(ArchiveKey, LoaderConfig.ArchiveUriRewriterHook.UriRewriter.Execute(ArchiveKey, LoaderConfig.ArchiveUriRewriterHook.Context));
+								}
+								else if (LoaderConfig.ArchiveUriRewriterHook.NativeUriRewriter.IsBound())
+								{
+									Parser->Archive->Remap(ArchiveKey, LoaderConfig.ArchiveUriRewriterHook.NativeUriRewriter.Execute(ArchiveKey, LoaderConfig.ArchiveUriRewriterHook.Context));
+								}
+							}, TStatId(), nullptr, ENamedThreads::GameThread);
+						FTaskGraphInterface::Get().WaitUntilTaskCompletes(Task);
+					}
+				}
+			}
+		}
 		Parser->AssetUserDataClasses = LoaderConfig.AssetUserDataClasses;
+		Parser->UriRewriterHook = LoaderConfig.UriRewriterHook;
 	}
 
 	return Parser;
@@ -957,17 +1059,43 @@ bool FglTFRuntimeParser::LoadNodes()
 	return true;
 }
 
+// Assigns Node as the parent of its direct children.
+// This used to recurse into the whole subtree, which made LoadNodes() O(nodes * depth) (every node
+// re-walked all of its descendants) and, more importantly, blew the stack on files whose node graph
+// contains a cycle (a is a child of b, b is a child of a). Since LoadNodes() already calls this for
+// *every* node, walking a single level is enough to give the whole graph its parents.
 void FglTFRuntimeParser::FixNodeParent(FglTFRuntimeNode& Node)
 {
 	for (int32 Index : Node.ChildrenIndices)
 	{
 		AllNodesCache[Index].ParentIndex = Node.Index;
-		FixNodeParent(AllNodesCache[Index]);
 	}
 }
 
-bool FglTFRuntimeParser::LoadNodesRecursive(const int32 NodeIndex, TArray<FglTFRuntimeNode>& Nodes)
+// Depth first collection of a node and its descendants.
+// VisitedNodes is an internal bookkeeping set (callers can leave it to nullptr): node graphs coming
+// from a file are not guaranteed to be acyclic, and without it a cycle recurses until the stack dies.
+bool FglTFRuntimeParser::LoadNodesRecursive(const int32 NodeIndex, TArray<FglTFRuntimeNode>& Nodes, TSet<int32>* VisitedNodes)
 {
+	if (VisitedNodes)
+	{
+		return LoadNodesRecursive_Internal(NodeIndex, Nodes, *VisitedNodes);
+	}
+
+	TSet<int32> LocalVisitedNodes;
+	return LoadNodesRecursive_Internal(NodeIndex, Nodes, LocalVisitedNodes);
+}
+
+bool FglTFRuntimeParser::LoadNodesRecursive_Internal(const int32 NodeIndex, TArray<FglTFRuntimeNode>& Nodes, TSet<int32>& VisitedNodes)
+{
+	bool bAlreadyVisited = false;
+	VisitedNodes.Add(NodeIndex, &bAlreadyVisited);
+	if (bAlreadyVisited)
+	{
+		AddError("LoadNodesRecursive()", FString::Printf(TEXT("Cycle detected in the node hierarchy at node %d"), NodeIndex));
+		return false;
+	}
+
 	FglTFRuntimeNode Node;
 	if (!LoadNode(NodeIndex, Node))
 	{
@@ -979,7 +1107,7 @@ bool FglTFRuntimeParser::LoadNodesRecursive(const int32 NodeIndex, TArray<FglTFR
 
 	for (int32 ChildIndex : Node.ChildrenIndices)
 	{
-		if (!LoadNodesRecursive(ChildIndex, Nodes))
+		if (!LoadNodesRecursive_Internal(ChildIndex, Nodes, VisitedNodes))
 		{
 			return false;
 		}
@@ -1646,7 +1774,7 @@ bool FglTFRuntimeParser::LoadNode_Internal(int32 Index, TSharedRef<FJsonObject> 
 				return false;
 			}
 
-			if (ChildIndex >= NodesCount)
+			if (ChildIndex < 0 || ChildIndex >= NodesCount)
 			{
 				return false;
 			}
@@ -1805,7 +1933,7 @@ bool FglTFRuntimeParser::LoadAnimation_Internal(TSharedRef<FJsonObject> JsonAnim
 		Callback(Node, Path, AnimationCurve);
 	}
 
-	return true;	
+	return true;
 }
 
 TArray<FString> FglTFRuntimeParser::GetCamerasNames()
@@ -2045,7 +2173,11 @@ bool FglTFRuntimeParser::HasRoot(int32 Index, int32 RootIndex)
 		return false;
 	}
 
-	while (Node.ParentIndex != INDEX_NONE)
+	// A chain of parents can never be longer than the number of nodes: capping it keeps a file with
+	// a cyclic hierarchy (perfectly expressible in json) from spinning here forever.
+	int32 RemainingSteps = AllNodesCache.Num();
+
+	while (Node.ParentIndex != INDEX_NONE && RemainingSteps-- > 0)
 	{
 		if (!LoadNode(Node.ParentIndex, Node))
 		{
@@ -2066,7 +2198,11 @@ int32 FglTFRuntimeParser::FindTopRoot(int32 Index)
 	FglTFRuntimeNode Node;
 	if (!LoadNode(Index, Node))
 		return INDEX_NONE;
-	while (Node.ParentIndex != INDEX_NONE)
+
+	// see HasRoot(): bounded walk, a cyclic hierarchy would otherwise never reach a root
+	int32 RemainingSteps = AllNodesCache.Num();
+
+	while (Node.ParentIndex != INDEX_NONE && RemainingSteps-- > 0)
 	{
 		if (!LoadNode(Node.ParentIndex, Node))
 			return INDEX_NONE;
@@ -3386,6 +3522,18 @@ bool FglTFRuntimeParser::LoadPrimitive(TSharedRef<FJsonObject> JsonPrimitiveObje
 			return false;
 		}
 
+		const uint32 NumPositions = static_cast<uint32>(Primitive.Positions.Num());
+
+		// indices addressing an empty vertex buffer can only produce a broken index buffer,
+		// there is no sane value to clamp them to
+		if (Count > 0 && NumPositions == 0)
+		{
+			AddError("LoadPrimitive()", "Primitive declares indices but its POSITION accessor is empty");
+			return false;
+		}
+
+		TAtomic<bool> bFoundOutOfRangeIndices(false);
+
 		Primitive.Indices.AddUninitialized(Count);
 		ParallelFor(Count, [&](const int32 Index)
 			{
@@ -3407,8 +3555,22 @@ bool FglTFRuntimeParser::LoadPrimitive(TSharedRef<FJsonObject> JsonPrimitiveObje
 					VertexIndex = *IndexPtr;
 				}
 
+				// Indices are uploaded to the gpu index buffer verbatim, so an index bigger than the
+				// POSITION accessor makes the driver read past the end of the vertex buffer (the
+				// mesh builders index vertices by Positions.Num()). Clamp instead of trusting it.
+				if (VertexIndex >= NumPositions)
+				{
+					bFoundOutOfRangeIndices = true;
+					VertexIndex = 0;
+				}
+
 				Primitive.Indices[Index] = VertexIndex;
 			});
+
+		if (bFoundOutOfRangeIndices)
+		{
+			AddError("LoadPrimitive()", FString::Printf(TEXT("Out of range vertex indices detected (POSITION count is %u), they have been clamped"), NumPositions));
+		}
 
 		// use indices only if their number is higher than positions (this reduces gpu usage on assets reusing the same POSITION buffer)
 		if (Primitive.Positions.Num() < Primitive.Indices.Num())
@@ -4501,10 +4663,49 @@ bool FglTFRuntimeParser::GetBuffer(const int32 Index, FglTFRuntimeBlob& Blob)
 		}
 		return false;
 	}
+	else if (Uri.StartsWith("http://") || Uri.StartsWith("https://"))
+	{
+		AddError("GetBuffer()", FString::Printf(TEXT("Unable to open from external url %s (feature not supported)"), *Uri));
+		return false;
+	}
+
+	if (UriRewriterHook.IsBound())
+	{
+		if (IsInGameThread())
+		{
+			if (UriRewriterHook.UriRewriter.IsBound())
+			{
+				Uri = UriRewriterHook.UriRewriter.Execute(Uri, UriRewriterHook.Context);
+			}
+			else if (UriRewriterHook.NativeUriRewriter.IsBound())
+			{
+				Uri = UriRewriterHook.NativeUriRewriter.Execute(Uri, UriRewriterHook.Context);
+			}
+		}
+		else
+		{
+			FGraphEventRef Task = FFunctionGraphTask::CreateAndDispatchWhenReady([&]()
+				{
+					if (UriRewriterHook.UriRewriter.IsBound())
+					{
+						Uri = UriRewriterHook.UriRewriter.Execute(Uri, UriRewriterHook.Context);
+					}
+					else if (UriRewriterHook.NativeUriRewriter.IsBound())
+					{
+						Uri = UriRewriterHook.NativeUriRewriter.Execute(Uri, UriRewriterHook.Context);
+					}
+				}, TStatId(), nullptr, ENamedThreads::GameThread);
+			FTaskGraphInterface::Get().WaitUntilTaskCompletes(Task);
+		}
+	}
 
 	if (Archive)
 	{
 		TArray64<uint8> ArchiveItemData;
+		if (!Archive->BaseDirectory.IsEmpty())
+		{
+			Uri = FPaths::Combine(Archive->BaseDirectory, Uri);
+		}
 		if (Archive->GetFileContent(Uri, ArchiveItemData))
 		{
 			BuffersCache.Add(Index, ArchiveItemData);
@@ -4602,7 +4803,9 @@ bool FglTFRuntimeParser::GetBufferView(const int32 Index, FglTFRuntimeBlob& Blob
 		Stride = 0;
 	}
 
-	if (ByteOffset + ByteLength > BufferBlob.Num)
+	// byteOffset/byteLength/byteStride are untrusted json numbers: a negative value would sail
+	// through the sum below and produce a blob pointing outside of the buffer.
+	if (ByteOffset < 0 || ByteLength < 0 || Stride < 0 || ByteOffset + ByteLength > BufferBlob.Num)
 	{
 		return false;
 	}
@@ -4717,6 +4920,14 @@ bool FglTFRuntimeParser::GetAccessor(const int32 Index, int64& ComponentType, in
 		return false;
 	}
 
+	// "count", "byteOffset" and "byteStride" all come straight from untrusted json:
+	// reject negative values and anything that would overflow the int64 size computations below
+	// (every bounds check in this function is meaningless if the sizes themselves wrap around).
+	if (Count < 0 || ByteOffset < 0 || Count > (TNumericLimits<int64>::Max() / (ElementSize * Elements)))
+	{
+		return false;
+	}
+
 	int64 FinalSize = ElementSize * Elements * Count;
 
 	if (AdditionalBufferView)
@@ -4767,9 +4978,23 @@ bool FglTFRuntimeParser::GetAccessor(const int32 Index, int64& ComponentType, in
 			Stride = ElementSize * Elements;
 		}
 
+		// a hostile/corrupted byteStride could make Stride * Count wrap around
+		if (Stride < 0 || (Stride > 0 && Count > (TNumericLimits<int64>::Max() / Stride)))
+		{
+			return false;
+		}
+
 		FinalSize = Stride * Count;
 
-		if (FinalSize > Blob.Num)
+		// Number of bytes an accessor read can actually touch: the last element only needs
+		// (ElementSize * Elements) bytes, not a full trailing stride (and an empty accessor
+		// touches nothing at all, which would otherwise come out negative).
+		const int64 ReadableSize = Count > 0 ? FinalSize - FMath::Max<int64>(Stride - (ElementSize * Elements), 0) : 0;
+
+		// byteOffset is relative to the bufferView, so it has to take part in the bounds check:
+		// without it an accessor sitting near the end of a large bufferView passes the size test
+		// and then reads past the end of the underlying buffer.
+		if (ByteOffset > Blob.Num || ReadableSize > Blob.Num - ByteOffset)
 		{
 			return false;
 		}
@@ -4777,14 +5002,7 @@ bool FglTFRuntimeParser::GetAccessor(const int32 Index, int64& ComponentType, in
 		if (ByteOffset > 0)
 		{
 			Blob.Data += ByteOffset;
-			if (Stride > ElementSize * Elements)
-			{
-				Blob.Num = FinalSize - (Stride - (ElementSize * Elements));
-			}
-			else
-			{
-				Blob.Num = FinalSize;
-			}
+			Blob.Num = ReadableSize;
 		}
 
 		if (!bHasSparse)
@@ -4807,7 +5025,8 @@ bool FglTFRuntimeParser::GetAccessor(const int32 Index, int64& ComponentType, in
 		return false;
 	}
 
-	if ((SparseCount > FinalSize) || (SparseCount < 1))
+	// (the sparse loops below index with int32 counters)
+	if ((SparseCount > FinalSize) || (SparseCount < 1) || (SparseCount > TNumericLimits<int32>::Max()))
 	{
 		return false;
 	}
@@ -4830,8 +5049,21 @@ bool FglTFRuntimeParser::GetAccessor(const int32 Index, int64& ComponentType, in
 		SparseByteOffset = 0;
 	}
 
+	if (SparseByteOffset < 0)
+	{
+		return false;
+	}
+
 	int64 SparseComponentType;
 	if (!(*JsonSparseIndicesObject)->TryGetNumberField(TEXT("componentType"), SparseComponentType))
+	{
+		return false;
+	}
+
+	// sparse indices are UNSIGNED_BYTE/UNSIGNED_SHORT/UNSIGNED_INT only (glTF 2.0 spec).
+	// Validating here (instead of in the decoding loop below) is what keeps
+	// GetComponentTypeSize() from returning 0 and turning the stride into a division by zero.
+	if (SparseComponentType != 5121 && SparseComponentType != 5123 && SparseComponentType != 5125)
 	{
 		return false;
 	}
@@ -4849,12 +5081,22 @@ bool FglTFRuntimeParser::GetAccessor(const int32 Index, int64& ComponentType, in
 	}
 
 
-	if (((SparseBytesIndices.Num - SparseByteOffset) / SparseBufferViewIndicesStride) < SparseCount)
+	// glTF forbids a byteStride on the sparse indices bufferView, so the stride can never be
+	// smaller than one index: without this the last element of the loop below reads past the view
+	// (the size check only accounts for SparseCount *strides*, not for the width of a read).
+	if (SparseBufferViewIndicesStride < GetComponentTypeSize(SparseComponentType))
+	{
+		return false;
+	}
+
+	if (SparseByteOffset > SparseBytesIndices.Num ||
+		((SparseBytesIndices.Num - SparseByteOffset) / SparseBufferViewIndicesStride) < SparseCount)
 	{
 		return false;
 	}
 
 	TArray<uint32> SparseIndices;
+	SparseIndices.Reserve(SparseCount);
 	uint8* SparseIndicesBase = &SparseBytesIndices.Data[SparseByteOffset];
 
 	for (int32 SparseIndexOffset = 0; SparseIndexOffset < SparseCount; SparseIndexOffset++)
@@ -4871,14 +5113,10 @@ bool FglTFRuntimeParser::GetAccessor(const int32 Index, int64& ComponentType, in
 			SparseIndices.Add(*SparseIndicesBaseUint16);
 		}
 		// UNSIGNED_INT
-		else if (SparseComponentType == 5125)
+		else // 5125, the only value left after the check above
 		{
 			uint32* SparseIndicesBaseUint32 = (uint32*)SparseIndicesBase;
 			SparseIndices.Add(*SparseIndicesBaseUint32);
-		}
-		else
-		{
-			return false;
 		}
 		SparseIndicesBase += SparseBufferViewIndicesStride;
 	}
@@ -4913,24 +5151,57 @@ bool FglTFRuntimeParser::GetAccessor(const int32 Index, int64& ComponentType, in
 		SparseBufferViewValuesStride = ElementSize * Elements;
 	}
 
+	// glTF requires the sparse values bufferView to be tightly packed, so the stride can never be
+	// smaller than one element; enforcing it keeps the destination offsets computed below in range.
+	if (SparseBufferViewValuesStride < (ElementSize * Elements) || SparseValueByteOffset < 0)
+	{
+		return false;
+	}
+
 	Stride = SparseBufferViewValuesStride;
+
+	// The replacement values live at [SparseValueByteOffset .. +SparseCount elements[ of their
+	// bufferView. Check that the whole run is inside the view *before* touching anything:
+	// the loop below used to walk the values blob without any bounds check at all.
+	// Expressed as a division so that a hostile stride/count pair cannot overflow the comparison.
+	if (SparseValueByteOffset > SparseBytesValues.Num)
+	{
+		return false;
+	}
+
+	const int64 SparseValuesAvailable = SparseBytesValues.Num - SparseValueByteOffset;
+	if (SparseValuesAvailable < (ElementSize * Elements) ||
+		((SparseValuesAvailable - (ElementSize * Elements)) / SparseBufferViewValuesStride) < (SparseCount - 1))
+	{
+		return false;
+	}
+
+	// Every destination slot must be addressable too. This is validated up-front so that the
+	// cache below is only ever filled with a fully rebuilt (valid) buffer: bailing out halfway
+	// through would leave a partially patched entry that every later lookup would happily reuse.
+	const int64 SparseMaxDestinationElements = Blob.Num / Stride;
+	for (int32 IndexToChange = 0; IndexToChange < SparseCount; IndexToChange++)
+	{
+		if (SparseIndices[IndexToChange] >= SparseMaxDestinationElements)
+		{
+			return false;
+		}
+	}
 
 	SparseAccessorsCache.Add(Index);
 	SparseAccessorsStridesCache.Add(Index, Stride);
 	TArray64<uint8>& SparseData = SparseAccessorsCache[Index];
 	SparseData.Append(Blob.Data, Blob.Num);
 
+	const uint8* SparseValuesBase = SparseBytesValues.Data + SparseValueByteOffset;
+
 	for (int32 IndexToChange = 0; IndexToChange < SparseCount; IndexToChange++)
 	{
-		uint32 SparseIndexToChange = SparseIndices[IndexToChange];
-		if (SparseIndexToChange >= (Blob.Num / Stride))
-		{
-			return false;
-		}
+		const uint32 SparseIndexToChange = SparseIndices[IndexToChange];
 
-		uint8* OriginalValuePtr = (uint8*)(SparseData.GetData() + Stride * SparseIndexToChange);
-		uint8* NewValuePtr = (uint8*)(SparseBytesValues.Data + SparseBufferViewValuesStride * IndexToChange);
-		FMemory::Memcpy(OriginalValuePtr, NewValuePtr, SparseBufferViewValuesStride);
+		uint8* OriginalValuePtr = SparseData.GetData() + (Stride * SparseIndexToChange);
+		const uint8* NewValuePtr = SparseValuesBase + (SparseBufferViewValuesStride * IndexToChange);
+		FMemory::Memcpy(OriginalValuePtr, NewValuePtr, ElementSize * Elements);
 	}
 
 	Blob.Data = SparseData.GetData();
@@ -5282,23 +5553,32 @@ void FglTFRuntimeArchiveZip::SetPassword(const FString& EncryptionKey)
 
 bool FglTFRuntimeArchiveZip::FromData(const uint8* DataPtr, const int64 DataNum)
 {
+	// the backing store is a 32bit FArrayReader, refuse anything it could not index
+	if (DataNum <= 0 || DataNum > TNumericLimits<int32>::Max())
+	{
+		return false;
+	}
+
 	Data.Append(DataPtr, DataNum);
 
-	// step0: retrieve the trailer magic
-	TArray<uint8> Magic;
+	constexpr int64 TrailerMinSize = 22;
+	constexpr int64 CentralDirectoryMinSize = 46;
+
+	// step0: retrieve the trailer magic (the "End Of Central Directory" record).
+	// The EOCD record sits in the last 22 bytes + up to 64KB of archive comment, so the scan is
+	// bounded to that window instead of walking the whole file backwards one byte at a time.
+	// (the previous loop also used an *unsigned* counter, so on a file without a valid EOCD -
+	// any non-zip blob - it wrapped around at 0 and kept indexing out of bounds).
 	bool bIndexFound = false;
-	uint64 Index = 0;
-	for (Index = Data.Num() - 1; Index >= 0; Index--)
+	int64 Index = 0;
+	const int64 DataSize = Data.Num();
+	const int64 ScanLimit = FMath::Max<int64>(DataSize - (TrailerMinSize + 0xFFFF), 0);
+	for (Index = DataSize - 4; Index >= ScanLimit; Index--)
 	{
-		Magic.Insert(Data[Index], 0);
-		if (Magic.Num() == 4)
+		if (Data[Index] == 0x50 && Data[Index + 1] == 0x4b && Data[Index + 2] == 0x05 && Data[Index + 3] == 0x06)
 		{
-			if (Magic[0] == 0x50 && Magic[1] == 0x4b && Magic[2] == 0x05 && Magic[3] == 0x06)
-			{
-				bIndexFound = true;
-				break;
-			}
-			Magic.Pop();
+			bIndexFound = true;
+			break;
 		}
 	}
 
@@ -5313,10 +5593,7 @@ bool FglTFRuntimeArchiveZip::FromData(const uint8* DataPtr, const int64 DataNum)
 	uint32 CentralDirectoryOffset = 0;
 	uint16 CommentLen = 0;
 
-	constexpr uint64 TrailerMinSize = 22;
-	constexpr uint64 CentralDirectoryMinSize = 46;
-
-	if (Index + TrailerMinSize > Data.Num())
+	if (Index + TrailerMinSize > DataSize)
 	{
 		return false;
 	}
@@ -5420,6 +5697,7 @@ bool FglTFRuntimeArchiveZip::GetFileContent(const FString& Filename, TArray64<ui
 	const uint8* CompressedData = Data.GetData() + *Offset + LocalEntryMinSize + FilenameLen + ExtraFieldLen;
 
 	// for streamed zips
+	// (the local header carries zeroed sizes, the real ones only live in the central directory)
 
 	if (CompressedSize == 0 && GlobalSizeMap.Contains(Filename))
 	{
@@ -5429,6 +5707,13 @@ bool FglTFRuntimeArchiveZip::GetFileContent(const FString& Filename, TArray64<ui
 	if (UncompressedSize == 0 && GlobalSizeMap.Contains(Filename))
 	{
 		UncompressedSize = GlobalSizeMap[Filename].Value;
+	}
+
+	// CompressedSize may have just been replaced by the central directory value, so the entry has
+	// to be bounds checked again: the check above only validated the (possibly zero) local one.
+	if (static_cast<uint64>(*Offset) + LocalEntryMinSize + FilenameLen + ExtraFieldLen + CompressedSize > static_cast<uint64>(Data.Num()))
+	{
+		return false;
 	}
 
 	// encrypted ?
@@ -5611,6 +5896,16 @@ bool FglTFRuntimeArchiveZip::GetFileContent(const FString& Filename, TArray64<ui
 
 	if (Compression == 8)
 	{
+		// Decompression-bomb guard (untrusted archives): DEFLATE's maximum expansion is 1032:1
+		// (RFC 1951; a 258-byte max-length match encoded as 2 bits => 258*8/2 = 1032). Anything
+		// larger than that from the actual compressed bytes is malformed/malicious.
+		constexpr uint64 MaxDeflateExpansion = 1032;
+		if (static_cast<uint64>(UncompressedSize) > static_cast<uint64>(CompressedSize) * MaxDeflateExpansion)
+		{
+			UE_LOG(LogGLTFRuntime, Error, TEXT("Refusing ZIP entry '%s': declared uncompressed size %u is implausible for %u compressed bytes (possible decompression bomb)."), *Filename, UncompressedSize, CompressedSize);
+			return false;
+		}
+
 		OutData.AddUninitialized(UncompressedSize);
 		if (!FCompression::UncompressMemory(NAME_Zlib, OutData.GetData(), UncompressedSize, CompressedData, CompressedSize, COMPRESS_NoFlags, -15))
 		{
@@ -5633,6 +5928,31 @@ bool FglTFRuntimeArchiveZip::GetFileContent(const FString& Filename, TArray64<ui
 bool FglTFRuntimeArchive::FileExists(const FString& Filename) const
 {
 	return OffsetsMap.Contains(Filename);
+}
+
+void FglTFRuntimeArchive::Remap(const FString& From, const FString& To)
+{
+	if (OffsetsMap.Contains(From))
+	{
+		const uint32 CurrentValue = OffsetsMap[From];
+		OffsetsMap.Remove(From);
+		if (OffsetsMap.Contains(To))
+		{
+			OffsetsMap.Remove(To);
+		}
+		OffsetsMap.Add(To, CurrentValue);
+	}
+
+	if (GlobalSizeMap.Contains(From))
+	{
+		const TPair<uint32, uint32> CurrentValue = GlobalSizeMap[From];
+		GlobalSizeMap.Remove(From);
+		if (GlobalSizeMap.Contains(To))
+		{
+			GlobalSizeMap.Remove(To);
+		}
+		GlobalSizeMap.Add(To, CurrentValue);
+	}
 }
 
 FString FglTFRuntimeArchive::GetFirstFilenameByExtension(const FString& Extension) const
@@ -5668,9 +5988,43 @@ bool FglTFRuntimeParser::GetJsonObjectBytes(TSharedRef<FJsonObject> JsonObject, 
 		}
 		else
 		{
+			if (UriRewriterHook.IsBound())
+			{
+				if (IsInGameThread())
+				{
+					if (UriRewriterHook.UriRewriter.IsBound())
+					{
+						Uri = UriRewriterHook.UriRewriter.Execute(Uri, UriRewriterHook.Context);
+					}
+					else if (UriRewriterHook.NativeUriRewriter.IsBound())
+					{
+						Uri = UriRewriterHook.NativeUriRewriter.Execute(Uri, UriRewriterHook.Context);
+					}
+				}
+				else
+				{
+					FGraphEventRef Task = FFunctionGraphTask::CreateAndDispatchWhenReady([&]()
+						{
+							if (UriRewriterHook.UriRewriter.IsBound())
+							{
+								Uri = UriRewriterHook.UriRewriter.Execute(Uri, UriRewriterHook.Context);
+							}
+							else if (UriRewriterHook.NativeUriRewriter.IsBound())
+							{
+								Uri = UriRewriterHook.NativeUriRewriter.Execute(Uri, UriRewriterHook.Context);
+							}
+						}, TStatId(), nullptr, ENamedThreads::GameThread);
+					FTaskGraphInterface::Get().WaitUntilTaskCompletes(Task);
+				}
+			}
+
 			bool bFound = false;
 			if (Archive)
 			{
+				if (!Archive->BaseDirectory.IsEmpty())
+				{
+					Uri = FPaths::Combine(Archive->BaseDirectory, Uri);
+				}
 				if (Archive->GetFileContent(Uri, Bytes))
 				{
 					bFound = true;
@@ -5933,7 +6287,7 @@ bool FglTFRuntimeParser::GetStringMapFromExtras(const FString& Key, TMap<FString
 		return false;
 	}
 
-	for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : (*JsonExtraObject)->Values)
+	for (const auto& Pair : (*JsonExtraObject)->Values)
 	{
 		if (!Pair.Value.IsValid())
 		{
@@ -5946,7 +6300,7 @@ bool FglTFRuntimeParser::GetStringMapFromExtras(const FString& Key, TMap<FString
 			continue;
 		}
 
-		StringMap.Add(Pair.Key, Value);
+		StringMap.Add(FString(Pair.Key), Value);
 	}
 
 	return true;
@@ -6008,6 +6362,14 @@ TSharedPtr<FJsonObject> FglTFRuntimeParser::GetNodeObject(const int32 NodeIndex)
 
 bool FglTFRuntimeParser::DecompressMeshOptimizer(const FglTFRuntimeBlob& Blob, const int64 Stride, const int64 Elements, const FString& Mode, const FString& Filter, TArray64<uint8>& UncompressedBytes)
 {
+	// Stride and Elements come from the EXT_meshopt_compression json object. The spec caps the
+	// stride at 256 bytes; without an upper bound (8192 / Stride) below collapses to 0 and the
+	// decoding loop stops advancing, hanging the loading thread on a crafted file.
+	if (Stride <= 0 || Stride > 256 || Elements <= 0 || Elements > (TNumericLimits<int64>::Max() / Stride))
+	{
+		return false;
+	}
+
 	auto DecodeZigZag = [](const uint8 V)
 		{
 			return ((V & 1) != 0) ? ~(V >> 1) : (V >> 1);
@@ -6147,8 +6509,23 @@ bool FglTFRuntimeParser::DecompressMeshOptimizer(const FglTFRuntimeBlob& Blob, c
 
 		uint32 Next = 0;
 		uint32 Last = 0;
-		TArray<TPair<uint32, uint32>> EdgeFifo;
-		TArray<uint32> VertexFifo;
+
+		// Fixed-size ring buffers matching the meshoptimizer spec (16 entries each).
+		// The previous TArray + Insert(0) approach was O(n^2): the arrays grew unboundedly
+		// because no entries were ever removed, making each prepend shift an ever-growing list.
+		// With 370k+ triangles this caused multi-second stalls.
+		TPair<uint32, uint32> EdgeFifoRing[16] = {};
+		uint32 EdgeFifoPos = 0;
+		uint32 VertexFifoRing[16] = {};
+		uint32 VertexFifoPos = 0;
+
+		auto EdgeFifoPush = [&](uint32 A, uint32 B) { EdgeFifoRing[(EdgeFifoPos++) & 15] = { A, B }; };
+		auto EdgeFifoGet  = [&](uint32 I) -> const TPair<uint32, uint32>& { return EdgeFifoRing[(EdgeFifoPos - 1 - I) & 15]; };
+		auto EdgeFifoSize = [&]() -> uint32 { return FMath::Min(EdgeFifoPos, 16u); };
+
+		auto VertexFifoPush = [&](uint32 V) { VertexFifoRing[(VertexFifoPos++) & 15] = V; };
+		auto VertexFifoGet  = [&](uint32 I) -> uint32 { return VertexFifoRing[(VertexFifoPos - 1 - I) & 15]; };
+		auto VertexFifoSize = [&]() -> uint32 { return FMath::Min(VertexFifoPos, 16u); };
 
 		int64 Offset = 1;
 		const uint32 TrianglesNum = Elements / 3;
@@ -6193,7 +6570,8 @@ bool FglTFRuntimeParser::DecompressMeshOptimizer(const FglTFRuntimeBlob& Blob, c
 				uint32 V = 0;
 				for (int32 Shift = 0; ; Shift += 7)
 				{
-					if (DataOffset >= Limit)
+					// a stream of continuation bytes would push the shift past the width of V
+					if (DataOffset >= Limit || Shift >= 32)
 					{
 						return false;
 					}
@@ -6225,79 +6603,79 @@ bool FglTFRuntimeParser::DecompressMeshOptimizer(const FglTFRuntimeBlob& Blob, c
 
 			if (NibbleLeft < 0xf && NibbleRight == 0) // 0xX0
 			{
-				if (NibbleLeft >= EdgeFifo.Num())
+				if (NibbleLeft >= EdgeFifoSize())
 				{
 					return false;
 				}
-				const TPair<uint32, uint32> AB = EdgeFifo[NibbleLeft];
+				const TPair<uint32, uint32> AB = EdgeFifoGet(NibbleLeft);
 				const uint32 C = Next++;
 
-				EdgeFifo.Insert(TPair<uint32, uint32>(C, AB.Value), 0); // push CB
-				EdgeFifo.Insert(TPair<uint32, uint32>(AB.Key, C), 0); // push AC
-				VertexFifo.Insert(C, 0);
+				EdgeFifoPush(C, AB.Value); // push CB
+				EdgeFifoPush(AB.Key, C);   // push AC
+				VertexFifoPush(C);
 
 				EmitTriangle(AB.Key, AB.Value, C);
 			}
 			else if (NibbleLeft < 0xf && NibbleRight > 0 && NibbleRight < 0x0d) // 0xXY
 			{
-				if (NibbleLeft >= EdgeFifo.Num())
+				if (NibbleLeft >= EdgeFifoSize())
 				{
 					return false;
 				}
-				const TPair<uint32, uint32> AB = EdgeFifo[NibbleLeft];
+				const TPair<uint32, uint32> AB = EdgeFifoGet(NibbleLeft);
 
-				if (NibbleRight >= VertexFifo.Num())
+				if (NibbleRight >= VertexFifoSize())
 				{
 					return false;
 				}
 
-				const uint32 C = VertexFifo[NibbleRight];
-				EdgeFifo.Insert(TPair<uint32, uint32>(C, AB.Value), 0); // push CB
-				EdgeFifo.Insert(TPair<uint32, uint32>(AB.Key, C), 0); // push AC
+				const uint32 C = VertexFifoGet(NibbleRight);
+				EdgeFifoPush(C, AB.Value); // push CB
+				EdgeFifoPush(AB.Key, C);   // push AC
 
 				EmitTriangle(AB.Key, AB.Value, C);
 			}
 			else if (NibbleLeft < 0xf && NibbleRight == 0x0d) // 0xXd
 			{
-				if (NibbleLeft >= EdgeFifo.Num())
+				if (NibbleLeft >= EdgeFifoSize())
 				{
 					return false;
 				}
-				const TPair<uint32, uint32> AB = EdgeFifo[NibbleLeft];
+				const TPair<uint32, uint32> AB = EdgeFifoGet(NibbleLeft);
 
 				const uint32 C = Last - 1;
 				Last = C;
 
-				EdgeFifo.Insert(TPair<uint32, uint32>(C, AB.Value), 0); // push CB
-				EdgeFifo.Insert(TPair<uint32, uint32>(AB.Key, C), 0); // push AC
-				VertexFifo.Insert(C, 0);
+				EdgeFifoPush(C, AB.Value); // push CB
+				EdgeFifoPush(AB.Key, C);   // push AC
+				VertexFifoPush(C);
 
 				EmitTriangle(AB.Key, AB.Value, C);
 			}
 			else if (NibbleLeft < 0xf && NibbleRight == 0x0e) // 0xXe
 			{
-				if (NibbleLeft >= EdgeFifo.Num())
+				if (NibbleLeft >= EdgeFifoSize())
 				{
 					return false;
 				}
-				const TPair<uint32, uint32> AB = EdgeFifo[NibbleLeft];
+				const TPair<uint32, uint32> AB = EdgeFifoGet(NibbleLeft);
 
 				const uint32 C = Last + 1;
 				Last = C;
 
-				EdgeFifo.Insert(TPair<uint32, uint32>(C, AB.Value), 0); // push CB
-				EdgeFifo.Insert(TPair<uint32, uint32>(AB.Key, C), 0); // push AC
-				VertexFifo.Insert(C, 0);
+				EdgeFifoPush(C, AB.Value); // push CB
+				EdgeFifoPush(AB.Key, C);   // push AC
+				VertexFifoPush(C);
 
 				EmitTriangle(AB.Key, AB.Value, C);
 			}
 			else if (NibbleLeft < 0xf && NibbleRight == 0x0f) // 0xXf
 			{
-				if (NibbleLeft >= EdgeFifo.Num())
+				if (NibbleLeft >= EdgeFifoSize())
 				{
 					return false;
 				}
-				const TPair<uint32, uint32> AB = EdgeFifo[NibbleLeft];
+				const TPair<uint32, uint32> AB = EdgeFifoGet(NibbleLeft);
 
 				if (!DecodeIndex())
 				{
@@ -6306,9 +6684,9 @@ bool FglTFRuntimeParser::DecompressMeshOptimizer(const FglTFRuntimeBlob& Blob, c
 
 				const uint32 C = Last;
 
-				EdgeFifo.Insert(TPair<uint32, uint32>(C, AB.Value), 0); // push CB
-				EdgeFifo.Insert(TPair<uint32, uint32>(AB.Key, C), 0); // push AC
-				VertexFifo.Insert(C, 0);
+				EdgeFifoPush(C, AB.Value); // push CB
+				EdgeFifoPush(AB.Key, C);   // push AC
+				VertexFifoPush(C);
 
 				EmitTriangle(AB.Key, AB.Value, C);
 			}
@@ -6328,11 +6706,11 @@ bool FglTFRuntimeParser::DecompressMeshOptimizer(const FglTFRuntimeBlob& Blob, c
 				}
 				else
 				{
-					if (Z - 1 >= VertexFifo.Num())
+					if (static_cast<uint32>(Z - 1) >= VertexFifoSize())
 					{
 						return false;
 					}
-					B = VertexFifo[Z - 1];
+					B = VertexFifoGet(Z - 1);
 				}
 
 				if (W == 0)
@@ -6341,24 +6719,24 @@ bool FglTFRuntimeParser::DecompressMeshOptimizer(const FglTFRuntimeBlob& Blob, c
 				}
 				else
 				{
-					if (W - 1 >= VertexFifo.Num())
+					if (static_cast<uint32>(W - 1) >= VertexFifoSize())
 					{
 						return false;
 					}
-					C = VertexFifo[W - 1];
+					C = VertexFifoGet(W - 1);
 				}
 
-				EdgeFifo.Insert(TPair<uint32, uint32>(B, A), 0); // push BA
-				EdgeFifo.Insert(TPair<uint32, uint32>(C, B), 0); // push CB
-				EdgeFifo.Insert(TPair<uint32, uint32>(A, C), 0); // push AC
-				VertexFifo.Insert(A, 0);
+				EdgeFifoPush(B, A); // push BA
+				EdgeFifoPush(C, B); // push CB
+				EdgeFifoPush(A, C); // push AC
+				VertexFifoPush(A);
 				if (Z == 0)
 				{
-					VertexFifo.Insert(B, 0);
+					VertexFifoPush(B);
 				}
 				if (W == 0)
 				{
-					VertexFifo.Insert(C, 0);
+					VertexFifoPush(C);
 				}
 
 				EmitTriangle(A, B, C);
@@ -6399,11 +6777,11 @@ bool FglTFRuntimeParser::DecompressMeshOptimizer(const FglTFRuntimeBlob& Blob, c
 				}
 				else if (Z < 0xf)
 				{
-					if (Z - 1 >= VertexFifo.Num())
+					if (static_cast<uint32>(Z - 1) >= VertexFifoSize())
 					{
 						return false;
 					}
-					B = VertexFifo[Z - 1];
+					B = VertexFifoGet(Z - 1);
 				}
 				else
 				{
@@ -6421,11 +6799,11 @@ bool FglTFRuntimeParser::DecompressMeshOptimizer(const FglTFRuntimeBlob& Blob, c
 				}
 				else if (W < 0xf)
 				{
-					if (W - 1 >= VertexFifo.Num())
+					if (static_cast<uint32>(W - 1) >= VertexFifoSize())
 					{
 						return false;
 					}
-					C = VertexFifo[W - 1];
+					C = VertexFifoGet(W - 1);
 				}
 				else
 				{
@@ -6436,17 +6814,17 @@ bool FglTFRuntimeParser::DecompressMeshOptimizer(const FglTFRuntimeBlob& Blob, c
 					C = Last;
 				}
 
-				EdgeFifo.Insert(TPair<uint32, uint32>(B, A), 0); // push BA
-				EdgeFifo.Insert(TPair<uint32, uint32>(C, B), 0); // push CB
-				EdgeFifo.Insert(TPair<uint32, uint32>(A, C), 0); // push AC
-				VertexFifo.Insert(A, 0);
+				EdgeFifoPush(B, A); // push BA
+				EdgeFifoPush(C, B); // push CB
+				EdgeFifoPush(A, C); // push AC
+				VertexFifoPush(A);
 				if (Z == 0 || Z == 0xf)
 				{
-					VertexFifo.Insert(B, 0);
+					VertexFifoPush(B);
 				}
 				if (W == 0 || W == 0xf)
 				{
-					VertexFifo.Insert(C, 0);
+					VertexFifoPush(C);
 				}
 
 				EmitTriangle(A, B, C);
@@ -6785,7 +7163,11 @@ void FglTFRuntimeParser::FillAssetUserData(const int32 Index, IInterface_AssetUs
 	{
 		if (AssetUserDataClass)
 		{
+#if ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8
+			UglTFRuntimeAssetUserData* AssetUserData = NewObject<UglTFRuntimeAssetUserData>(Cast<UObject>(InObject), AssetUserDataClass, NAME_None, RF_Public);
+#else
 			UglTFRuntimeAssetUserData* AssetUserData = NewObject<UglTFRuntimeAssetUserData>(InObject->_getUObject(), AssetUserDataClass, NAME_None, RF_Public);
+#endif
 			AssetUserData->SetParser(AsShared());
 			AssetUserData->ReceiveFillAssetUserData(Index);
 			InObject->AddAssetUserData(AssetUserData);

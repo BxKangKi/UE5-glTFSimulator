@@ -1655,22 +1655,22 @@ TMap<FString, FString> UglTFRuntimeAsset::GetAssetMeta() const
 
 	if (JsonObject)
 	{
-		for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : JsonObject->Values)
+		for (const auto& Pair : JsonObject->Values)
 		{
 			if (!Pair.Value.IsValid())
 			{
-				Meta.Add(Pair.Key, "");
+				Meta.Add(FString(Pair.Key), "");
 				continue;
 			}
 
 			FString Value;
 			if (!Pair.Value->TryGetString(Value))
 			{
-				Meta.Add(Pair.Key, "");
+				Meta.Add(FString(Pair.Key), "");
 				continue;
 			}
 
-			Meta.Add(Pair.Key, Value);
+			Meta.Add(FString(Pair.Key), Value);
 		}
 	}
 
@@ -1780,4 +1780,40 @@ UTexture2D* UglTFRuntimeAsset::LoadTexture(const int32 TextureIndex, const FglTF
 	}
 
 	return nullptr;
+}
+
+bool UglTFRuntimeAsset::SkinHasJoint(const int32 SkinIndex, const FString& JointName)
+{
+	GLTF_CHECK_PARSER(false);
+
+	return Parser->SkinHasJoint(SkinIndex, JointName);
+
+}
+
+int32 UglTFRuntimeAsset::GetSkinJointIndexFromName(const int32 SkinIndex, const FString& JointName)
+{
+	GLTF_CHECK_PARSER(-1);
+
+	return Parser->GetSkinJointIndexFromName(SkinIndex, JointName);
+}
+
+FString UglTFRuntimeAsset::GetSkinJointNameFromJointIndex(const int32 SkinIndex, const int32 JointIndex)
+{
+	GLTF_CHECK_PARSER("");
+
+	return Parser->GetSkinJointNameFromJointIndex(SkinIndex, JointIndex);
+}
+
+int32 UglTFRuntimeAsset::GetSkinNodeIndexFromName(const int32 SkinIndex, const FString& JointName)
+{
+	GLTF_CHECK_PARSER(-1);
+
+	return Parser->GetSkinNodeIndexFromName(SkinIndex, JointName);
+}
+
+FString UglTFRuntimeAsset::GetSkinJointNameFromNodeIndex(const int32 SkinIndex, const int32 NodeIndex)
+{
+	GLTF_CHECK_PARSER("");
+
+	return Parser->GetSkinJointNameFromNodeIndex(SkinIndex, NodeIndex);
 }

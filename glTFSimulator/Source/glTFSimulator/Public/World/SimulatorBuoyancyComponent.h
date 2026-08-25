@@ -5,7 +5,7 @@
 #include "CoreMinimal.h"
 #include "Components/ActorComponent.h"
 #include "Interface/WaterInteract.h"
-#include "BuoyancyComponent.generated.h"
+#include "SimulatorBuoyancyComponent.generated.h"
 
 class UPrimitiveComponent;
 class USkeletalMeshComponent;
@@ -171,12 +171,12 @@ struct GLTFSIMULATOR_API FSkeletalBuoyancySettings
 };
 
 UCLASS(ClassGroup=(Physics), Blueprintable, BlueprintType, meta=(BlueprintSpawnableComponent))
-class GLTFSIMULATOR_API UBuoyancyComponent : public UActorComponent, public IWaterInteract
+class GLTFSIMULATOR_API USimulatorBuoyancyComponent : public UActorComponent, public IWaterInteract
 {
     GENERATED_BODY()
 
 public:
-    UBuoyancyComponent();
+    USimulatorBuoyancyComponent();
 
     virtual void BeginPlay() override;
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;

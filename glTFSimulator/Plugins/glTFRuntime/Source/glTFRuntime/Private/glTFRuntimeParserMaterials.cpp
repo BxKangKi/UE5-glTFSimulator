@@ -329,6 +329,37 @@ UMaterialInterface* FglTFRuntimeParser::LoadMaterial_Internal(const int32 Index,
 			GetMaterialTexture(JsonMaterialSheen->ToSharedRef(), "sheenRoughnessTexture", false, RuntimeMaterial.SheenRoughnessTextureCache, RuntimeMaterial.SheenRoughnessTextureMips, RuntimeMaterial.SheenRoughnessTextureTransform, RuntimeMaterial.SheenRoughnessTextureSampler, false);
 			RuntimeMaterial.bKHR_materials_sheen = true;
 		}
+
+		// KHR_materials_iridescence
+		const TSharedPtr<FJsonObject>* JsonMaterialIridescence;
+		if ((*JsonExtensions)->TryGetObjectField(TEXT("KHR_materials_iridescence"), JsonMaterialIridescence))
+		{
+			if (!(*JsonMaterialIridescence)->TryGetNumberField(TEXT("iridescenceFactor"), RuntimeMaterial.IridescenceFactor))
+			{
+				RuntimeMaterial.IridescenceFactor = 0;
+			}
+
+			if (!(*JsonMaterialIridescence)->TryGetNumberField(TEXT("iridescenceIor"), RuntimeMaterial.IridescenceIor))
+			{
+				RuntimeMaterial.IridescenceIor = 1.3;
+			}
+
+			if (!(*JsonMaterialIridescence)->TryGetNumberField(TEXT("iridescenceThicknessMinimum"), RuntimeMaterial.IridescenceThicknessMinimum))
+			{
+				RuntimeMaterial.IridescenceThicknessMinimum = 100;
+			}
+
+			if (!(*JsonMaterialIridescence)->TryGetNumberField(TEXT("iridescenceThicknessMaximum"), RuntimeMaterial.IridescenceThicknessMaximum))
+			{
+				RuntimeMaterial.IridescenceThicknessMaximum = 400;
+			}
+
+			GetMaterialTexture(JsonMaterialIridescence->ToSharedRef(), "iridescenceTexture", false, RuntimeMaterial.IridescenceTextureCache, RuntimeMaterial.IridescenceTextureMips, RuntimeMaterial.IridescenceTextureTransform, RuntimeMaterial.IridescenceTextureSampler, false);
+			GetMaterialTexture(JsonMaterialIridescence->ToSharedRef(), "iridescenceThicknessTexture", false, RuntimeMaterial.IridescenceThicknessTextureCache, RuntimeMaterial.IridescenceThicknessTextureMips, RuntimeMaterial.IridescenceThicknessTextureTransform, RuntimeMaterial.IridescenceThicknessTextureSampler, false);
+
+			RuntimeMaterial.bKHR_materials_iridescence = true;
+		}
+
 	}
 
 	if (IsInGameThread())
@@ -956,6 +987,23 @@ UMaterialInterface* FglTFRuntimeParser::BuildMaterial(const int32 Index, const F
 			TextureCompressionSettings::TC_Default, false);
 	}
 
+	ApplyMaterialFloatFactor(RuntimeMaterial.bKHR_materials_iridescence, "iridescenceFactor", RuntimeMaterial.IridescenceFactor);
+	ApplyMaterialFloatFactor(RuntimeMaterial.bKHR_materials_iridescence, "iridescenceIor", RuntimeMaterial.IridescenceIor);
+	ApplyMaterialFloatFactor(RuntimeMaterial.bKHR_materials_iridescence, "iridescenceThicknessMaximum", RuntimeMaterial.IridescenceThicknessMaximum);
+	ApplyMaterialFloatFactor(RuntimeMaterial.bKHR_materials_iridescence, "iridescenceThicknessMinimum", RuntimeMaterial.IridescenceThicknessMinimum);
+	if (RuntimeMaterial.bKHR_materials_iridescence)
+	{
+		ApplyMaterialTexture("iridescenceTexture", RuntimeMaterial.IridescenceTextureCache, RuntimeMaterial.IridescenceTextureMips,
+			RuntimeMaterial.IridescenceTextureSampler,
+			"iridescence", RuntimeMaterial.IridescenceTextureTransform,
+			TextureCompressionSettings::TC_Default, true);
+
+		ApplyMaterialTexture("iridescenceThicknessTexture", RuntimeMaterial.IridescenceThicknessTextureCache, RuntimeMaterial.IridescenceThicknessTextureMips,
+			RuntimeMaterial.IridescenceThicknessTextureSampler,
+			"iridescenceThickness", RuntimeMaterial.IridescenceThicknessTextureTransform,
+			TextureCompressionSettings::TC_Default, true);
+	}
+
 	ApplyMaterialFloatFactor(RuntimeMaterial.bKHR_materials_emissive_strength, "emissiveStrength", RuntimeMaterial.EmissiveStrength);
 
 	for (const TPair<FString, float>& Pair : MaterialsConfig.ScalarParamsOverrides)
@@ -1462,6 +1510,28 @@ UMaterialInterface* FglTFRuntimeParser::LoadMaterial(const int32 Index, const Fg
 
 UTextureCube* FglTFRuntimeParser::BuildTextureCube(UObject* Outer, const TArray<FglTFRuntimeMipMap>& MipsXP, const TArray<FglTFRuntimeMipMap>& MipsXN, const TArray<FglTFRuntimeMipMap>& MipsYP, const TArray<FglTFRuntimeMipMap>& MipsYN, const TArray<FglTFRuntimeMipMap>& MipsZP, const TArray<FglTFRuntimeMipMap>& MipsZN, const bool bAutoRotate, const FglTFRuntimeImagesConfig& ImagesConfig, const FglTFRuntimeTextureSampler& Sampler)
 {
+	// Every face is addressed with the mip index/size of the X+ face below, so all six of them
+	// must describe the same mip chain (BuildTexture()/BuildTextureArray() do the same check).
+	if (MipsXP.Num() == 0 ||
+		MipsXN.Num() != MipsXP.Num() || MipsYP.Num() != MipsXP.Num() || MipsYN.Num() != MipsXP.Num() ||
+		MipsZP.Num() != MipsXP.Num() || MipsZN.Num() != MipsXP.Num())
+	{
+		UE_LOG(LogGLTFRuntime, Error, TEXT("Unable to build TextureCube: the six faces must share the same number of mips"));
+		return nullptr;
+	}
+
+	for (int32 FaceMipIndex = 0; FaceMipIndex < MipsXP.Num(); FaceMipIndex++)
+	{
+		const int64 FaceMipSize = MipsXP[FaceMipIndex].Pixels.Num();
+		if (MipsXN[FaceMipIndex].Pixels.Num() != FaceMipSize || MipsYP[FaceMipIndex].Pixels.Num() != FaceMipSize ||
+			MipsYN[FaceMipIndex].Pixels.Num() != FaceMipSize || MipsZP[FaceMipIndex].Pixels.Num() != FaceMipSize ||
+			MipsZN[FaceMipIndex].Pixels.Num() != FaceMipSize)
+		{
+			UE_LOG(LogGLTFRuntime, Error, TEXT("Unable to build TextureCube: mismatching face size for mip %d"), FaceMipIndex);
+			return nullptr;
+		}
+	}
+
 	UTextureCube* Texture = NewObject<UTextureCube>(Outer, NAME_None, RF_Public);
 	FTexturePlatformData* PlatformData = new FTexturePlatformData();
 	PlatformData->SizeX = MipsXP[0].Width;
@@ -1554,7 +1624,7 @@ UTextureCube* FglTFRuntimeParser::BuildTextureCube(UObject* Outer, const TArray<
 			FMemory::Memcpy(reinterpret_cast<uint8*>(Data) + (MipMap.Pixels.Num() * 5), MipsYN[MipIndex].Pixels.GetData(), MipsYN[MipIndex].Pixels.Num());
 		}
 
-		FMemory::Memcpy(reinterpret_cast<uint8*>(Data) + (MipMap.Pixels.Num() * 3), MipsZP[MipIndex].Pixels.GetData(), MipsXN[MipIndex].Pixels.Num());
+		FMemory::Memcpy(reinterpret_cast<uint8*>(Data) + (MipMap.Pixels.Num() * 3), MipsZP[MipIndex].Pixels.GetData(), MipsZP[MipIndex].Pixels.Num());
 		FMemory::Memcpy(reinterpret_cast<uint8*>(Data) + (MipMap.Pixels.Num() * 4), MipsYP[MipIndex].Pixels.GetData(), MipsYP[MipIndex].Pixels.Num());
 
 
@@ -1586,6 +1656,19 @@ UTexture2DArray* FglTFRuntimeParser::BuildTextureArray(UObject* Outer, const TAr
 	if (Mips.Num() == 0)
 	{
 		return nullptr;
+	}
+
+	// Slices are packed with the stride of the first one, so a bigger slice would write past the
+	// end of the bulk data allocation below (LoadImageArray() happily accepts unrelated images).
+	for (int32 SliceIndex = 1; SliceIndex < Mips.Num(); SliceIndex++)
+	{
+		if (Mips[SliceIndex].Pixels.Num() != Mips[0].Pixels.Num() ||
+			Mips[SliceIndex].Width != Mips[0].Width || Mips[SliceIndex].Height != Mips[0].Height ||
+			Mips[SliceIndex].PixelFormat != Mips[0].PixelFormat)
+		{
+			UE_LOG(LogGLTFRuntime, Error, TEXT("Unable to build Texture2DArray: every slice must have the same size and pixel format"));
+			return nullptr;
+		}
 	}
 
 	UTexture2DArray* Texture = NewObject<UTexture2DArray>(Outer, NAME_None, RF_Public);
@@ -1787,9 +1870,46 @@ void FglTFRuntimeDDS::LoadMips(const int32 TextureIndex, TArray<FglTFRuntimeMipM
 	}
 	else
 	{
-		if (!(Ptr32[20] & DDPF_ALPHAPIXELS))
+		// slow path for 24 bit textures
+		if (Ptr32[22] == 24)
 		{
-			UE_LOG(LogGLTFRuntime, Warning, TEXT("DDS Uncompressed PixelFormat without Alpha is not supported"));
+			int32 MipWidth = Width;
+			int32 MipHeight = Height;
+
+			for (int32 MipIndex = 0; MipIndex < NumberOfMips; MipIndex++)
+			{
+				const int64 BlockX = GPixelFormats[PixelFormat].BlockSizeX;
+				const int64 BlockY = GPixelFormats[PixelFormat].BlockSizeY;
+				const int64 MipWidthAligned = FMath::Max(((MipWidth / BlockX) + ((MipWidth % BlockX) != 0 ? 1 : 0)) * BlockX, BlockX);
+				const int64 MipHeightAligned = FMath::Max(((MipHeight / BlockY) + ((MipHeight % BlockY) != 0 ? 1 : 0)) * BlockY, BlockY);
+				const int64 MipSize = ((MipWidthAligned * GPixelFormats[PixelFormat].BlockBytes * MipHeightAligned) / (BlockX * BlockY)) * NumberOfSlices;
+
+				const int64 DDSMipSize = (MipWidthAligned * 3 * MipHeightAligned) * NumberOfSlices;
+				if (PixelsOffset + DDSMipSize > Data.Num())
+				{
+					return;
+				}
+				FglTFRuntimeMipMap MipMap(TextureIndex, PixelFormat, MipWidth, MipHeight);
+				MipMap.Pixels.AddUninitialized(MipSize);
+
+				for (int64 PixelIndex = 0; PixelIndex < MipWidthAligned * MipHeightAligned; PixelIndex++)
+				{
+					MipMap.Pixels[PixelIndex * 4] = Data[PixelsOffset + (PixelIndex * 3)];
+					MipMap.Pixels[PixelIndex * 4 + 1] = Data[PixelsOffset + (PixelIndex * 3 + 1)];
+					MipMap.Pixels[PixelIndex * 4 + 2] = Data[PixelsOffset + (PixelIndex * 3 + 2)];
+					MipMap.Pixels[PixelIndex * 4 + 3] = 0xff;
+				}
+
+				Mips.Add(MoveTemp(MipMap));
+				PixelsOffset += DDSMipSize;
+				MipWidth = FMath::Max(MipWidth / 2, 1);
+				MipHeight = FMath::Max(MipHeight / 2, 1);
+			}
+			return;
+		}
+		else if (Ptr32[22] != 32)
+		{
+			UE_LOG(LogGLTFRuntime, Warning, TEXT("DDS Uncompressed Pixel Size must be 24 or 32 bits (found %u)"), Ptr32[22]);
 			return;
 		}
 	}

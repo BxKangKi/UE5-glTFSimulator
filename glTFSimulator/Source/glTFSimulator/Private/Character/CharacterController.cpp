@@ -19,7 +19,7 @@
 #include "NiagaraFunctionLibrary.h"
 #include "Character/CharacterLoadAsyncAction.h"
 #include "World/WaterActor.h"
-#include "World/BuoyancyComponent.h"
+#include "World/SimulatorBuoyancyComponent.h"
 #include "World/WorldData.h"
 #include "System/MacroLibrary.h"
 #include "Components/PrimitiveComponent.h"
@@ -66,7 +66,7 @@ ACharacterController::ACharacterController()
     FollowCamera->SetupAttachment(SpringArm);
     FollowCamera->bUsePawnControlRotation = false;
 
-    SkeletalMeshBuoyancyComponent = CreateDefaultSubobject<UBuoyancyComponent>(TEXT("SkeletalMeshBuoyancy"));
+    SkeletalMeshBuoyancyComponent = CreateDefaultSubobject<USimulatorBuoyancyComponent>(TEXT("SkeletalMeshBuoyancy"));
     if (SkeletalMeshBuoyancyComponent)
     {
         if (USkeletalMeshComponent* MeshComponent = GetMesh())
