@@ -505,7 +505,7 @@ float3 MoonUV(float3 viewDir, float3 lightDir, float size, float intensity)
         // 3. Projection & Scaling
         // We can merge the division by sin(size) into the scale factor.
         // Note: sin(size) is sqrt(1 - cosR^2) which might be cheaper if size is a constant.
-        const const float invS = 1.0f / sqrt(1.0f - cosR * cosR);
+        const float invS = 1.0f / sqrt(1.0f - cosR * cosR);
 
         // Project V onto the planes defined by Right and Up
         // Since V is normalized and Right/Up are orthonormal to M,

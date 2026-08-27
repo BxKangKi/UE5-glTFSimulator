@@ -1001,6 +1001,9 @@ void UStreamAsyncAction::LoadStaticMeshAsync(const FName &MeshName)
         : ECollisionTraceFlag::CTF_UseDefault;
     Config.LODScreenSize = LODScreenSize;
     Config.LODScreenSizeMultiplier = 1.0f;
+    Config.MaterialsConfig.bGeneratesMipMaps = false;
+    Config.MaterialsConfig.bLoadMipMaps = false;
+    Config.MaterialsConfig.ImagesConfig.bCompressMips = false;
 
     const TArray<int32> RequestedIndices = LocalIndices;
     const FglTFRuntimeStaticMeshConfig RequestedConfig = Config;

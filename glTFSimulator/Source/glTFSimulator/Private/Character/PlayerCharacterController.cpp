@@ -26,6 +26,7 @@
 #include "Components/Widget.h"
 #include "Engine/Engine.h"
 #include "Kismet/GameplayStatics.h"
+#include "UI/ChatWidget.h"
 
 APlayerCharacterController::APlayerCharacterController()
 {
@@ -40,6 +41,7 @@ APlayerCharacterController::APlayerCharacterController()
     bAutoCreateCreatorHUD = false;
     PauseMenuWidgetClass = nullptr;
     SettingsMenuWidgetClass = nullptr;
+    ChatWidgetClass = UChatWidget::StaticClass();
 }
 
 void APlayerCharacterController::BeginPlay()
@@ -830,6 +832,7 @@ void APlayerCharacterController::BindConfiguredInputActions()
     {
         EnhancedInputComponent->BindAction(DebugAction.Get(), ETriggerEvent::Started, this, &APlayerCharacterController::Input_DebugPressed);
     }
+    if (ChatAction) EnhancedInputComponent->BindAction(ChatAction.Get(), ETriggerEvent::Started, this, &APlayerCharacterController::Input_ChatPressed);
 }
 
 int32 APlayerCharacterController::CountConfiguredInputMappingContexts() const
@@ -875,6 +878,7 @@ int32 APlayerCharacterController::CountAssignedEnhancedInputActions() const
     CountIfValid(VehicleStopAction.Get());
     CountIfValid(PauseAction.Get());
     CountIfValid(DebugAction.Get());
+    CountIfValid(ChatAction.Get());
 
     return Count;
 }
@@ -1566,6 +1570,36 @@ void APlayerCharacterController::Input_DebugPressed()
             UE_LOG(LogTemp, Warning, TEXT("DebugWidgetClass is not assigned in PlayerCharacterController!"));
         }
     }
+}
+
+void APlayerCharacterController::Input_ChatPressed()
+{
+    if (!ConsumeInputDebounce(LastChatInputTime) || bMenuWorldTravelPending) return;
+    if (!IsValid(SubSystem)) SubSystem=UGameManagerSubSystem::GetSubSystem(this);
+    if (IsValid(SubSystem) && (SubSystem->IsWorldLoading() || SubSystem->GetGamePaused())) return;
+    if (IsValid(ChatWidget) && ChatWidget->IsInViewport()) { CloseChat(); return; }
+    TSubclassOf<UChatWidget> ClassToUse = ChatWidgetClass;
+    if (!ClassToUse)
+    {
+        ClassToUse = UChatWidget::StaticClass();
+    }
+    if (!IsValid(ChatWidget))
+    {
+        ChatWidget=CreateWidget<UChatWidget>(this,ClassToUse);
+        if(ChatWidget){ChatWidget->OnTextSubmitted.AddDynamic(this,&APlayerCharacterController::HandleChatSubmitted);ChatWidget->OnCloseRequested.AddDynamic(this,&APlayerCharacterController::HandleChatCloseRequested);}
+    }
+    if(ChatWidget){ChatWidget->AddToViewport(ChatZOrder);StopGameplayMotionForUI();ApplyUIInputMode(ChatWidget);ChatWidget->FocusInput();}
+}
+void APlayerCharacterController::CloseChat(){if(ChatWidget)ChatWidget->RemoveFromParent();ApplyGameInputMode();FinalizeGameplayInputRecovery();}
+void APlayerCharacterController::HandleChatCloseRequested(){CloseChat();}
+void APlayerCharacterController::HandleChatSubmitted(const FString& Text){FString R;if(ExecuteChatCommand(Text,R)){if(ChatWidget)ChatWidget->AddMessage(R);}else if(ChatWidget)ChatWidget->AddMessage(FString::Printf(TEXT("You: %s"),*Text));}
+bool APlayerCharacterController::ExecuteChatCommand(const FString& Text,FString& OutResponse)
+{
+    FString C=Text.TrimStartAndEnd();if(!C.StartsWith(TEXT("/time"),ESearchCase::IgnoreCase)&&!C.StartsWith(TEXT("/settime"),ESearchCase::IgnoreCase))return false;
+    FString V;if(!C.Split(TEXT(" "),nullptr,&V)){OutResponse=TEXT("Usage: /time HH:MM or /time seconds");return true;}V=V.TrimStartAndEnd();float S=0;FString Hs,Ms;
+    if(V.Split(TEXT(":"),&Hs,&Ms)){int32 H=0,M=0;if(!LexTryParseString(H,*Hs)||!LexTryParseString(M,*Ms)||H<0||H>23||M<0||M>59){OutResponse=TEXT("Invalid time. Use 00:00-23:59.");return true;}S=float(H*3600+M*60);}else if(!LexTryParseString(S,*V)){OutResponse=TEXT("Invalid time.");return true;}
+    if(!IsValid(SubSystem))SubSystem=UGameManagerSubSystem::GetSubSystem(this);if(!IsValid(SubSystem)||!SubSystem->SetWorldTimeSeconds(S)){OutResponse=TEXT("World time is not available.");return true;}
+    const int32 T=FMath::FloorToInt(S/60.0f)%(24*60);OutResponse=FString::Printf(TEXT("World time set to %02d:%02d"),T/60,T%60);return true;
 }
 
 void APlayerCharacterController::Input_PausePressed()

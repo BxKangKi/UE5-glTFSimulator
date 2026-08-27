@@ -2312,6 +2312,17 @@ void UGameManagerSubSystem::LoadWorldAsync()
     }
 }
 
+bool UGameManagerSubSystem::SetWorldTimeSeconds(float InSeconds)
+{
+    if (!IsValid(ActiveWorldData) || !FMath::IsFinite(InSeconds)) return false;
+    const float DayLength = FMath::Max(1.0f, ActiveWorldData->OneDayTime);
+    ActiveWorldData->WorldTime = FMath::Fmod(InSeconds, DayLength);
+    if (ActiveWorldData->WorldTime < 0.0f) ActiveWorldData->WorldTime += DayLength;
+    SaveWorldData();
+    NotifyStateChanged();
+    return true;
+}
+
 void UGameManagerSubSystem::UpdateWorldTime(float DeltaSeconds)
 {
     if (!IsValid(ActiveWorldData))
