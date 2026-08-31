@@ -22,7 +22,6 @@ class UProceduralMeshComponent;
 class USceneComponent;
 class UWorldData;
 class UPlayerData;
-class AWeatherActor;
 class UUserWidget;
 class AWorldEnvManager;
 class AglTFStreamActor;
@@ -592,9 +591,6 @@ private:
     UPROPERTY(Transient)
     TSubclassOf<AWeaponActor> WeaponActorClass;
 
-    UPROPERTY(Transient)
-    TSubclassOf<AWeatherActor> WeatherActorClass;
-
     // GameManager owns the world boot sequence so WorldEnvManager can stay rendering-only.
     UPROPERTY(Transient)
     TSubclassOf<AWorldEnvManager> WorldEnvManagerClass;
@@ -616,9 +612,6 @@ private:
 
     UPROPERTY()
     TObjectPtr<UPlayerData> ActivePlayerData;
-
-    UPROPERTY()
-    TObjectPtr<AWeatherActor> ActiveWeatherActor;
 
     UPROPERTY()
     TObjectPtr<AWorldEnvManager> WorldEnvManagerActor;
@@ -838,7 +831,6 @@ private:
     void FlushPendingInitialTransformSaves();
     void SaveWorldDataDelayed();
     void ApplyLevelSettings();
-    void ApplyWeatherSettings();
     void ApplyGameplaySettings();
     /** Logs and validates the actual server GameMode selected before gameplay bootstrap begins. */
     void ValidateResolvedGameMode() const;

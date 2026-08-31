@@ -18,6 +18,7 @@
 #include "System/BinaryDataStore.h"
 #include "System/FileFunctionLibrary.h"
 #include "System/GameManagerSubSystem.h"
+#include "Weather/WeatherRuntimeSubsystem.h"
 #include "System/GlbValidation.h"
 #include "System/MacroLibrary.h"
 #include "System/SafeFileIO.h"
@@ -1273,7 +1274,12 @@ void UglTFStreamSubSystem::CompletePlayerStreamingWithExistingCharacter(const FS
         if (UGameManagerSubSystem* GameSystem = UGameManagerSubSystem::GetSubSystem(OwnerActor))
         {
             GameSystem->SetPlayerActor(ExistingCharacter);
-            GameSystem->SetCameraComponent(ExistingCharacter->GetFollowCameraComponent());
+            USceneComponent* FollowCamera = ExistingCharacter->GetFollowCameraComponent();
+            GameSystem->SetCameraComponent(FollowCamera);
+            if (UWeatherRuntimeSubsystem* Weather = GetGameInstance()->GetSubsystem<UWeatherRuntimeSubsystem>())
+            {
+                Weather->SetWeatherCamera(FollowCamera);
+            }
             GameSystem->SetPlayerLocation(ExistingCharacter->GetActorLocation(), ExistingCharacter);
         }
     }

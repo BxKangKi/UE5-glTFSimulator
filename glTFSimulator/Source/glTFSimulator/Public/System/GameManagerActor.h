@@ -11,7 +11,6 @@ class APrefabActor;
 class AVehiclePawn;
 class AWeaponActor;
 class AWorldEnvManager;
-class AWeatherActor;
 class AglTFStreamActor;
 class UMaterialInterface;
 class UMaterialDefaultAsset;
@@ -77,9 +76,6 @@ public:
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|World")
     TSubclassOf<AglTFStreamActor> SpawnActorClass;
-
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|World")
-    TSubclassOf<AWeatherActor> WeatherActorClass;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|World")
     TSubclassOf<AActor> WaterClass;

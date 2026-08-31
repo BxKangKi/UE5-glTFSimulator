@@ -17,7 +17,6 @@
 #include "Model/glTFStreamActor.h"
 #include "Model/MaterialDefaultAsset.h"
 #include "World/WorldEnvManager.h"
-#include "World/WeatherActor.h"
 #include "World/PlayerData.h"
 #include "ProceduralMeshComponent.h"
 #include "System/MacroLibrary.h"
@@ -40,6 +39,7 @@
 #include "System/FileFunctionLibrary.h"
 #include "System/GlbValidation.h"
 #include "Camera/CameraComponent.h"
+#include "Weather/WeatherRuntimeSubsystem.h"
 #include "Blueprint/UserWidget.h"
 #include "Components/PrimitiveComponent.h"
 #include "Components/SceneComponent.h"
@@ -377,7 +377,6 @@ UGameManagerSubSystem::UGameManagerSubSystem()
     PrefabActorClass = APrefabActor::StaticClass();
     VehiclePawnClass = AVehiclePawn::StaticClass();
     WeaponActorClass = AWeaponActor::StaticClass();
-    WeatherActorClass = AWeatherActor::StaticClass();
     WorldEnvManagerClass = AWorldEnvManager::StaticClass();
     SpawnActorClass = AglTFStreamActor::StaticClass();
 }
@@ -859,7 +858,6 @@ void UGameManagerSubSystem::ApplyEditorConfig(const AGameManagerActor* InConfigA
     PrefabActorClass = InConfigActor->PrefabActorClass;
     VehiclePawnClass = InConfigActor->VehiclePawnClass;
     WeaponActorClass = InConfigActor->WeaponActorClass;
-    WeatherActorClass = InConfigActor->WeatherActorClass;
 
     // Use the editor-authored world environment class, with the native class as a safe fallback.
     if (InConfigActor->WorldEnvManagerClass)
@@ -1414,12 +1412,6 @@ void UGameManagerSubSystem::StopWorldSystems()
         // GameInstance subsystems persist after map travel. If our cached pointer was already cleared,
         // still force-stop the global streaming subsystem so glTF assets cannot stay resident.
         GlobalStreamSubSystem->StopMainWorldStreaming();
-    }
-
-    if (IsValid(ActiveWeatherActor))
-    {
-        ActiveWeatherActor->Destroy();
-        ActiveWeatherActor = nullptr;
     }
 
     if (IsValid(OceanActor))
@@ -2162,38 +2154,20 @@ void UGameManagerSubSystem::ValidateResolvedGameMode() const
 void UGameManagerSubSystem::ApplyLevelSettings()
 {
     ApplyGameplaySettings();
-    ApplyWeatherSettings();
-}
 
-void UGameManagerSubSystem::ApplyWeatherSettings()
-{
-    UWorld* World = GetWorld();
-    if (!World || !IsValid(ActiveWorldData))
+    if (UGameInstance* GameInstance = GetGameInstance())
     {
-        return;
-    }
-
-    if (!ActiveWorldData->Weather.bEnabled)
-    {
-        if (IsValid(ActiveWeatherActor))
+        if (UWeatherRuntimeSubsystem* Weather = GameInstance->GetSubsystem<UWeatherRuntimeSubsystem>())
         {
-            ActiveWeatherActor->Destroy();
-            ActiveWeatherActor = nullptr;
+            if (IsValid(CurrentCamera.Get()))
+            {
+                Weather->SetWeatherCamera(CurrentCamera.Get());
+            }
+            Weather->ApplyWeather(
+                ActiveWorldData->Weather.Preset,
+                ActiveWorldData->Weather.Intensity,
+                ActiveWorldData->Weather.bEnabled);
         }
-        return;
-    }
-
-    if (!IsValid(ActiveWeatherActor))
-    {
-        UClass* SpawnClass = WeatherActorClass ? WeatherActorClass.Get() : AWeatherActor::StaticClass();
-        FActorSpawnParameters Params;
-        Params.Owner = ConfigActor.Get();
-        ActiveWeatherActor = World->SpawnActor<AWeatherActor>(SpawnClass, FTransform::Identity, Params);
-    }
-
-    if (IsValid(ActiveWeatherActor))
-    {
-        ActiveWeatherActor->ConfigureWeather(ActiveWorldData->Weather.Preset, ActiveWorldData->Weather.Intensity);
     }
 }
 
@@ -2486,7 +2460,6 @@ void UGameManagerSubSystem::ClearTransientRuntimeReferences()
     PrefabActorClass = APrefabActor::StaticClass();
     VehiclePawnClass = AVehiclePawn::StaticClass();
     WeaponActorClass = AWeaponActor::StaticClass();
-    WeatherActorClass = AWeatherActor::StaticClass();
     WorldEnvManagerClass = AWorldEnvManager::StaticClass();
     SpawnActorClass = AglTFStreamActor::StaticClass();
     WaterClass = nullptr;

@@ -1,23 +1,25 @@
-// Copyright © 2026 BxKangKi. Licensed under the MIT License.
-
 using UnrealBuildTool;
 
 public class ShaderLibrary : ModuleRules
 {
     public ShaderLibrary(ReadOnlyTargetRules Target) : base(Target)
     {
-        PCHUsage = ModuleRules.PCHUsageMode.UseExplicitOrSharedPCHs;
-        bUseUnity = false;
+        PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 
         PublicDependencyModuleNames.AddRange(
-        new string[] {
-            "Core",
-            "CoreUObject",
-            "Engine",
-            "InputCore",
-            "Projects",
-            "RenderCore"
-        }
-    );
+            new string[]
+            {
+                "Core",
+                "CoreUObject",
+                "Engine"
+            });
+
+        PrivateDependencyModuleNames.AddRange(
+            new string[]
+            {
+                "Niagara",
+                "RenderCore",
+                "RHI"
+            });
     }
 }

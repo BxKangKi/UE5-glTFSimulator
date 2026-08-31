@@ -1,29 +1,17 @@
-// Copyright 2026 BxKangKi. MIT
+// Copyright © 2026 BxKangKi. Licensed under the MIT License.
 #ifndef SHADERLIBRARY_POSTPROCESS_USH
 #define SHADERLIBRARY_POSTPROCESS_USH
-
-// UE 5.8 Post Process / Custom Node shader library.
-//
-// Important coordinate rule:
-//   Custom Node receives viewport UV (0..1).
-//   Every SceneTextureLookup in this file converts that viewport UV with
-//   ViewportUVToSceneTextureUV() first. This keeps sampling correct when the
-//   scene texture buffer is larger than the viewport (editor, TSR, dynamic
-//   resolution, split-screen, VR, etc.).
-//
-// This file intentionally keeps the public functions small. Scene textures are
-// sampled directly here; the caller does not need to pass texture values.
-// The material using this Custom node must reference at least one SceneTexture
-// expression so UE emits the SceneTexture lookup helpers.
+#pragma once
+// /Plugin/ShaderLibrary/PostProcess.ush
 
 // ------------------------------------------------------------
 // Scene texture indices (UE 5.8 ESceneTextureId)
 // ------------------------------------------------------------
-#define SL_PPI_SCENE_DEPTH        1
-#define SL_PPI_WORLD_NORMAL       8
-#define SL_PPI_CUSTOM_DEPTH      13
+#define SL_PPI_SCENE_DEPTH 1
+#define SL_PPI_WORLD_NORMAL 8
+#define SL_PPI_CUSTOM_DEPTH 13
 #define SL_PPI_POSTPROCESS_INPUT0 14
-#define SL_PPI_CUSTOM_STENCIL    25
+#define SL_PPI_CUSTOM_STENCIL 25
 
 float2 SL_SceneUV(float2 ViewportUV, int SceneTextureId)
 {
@@ -66,7 +54,7 @@ float3 SL_QuantizeHDR(float3 Color, float Steps)
 // graph only needs to supply UV. This also fixes the classic editor viewport
 // scaling mismatch from using raw ViewportUV in SceneTextureLookup.
 // ------------------------------------------------------------
-float3 CelShading_Toon_Default(float3 SceneColor, float2 UV)
+float3 CelShading_Toon_Default(float3 SceneColor, float2 UV, float2 TexSize)
 {
     // Re-sample the authoritative post-process input from the correctly
     // converted UV. SceneColor is kept as an argument for backward
@@ -80,7 +68,8 @@ float3 CelShading_Toon_Default(float3 SceneColor, float2 UV)
 // ------------------------------------------------------------
 // Weather constants. Kept in shader code intentionally.
 // WeatherMode: 0 = rain, 1 = snow; values in between blend both.
-// Precipitation: 0 = clear, 1 = maximum precipitation.
+// Precipitation: runtime surface coverage/intensity, 0 = clear/dry, 1 = maximum coverage.
+// The ShaderLibrary weather actor drives this value as a temporal wetness/snow accumulation state.
 // ------------------------------------------------------------
 static const float SL_ROOF_STENCIL = 240.0 / 255.0;
 static const float SL_ROOF_STENCIL_EPS = 1.25 / 255.0;
@@ -116,27 +105,45 @@ float SL_IsRoofStencil(float S)
 
 float SL_RoofMask(float2 ViewportUV)
 {
-    // Offsets are specified in viewport-pixel units. The converted scene UV
-    // handles the actual SceneTexture placement/scale. View.ViewSizeAndInvSize
-    // is the viewport pixel reciprocal and remains valid under dynamic res.
-    float2 VPInvSize = View.ViewSizeAndInvSize.zw;
+    // SceneTextureBufferSize is the actual render-buffer size. This remains
+    // correct when internal render resolution / screen percentage changes.
+    float2 DepthInvSize = GetSceneTextureBufferSize(SL_PPI_SCENE_DEPTH).zw;
+    float2 StencilInvSize = GetSceneTextureBufferSize(SL_PPI_CUSTOM_STENCIL).zw;
 
-    float2 O1 = float2(0.0, -4.0) * VPInvSize;
-    float2 O2 = float2(0.0, -10.0) * VPInvSize;
-    float2 O3 = float2(0.0, -18.0) * VPInvSize;
-    float2 O4 = float2(0.0, -30.0) * VPInvSize;
-    float2 O5 = float2(0.0, -48.0) * VPInvSize;
+    float2 SceneUV = SL_SceneUV(ViewportUV, SL_PPI_SCENE_DEPTH);
+    float CurrentDepth = SceneTextureLookup(SceneUV, SL_PPI_SCENE_DEPTH, false).r;
 
-    float S0 = SL_SceneSample(ViewportUV, SL_PPI_CUSTOM_STENCIL, false).r;
-    float S1 = SL_SceneSample(ViewportUV + O1, SL_PPI_CUSTOM_STENCIL, false).r;
-    float S2 = SL_SceneSample(ViewportUV + O2, SL_PPI_CUSTOM_STENCIL, false).r;
-    float S3 = SL_SceneSample(ViewportUV + O3, SL_PPI_CUSTOM_STENCIL, false).r;
-    float S4 = SL_SceneSample(ViewportUV + O4, SL_PPI_CUSTOM_STENCIL, false).r;
-    float S5 = SL_SceneSample(ViewportUV + O5, SL_PPI_CUSTOM_STENCIL, false).r;
+    // Roof stencil is authoritative when present.
+    float2 StencilUV = SL_SceneUV(ViewportUV, SL_PPI_CUSTOM_STENCIL);
+    float RoofStencil = SL_IsRoofStencil(
+        SceneTextureLookup(StencilUV, SL_PPI_CUSTOM_STENCIL, false).r);
 
-    return max(
-        max(max(SL_IsRoofStencil(S0), SL_IsRoofStencil(S1)), SL_IsRoofStencil(S2)),
-        max(max(SL_IsRoofStencil(S3), SL_IsRoofStencil(S4)), SL_IsRoofStencil(S5)));
+    // Depth-only fallback: look upward in viewport space. Unreal uses reversed
+    // device-Z, so a significantly larger sample is closer to the camera.
+    float DepthHit = 0.0;
+    const float2 RoofOffsets[5] = {
+        float2(0.0, -4.0),
+        float2(0.0, -10.0),
+        float2(0.0, -18.0),
+        float2(0.0, -30.0),
+        float2(0.0, -48.0)};
+
+    [unroll] for (int i = 0; i < 5; ++i)
+    {
+        // Convert the viewport-space offset through the actual scene-texture
+        // transform first, then sample using SceneTextureLookup.
+        float2 TapVP = saturate(ViewportUV + RoofOffsets[i] * GetSceneTextureViewSize(SL_PPI_SCENE_DEPTH).zw);
+        float2 TapUV = SL_SceneUV(TapVP, SL_PPI_SCENE_DEPTH);
+        float TapDepth = SceneTextureLookup(TapUV, SL_PPI_SCENE_DEPTH, false).r;
+
+        // Only count a tap as a roof if it has geometry and is closer than the
+        // current surface. Empty/far background is ignored.
+        float HasTap = step(1.0e-5, TapDepth);
+        float Closer = step(0.0008, TapDepth - CurrentDepth);
+        DepthHit = max(DepthHit, HasTap * Closer);
+    }
+
+    return saturate(max(RoofStencil, DepthHit));
 }
 
 float SL_SurfaceNoise(float2 UV, float Time)
@@ -147,8 +154,10 @@ float SL_SurfaceNoise(float2 UV, float Time)
 
 float3 SL_RainOverlay(float2 UV, float Time, float Amount)
 {
+    // Positive texture-space Y makes the procedural pattern travel upward in
+    // a standard 0..1 viewport UV. Negate Y so rain visibly falls downward.
     float2 P = UV * float2(SL_RAIN_DENSITY, SL_RAIN_DENSITY * 0.56);
-    P += float2(Time * 0.045, Time * SL_RAIN_SPEED * 0.33);
+    P += float2(Time * 0.045, -Time * SL_RAIN_SPEED * 0.33);
 
     float2 Cell = floor(P);
     float2 F = frac(P);
@@ -192,7 +201,7 @@ float3 SL_SnowOverlay(float2 UV, float Time, float Amount)
 // ------------------------------------------------------------
 // Single weather entry point.
 // ------------------------------------------------------------
-float3 RS_WeatherPostProcess(float2 UV, float WeatherMode, float Precipitation)
+float3 RS_WeatherPostProcess(float2 UV, float WeatherMode, float Precipitation, float Time)
 {
     float2 P = saturate(UV);
     float Precip = saturate(Precipitation);
@@ -220,16 +229,16 @@ float3 RS_WeatherPostProcess(float2 UV, float WeatherMode, float Precipitation)
     Out *= 1.0 - Wet * SL_WET_DARKEN;
     Out += pow(saturate(0.5 + 0.5 * N.z), 12.0) * Wet * SL_WET_SHEEN;
 
-    // Stateless snow cover. It appears immediately while snowing and is
+    // Snow cover follows the temporal accumulation value driven by the runtime actor and is
     // modulated strongly toward horizontal/upward-facing surfaces.
     float SnowCover = GroundMask * SnowSlope * SnowWeight;
-    float Noise = SL_SurfaceNoise(P, View.GameTime);
+    float Noise = SL_SurfaceNoise(P, Time);
     SnowCover = saturate(SnowCover * Noise);
     Out = lerp(Out, SL_SNOW_COLOR, SnowCover * 0.88);
 
     // Atmospheric overlays are attenuated under the roof.
-    Out += SL_RainOverlay(P, View.GameTime, RainWeight * OpenSky);
-    Out += SL_SnowOverlay(P, View.GameTime, SnowWeight * OpenSky);
+    Out += SL_RainOverlay(P, Time, RainWeight * OpenSky);
+    Out += SL_SnowOverlay(P, Time, SnowWeight * OpenSky);
 
     return Out;
 }

@@ -141,7 +141,6 @@ void AWorldEnvManager::ConfigureRenderingSettings()
     }
 
     UGameSettings* Setting = GameManager->GetGameSettings();
-    GameManager->SetPostProcess(PostProcess);
 
     if (IsValid(Setting))
     {

@@ -8,7 +8,6 @@
 #include "Weapon/WeaponActor.h"
 #include "Model/glTFStreamActor.h"
 #include "World/WorldEnvManager.h"
-#include "World/WeatherActor.h"
 #include "Components/SceneComponent.h"
 #include "Materials/MaterialInterface.h"
 
@@ -26,7 +25,6 @@ AGameManagerActor::AGameManagerActor()
     WeaponActorClass = AWeaponActor::StaticClass();
     WorldEnvManagerClass = AWorldEnvManager::StaticClass();
     SpawnActorClass = AglTFStreamActor::StaticClass();
-    WeatherActorClass = AWeatherActor::StaticClass();
 }
 
 

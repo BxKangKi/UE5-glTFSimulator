@@ -23,6 +23,7 @@
 #include "Blueprint/WidgetBlueprintLibrary.h"
 #include "Blueprint/UserWidget.h"
 #include "Camera/CameraComponent.h"
+#include "Weather/WeatherRuntimeSubsystem.h"
 #include "Components/Widget.h"
 #include "Engine/Engine.h"
 #include "Kismet/GameplayStatics.h"
@@ -290,7 +291,12 @@ void APlayerCharacterController::RegisterPrimaryCharacterPawn(APawn* InPawn)
             if (IsValid(SubSystem))
             {
                 SubSystem->SetPlayerActor(PlayerCharacter);
-                SubSystem->SetCameraComponent(PlayerCharacter->GetFollowCameraComponent());
+                USceneComponent* FollowCamera = PlayerCharacter->GetFollowCameraComponent();
+                SubSystem->SetCameraComponent(FollowCamera);
+                if (UWeatherRuntimeSubsystem* Weather = GetGameInstance()->GetSubsystem<UWeatherRuntimeSubsystem>())
+                {
+                    Weather->SetWeatherCamera(FollowCamera);
+                }
             }
         }
     }
