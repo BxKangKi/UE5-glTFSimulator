@@ -4,6 +4,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "HAL/ThreadSafeCounter.h"
 #include "Kismet/BlueprintAsyncActionBase.h"
 #include "Model/ModelData.h"
 #include "glTFRuntimeAsset.h"
@@ -11,6 +12,7 @@
 #include "StreamAsyncAction.generated.h"
 
 class AglTFStreamActor;
+class UglTFPrefabSubSystem;
 class UMaterialDefaultRuntimeCache;
 class UStaticMeshComponent;
 class UStaticMesh;
@@ -137,6 +139,22 @@ private:
     bool bIsLoading = false;
     bool bAbortRequested = false;
     bool bStaticMeshLoadInFlight = false;
+    bool bPrefabAssetLoadInFlight = false;
+
+    UPROPERTY(Transient)
+    TObjectPtr<UglTFRuntimeAsset> PrefabAsset;
+    TWeakObjectPtr<UglTFPrefabSubSystem> PrefabSubSystem;
+    int32 PrefabMeshIndex = INDEX_NONE;
+    FString PrefabReferenceName;
+    FString PrefabFilePath;
+    TMap<FName, FString> PrefabReferenceTokensByNode;
+    TSet<FName> PrefabReferenceReleasePendingNodes;
+    TSet<FName> PrefabUseNodesInFlight;
+    FName ActivePrefabUseNode = NAME_None;
+    FString ActivePrefabUsePath;
+    FString ActivePrefabUseToken;
+    FName PendingPrefabReferenceNode = NAME_None;
+    FGuid PrefabReferenceSessionId = FGuid::NewGuid();
 
     /** Ticket held while this action owns or waits for its per-asset glTFRuntime slot. */
     uint64 GlTFRuntimeOperationTicket = 0;
@@ -166,6 +184,10 @@ private:
     void SetStaticMesh(UStaticMesh *StaticMesh);
 
     void ProcessChunk();
+    bool AcquirePrefabReferenceForNode(const FName& NodeName);
+    void ReleasePrefabReferenceForNode(const FName& NodeName);
+    void EndPrefabAssetUseForNode(const FName& NodeName);
+    FString MakePrefabReferenceToken(const FName& NodeName) const;
     void SanitizeRuntimeMaps();
     void AbortAndRelease(UStaticMesh* OrphanedMesh = nullptr);
     void ResetLoadState();

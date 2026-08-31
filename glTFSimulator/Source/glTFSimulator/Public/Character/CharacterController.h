@@ -16,7 +16,7 @@ class UCharacterComponent;
 class USpringArmComponent;
 class UGameManagerSubSystem;
 class UCameraComponent;
-class USimulatorBuoyancyComponent;
+class UBuoyancyComponent;
 class UPrimitiveComponent;
 class UAnimInstance;
 class UCharacterLoadAsyncAction;
@@ -147,7 +147,7 @@ protected:
 
     /** Applies buoyancy to the targeted skeletal mesh while its bodies simulate in water. */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly)
-    TObjectPtr<USimulatorBuoyancyComponent> SkeletalMeshBuoyancyComponent;
+    TObjectPtr<UBuoyancyComponent> SkeletalMeshBuoyancyComponent;
 
     /** If true, non-ragdoll players receive velocity impulses from moving simulated physics objects. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Physics Impact")

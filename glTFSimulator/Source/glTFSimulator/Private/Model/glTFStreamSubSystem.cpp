@@ -218,7 +218,9 @@ void UglTFStreamSubSystem::StartMainWorldStreaming(AActor* InOwnerActor, TSubcla
     ModelMetadataMap.Empty();
     SpawnActorMap.Empty();
 
-    GlbFilePaths = UFileFunctionLibrary::GetFileNamesWithExtension(ModelDirectory, TEXT("glb"));
+    const FString StreamDirectory = GlbValidation::NormalizePath(
+        FPaths::Combine(ModelDirectory, TEXT("stream")));
+    GlbFilePaths = UFileFunctionLibrary::GetFileNamesWithExtension(StreamDirectory, TEXT("glb"));
     NormalizeAndDeduplicatePaths(GlbFilePaths);
     InitialPathProgress.Reserve(GlbFilePaths.Num());
     for (const FString& GlbPath : GlbFilePaths)
@@ -227,8 +229,9 @@ void UglTFStreamSubSystem::StartMainWorldStreaming(AActor* InOwnerActor, TSubcla
     }
     DiscoverPlayerPaths();
 
-    WriteLogAsync(FString::Printf(TEXT("glTFStreamSubSystem started. ModelDirectory=%s GLBCount=%d PlayerDirectory=%s PlayerCount=%d InitialPlayer=%s RenderOnly=%s"),
+    WriteLogAsync(FString::Printf(TEXT("glTFStreamSubSystem started. ModelDirectory=%s StreamDirectory=%s GLBCount=%d PlayerDirectory=%s PlayerCount=%d InitialPlayer=%s RenderOnly=%s"),
         *ModelDirectory,
+        *StreamDirectory,
         GlbFilePaths.Num(),
         *PlayerDirectory,
         PlayerGlbFilePaths.Num(),

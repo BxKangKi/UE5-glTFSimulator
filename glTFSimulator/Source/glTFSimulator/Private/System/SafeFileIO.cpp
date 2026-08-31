@@ -524,8 +524,8 @@ namespace SafeFileIOPrivate
             }
             for (const auto& Pair : Object->Values)
             {
-                const FString Key(Pair.Key);
-                if (Key.IsEmpty() || Key.Len() > Limits.MaxStringCharacters)
+                const FString JsonKey(Pair.Key);
+                if (JsonKey.IsEmpty() || JsonKey.Len() > Limits.MaxStringCharacters)
                 {
                     OutError = TEXT("A JSON object key is empty or exceeds the configured character limit");
                     return false;

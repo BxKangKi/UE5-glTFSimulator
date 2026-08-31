@@ -35,9 +35,7 @@ public class glTFSimulator : ModuleRules
                 "ImageWrapper",
                 // MoviePlayer renders a pure-Slate loading screen while blocking map loads run.
                 "MoviePlayer",
-                "RenderCore",
-                "ControlRig",
-                "RigVM" 
+                "RenderCore"
             });
 
         if (Target.bBuildEditor)

@@ -13,10 +13,16 @@
 #include "Engine/World.h"
 #include "Engine/Texture.h"
 #include "Engine/StaticMesh.h"
+#include "HAL/FileManager.h"
+#include "Misc/Paths.h"
 #include "HAL/IConsoleManager.h"
 #include "Model/glTFStreamActor.h"
+#include "System/GlbValidation.h"
+#include "System/SafeFileIO.h"
 #include "Misc/ScopeExit.h"
+#include "Misc/FileHelper.h"
 #include "System/glTFRuntimeSafety.h"
+#include "Model/glTFPrefabSubSystem.h"
 #include "TimerManager.h"
 #include "UObject/UObjectGlobals.h"
 #include "World/WaterActor.h"
@@ -37,6 +43,30 @@ namespace
     bool EnsureStreamActionGameThread(const TCHAR* FunctionName)
     {
         return ensureMsgf(IsInGameThread(), TEXT("%s must run on the game thread"), FunctionName);
+    }
+
+    int32 FindFirstRenderableMeshIndex(UglTFRuntimeAsset* RuntimeAsset)
+    {
+        if (!IsValid(RuntimeAsset))
+        {
+            return INDEX_NONE;
+        }
+
+        const int32 MeshCount = RuntimeAsset->GetNumMeshes();
+        if (MeshCount <= 0)
+        {
+            return INDEX_NONE;
+        }
+
+        for (const FglTFRuntimeNode& Node : RuntimeAsset->GetNodes())
+        {
+            if (Node.MeshIndex >= 0 && Node.MeshIndex < MeshCount)
+            {
+                return Node.MeshIndex;
+            }
+        }
+
+        return 0;
     }
 
     bool ConfigureGeneratedMeshCollision(
@@ -147,6 +177,7 @@ UStreamAsyncAction *UStreamAsyncAction::StreamAsync(
         Action->LoadedWaterNodes = Actor->GetLoadedWaterNodesRef();
         Action->InstanceMap = Actor->GetInstanceMapRef();
         Action->Asset = Actor->GetAsset();
+        Action->PrefabReferenceName = Actor->GetModelMetadata().Prefab;
         Action->WaterClass = Actor->GetWaterClass();
     }
     Action->PlayerLocation = InPlayerLocation;
@@ -206,7 +237,7 @@ void UStreamAsyncAction::AbortAndRelease(UStaticMesh* OrphanedMesh)
 
     // Do not release the parser/action while glTFRuntime still owns an async mesh build.
     // SetStaticMesh will receive the terminal callback and complete the deferred cleanup.
-    if (bStaticMeshLoadInFlight && OrphanedMesh == nullptr)
+    if ((bStaticMeshLoadInFlight || bPrefabAssetLoadInFlight) && OrphanedMesh == nullptr)
     {
         OwnerActor = nullptr;
         WorldContextObject = nullptr;
@@ -218,6 +249,22 @@ void UStreamAsyncAction::AbortAndRelease(UStaticMesh* OrphanedMesh)
     if (IsValid(OrphanedMesh) && !OrphanedMesh->IsAsset())
     {
         OrphanedMesh->ClearFlags(RF_Public | RF_Standalone);
+    }
+
+    TArray<FName> PrefabNodesToRelease;
+    PrefabReferenceTokensByNode.GetKeys(PrefabNodesToRelease);
+    for (const FName& PrefabNode : PrefabNodesToRelease)
+    {
+        ReleasePrefabReferenceForNode(PrefabNode);
+    }
+    PrefabReferenceName.Reset();
+    bPrefabAssetLoadInFlight = false;
+    if (PrefabReferenceTokensByNode.Num() == 0)
+    {
+        PrefabAsset = nullptr;
+        PrefabMeshIndex = INDEX_NONE;
+        PrefabFilePath.Reset();
+        PrefabReferenceReleasePendingNodes.Empty();
     }
 
     if (IsValid(Asset))
@@ -255,8 +302,14 @@ void UStreamAsyncAction::AbortAndRelease(UStaticMesh* OrphanedMesh)
     }
     GeneratedMeshWorldContext = nullptr;
     DecalLight = nullptr;
-    CurrentLoadingNode = NAME_None;
-    CurrentLoadingMesh = NAME_None;
+    // Do not clear the active node here. A native prefab mesh request may still be inside
+    // glTFRuntime; EndPrefabAssetUseForNode needs its token even after an abort clears the
+    // actor/world references above.
+    if (PrefabUseNodesInFlight.Num() == 0)
+    {
+        CurrentLoadingNode = NAME_None;
+        CurrentLoadingMesh = NAME_None;
+    }
     bIsLoading = false;
     bRenderOnly = false;
     SetReadyToDestroy();
@@ -372,6 +425,220 @@ void UStreamAsyncAction::Activate()
     ProcessChunk();
 }
 
+FString UStreamAsyncAction::MakePrefabReferenceToken(const FName& NodeName) const
+{
+    return PrefabReferenceSessionId.ToString(EGuidFormats::Digits) + TEXT("|") + NodeName.ToString();
+}
+
+bool UStreamAsyncAction::AcquirePrefabReferenceForNode(const FName& NodeName)
+{
+    if (!EnsureStreamActionGameThread(TEXT("UStreamAsyncAction::AcquirePrefabReferenceForNode")))
+    {
+        return false;
+    }
+
+    if (PrefabReferenceName.TrimStartAndEnd().IsEmpty())
+    {
+        return true;
+    }
+
+    if (PrefabReferenceTokensByNode.Contains(NodeName) && IsValid(PrefabAsset) && PrefabMeshIndex != INDEX_NONE)
+    {
+        return true;
+    }
+
+    if (bPrefabAssetLoadInFlight)
+    {
+        return false;
+    }
+
+    const AglTFStreamActor* StreamActor = Cast<AglTFStreamActor>(OwnerActor.Get());
+    const FString ModelFilePath = IsValid(StreamActor) ? StreamActor->GetFilePath() : FString();
+    UglTFPrefabSubSystem* PrefabManager = PrefabSubSystem.IsValid()
+        ? PrefabSubSystem.Get()
+        : UglTFPrefabSubSystem::Get(WorldContextObject);
+    PrefabSubSystem = PrefabManager;
+    if (!IsValid(PrefabManager) || ModelFilePath.IsEmpty())
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("UStreamAsyncAction: prefab subsystem/model path unavailable; using source model. Node=%s Prefab=%s"),
+            *NodeName.ToString(),
+            *PrefabReferenceName);
+        return true;
+    }
+
+    const FString ResolvedPrefabPath = PrefabManager->ResolvePrefabPath(ModelFilePath, PrefabReferenceName);
+    if (ResolvedPrefabPath.IsEmpty())
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("UStreamAsyncAction: invalid prefab reference; using source model. Node=%s Prefab=%s"),
+            *NodeName.ToString(),
+            *PrefabReferenceName);
+        return true;
+    }
+
+    const FString ReferenceToken = MakePrefabReferenceToken(NodeName);
+    PendingPrefabReferenceNode = NodeName;
+    PrefabFilePath = ResolvedPrefabPath;
+    bPrefabAssetLoadInFlight = true;
+    bIsLoading = true;
+
+    TWeakObjectPtr<UStreamAsyncAction> WeakThis(this);
+    FOnPrefabRuntimeAssetReady Callback;
+    Callback.BindLambda(
+        [WeakThis, NodeName, ResolvedPrefabPath, ReferenceToken](
+            UglTFRuntimeAsset* RuntimeAsset,
+            const int32 MeshIndex,
+            const bool bSuccess,
+            const FString& FailureReason)
+        {
+            UStreamAsyncAction* StrongThis = WeakThis.Get();
+            if (!IsValid(StrongThis))
+            {
+                return;
+            }
+
+            StrongThis->bPrefabAssetLoadInFlight = false;
+            StrongThis->PendingPrefabReferenceNode = NAME_None;
+
+            if (StrongThis->bAbortRequested)
+            {
+                if (UglTFPrefabSubSystem* PrefabManager = StrongThis->PrefabSubSystem.Get())
+                {
+                    PrefabManager->ReleasePrefabReference(ResolvedPrefabPath, ReferenceToken);
+                }
+                StrongThis->ReleaseActionReferences();
+                StrongThis->SetReadyToDestroy();
+                return;
+            }
+
+            if (!bSuccess || !IsValid(RuntimeAsset) || MeshIndex == INDEX_NONE)
+            {
+                UE_LOG(LogTemp, Warning,
+                    TEXT("UStreamAsyncAction: prefab '%s' could not be resolved for node '%s' (%s); using source model."),
+                    *ResolvedPrefabPath,
+                    *NodeName.ToString(),
+                    FailureReason.IsEmpty() ? TEXT("unknown error") : *FailureReason);
+                if (UglTFPrefabSubSystem* PrefabManager = StrongThis->PrefabSubSystem.Get())
+                {
+                    PrefabManager->ReleasePrefabReference(ResolvedPrefabPath, ReferenceToken);
+                }
+                StrongThis->PrefabAsset = nullptr;
+                StrongThis->PrefabMeshIndex = INDEX_NONE;
+                StrongThis->PrefabFilePath.Reset();
+                StrongThis->bIsLoading = true;
+                StrongThis->LoadStaticMeshAsync(StrongThis->CurrentLoadingMesh);
+                return;
+            }
+
+            StrongThis->PrefabAsset = RuntimeAsset;
+            StrongThis->PrefabMeshIndex = MeshIndex;
+            StrongThis->PrefabFilePath = ResolvedPrefabPath;
+            StrongThis->PrefabReferenceReleasePendingNodes.Remove(NodeName);
+            StrongThis->PrefabReferenceTokensByNode.Add(NodeName, ReferenceToken);
+            UE_LOG(LogTemp, Verbose,
+                TEXT("UStreamAsyncAction: prefab reference acquired. Node=%s Prefab=%s MeshIndex=%d"),
+                *NodeName.ToString(),
+                *ResolvedPrefabPath,
+                MeshIndex);
+
+            StrongThis->LoadStaticMeshAsync(StrongThis->CurrentLoadingMesh);
+        });
+
+    PrefabManager->AcquirePrefabReference(
+        ModelFilePath,
+        PrefabReferenceName,
+        ReferenceToken,
+        MoveTemp(Callback));
+
+    return false;
+}
+
+void UStreamAsyncAction::ReleasePrefabReferenceForNode(const FName& NodeName)
+{
+    if (!EnsureStreamActionGameThread(TEXT("UStreamAsyncAction::ReleasePrefabReferenceForNode")))
+    {
+        return;
+    }
+
+    FString* TokenPtr = PrefabReferenceTokensByNode.Find(NodeName);
+    if (!TokenPtr || PrefabReferenceReleasePendingNodes.Contains(NodeName))
+    {
+        return;
+    }
+
+    const FString Token = *TokenPtr;
+    const FString Path = PrefabFilePath;
+    if (UglTFPrefabSubSystem* PrefabManager = PrefabSubSystem.Get())
+    {
+        PrefabManager->ReleasePrefabReference(Path, Token);
+    }
+
+    if (PrefabUseNodesInFlight.Contains(NodeName))
+    {
+        PrefabReferenceReleasePendingNodes.Add(NodeName);
+        return;
+    }
+
+    PrefabReferenceTokensByNode.Remove(NodeName);
+    if (PrefabReferenceTokensByNode.Num() == 0)
+    {
+        PrefabAsset = nullptr;
+        PrefabMeshIndex = INDEX_NONE;
+        PrefabFilePath.Reset();
+    }
+}
+
+void UStreamAsyncAction::EndPrefabAssetUseForNode(const FName& NodeName)
+{
+    if (!EnsureStreamActionGameThread(TEXT("UStreamAsyncAction::EndPrefabAssetUseForNode")))
+    {
+        return;
+    }
+
+    // The action may already have released OwnerActor/WorldContextObject after an abort.
+    // Keep the exact token/path captured at BeginPrefabAssetUse time so the subsystem can
+    // always balance the native-use lease and eventually unload the shared prefab asset.
+    const FName UseNode = !NodeName.IsNone() ? NodeName : ActivePrefabUseNode;
+    const FString* TokenPtr = PrefabReferenceTokensByNode.Find(UseNode);
+    const FString Token = TokenPtr ? *TokenPtr : ActivePrefabUseToken;
+    const FString Path = !ActivePrefabUsePath.IsEmpty() ? ActivePrefabUsePath : PrefabFilePath;
+
+    if (UglTFPrefabSubSystem* PrefabManager = PrefabSubSystem.Get())
+    {
+        if (!Token.IsEmpty() && !Path.IsEmpty())
+        {
+            PrefabManager->EndPrefabAssetUse(Path, Token);
+        }
+    }
+
+    if (!UseNode.IsNone())
+    {
+        PrefabUseNodesInFlight.Remove(UseNode);
+
+        if (PrefabReferenceReleasePendingNodes.Remove(UseNode) > 0)
+        {
+            PrefabReferenceTokensByNode.Remove(UseNode);
+        }
+    }
+
+    ActivePrefabUseNode = NAME_None;
+    ActivePrefabUsePath.Reset();
+    ActivePrefabUseToken.Reset();
+
+    if (PrefabReferenceTokensByNode.Num() == 0 && PrefabUseNodesInFlight.Num() == 0)
+    {
+        PrefabAsset = nullptr;
+        PrefabMeshIndex = INDEX_NONE;
+        PrefabFilePath.Reset();
+        PrefabReferenceReleasePendingNodes.Empty();
+        if (bAbortRequested)
+        {
+            PrefabSubSystem = nullptr;
+        }
+    }
+}
+
 void UStreamAsyncAction::SanitizeRuntimeMaps()
 {
     if (!EnsureStreamActionGameThread(TEXT("UStreamAsyncAction::SanitizeRuntimeMaps")))
@@ -465,6 +732,22 @@ void UStreamAsyncAction::ReleaseActionReferences()
         World->GetTimerManager().ClearTimer(ProcessTimerHandle);
     }
 
+    TArray<FName> PrefabNodesToRelease;
+    PrefabReferenceTokensByNode.GetKeys(PrefabNodesToRelease);
+    for (const FName& PrefabNode : PrefabNodesToRelease)
+    {
+        ReleasePrefabReferenceForNode(PrefabNode);
+    }
+    PrefabReferenceName.Reset();
+    bPrefabAssetLoadInFlight = false;
+    if (PrefabReferenceTokensByNode.Num() == 0 && PrefabUseNodesInFlight.Num() == 0)
+    {
+        PrefabReferenceReleasePendingNodes.Empty();
+        PrefabAsset = nullptr;
+        PrefabMeshIndex = INDEX_NONE;
+        PrefabFilePath.Reset();
+    }
+
     Asset = nullptr;
     OwnerActor = nullptr;
     WorldContextObject = nullptr;
@@ -498,6 +781,10 @@ void UStreamAsyncAction::ReleaseActionReferences()
     bStaticMeshLoadInFlight = false;
     bAbortRequested = true;
     bRenderOnly = false;
+    if (PrefabReferenceTokensByNode.Num() == 0 && PrefabUseNodesInFlight.Num() == 0)
+    {
+        PrefabSubSystem = nullptr;
+    }
 }
 
 void UStreamAsyncAction::ProcessChunk()
@@ -510,6 +797,11 @@ void UStreamAsyncAction::ProcessChunk()
     if (bAbortRequested || !IsValid(OwnerActor))
     {
         AbortAndRelease();
+        return;
+    }
+
+    if (bPrefabAssetLoadInFlight)
+    {
         return;
     }
 
@@ -686,7 +978,10 @@ bool UStreamAsyncAction::ProcessLoadNode(const FName &Name)
     if (FModelNodeData *Info = NodeMap.Find(Name))
     {
         if (LoadedNodes.Contains(Name))
+        {
             return false;
+        }
+
         if (Info->MeshName.IsNone() || Info->Transform.ContainsNaN() || !MeshMap.Contains(Info->MeshName))
         {
             LoadedNodes.Remove(Name);
@@ -694,23 +989,32 @@ bool UStreamAsyncAction::ProcessLoadNode(const FName &Name)
             return false;
         }
 
+        // Every node gets its own prefab reference token, even when the mesh component can be shared
+        // with another node. This keeps the global prefab reference count equal to actual node usage.
+        CurrentLoadingNode = Name;
+        CurrentLoadingMesh = Info->MeshName;
+        bIsLoading = true;
+
+        if (!AcquirePrefabReferenceForNode(Name))
+        {
+            // The prefab subsystem is loading this node's referenced asset. Its callback resumes the
+            // same node and invokes LoadStaticMeshAsync once the shared asset becomes available.
+            return true;
+        }
+
         UInstancedStaticMeshComponent *ISMC = InstanceMap.FindRef(Info->MeshName);
         if (IsValid(ISMC))
         {
             AddTrasnform(Name, ISMC);
-            return false;
-        }
-        else
-        {
-            if (bIsLoading)
-                return true;
-            CurrentLoadingNode = Name;
-            CurrentLoadingMesh = Info->MeshName;
-            bIsLoading = true;
-            LoadStaticMeshAsync(CurrentLoadingMesh);
             return true;
         }
+
+        // Prefab acquisition either completed synchronously or was not required. Current loading
+        // state already belongs to this node, so start the native mesh request directly.
+        LoadStaticMeshAsync(CurrentLoadingMesh);
+        return true;
     }
+
     return false;
 }
 
@@ -761,6 +1065,8 @@ void UStreamAsyncAction::ProcessUnloadNode(const FName &Name)
         LoadedNodes.Remove(Name);
     }
 
+    ReleasePrefabReferenceForNode(Name);
+
     if (bRenderOnly)
     {
         return;
@@ -789,6 +1095,7 @@ void UStreamAsyncAction::SetStaticMesh(UStaticMesh *StaticMesh)
     const uint64 CompletedTicket = GlTFRuntimeOperationTicket;
     GlTFRuntimeOperationTicket = 0;
     bStaticMeshLoadInFlight = false;
+    EndPrefabAssetUseForNode(CurrentLoadingNode);
     ON_SCOPE_EXIT
     {
         // Collision finalization happens before glTFRuntime invokes this delegate. Drop the strong
@@ -858,6 +1165,7 @@ void UStreamAsyncAction::SetStaticMesh(UStaticMesh *StaticMesh)
     }
     else
     {
+        ReleasePrefabReferenceForNode(CurrentLoadingNode);
         ResetLoadState();
     }
 }
@@ -885,6 +1193,14 @@ void UStreamAsyncAction::LoadStaticMeshAsync(const FName &MeshName)
         return;
     }
 
+    const bool bUsePrefabRuntimeMesh = IsValid(PrefabAsset) && PrefabMeshIndex != INDEX_NONE;
+    UglTFRuntimeAsset* MeshSourceAsset = bUsePrefabRuntimeMesh ? PrefabAsset.Get() : Asset.Get();
+    if (!IsValid(MeshSourceAsset))
+    {
+        ResetLoadState();
+        return;
+    }
+
     FModelMeshData* Mesh = MeshMap.Find(MeshName);
     if (!Mesh)
     {
@@ -892,9 +1208,17 @@ void UStreamAsyncAction::LoadStaticMeshAsync(const FName &MeshName)
         return;
     }
 
-    const int32 RuntimeMeshCount = Asset->GetNumMeshes();
+    const int32 RuntimeMeshCount = MeshSourceAsset->GetNumMeshes();
     TArray<int32> LocalIndices;
     LocalIndices.Reserve(4);
+
+    if (bUsePrefabRuntimeMesh)
+    {
+        if (PrefabMeshIndex >= 0 && PrefabMeshIndex < RuntimeMeshCount)
+        {
+            LocalIndices.Add(PrefabMeshIndex);
+        }
+    }
 
     const auto AddValidLOD = [this, &LocalIndices, RuntimeMeshCount, MeshName](
         const int32 MeshIndex,
@@ -918,15 +1242,16 @@ void UStreamAsyncAction::LoadStaticMeshAsync(const FName &MeshName)
         LocalIndices.AddUnique(MeshIndex);
     };
 
-    const bool bEnableRuntimeMultiLOD = CVarEnableRuntimeMultiLOD.GetValueOnGameThread() != 0;
-    if (bEnableRuntimeMultiLOD)
+    const bool bEnableRuntimeMultiLOD = !bUsePrefabRuntimeMesh &&
+        CVarEnableRuntimeMultiLOD.GetValueOnGameThread() != 0;
+    if (!bUsePrefabRuntimeMesh && bEnableRuntimeMultiLOD)
     {
         AddValidLOD(Mesh->LOD0, TEXT("LOD0"));
         AddValidLOD(Mesh->LOD1, TEXT("LOD1"));
         AddValidLOD(Mesh->LOD2, TEXT("LOD2"));
         AddValidLOD(Mesh->LOD3, TEXT("LOD3"));
     }
-    else
+    else if (!bUsePrefabRuntimeMesh)
     {
         // Prefer LOD0, but tolerate malformed/legacy metadata by selecting the first valid fallback.
         AddValidLOD(Mesh->LOD0, TEXT("LOD0"));
@@ -962,6 +1287,7 @@ void UStreamAsyncAction::LoadStaticMeshAsync(const FName &MeshName)
             RuntimeMeshCount);
         LoadedNodes.Remove(CurrentLoadingNode);
         NodeMap.Remove(CurrentLoadingNode);
+        ReleasePrefabReferenceForNode(CurrentLoadingNode);
         ResetLoadState();
         return;
     }
@@ -986,6 +1312,7 @@ void UStreamAsyncAction::LoadStaticMeshAsync(const FName &MeshName)
             *CurrentLoadingNode.ToString());
         LoadedNodes.Remove(CurrentLoadingNode);
         NodeMap.Remove(CurrentLoadingNode);
+        ReleasePrefabReferenceForNode(CurrentLoadingNode);
         ResetLoadState();
         return;
     }
@@ -1001,21 +1328,25 @@ void UStreamAsyncAction::LoadStaticMeshAsync(const FName &MeshName)
         : ECollisionTraceFlag::CTF_UseDefault;
     Config.LODScreenSize = LODScreenSize;
     Config.LODScreenSizeMultiplier = 1.0f;
-    Config.MaterialsConfig.bGeneratesMipMaps = false;
-    Config.MaterialsConfig.bLoadMipMaps = false;
-    Config.MaterialsConfig.ImagesConfig.bCompressMips = false;
 
     const TArray<int32> RequestedIndices = LocalIndices;
     const FglTFRuntimeStaticMeshConfig RequestedConfig = Config;
     const FName RequestedNode = CurrentLoadingNode;
     const FName RequestedMesh = CurrentLoadingMesh;
+    const FString RequestedPrefabPath = PrefabFilePath;
+    const FString* PrefabTokenPtr = PrefabReferenceTokensByNode.Find(RequestedNode);
+    const FString RequestedPrefabToken = PrefabTokenPtr ? *PrefabTokenPtr : FString();
+    const bool bRequestUsesPrefab = bUsePrefabRuntimeMesh && !RequestedPrefabPath.IsEmpty() && !RequestedPrefabToken.IsEmpty();
     TWeakObjectPtr<UStreamAsyncAction> WeakThis(this);
     bStaticMeshLoadInFlight = true;
     const uint64 SubmittedTicket = FglTFRuntimeSafety::EnqueueOperation(
         this,
-        Asset,
-        FString::Printf(TEXT("Stream mesh %s for node %s"), *RequestedMesh.ToString(), *RequestedNode.ToString()),
-        [WeakThis, RequestedIndices, RequestedConfig, RequestedNode, RequestedMesh](const uint64 Ticket)
+        MeshSourceAsset,
+        FString::Printf(TEXT("Stream mesh %s for node %s%s"),
+            *RequestedMesh.ToString(),
+            *RequestedNode.ToString(),
+            bUsePrefabRuntimeMesh ? TEXT(" (prefab)") : TEXT("")),
+        [WeakThis, RequestedIndices, RequestedConfig, RequestedNode, RequestedMesh, RequestedPrefabPath, RequestedPrefabToken, bRequestUsesPrefab](const uint64 Ticket)
         {
             UStreamAsyncAction* StrongThis = WeakThis.Get();
             if (!IsValid(StrongThis) || StrongThis->bAbortRequested || !IsValid(StrongThis->Asset))
@@ -1028,6 +1359,20 @@ void UStreamAsyncAction::LoadStaticMeshAsync(const FName &MeshName)
                 }
                 // Native mesh construction has not started in this branch, so immediate ticket
                 // completion is safe and allows a pending asset release to proceed.
+                FglTFRuntimeSafety::CompleteOperation(Ticket);
+                return;
+            }
+
+            UglTFRuntimeAsset* CallbackMeshSourceAsset =
+                IsValid(StrongThis->PrefabAsset) && StrongThis->PrefabMeshIndex != INDEX_NONE
+                    ? StrongThis->PrefabAsset.Get()
+                    : StrongThis->Asset.Get();
+            if (!IsValid(CallbackMeshSourceAsset))
+            {
+                StrongThis->GlTFRuntimeOperationTicket = 0;
+                StrongThis->bStaticMeshLoadInFlight = false;
+                StrongThis->ReleasePrefabReferenceForNode(RequestedNode);
+                StrongThis->ResetLoadState();
                 FglTFRuntimeSafety::CompleteOperation(Ticket);
                 return;
             }
@@ -1046,9 +1391,33 @@ void UStreamAsyncAction::LoadStaticMeshAsync(const FName &MeshName)
                 StrongThis->bStaticMeshLoadInFlight = false;
                 StrongThis->LoadedNodes.Remove(RequestedNode);
                 StrongThis->NodeMap.Remove(RequestedNode);
+                StrongThis->ReleasePrefabReferenceForNode(RequestedNode);
                 StrongThis->ResetLoadState();
                 FglTFRuntimeSafety::CompleteOperation(Ticket);
                 return;
+            }
+
+            if (bRequestUsesPrefab)
+            {
+                UglTFPrefabSubSystem* PrefabSubSystem = UglTFPrefabSubSystem::Get(StrongThis->WorldContextObject);
+                if (!IsValid(PrefabSubSystem) || !PrefabSubSystem->BeginPrefabAssetUse(RequestedPrefabPath, RequestedPrefabToken))
+                {
+                    StrongThis->GlTFRuntimeOperationTicket = 0;
+                    StrongThis->bStaticMeshLoadInFlight = false;
+                    StrongThis->LoadedNodes.Remove(RequestedNode);
+                    StrongThis->ReleasePrefabReferenceForNode(RequestedNode);
+                    if (IsValid(StrongThis->GeneratedMeshWorldContext))
+                    {
+                        StrongThis->GeneratedMeshWorldContext->ReleaseWorldPin();
+                    }
+                    StrongThis->ResetLoadState();
+                    FglTFRuntimeSafety::CompleteOperation(Ticket);
+                    return;
+                }
+                StrongThis->PrefabUseNodesInFlight.Add(RequestedNode);
+                StrongThis->ActivePrefabUseNode = RequestedNode;
+                StrongThis->ActivePrefabUsePath = RequestedPrefabPath;
+                StrongThis->ActivePrefabUseToken = RequestedPrefabToken;
             }
 
             StrongThis->GlTFRuntimeOperationTicket = Ticket;
@@ -1066,11 +1435,11 @@ void UStreamAsyncAction::LoadStaticMeshAsync(const FName &MeshName)
             if (RequestedIndices.Num() == 1)
             {
                 // The single-mesh API avoids the plugin's separate multi-LOD assembly path.
-                StrongThis->Asset->LoadStaticMeshAsync(RequestedIndices[0], Callback, RequestedConfig);
+                CallbackMeshSourceAsset->LoadStaticMeshAsync(RequestedIndices[0], Callback, RequestedConfig);
             }
             else
             {
-                StrongThis->Asset->LoadStaticMeshLODsAsync(RequestedIndices, Callback, RequestedConfig);
+                CallbackMeshSourceAsset->LoadStaticMeshLODsAsync(RequestedIndices, Callback, RequestedConfig);
             }
         },
         [WeakThis, RequestedNode](const FString& Reason)
@@ -1094,6 +1463,7 @@ void UStreamAsyncAction::LoadStaticMeshAsync(const FName &MeshName)
                 return;
             }
 
+            StrongThis->EndPrefabAssetUseForNode(RequestedNode);
             UE_LOG(LogTemp, Warning,
                 TEXT("Stream mesh request rejected. Node=%s Reason=%s"),
                 *RequestedNode.ToString(),
@@ -1130,6 +1500,7 @@ void UStreamAsyncAction::AddTrasnform(const FName &Name, UInstancedStaticMeshCom
         {
             LoadedNodes.Remove(Name);
             NodeMap.Remove(Name);
+            ReleasePrefabReferenceForNode(Name);
             ResetLoadState();
             return;
         }

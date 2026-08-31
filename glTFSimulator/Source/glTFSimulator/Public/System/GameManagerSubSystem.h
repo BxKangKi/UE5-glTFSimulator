@@ -477,9 +477,6 @@ public:
     UFUNCTION(BlueprintPure, Category="Game|World")
     UWorldData* GetActiveWorldData() const { return ActiveWorldData; }
 
-    UFUNCTION(BlueprintCallable, Category="World|Time")
-    bool SetWorldTimeSeconds(float InSeconds);
-
     /** Returns true when initial streamed GLB models and the player replacement are ready. */
     UFUNCTION(BlueprintPure, Category="Game|World")
     bool AreWorldSystemsReady() const;

@@ -105,6 +105,10 @@ struct FModelData
     UPROPERTY()
     TMap<FName, FMeshData> MeshData;
 
+    /** Optional prefab name referenced by this model. The corresponding prefab JSON must declare AssetType="prefab". */
+    UPROPERTY()
+    FString Prefab;
+
     TSharedRef<FJsonObject> Serialization() const;
     bool Deserialization(const TSharedPtr<FJsonObject> &Json);
 };

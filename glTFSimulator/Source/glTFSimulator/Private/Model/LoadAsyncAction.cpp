@@ -812,10 +812,7 @@ void ULoadAsyncAction::CalculateSize()
         // only after every parsed node (including skipped nodes) has advanced the loading progress.
         bModelCacheDirty = !CurrentModelHash.IsEmpty();
         const int32 RequestedMeshIndex = CurrentNode.MeshIndex;
-        FglTFRuntimeStaticMeshConfig RequestedConfig = StaticMeshConfig;
-        RequestedConfig.MaterialsConfig.bGeneratesMipMaps = false;
-        RequestedConfig.MaterialsConfig.bLoadMipMaps = false;
-        RequestedConfig.MaterialsConfig.ImagesConfig.bCompressMips = false;
+        const FglTFRuntimeStaticMeshConfig RequestedConfig = StaticMeshConfig;
         TWeakObjectPtr<ULoadAsyncAction> WeakThis(this);
         bStaticMeshLoadInFlight = true;
         const uint64 SubmittedTicket = FglTFRuntimeSafety::EnqueueOperation(

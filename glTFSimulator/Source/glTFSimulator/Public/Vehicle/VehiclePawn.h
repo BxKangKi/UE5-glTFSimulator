@@ -13,7 +13,7 @@ class UBoxComponent;
 class UPhysicalMaterial;
 class UStaticMesh;
 class UglTFRuntimeAsset;
-class USimulatorBuoyancyComponent;
+class UBuoyancyComponent;
 class USpringArmComponent;
 class UCameraComponent;
 class APlayerController;
@@ -123,7 +123,7 @@ private:
     TObjectPtr<UBoxComponent> Body;
 
     UPROPERTY(VisibleAnywhere)
-    TObjectPtr<USimulatorBuoyancyComponent> BuoyancyComponent;
+    TObjectPtr<UBuoyancyComponent> BuoyancyComponent;
 
     UPROPERTY(VisibleAnywhere)
     TObjectPtr<USpringArmComponent> SpringArm;

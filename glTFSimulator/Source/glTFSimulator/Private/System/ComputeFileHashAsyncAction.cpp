@@ -2,7 +2,7 @@
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
 #include "System/ComputeFileHashAsyncAction.h"
-#include "HAL/PlatformFilemanager.h"
+#include "HAL/PlatformFileManager.h"
 #include "Misc/SecureHash.h"
 #include "System/SafeFileIO.h"
 

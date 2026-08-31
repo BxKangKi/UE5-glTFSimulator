@@ -116,7 +116,10 @@ TSharedRef<FJsonObject> FModelData::Serialization() const
     Json->SetStringField(JSON_VERSION_FIELD, JSON_SCHEMA_VERSION);
     // A generic model template is a plain placed entity unless the map author explicitly changes it
     // to Vehicle or Weapon. Existing JSON is never rewritten, so this default cannot override input.
-    Json->SetStringField(TEXT("AssetType"), TEXT("Entity"));
+    if (!Prefab.IsEmpty())
+    {
+        Json->SetStringField(TEXT("prefab"), Prefab);
+    }
 
     // JSON is external, user-authored, and read-only at runtime. Program-owned bounds are stored
     // only in the sibling .scz cache and must never be mixed into this settings document.
@@ -135,6 +138,10 @@ bool FModelData::Deserialization(const TSharedPtr<FJsonObject> &Json)
     Center = FVector::ZeroVector;
     Size = FVector::ZeroVector;
     MeshData.Empty();
+    Prefab.Reset();
+
+    Json->TryGetStringField(TEXT("prefab"), Prefab);
+    Prefab.TrimStartAndEndInline();
 
     // Automates TMap struct deserialization while safely restoring JSON keys as FName values.
     FJsonHelper::TryGetMap<FMeshData>(Json, TEXT("MeshData"), MeshData, [](const TSharedPtr<FJsonObject> &Obj, FMeshData &OutItem)

@@ -40,7 +40,7 @@
 #include "System/glTFRuntimeSafety.h"
 #include "Net/UnrealNetwork.h"
 #include "Vehicle/VehicleSubSystem.h"
-#include "World/SimulatorBuoyancyComponent.h"
+#include "World/BuoyancyComponent.h"
 #include "World/WaterActor.h"
 
 static bool IsVehicleWheelTaggedName(const FString& Name)
@@ -307,7 +307,7 @@ AVehiclePawn::AVehiclePawn()
         }
     }
 
-    BuoyancyComponent = CreateDefaultSubobject<USimulatorBuoyancyComponent>(TEXT("Buoyancy"));
+    BuoyancyComponent = CreateDefaultSubobject<UBuoyancyComponent>(TEXT("Buoyancy"));
 
     bUseControllerRotationPitch = false;
     bUseControllerRotationYaw = false;
@@ -2960,8 +2960,8 @@ void AVehiclePawn::UpdateStableWheelVehicle(float DeltaSeconds)
 
 void AVehiclePawn::ApplyStableVehicleGrounding(float DeltaSeconds)
 {
-    // Intentionally disabled. Snap-grounding injected artificial vertical motion;
-    // runtime driving is handled by UpdateStableWheelVehicle instead.
+    // Intentionally disabled. Snap-grounding can inject artificial vertical motion.
+    // Runtime driving uses UpdateStableWheelVehicle.
     (void)DeltaSeconds;
 }
 

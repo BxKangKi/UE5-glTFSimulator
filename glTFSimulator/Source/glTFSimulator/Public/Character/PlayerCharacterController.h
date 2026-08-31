@@ -21,7 +21,6 @@ class UPauseMenuWidget;
 class USettingsMenuWidget;
 class UGameUpdateSubSystem;
 class UWorld;
-class UChatWidget;
 
 USTRUCT(BlueprintType)
 struct GLTFSIMULATOR_API FPlayerInputMappingContextConfig
@@ -144,9 +143,6 @@ public:
 
     UFUNCTION(BlueprintCallable, Category = "Input|System")
     void Input_PausePressed();
-
-    UFUNCTION(BlueprintCallable, Category="Input|Chat") void Input_ChatPressed();
-    UFUNCTION(BlueprintCallable, Category="Chat") void CloseChat();
 
     /** Restores normal gameplay mouse capture: cursor hidden, camera look enabled. */
     UFUNCTION(BlueprintCallable, Category="Input|Mouse")
@@ -403,9 +399,6 @@ public:
     /** Boolean action for toggling the debug overlay. Assign the InputAction asset directly. */
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Input|Enhanced Input|System")
     TObjectPtr<UInputAction> DebugAction;
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|System") TObjectPtr<UInputAction> ChatAction;
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Chat") TSubclassOf<UChatWidget> ChatWidgetClass;
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Chat") int32 ChatZOrder = 200;
 
     // Assign the debug widget class directly in the editor.
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "UI")
@@ -470,9 +463,6 @@ private:
     void HandleVehicleThrottleCompleted(const FInputActionValue& Value);
     void HandleVehicleSteeringTriggered(const FInputActionValue& Value);
     void HandleVehicleSteeringCompleted(const FInputActionValue& Value);
-    UFUNCTION() void HandleChatSubmitted(const FString& Text);
-    UFUNCTION() void HandleChatCloseRequested();
-    bool ExecuteChatCommand(const FString& Text, FString& OutResponse);
 
     /** Previous subsystem pause state used to detect the exact frame gameplay resumes. */
     bool bPrevGamePaused = false;
@@ -505,8 +495,6 @@ private:
     double LastToggleItemListInputTime = -1.0;
     double LastSnapInputTime = -1.0;
     double LastDebugInputTime = -1.0;
-    double LastChatInputTime = -1.0;
-    UPROPERTY(Transient) TObjectPtr<UChatWidget> ChatWidget;
 
     UPROPERTY()
     TObjectPtr<UGameManagerSubSystem> SubSystem;

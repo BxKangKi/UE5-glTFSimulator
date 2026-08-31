@@ -825,14 +825,14 @@ FglTFRuntimeStaticMeshConfig AglTFStreamActor::BuildStreamingStaticMeshConfig()
             Config.MaterialsConfig);
     }
 
-    Config.MaterialsConfig.bGeneratesMipMaps = false;
+    Config.MaterialsConfig.bGeneratesMipMaps = true;
     Config.MaterialsConfig.SpecularFactor = 0.0f;
     const int32 TextureDimensionLimit = UGameSettings::ResolveMaxTextureResolution(this);
     Config.MaterialsConfig.ImagesConfig.MaxWidth = TextureDimensionLimit;
     Config.MaterialsConfig.ImagesConfig.MaxHeight = TextureDimensionLimit;
-    Config.MaterialsConfig.ImagesConfig.bCompressMips = false;
-    Config.MaterialsConfig.ImagesConfig.bStreaming = false;
-    Config.MaterialsConfig.bLoadMipMaps = false;
+    Config.MaterialsConfig.ImagesConfig.bCompressMips = true;
+    Config.MaterialsConfig.ImagesConfig.bStreaming = true;
+    Config.MaterialsConfig.bLoadMipMaps = true;
     // UStreamAsyncAction supplies a transient world-aware outer whose lifetime covers the native
     // request without retaining the actor or world during teardown.
     Config.Outer = nullptr;

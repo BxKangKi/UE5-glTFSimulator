@@ -137,7 +137,8 @@ namespace
         Auto,
         Entity,
         Vehicle,
-        Weapon
+        Weapon,
+        Prefab
     };
 
     EAuthoredAssetType ReadAuthoredAssetType(const FString& ModelPath, bool& bOutExplicit)
@@ -179,10 +180,13 @@ namespace
         Canonical.ReplaceInline(TEXT(" "), TEXT(""));
         Canonical.ReplaceInline(TEXT("_"), TEXT(""));
         Canonical.ReplaceInline(TEXT("-"), TEXT(""));
-        if (Canonical.Equals(TEXT("Entity"), ESearchCase::IgnoreCase) ||
-            Canonical.Equals(TEXT("Prefab"), ESearchCase::IgnoreCase))
+        if (Canonical.Equals(TEXT("Entity"), ESearchCase::IgnoreCase))
         {
             return EAuthoredAssetType::Entity;
+        }
+        if (Canonical.Equals(TEXT("Prefab"), ESearchCase::IgnoreCase))
+        {
+            return EAuthoredAssetType::Prefab;
         }
         if (Canonical.Equals(TEXT("Vehicle"), ESearchCase::IgnoreCase) ||
             Canonical.Equals(TEXT("Car"), ESearchCase::IgnoreCase))
@@ -2312,17 +2316,6 @@ void UGameManagerSubSystem::LoadWorldAsync()
     }
 }
 
-bool UGameManagerSubSystem::SetWorldTimeSeconds(float InSeconds)
-{
-    if (!IsValid(ActiveWorldData) || !FMath::IsFinite(InSeconds)) return false;
-    const float DayLength = FMath::Max(1.0f, ActiveWorldData->OneDayTime);
-    ActiveWorldData->WorldTime = FMath::Fmod(InSeconds, DayLength);
-    if (ActiveWorldData->WorldTime < 0.0f) ActiveWorldData->WorldTime += DayLength;
-    SaveWorldData();
-    NotifyStateChanged();
-    return true;
-}
-
 void UGameManagerSubSystem::UpdateWorldTime(float DeltaSeconds)
 {
     if (!IsValid(ActiveWorldData))
@@ -2568,7 +2561,7 @@ FString UGameManagerSubSystem::GetWorldRootPath() const
 
 FString UGameManagerSubSystem::GetPrefabDirectory() const
 {
-    return FPaths::Combine(GetWorldRootPath(), TEXT("prefab"));
+    return FPaths::Combine(GetWorldRootPath(), TEXT("model"), TEXT("prefab"));
 }
 
 FString UGameManagerSubSystem::GetItemsDirectory() const
@@ -2829,8 +2822,6 @@ void UGameManagerSubSystem::ScanAssetFolders()
 
     TArray<FString> PrefabDirectories;
     PrefabDirectories.Add(GetPrefabDirectory());
-    PrefabDirectories.Add(FPaths::Combine(FPaths::ProjectDir(), TEXT("World"), TEXT("prefab")));
-    PrefabDirectories.Add(FPaths::Combine(FPaths::ProjectDir(), TEXT("World"), WorldName, TEXT("prefab")));
 
     TArray<FString> ItemDirectories;
     ItemDirectories.Add(GetItemsDirectory());
@@ -2884,17 +2875,24 @@ void UGameManagerSubSystem::ScanAssetFolders()
         case EAuthoredAssetType::Weapon:
             WeaponFiles.AddUnique(ModelPath);
             break;
+        case EAuthoredAssetType::Prefab:
+            PrefabFiles.AddUnique(ModelPath);
+            break;
         case EAuthoredAssetType::Entity:
         case EAuthoredAssetType::Auto:
         default:
-            PrefabFiles.AddUnique(ModelPath);
             break;
         }
     };
 
     for (const FString& ModelPath : PrefabCandidates)
     {
-        ClassifyAsset(ModelPath, false);
+        bool bExplicitType = false;
+        const EAuthoredAssetType AssetType = ReadAuthoredAssetType(ModelPath, bExplicitType);
+        if (bExplicitType && AssetType == EAuthoredAssetType::Prefab)
+        {
+            PrefabFiles.AddUnique(ModelPath);
+        }
     }
     for (const FString& ModelPath : ItemCandidates)
     {

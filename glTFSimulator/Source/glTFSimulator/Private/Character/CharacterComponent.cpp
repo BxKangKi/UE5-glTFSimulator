@@ -4,7 +4,7 @@
 #include "Character/CharacterComponent.h"
 #include "Character/CharacterController.h"
 #include "Character/CharacterFunctionLibrary.h"
-#include "Animation/CharacterAnimInstance.h"
+#include "Character/CharacterAnimInstance.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "System/ActorHelper.h"
 #include "System/MacroLibrary.h"
