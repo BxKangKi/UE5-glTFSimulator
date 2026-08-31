@@ -34,6 +34,10 @@
 		{
 			"Name": "ProceduralMeshComponent",
 			"Enabled": true
+		},
+		{
+			"Name": "ChaosCloth",
+			"Enabled": false
 		}
 	]
 }
