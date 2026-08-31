@@ -1,0 +1,237 @@
+// Copyright 2026 BxKangKi. MIT
+#ifndef SHADERLIBRARY_POSTPROCESS_USH
+#define SHADERLIBRARY_POSTPROCESS_USH
+
+// UE 5.8 Post Process / Custom Node shader library.
+//
+// Important coordinate rule:
+//   Custom Node receives viewport UV (0..1).
+//   Every SceneTextureLookup in this file converts that viewport UV with
+//   ViewportUVToSceneTextureUV() first. This keeps sampling correct when the
+//   scene texture buffer is larger than the viewport (editor, TSR, dynamic
+//   resolution, split-screen, VR, etc.).
+//
+// This file intentionally keeps the public functions small. Scene textures are
+// sampled directly here; the caller does not need to pass texture values.
+// The material using this Custom node must reference at least one SceneTexture
+// expression so UE emits the SceneTexture lookup helpers.
+
+// ------------------------------------------------------------
+// Scene texture indices (UE 5.8 ESceneTextureId)
+// ------------------------------------------------------------
+#define SL_PPI_SCENE_DEPTH        1
+#define SL_PPI_WORLD_NORMAL       8
+#define SL_PPI_CUSTOM_DEPTH      13
+#define SL_PPI_POSTPROCESS_INPUT0 14
+#define SL_PPI_CUSTOM_STENCIL    25
+
+float2 SL_SceneUV(float2 ViewportUV, int SceneTextureId)
+{
+    return ClampSceneTextureUV(
+        ViewportUVToSceneTextureUV(DERIV_BASE_VALUE(saturate(ViewportUV)), SceneTextureId),
+        SceneTextureId);
+}
+
+float4 SL_SceneSample(float2 ViewportUV, int SceneTextureId, bool Filtered)
+{
+    float2 UV = SL_SceneUV(ViewportUV, SceneTextureId);
+    return SceneTextureLookup(UV, SceneTextureId, Filtered);
+}
+
+float SL_Luminance(float3 C)
+{
+    return dot(max(C, 0.0), float3(0.2126, 0.7152, 0.0722));
+}
+
+float3 SL_QuantizeHDR(float3 Color, float Steps)
+{
+    const float MAX_LOG_LUMA = 3.0;
+    Steps = max(Steps, 1.0);
+
+    float3 C = max(Color, 0.0);
+    float L = SL_Luminance(C);
+    float LogL = log2(1.0 + L);
+    float T = saturate(LogL / MAX_LOG_LUMA);
+    float QT = round(T * Steps) / Steps;
+    float TargetLogL = QT * MAX_LOG_LUMA;
+    float TargetL = exp2(TargetLogL) - 1.0;
+    float Scale = TargetL / max(L, 1.0e-5);
+    return max(C * Scale, 0.0);
+}
+
+// ------------------------------------------------------------
+// Cel shading
+//
+// Scene color is sampled here from the current viewport UV, so the material
+// graph only needs to supply UV. This also fixes the classic editor viewport
+// scaling mismatch from using raw ViewportUV in SceneTextureLookup.
+// ------------------------------------------------------------
+float3 CelShading_Toon_Default(float3 SceneColor, float2 UV)
+{
+    // Re-sample the authoritative post-process input from the correctly
+    // converted UV. SceneColor is kept as an argument for backward
+    // compatibility with the existing material function signature.
+    float3 Scene = SL_SceneSample(UV, SL_PPI_POSTPROCESS_INPUT0, false).rgb;
+
+    float3 Q = SL_QuantizeHDR(Scene, 4.0);
+    return Q;
+}
+
+// ------------------------------------------------------------
+// Weather constants. Kept in shader code intentionally.
+// WeatherMode: 0 = rain, 1 = snow; values in between blend both.
+// Precipitation: 0 = clear, 1 = maximum precipitation.
+// ------------------------------------------------------------
+static const float SL_ROOF_STENCIL = 240.0 / 255.0;
+static const float SL_ROOF_STENCIL_EPS = 1.25 / 255.0;
+
+static const float SL_WET_DARKEN = 0.11;
+static const float SL_WET_SHEEN = 0.08;
+static const float SL_RAIN_DENSITY = 230.0;
+static const float SL_RAIN_SPEED = 2.4;
+static const float SL_RAIN_LENGTH = 0.62;
+static const float SL_RAIN_BRIGHTNESS = 0.19;
+static const float SL_SNOW_DENSITY_A = 78.0;
+static const float SL_SNOW_DENSITY_B = 132.0;
+static const float SL_SNOW_SIZE = 0.85;
+static const float SL_SNOW_BRIGHTNESS = 0.26;
+static const float3 SL_SNOW_COLOR = float3(0.92, 0.96, 1.0);
+
+float SL_Hash12(float2 P)
+{
+    return frac(sin(dot(P, float2(127.1, 311.7))) * 43758.5453123);
+}
+
+float2 SL_Hash22(float2 P)
+{
+    return float2(
+        SL_Hash12(P + float2(17.0, 59.0)),
+        SL_Hash12(P + float2(113.0, 271.0)));
+}
+
+float SL_IsRoofStencil(float S)
+{
+    return 1.0 - step(SL_ROOF_STENCIL_EPS, abs(S - SL_ROOF_STENCIL));
+}
+
+float SL_RoofMask(float2 ViewportUV)
+{
+    // Offsets are specified in viewport-pixel units. The converted scene UV
+    // handles the actual SceneTexture placement/scale. View.ViewSizeAndInvSize
+    // is the viewport pixel reciprocal and remains valid under dynamic res.
+    float2 VPInvSize = View.ViewSizeAndInvSize.zw;
+
+    float2 O1 = float2(0.0, -4.0) * VPInvSize;
+    float2 O2 = float2(0.0, -10.0) * VPInvSize;
+    float2 O3 = float2(0.0, -18.0) * VPInvSize;
+    float2 O4 = float2(0.0, -30.0) * VPInvSize;
+    float2 O5 = float2(0.0, -48.0) * VPInvSize;
+
+    float S0 = SL_SceneSample(ViewportUV, SL_PPI_CUSTOM_STENCIL, false).r;
+    float S1 = SL_SceneSample(ViewportUV + O1, SL_PPI_CUSTOM_STENCIL, false).r;
+    float S2 = SL_SceneSample(ViewportUV + O2, SL_PPI_CUSTOM_STENCIL, false).r;
+    float S3 = SL_SceneSample(ViewportUV + O3, SL_PPI_CUSTOM_STENCIL, false).r;
+    float S4 = SL_SceneSample(ViewportUV + O4, SL_PPI_CUSTOM_STENCIL, false).r;
+    float S5 = SL_SceneSample(ViewportUV + O5, SL_PPI_CUSTOM_STENCIL, false).r;
+
+    return max(
+        max(max(SL_IsRoofStencil(S0), SL_IsRoofStencil(S1)), SL_IsRoofStencil(S2)),
+        max(max(SL_IsRoofStencil(S3), SL_IsRoofStencil(S4)), SL_IsRoofStencil(S5)));
+}
+
+float SL_SurfaceNoise(float2 UV, float Time)
+{
+    float2 P = floor(UV * 220.0 + float2(Time * 0.07, -Time * 0.045));
+    return 0.78 + 0.22 * SL_Hash12(P);
+}
+
+float3 SL_RainOverlay(float2 UV, float Time, float Amount)
+{
+    float2 P = UV * float2(SL_RAIN_DENSITY, SL_RAIN_DENSITY * 0.56);
+    P += float2(Time * 0.045, Time * SL_RAIN_SPEED * 0.33);
+
+    float2 Cell = floor(P);
+    float2 F = frac(P);
+    float2 J = SL_Hash22(Cell);
+
+    float LineX = J.x * 0.90 + 0.05;
+    float LocalX = LineX + (F.y - 0.5) * 0.09;
+    float Line = 1.0 - smoothstep(0.008, 0.032, abs(F.x - LocalX));
+
+    float Start = 0.06 + J.y * 0.24;
+    float End = Start + 0.18 + 0.48 * SL_RAIN_LENGTH;
+    float Segment = step(Start, F.y) * (1.0 - smoothstep(End, End + 0.08, F.y));
+    float Spawn = step(0.52, SL_Hash12(Cell + 19.0));
+
+    float M = Line * Segment * Spawn * Amount;
+    return float3(0.74, 0.84, 0.98) * (M * SL_RAIN_BRIGHTNESS);
+}
+
+float3 SL_SnowOverlay(float2 UV, float Time, float Amount)
+{
+    float2 P1 = UV * float2(SL_SNOW_DENSITY_A, SL_SNOW_DENSITY_A * 0.58);
+    P1 += float2(Time * 0.018, Time * 0.075);
+    float2 C1 = floor(P1);
+    float2 F1 = frac(P1);
+    float2 J1 = SL_Hash22(C1);
+    float D1 = length(F1 - J1);
+    float M1 = 1.0 - smoothstep(0.03 * SL_SNOW_SIZE, 0.0, D1);
+
+    float2 P2 = UV * float2(SL_SNOW_DENSITY_B, SL_SNOW_DENSITY_B * 0.70);
+    P2 += float2(-Time * 0.012, Time * 0.115);
+    float2 C2 = floor(P2);
+    float2 F2 = frac(P2);
+    float2 J2 = SL_Hash22(C2);
+    float D2 = length(F2 - J2);
+    float M2 = 1.0 - smoothstep(0.023 * SL_SNOW_SIZE, 0.0, D2);
+
+    float M = max(M1, 0.65 * M2) * Amount * SL_SNOW_BRIGHTNESS;
+    return float3(0.92, 0.97, 1.0) * M;
+}
+
+// ------------------------------------------------------------
+// Single weather entry point.
+// ------------------------------------------------------------
+float3 RS_WeatherPostProcess(float2 UV, float WeatherMode, float Precipitation)
+{
+    float2 P = saturate(UV);
+    float Precip = saturate(Precipitation);
+    if (Precip <= 1.0e-4)
+    {
+        return SL_SceneSample(P, SL_PPI_POSTPROCESS_INPUT0, false).rgb;
+    }
+
+    float Mode = saturate(WeatherMode);
+    float RainWeight = (1.0 - Mode) * Precip;
+    float SnowWeight = Mode * Precip;
+
+    float3 Out = SL_SceneSample(P, SL_PPI_POSTPROCESS_INPUT0, false).rgb;
+    float3 N = normalize(SL_SceneSample(P, SL_PPI_WORLD_NORMAL, false).rgb);
+
+    float Roof = SL_RoofMask(P);
+    float OpenSky = 1.0 - Roof;
+
+    float Up = saturate(N.z);
+    float GroundMask = smoothstep(0.18, 0.90, Up) * OpenSky;
+    float SnowSlope = smoothstep(0.46, 0.96, Up);
+
+    // Wet road / ground appearance.
+    float Wet = GroundMask * RainWeight;
+    Out *= 1.0 - Wet * SL_WET_DARKEN;
+    Out += pow(saturate(0.5 + 0.5 * N.z), 12.0) * Wet * SL_WET_SHEEN;
+
+    // Stateless snow cover. It appears immediately while snowing and is
+    // modulated strongly toward horizontal/upward-facing surfaces.
+    float SnowCover = GroundMask * SnowSlope * SnowWeight;
+    float Noise = SL_SurfaceNoise(P, View.GameTime);
+    SnowCover = saturate(SnowCover * Noise);
+    Out = lerp(Out, SL_SNOW_COLOR, SnowCover * 0.88);
+
+    // Atmospheric overlays are attenuated under the roof.
+    Out += SL_RainOverlay(P, View.GameTime, RainWeight * OpenSky);
+    Out += SL_SnowOverlay(P, View.GameTime, SnowWeight * OpenSky);
+
+    return Out;
+}
+
+#endif // SHADERLIBRARY_POSTPROCESS_USH

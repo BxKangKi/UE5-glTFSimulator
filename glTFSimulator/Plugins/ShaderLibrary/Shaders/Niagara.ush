@@ -1,3 +1,6 @@
+#ifndef NIAGARA_USH
+#define NIAGARA_USH
+
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 // Niagara.ush
 #pragma once
@@ -38,3 +41,4 @@ bool DepthCheck(float4 SAMPLE_DEPTH, float PARTICLE_DEPTH)
         return false;
     }
 }
+#endif
