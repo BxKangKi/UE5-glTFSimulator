@@ -3,6 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Containers/Ticker.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "TimerManager.h"
 #include "WeatherSubsystem.generated.h"
@@ -59,6 +60,7 @@ private:
     TWeakObjectPtr<AActor> ActiveWeatherActor;
 
     FTimerHandle WeatherTickHandle;
+    FTSTicker::FDelegateHandle CameraFollowTickerHandle;
     FString CurrentPreset = TEXT("clear");
     float CurrentIntensity = 1.0f;
     int32 RemainingWeatherTicks = 0;
@@ -69,6 +71,9 @@ private:
     void WeatherTick();
     void ChooseNextAutomaticWeather();
     void ApplyEffectActorState();
+    void StartCameraFollowTicker();
+    void StopCameraFollowTicker();
+    bool TickWeatherActorFollow(float DeltaTime);
     void DestroyEffectActor();
     int32 ResolveRandomDurationTicks() const;
     float GetTickIntervalSeconds() const;

@@ -3,6 +3,7 @@
 #include "Weather/WeatherSubsystem.h"
 
 #include "Components/SceneComponent.h"
+#include "Containers/Ticker.h"
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
@@ -250,6 +251,8 @@ void UWeatherSubsystem::ApplyEffectActorState()
         Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
         Params.ObjectFlags |= RF_Transient;
         EffectActor = World->SpawnActor<AActor>(WeatherActorClass, FTransform::Identity, Params);
+        // for fix the capture direction.
+        EffectActor->SetActorRotation(FRotator(90.0f, 0.0f, 0.0f));
         ActiveWeatherActor = EffectActor;
     }
 
@@ -259,11 +262,17 @@ void UWeatherSubsystem::ApplyEffectActorState()
     }
 
     USceneComponent* Camera = WeatherCamera.Get();
+
+    // Weather effects must remain independent world actors.  Attaching the effect to the
+    // character/camera makes it a child in the world hierarchy and can also inherit an
+    // unwanted camera rotation/scale.  Keep it detached and copy only the camera's world
+    // position instead.  The per-frame ticker below continues to follow camera movement.
+    EffectActor->DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
     if (IsValid(Camera))
     {
-        EffectActor->AttachToComponent(Camera, FAttachmentTransformRules::SnapToTargetNotIncludingScale);
-        EffectActor->SetActorRelativeLocation(FVector::ZeroVector);
+        EffectActor->SetActorLocation(Camera->GetComponentLocation(), false, nullptr, ETeleportType::TeleportPhysics);
     }
+    StartCameraFollowTicker();
 
     if (EffectActor->GetClass()->ImplementsInterface(UWeatherEffectInterface::StaticClass()))
     {
@@ -277,8 +286,61 @@ void UWeatherSubsystem::ApplyEffectActorState()
     EffectActor->SetActorTickEnabled(true);
 }
 
+void UWeatherSubsystem::StartCameraFollowTicker()
+{
+    check(IsInGameThread());
+
+    if (CameraFollowTickerHandle.IsValid())
+    {
+        return;
+    }
+
+    CameraFollowTickerHandle = FTSTicker::GetCoreTicker().AddTicker(
+        FTickerDelegate::CreateUObject(this, &UWeatherSubsystem::TickWeatherActorFollow));
+}
+
+void UWeatherSubsystem::StopCameraFollowTicker()
+{
+    check(IsInGameThread());
+
+    if (!CameraFollowTickerHandle.IsValid())
+    {
+        return;
+    }
+
+    FTSTicker::GetCoreTicker().RemoveTicker(CameraFollowTickerHandle);
+    CameraFollowTickerHandle.Reset();
+}
+
+bool UWeatherSubsystem::TickWeatherActorFollow(float DeltaTime)
+{
+    (void)DeltaTime;
+
+    // FTSTicker is driven on the game thread.  Weak references guarantee that a camera or
+    // weather actor destroyed during level travel is never dereferenced after destruction.
+    AActor* EffectActor = ActiveWeatherActor.Get();
+    USceneComponent* Camera = WeatherCamera.Get();
+    if (!IsValid(EffectActor))
+    {
+        ActiveWeatherActor.Reset();
+        CameraFollowTickerHandle.Reset();
+        return false;
+    }
+
+    if (IsValid(Camera))
+    {
+        // Intentionally follow position only.  Rain/snow stays aligned to world space instead
+        // of pitching/rolling with the player's view.  The actor remains at the world root.
+        EffectActor->SetActorLocation(Camera->GetComponentLocation(), false, nullptr, ETeleportType::TeleportPhysics);
+    }
+
+    return true;
+}
+
 void UWeatherSubsystem::DestroyEffectActor()
 {
+    StopCameraFollowTicker();
+
     AActor* EffectActor = ActiveWeatherActor.Get();
     if (!IsValid(EffectActor))
     {

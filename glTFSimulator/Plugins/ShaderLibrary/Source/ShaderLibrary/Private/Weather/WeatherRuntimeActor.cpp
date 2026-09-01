@@ -48,10 +48,11 @@ AWeatherRuntimeActor::AWeatherRuntimeActor()
     SceneCapture->bUpdateOrthoPlanes = true;
     SceneCapture->CustomNearClippingPlane = 50.0f;
     SceneCapture->MaxViewDistanceOverride = CaptureMaxViewDistance;
-    SceneCapture->SetRelativeRotation(FRotator(-90.0f, 0.0f, 0.0f));
+    SceneCapture->SetRelativeRotation(FRotator(90.0f, 0.0f, 0.0f));
 
     Niagara = CreateDefaultSubobject<UNiagaraComponent>(TEXT("RainNiagara"));
     Niagara->SetupAttachment(SceneCapture);
+    Niagara->SetRelativeRotation(FRotator(-90.0f, 0.0f, 0.0f));
 
     PostProcess = CreateDefaultSubobject<UPostProcessComponent>(TEXT("WeatherPostProcess"));
     PostProcess->SetupAttachment(SceneCapture);
@@ -63,24 +64,6 @@ AWeatherRuntimeActor::AWeatherRuntimeActor()
 void AWeatherRuntimeActor::BeginPlay()
 {
     Super::BeginPlay();
-
-    if (UTextureRenderTarget2D* RTWeather = LoadObject<UTextureRenderTarget2D>(nullptr, TEXT("/ShaderLibrary/Niagara/Rain/RT_Rain.RT_Rain")))
-    {
-        SceneCapture->TextureTarget = RTWeather;
-    }
-    if (UNiagaraSystem* RainSystem = LoadObject<UNiagaraSystem>(nullptr, TEXT("/ShaderLibrary/Niagara/Rain/NG_Rain.NG_Rain")))
-    {
-        Niagara->SetAsset(RainSystem);
-    }
-    if (UMaterialInterface* WeatherMaterial = LoadObject<UMaterialInterface>(nullptr, TEXT("/ShaderLibrary/PostProcess/PP_Weather.PP_Weather")))
-    {
-        WeatherPostProcessMID = UMaterialInstanceDynamic::Create(WeatherMaterial, this);
-        if (IsValid(WeatherPostProcessMID))
-        {
-            PostProcess->AddOrUpdateBlendable(WeatherPostProcessMID, 1.0f);
-        }
-    }
-
     SceneCapture->OrthoWidth = CaptureOrthoWidth;
     SceneCapture->MaxViewDistanceOverride = CaptureMaxViewDistance;
     UpdateRainCaptureParameters();
