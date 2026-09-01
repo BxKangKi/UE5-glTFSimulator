@@ -54,6 +54,12 @@ class GLTFSIMULATOR_API APlayerCharacterController : public APlayerController
 public:
     APlayerCharacterController();
 
+    /** Console frontend for weather/time/tp. Parsing/execution lives in SimulatorCommandSubsystem. */
+    virtual bool ProcessConsoleExec(const TCHAR* Cmd, FOutputDevice& Ar, UObject* Executor) override;
+
+    UFUNCTION(Server, Reliable)
+    void ServerExecuteSimulatorCommand(const FString& CommandLine);
+
     /** 2D axis. X = right/left, Y = forward/back. Also drives the vehicle when possessed. */
     UFUNCTION(BlueprintCallable, Category="Input|Character")
     void Input_Move(const FVector2D& MoveValue);

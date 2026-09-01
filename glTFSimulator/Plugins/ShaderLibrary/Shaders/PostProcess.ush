@@ -54,7 +54,7 @@ float3 SL_QuantizeHDR(float3 Color, float Steps)
 // graph only needs to supply UV. This also fixes the classic editor viewport
 // scaling mismatch from using raw ViewportUV in SceneTextureLookup.
 // ------------------------------------------------------------
-float3 CelShading_Toon_Default(float3 SceneColor, float2 UV, float2 TexSize)
+float3 CelShading_Toon_Default(float3 SceneColor, float2 UV)
 {
     // Re-sample the authoritative post-process input from the correctly
     // converted UV. SceneColor is kept as an argument for backward

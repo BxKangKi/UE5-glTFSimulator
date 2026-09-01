@@ -176,7 +176,7 @@ public:
     void SetPlayerActor(AActor* Actor);
     /** Reasserts a saved initial view rotation after GameMode finishes possessing the first player. */
     void ApplyPendingInitialPlayerControlRotation(APlayerController* Controller);
-    void SetCameraComponent(USceneComponent* InCamera) { CurrentCamera = InCamera; }
+    void SetCameraComponent(USceneComponent* InCamera);
     void SetGameSettings(UGameSettings* Settings) { GameSettings = Settings; }
     void SetWorldData(UWorldData* Data) { CurrentWorldData = Data; }
     UFUNCTION(BlueprintCallable, Category="Game|World")
@@ -192,6 +192,11 @@ public:
     FVector GetCameraLocation() const { return IsValid(CurrentCamera) ? CurrentCamera->GetComponentLocation() : FVector::ZeroVector; }
     bool GetGamePaused() const { return bIsGamePaused; }
     UWorldData* GetWorldData() const { return CurrentWorldData; }
+
+    /** Authority-side command helpers shared by console and the future chat command path. */
+    bool SetWorldTimeSeconds(double Seconds);
+    bool AddWorldTimeSeconds(double DeltaSeconds);
+    bool SetWorldDay(double DayNumber);
     UFUNCTION(BlueprintPure, Category="Game|Player")
     UPlayerData* GetPlayerData() const { return ActivePlayerData; }
     UFUNCTION(BlueprintPure, Category="Game|Weapon")
@@ -602,6 +607,9 @@ private:
     TSubclassOf<AActor> WaterClass;
 
     UPROPERTY(Transient)
+    TSubclassOf<AActor> RainWeatherActorClass;
+
+    UPROPERTY(Transient)
     FTransform OceanTransform;
 
     UPROPERTY(Transient)
@@ -818,7 +826,6 @@ private:
     bool ShouldSpawnOcean() const;
     void SpawnOcean();
     void MainWorldStreaming(const FString& InModelDirectory, const FString& InPlayerDirectory, const FString& InInitialPlayerName);
-    void StartWorldStreaming(const FString& InModelDirectory, const FString& InPlayerDirectory, const FString& InInitialPlayerName);
     void InitializeWorldBootstrap();
     void SpawnWorldEnvManager();
     bool CheckWorldSystemsLoaded();

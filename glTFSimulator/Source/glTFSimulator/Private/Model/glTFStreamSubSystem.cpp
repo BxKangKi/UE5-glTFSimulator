@@ -18,7 +18,7 @@
 #include "System/BinaryDataStore.h"
 #include "System/FileFunctionLibrary.h"
 #include "System/GameManagerSubSystem.h"
-#include "Weather/WeatherRuntimeSubsystem.h"
+#include "Weather/WeatherSubsystem.h"
 #include "System/GlbValidation.h"
 #include "System/MacroLibrary.h"
 #include "System/SafeFileIO.h"
@@ -31,7 +31,6 @@ namespace
     constexpr double PLAYER_ACTOR_WAIT_TIMEOUT_SECONDS = 30.0;
     constexpr double PLAYER_LOAD_TIMEOUT_SECONDS = 120.0;
     constexpr double MODEL_LOAD_TIMEOUT_SECONDS = 180.0;
-    constexpr int32 MAX_CONCURRENT_INITIAL_MODEL_LOADS = 1;
 
     /** Pure-data result produced off the game thread for one initial model path. */
     struct FInitialModelPreflightResult
@@ -239,8 +238,10 @@ void UglTFStreamSubSystem::StartMainWorldStreaming(AActor* InOwnerActor, TSubcla
         *InitialPlayerName,
         bRenderOnlyStreaming ? TEXT("true") : TEXT("false")));
 
-    // Initial GLB validation/metadata parsing and metadata-less bounds calculation run one model
-    // at a time. This keeps parser, LOD, texture, and collision peaks from overlapping at map entry.
+    // Queue every model preflight immediately. Worker-pool scheduling naturally limits actual CPU
+    // concurrency, while each completed preflight creates its stream actor on the game thread. The
+    // glTFRuntime safety coordinator remains the final native-operation barrier, so actors can all
+    // enter their loading lifecycle without racing parser/cache teardown or UObject mutation.
     ScheduleProcessNextPath();
 }
 
@@ -512,11 +513,11 @@ void UglTFStreamSubSystem::ProcessNextPathAsync()
         return;
     }
 
-    // Keep one GLB in the combined preflight/bounds-calculation pipeline. A path whose
-    // metadata already proves it is outside the streaming range releases its slot immediately;
-    // an in-range path retains the slot until its stream actor finishes loading.
-    while (CurrentPathIndex < GlbFilePaths.Num() &&
-        ActiveInitialPreflightCount + ActiveInitialActorScans.Num() < MAX_CONCURRENT_INITIAL_MODEL_LOADS)
+    // Start every discovered path in this pass instead of waiting for the previous model actor to
+    // finish. Preflight is pure data on the worker pool; UObject/actor creation happens only in the
+    // game-thread completion. Heavy glTFRuntime native mesh work is still coordinated separately by
+    // FglTFRuntimeSafety, which is intentionally conservative to prioritize reference safety.
+    while (CurrentPathIndex < GlbFilePaths.Num())
     {
         const FString GlbPath = GlbFilePaths[CurrentPathIndex++];
         if (CompletedInitialPaths.Contains(GlbPath))
@@ -1276,7 +1277,7 @@ void UglTFStreamSubSystem::CompletePlayerStreamingWithExistingCharacter(const FS
             GameSystem->SetPlayerActor(ExistingCharacter);
             USceneComponent* FollowCamera = ExistingCharacter->GetFollowCameraComponent();
             GameSystem->SetCameraComponent(FollowCamera);
-            if (UWeatherRuntimeSubsystem* Weather = GetGameInstance()->GetSubsystem<UWeatherRuntimeSubsystem>())
+            if (UWeatherSubsystem* Weather = GetGameInstance()->GetSubsystem<UWeatherSubsystem>())
             {
                 Weather->SetWeatherCamera(FollowCamera);
             }
@@ -1711,7 +1712,7 @@ void UglTFStreamSubSystem::FinalizeInitialPathScanIfReady()
         SetInitialPathProgress(GlbPath, 1.0f);
     }
     WriteLogAsync(FString::Printf(
-        TEXT("Initial GLB scan completed with serialized runtime loading. Paths=%d"),
+        TEXT("Initial GLB scan completed with parallel actor bootstrap and guarded native loading. Paths=%d"),
         GlbFilePaths.Num()));
     BeginInitialPlayerStreamingIfNeeded();
     ScheduleUpdateStreaming();

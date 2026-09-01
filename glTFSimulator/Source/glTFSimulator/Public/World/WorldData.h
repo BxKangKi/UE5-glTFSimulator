@@ -60,6 +60,30 @@ struct GLTFSIMULATOR_API FLevelWeatherSettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level|Weather")
     float Intensity = 1.0f;
 
+    /** Real seconds per simulation weather tick. This is the Minecraft-style discrete weather clock. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level|Weather", meta=(ClampMin="0.05", Units="s"))
+    float TickIntervalSeconds = 1.0f;
+
+    /** Automatically choose clear/rain/snow again when the current weather duration expires. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level|Weather")
+    bool bAutoCycle = true;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level|Weather", meta=(ClampMin="1"))
+    int32 MinDurationTicks = 300;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level|Weather", meta=(ClampMin="1"))
+    int32 MaxDurationTicks = 1200;
+
+    /** Relative weights used only when bAutoCycle is true. They do not need to sum to 1. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level|Weather", meta=(ClampMin="0.0"))
+    float ClearWeight = 0.55f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level|Weather", meta=(ClampMin="0.0"))
+    float RainWeight = 0.35f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level|Weather", meta=(ClampMin="0.0"))
+    float SnowWeight = 0.10f;
+
     TSharedRef<FJsonObject> ToJson() const;
     bool FromJson(const TSharedPtr<FJsonObject>& Json);
 };

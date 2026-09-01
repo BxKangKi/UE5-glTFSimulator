@@ -80,6 +80,14 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|World")
     TSubclassOf<AActor> WaterClass;
 
+    /**
+     * Weather effect Blueprint class (normally BP_Rain). The runtime subsystem spawns it only for
+     * rain/snow, attaches it to the active player camera, and destroys it for clear/disabled weather.
+     * Implement WeatherEffectInterface on BP_Rain for optional preset/intensity callbacks.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|Weather", meta=(DisplayName="BP Rain Actor Class"))
+    TSubclassOf<AActor> RainWeatherActorClass;
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Game|World")
     FTransform OceanTransform;
 

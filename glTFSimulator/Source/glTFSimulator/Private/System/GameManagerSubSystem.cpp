@@ -39,7 +39,7 @@
 #include "System/FileFunctionLibrary.h"
 #include "System/GlbValidation.h"
 #include "Camera/CameraComponent.h"
-#include "Weather/WeatherRuntimeSubsystem.h"
+#include "Weather/WeatherSubsystem.h"
 #include "Blueprint/UserWidget.h"
 #include "Components/PrimitiveComponent.h"
 #include "Components/SceneComponent.h"
@@ -614,6 +614,23 @@ void UGameManagerSubSystem::SetWorldLoading(bool bLoading)
     }
 }
 
+void UGameManagerSubSystem::SetCameraComponent(USceneComponent* InCamera)
+{
+    if (!ensureMsgf(IsInGameThread(), TEXT("UGameManagerSubSystem::SetCameraComponent must run on the game thread")))
+    {
+        return;
+    }
+
+    CurrentCamera = InCamera;
+    if (UGameInstance* GameInstance = GetGameInstance())
+    {
+        if (UWeatherSubsystem* Weather = GameInstance->GetSubsystem<UWeatherSubsystem>())
+        {
+            Weather->SetWeatherCamera(InCamera);
+        }
+    }
+}
+
 void UGameManagerSubSystem::SetPlayerActor(AActor* Actor)
 {
     UWorld* World = GetWorld();
@@ -883,6 +900,7 @@ void UGameManagerSubSystem::ApplyEditorConfig(const AGameManagerActor* InConfigA
 
     SpawnActorClass = InConfigActor->SpawnActorClass;
     WaterClass = InConfigActor->WaterClass;
+    RainWeatherActorClass = InConfigActor->RainWeatherActorClass;
     OceanTransform = InConfigActor->OceanTransform;
     LoadingWidgetClass = InConfigActor->LoadingWidgetClass;
     PlacementTraceDistance = InConfigActor->PlacementTraceDistance;
@@ -2157,16 +2175,11 @@ void UGameManagerSubSystem::ApplyLevelSettings()
 
     if (UGameInstance* GameInstance = GetGameInstance())
     {
-        if (UWeatherRuntimeSubsystem* Weather = GameInstance->GetSubsystem<UWeatherRuntimeSubsystem>())
+        if (UWeatherSubsystem* Weather = GameInstance->GetSubsystem<UWeatherSubsystem>())
         {
-            if (IsValid(CurrentCamera.Get()))
-            {
-                Weather->SetWeatherCamera(CurrentCamera.Get());
-            }
-            Weather->ApplyWeather(
-                ActiveWorldData->Weather.Preset,
-                ActiveWorldData->Weather.Intensity,
-                ActiveWorldData->Weather.bEnabled);
+            Weather->ConfigureWeatherActorClass(RainWeatherActorClass);
+            Weather->SetWeatherCamera(CurrentCamera.Get());
+            Weather->ConfigureFromWorldData(ActiveWorldData);
         }
     }
 }
@@ -2290,6 +2303,46 @@ void UGameManagerSubSystem::LoadWorldAsync()
     }
 }
 
+bool UGameManagerSubSystem::SetWorldTimeSeconds(const double Seconds)
+{
+    if (!IsInGameThread() || !IsValid(ActiveWorldData) || !FMath::IsFinite(Seconds))
+    {
+        return false;
+    }
+    if (const UWorld* World = GetWorld(); World && World->GetNetMode() == NM_Client)
+    {
+        return false;
+    }
+
+    // Keep astronomical/sky calculations in a numerically useful range even if a malformed console
+    // or future chat command supplies an extreme double. WorldTime is stored as float.
+    constexpr double MaxSafeWorldTimeSeconds = 1.0e12;
+    ActiveWorldData->WorldTime = static_cast<float>(FMath::Clamp(Seconds, 0.0, MaxSafeWorldTimeSeconds));
+    return true;
+}
+
+bool UGameManagerSubSystem::AddWorldTimeSeconds(const double DeltaSeconds)
+{
+    if (!IsValid(ActiveWorldData) || !FMath::IsFinite(DeltaSeconds))
+    {
+        return false;
+    }
+    return SetWorldTimeSeconds(static_cast<double>(ActiveWorldData->WorldTime) + DeltaSeconds);
+}
+
+bool UGameManagerSubSystem::SetWorldDay(const double DayNumber)
+{
+    if (!IsValid(ActiveWorldData) || !FMath::IsFinite(DayNumber) || DayNumber < 0.0)
+    {
+        return false;
+    }
+
+    const double SecondsPerDay = FMath::Max(1.0, static_cast<double>(ActiveWorldData->OneDayTime));
+    const double CurrentSeconds = FMath::Max(0.0, static_cast<double>(ActiveWorldData->WorldTime));
+    const double TimeOfDay = FMath::Fmod(CurrentSeconds, SecondsPerDay);
+    return SetWorldTimeSeconds(DayNumber * SecondsPerDay + TimeOfDay);
+}
+
 void UGameManagerSubSystem::UpdateWorldTime(float DeltaSeconds)
 {
     if (!IsValid(ActiveWorldData))
@@ -2305,7 +2358,15 @@ void UGameManagerSubSystem::UpdateWorldTime(float DeltaSeconds)
         }
     }
 
-    ActiveWorldData->WorldTime += DeltaSeconds * ActiveWorldData->TimeSpeed;
+    if (!FMath::IsFinite(DeltaSeconds) || !FMath::IsFinite(ActiveWorldData->TimeSpeed))
+    {
+        return;
+    }
+
+    constexpr double MaxSafeWorldTimeSeconds = 1.0e12;
+    const double AdvancedTime = static_cast<double>(ActiveWorldData->WorldTime) +
+        static_cast<double>(DeltaSeconds) * static_cast<double>(ActiveWorldData->TimeSpeed);
+    ActiveWorldData->WorldTime = static_cast<float>(FMath::Clamp(AdvancedTime, 0.0, MaxSafeWorldTimeSeconds));
 
     // Player transforms live only in data/players.dat. Keep the in-memory mirrors current so the
     // next periodic binary save has an immutable validated snapshot.
@@ -2379,12 +2440,6 @@ void UGameManagerSubSystem::SpawnOcean()
     OceanActor = World->SpawnActor<AActor>(WaterClass, OceanTransform, SpawnParams);
 }
 
-void UGameManagerSubSystem::StartWorldStreaming(const FString& InModelDirectory, const FString& InPlayerDirectory, const FString& InInitialPlayerName)
-{
-    // Backward-compatible private wrapper for pre-rename C++ call sites.
-    MainWorldStreaming(InModelDirectory, InPlayerDirectory, InInitialPlayerName);
-}
-
 void UGameManagerSubSystem::MainWorldStreaming(const FString& InModelDirectory, const FString& InPlayerDirectory, const FString& InInitialPlayerName)
 {
     UWorld* World = GetWorld();
@@ -2440,6 +2495,16 @@ void UGameManagerSubSystem::UpdateGameManager(float DeltaSeconds)
 
 void UGameManagerSubSystem::ClearTransientRuntimeReferences()
 {
+    // Weather is a GameInstance subsystem, so explicitly release its world actor/timer before
+    // dropping camera/world references during travel.
+    if (UGameInstance* GameInstance = GetGameInstance())
+    {
+        if (UWeatherSubsystem* Weather = GameInstance->GetSubsystem<UWeatherSubsystem>())
+        {
+            Weather->StopWeather();
+        }
+    }
+
     // GameInstanceSubsystems persist across level travel. Drop every strong reference to
     // gameplay actors, components, streamed assets, UI, and world data so GC can reclaim them.
     PlayerActor = nullptr;
@@ -2463,6 +2528,7 @@ void UGameManagerSubSystem::ClearTransientRuntimeReferences()
     WorldEnvManagerClass = AWorldEnvManager::StaticClass();
     SpawnActorClass = AglTFStreamActor::StaticClass();
     WaterClass = nullptr;
+    RainWeatherActorClass = nullptr;
     LoadingWidgetClass = nullptr;
     OceanTransform = FTransform::Identity;
 

@@ -69,6 +69,13 @@ TSharedRef<FJsonObject> FLevelWeatherSettings::ToJson() const
     Json->SetBoolField(TEXT("bEnabled"), bEnabled);
     Json->SetStringField(TEXT("Preset"), Preset);
     Json->SetNumberField(TEXT("Intensity"), Intensity);
+    Json->SetNumberField(TEXT("TickIntervalSeconds"), TickIntervalSeconds);
+    Json->SetBoolField(TEXT("bAutoCycle"), bAutoCycle);
+    Json->SetNumberField(TEXT("MinDurationTicks"), MinDurationTicks);
+    Json->SetNumberField(TEXT("MaxDurationTicks"), MaxDurationTicks);
+    Json->SetNumberField(TEXT("ClearWeight"), ClearWeight);
+    Json->SetNumberField(TEXT("RainWeight"), RainWeight);
+    Json->SetNumberField(TEXT("SnowWeight"), SnowWeight);
     return Json;
 }
 
@@ -82,6 +89,40 @@ bool FLevelWeatherSettings::FromJson(const TSharedPtr<FJsonObject>& Json)
     Json->TryGetBoolField(TEXT("bEnabled"), bEnabled);
     Json->TryGetStringField(TEXT("Preset"), Preset);
     Json->TryGetNumberField(TEXT("Intensity"), Intensity);
+
+    double LoadedTickInterval = TickIntervalSeconds;
+    if (Json->TryGetNumberField(TEXT("TickIntervalSeconds"), LoadedTickInterval) && FMath::IsFinite(LoadedTickInterval))
+    {
+        TickIntervalSeconds = FMath::Clamp(static_cast<float>(LoadedTickInterval), 0.05f, 3600.0f);
+    }
+
+    Json->TryGetBoolField(TEXT("bAutoCycle"), bAutoCycle);
+
+    double LoadedMinTicks = MinDurationTicks;
+    if (Json->TryGetNumberField(TEXT("MinDurationTicks"), LoadedMinTicks) && FMath::IsFinite(LoadedMinTicks))
+    {
+        MinDurationTicks = FMath::Clamp(FMath::RoundToInt(LoadedMinTicks), 1, 100000000);
+    }
+
+    double LoadedMaxTicks = MaxDurationTicks;
+    if (Json->TryGetNumberField(TEXT("MaxDurationTicks"), LoadedMaxTicks) && FMath::IsFinite(LoadedMaxTicks))
+    {
+        MaxDurationTicks = FMath::Clamp(FMath::RoundToInt(LoadedMaxTicks), MinDurationTicks, 100000000);
+    }
+    MaxDurationTicks = FMath::Max(MinDurationTicks, MaxDurationTicks);
+
+    auto LoadWeight = [Json](const TCHAR* FieldName, float& OutValue)
+    {
+        double LoadedValue = OutValue;
+        if (Json->TryGetNumberField(FieldName, LoadedValue) && FMath::IsFinite(LoadedValue))
+        {
+            OutValue = FMath::Clamp(static_cast<float>(LoadedValue), 0.0f, 1000000.0f);
+        }
+    };
+    LoadWeight(TEXT("ClearWeight"), ClearWeight);
+    LoadWeight(TEXT("RainWeight"), RainWeight);
+    LoadWeight(TEXT("SnowWeight"), SnowWeight);
+    Intensity = FMath::Clamp(FMath::IsFinite(Intensity) ? Intensity : 1.0f, 0.0f, 10.0f);
     return true;
 }
 

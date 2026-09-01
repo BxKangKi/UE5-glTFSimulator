@@ -18,6 +18,7 @@ public class ShaderLibrary : ModuleRules
             new string[]
             {
                 "Niagara",
+                "Projects",
                 "RenderCore",
                 "RHI"
             });

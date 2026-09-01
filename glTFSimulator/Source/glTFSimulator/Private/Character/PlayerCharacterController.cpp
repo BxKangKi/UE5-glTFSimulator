@@ -18,15 +18,64 @@
 #include "UI/SettingsMenuWidget.h"
 #include "Vehicle/VehiclePawn.h"
 #include "System/GameManagerSubSystem.h"
+#include "System/SimulatorCommandSubsystem.h"
 #include "System/GameUpdateSubSystem.h"
 #include "TimerManager.h"
 #include "Blueprint/WidgetBlueprintLibrary.h"
 #include "Blueprint/UserWidget.h"
 #include "Camera/CameraComponent.h"
-#include "Weather/WeatherRuntimeSubsystem.h"
+#include "Weather/WeatherSubsystem.h"
 #include "Components/Widget.h"
 #include "Engine/Engine.h"
 #include "Kismet/GameplayStatics.h"
+
+bool APlayerCharacterController::ProcessConsoleExec(const TCHAR* Cmd, FOutputDevice& Ar, UObject* Executor)
+{
+    if (USimulatorCommandSubsystem::IsSimulatorCommand(Cmd))
+    {
+        const FString CommandLine(Cmd);
+        if (GetNetMode() == NM_Client)
+        {
+            ServerExecuteSimulatorCommand(CommandLine);
+            return true;
+        }
+
+        FString Message;
+        if (UGameInstance* GameInstance = GetGameInstance())
+        {
+            if (USimulatorCommandSubsystem* Commands = GameInstance->GetSubsystem<USimulatorCommandSubsystem>())
+            {
+                Commands->ExecuteCommand(this, CommandLine, Message);
+            }
+        }
+
+        if (!Message.IsEmpty())
+        {
+            Ar.Log(*Message);
+            ClientMessage(Message);
+        }
+        return true;
+    }
+
+    return Super::ProcessConsoleExec(Cmd, Ar, Executor);
+}
+
+void APlayerCharacterController::ServerExecuteSimulatorCommand_Implementation(const FString& CommandLine)
+{
+    FString Message;
+    if (UGameInstance* GameInstance = GetGameInstance())
+    {
+        if (USimulatorCommandSubsystem* Commands = GameInstance->GetSubsystem<USimulatorCommandSubsystem>())
+        {
+            Commands->ExecuteCommand(this, CommandLine.Left(1024), Message);
+        }
+    }
+
+    if (!Message.IsEmpty())
+    {
+        ClientMessage(Message);
+    }
+}
 
 APlayerCharacterController::APlayerCharacterController()
 {
@@ -293,7 +342,7 @@ void APlayerCharacterController::RegisterPrimaryCharacterPawn(APawn* InPawn)
                 SubSystem->SetPlayerActor(PlayerCharacter);
                 USceneComponent* FollowCamera = PlayerCharacter->GetFollowCameraComponent();
                 SubSystem->SetCameraComponent(FollowCamera);
-                if (UWeatherRuntimeSubsystem* Weather = GetGameInstance()->GetSubsystem<UWeatherRuntimeSubsystem>())
+                if (UWeatherSubsystem* Weather = GetGameInstance()->GetSubsystem<UWeatherSubsystem>())
                 {
                     Weather->SetWeatherCamera(FollowCamera);
                 }

@@ -831,7 +831,14 @@ FglTFRuntimeStaticMeshConfig AglTFStreamActor::BuildStreamingStaticMeshConfig()
     Config.MaterialsConfig.ImagesConfig.MaxWidth = TextureDimensionLimit;
     Config.MaterialsConfig.ImagesConfig.MaxHeight = TextureDimensionLimit;
     Config.MaterialsConfig.ImagesConfig.bCompressMips = true;
-    Config.MaterialsConfig.ImagesConfig.bStreaming = true;
+
+    // UE 5.8 validates that a texture mip provider exposes the exact same tiled/non-tiled layout
+    // as the runtime texture resource. glTFRuntime's legacy streaming provider is installed when
+    // ImagesConfig.bStreaming is true, and can trip ProviderDataIsTiled == bTextureDataIsTiled for
+    // dynamically built textures. Keep generated/embedded mips and the existing resolution limit,
+    // but upload them without glTFRuntime's mip provider. This is the smallest configuration-only
+    // fix and does not modify the glTFRuntime plugin itself.
+    Config.MaterialsConfig.ImagesConfig.bStreaming = false;
     Config.MaterialsConfig.bLoadMipMaps = true;
     // UStreamAsyncAction supplies a transient world-aware outer whose lifetime covers the native
     // request without retaining the actor or world during teardown.
