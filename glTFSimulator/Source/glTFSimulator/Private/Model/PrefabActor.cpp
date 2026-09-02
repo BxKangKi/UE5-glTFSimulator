@@ -1,6 +1,7 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
 #include "World/PrefabActor.h"
+#include "RuntimeFramework/SimulatorGlTFRuntimeCacheLibrary.h"
 
 #include "Components/BoxComponent.h"
 #include "Dom/JsonObject.h"
@@ -496,7 +497,7 @@ bool APrefabActor::LoadPrefab(const FString& InFilePath, const FString& InObject
 
     FglTFRuntimeConfig LoaderConfig;
     LoaderConfig.bAllowExternalFiles = true;
-    GltfAsset = UglTFRuntimeFunctionLibrary::glTFLoadAssetFromFilename(SourceFilePath, false, LoaderConfig);
+    GltfAsset = USimulatorGlTFRuntimeCacheLibrary::LoadSharedAssetFromFilename(this, SourceFilePath, false, LoaderConfig);
     if (!IsValid(GltfAsset))
     {
         const FString FailedPath = SourceFilePath;

@@ -12,6 +12,7 @@ public class glTFSimulator : ModuleRules
         PublicDependencyModuleNames.AddRange(
             new string[]
             {
+                "JsonUtilities",
                 "Core",
                 "CoreUObject",
                 "Engine",

@@ -1,6 +1,7 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
 #include "Weapon/WeaponActor.h"
+#include "RuntimeFramework/SimulatorGlTFRuntimeCacheLibrary.h"
 
 #include "Camera/CameraComponent.h"
 #include "Components/SkeletalMeshComponent.h"
@@ -424,7 +425,7 @@ bool AWeaponActor::LoadWeaponMesh()
 
     FglTFRuntimeConfig LoaderConfig;
     LoaderConfig.bAllowExternalFiles = true;
-    GltfAsset = UglTFRuntimeFunctionLibrary::glTFLoadAssetFromFilename(SourceFilePath, false, LoaderConfig);
+    GltfAsset = USimulatorGlTFRuntimeCacheLibrary::LoadSharedAssetFromFilename(this, SourceFilePath, false, LoaderConfig);
     if (!IsValid(GltfAsset))
     {
         return false;

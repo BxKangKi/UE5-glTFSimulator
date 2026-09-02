@@ -2,6 +2,7 @@
 // Copyright © 2025 Epic Games, Inc. All rights reserved.
 
 #include "Model/LoadAsyncAction.h"
+#include "RuntimeFramework/SimulatorNodeTokenLibrary.h"
 #include "System/GameManagerSubSystem.h"
 
 #include "Dom/JsonObject.h"
@@ -64,7 +65,7 @@ namespace
 
     static bool IsWaterNodeName(const FString& NodeName)
     {
-        return FStringHelper::GetTextAfterChar(NodeName, ';').ToUpper().Contains(TEXT("WATER"));
+        return USimulatorNodeTokenLibrary::HasEffectiveToken(NodeName, FName(TEXT("WATER")));
     }
 
     /** UObject, timer, delegate, and glTFRuntimeAsset access is confined to the game thread. */
@@ -731,12 +732,10 @@ void ULoadAsyncAction::CalculateSize()
     }
 
     const FString Prefix = FStringHelper::GetTextBeforeChar(CurrentNode.Name, ';').TrimStartAndEnd();
-    const FString Suffix = FStringHelper::GetTextAfterChar(CurrentNode.Name, ';');
-    const FString SuffixUpper = Suffix.ToUpper();
-
+    // Reserved directives are parsed from the complete node name. Passing only the suffix
+    // would reinterpret the first token as a base name (for example INST;LOD0 -> LOD0 only).
     // A glTF node named "Something;WATER" is a streaming water-volume marker.
-    // It owns an AWaterActor at runtime and intentionally does not create mesh data.
-    if (SuffixUpper.Contains(TEXT("WATER")))
+    if (USimulatorNodeTokenLibrary::HasEffectiveToken(CurrentNode.Name, FName(TEXT("WATER"))))
     {
         UpdateWaterNodeData();
         return;
@@ -756,27 +755,27 @@ void ULoadAsyncAction::CalculateSize()
     }
     FModelMeshData &Info = MeshMap.FindOrAdd(CurrentMeshName);
 
-    if (SuffixUpper.Contains(TEXT("NCOL")))
+    if (USimulatorNodeTokenLibrary::HasEffectiveToken(CurrentNode.Name, FName(TEXT("NCOL"))))
     {
         Info.Data.bComplexCollision = false;
         Info.Data.bSimpleCollision = false;
     }
 
-    if (SuffixUpper.Contains(TEXT("INST")))
+    if (USimulatorNodeTokenLibrary::HasEffectiveToken(CurrentNode.Name, FName(TEXT("INST"))))
     {
         UpdateModelNodeData();
     }
-    else if (SuffixUpper.Contains(TEXT("LOD1")))
+    else if (USimulatorNodeTokenLibrary::HasEffectiveToken(CurrentNode.Name, FName(TEXT("LOD1"))))
     {
         Info.LOD1 = CurrentNode.MeshIndex;
         UpdateNext();
     }
-    else if (SuffixUpper.Contains(TEXT("LOD2")))
+    else if (USimulatorNodeTokenLibrary::HasEffectiveToken(CurrentNode.Name, FName(TEXT("LOD2"))))
     {
         Info.LOD2 = CurrentNode.MeshIndex;
         UpdateNext();
     }
-    else if (SuffixUpper.Contains(TEXT("LOD3")))
+    else if (USimulatorNodeTokenLibrary::HasEffectiveToken(CurrentNode.Name, FName(TEXT("LOD3"))))
     {
         Info.LOD3 = CurrentNode.MeshIndex;
         UpdateNext();

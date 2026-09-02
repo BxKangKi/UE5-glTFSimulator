@@ -2959,27 +2959,41 @@ bool UGameManagerSubSystem::DoesAssetFileContainWheelTag(const FString& FilePath
         return Value >= 'a' && Value <= 'z' ? Value - ('a' - 'A') : Value;
     };
 
-    auto ContainsTag = [&Bytes, &ToUpperAscii](const ANSICHAR* Tag) -> bool
+    auto ContainsReservedToken = [&Bytes, &ToUpperAscii](const ANSICHAR* Token) -> bool
     {
-        const int32 TagLen = FCStringAnsi::Strlen(Tag);
-        if (TagLen <= 0 || Bytes.Num() < TagLen)
+        const int32 TokenLen = FCStringAnsi::Strlen(Token);
+        if (TokenLen <= 0 || Bytes.Num() < TokenLen + 1)
         {
             return false;
         }
 
-        for (int32 Index = 0; Index <= Bytes.Num() - TagLen; ++Index)
+        // The leading ';' is part of the grammar. The byte immediately after the token must
+        // terminate the JSON string/name or begin another reserved token. This prevents a raw
+        // byte match such as ;WHEELHOUSE from being treated as ;WHEEL.
+        for (int32 Index = 0; Index <= Bytes.Num() - TokenLen - 1; ++Index)
         {
-            bool bMatches = true;
-            for (int32 TagIndex = 0; TagIndex < TagLen; ++TagIndex)
+            if (Bytes[Index] != static_cast<uint8>(';'))
             {
-                if (ToUpperAscii(Bytes[Index + TagIndex]) != static_cast<uint8>(Tag[TagIndex]))
+                continue;
+            }
+
+            bool bMatches = true;
+            for (int32 TokenIndex = 0; TokenIndex < TokenLen; ++TokenIndex)
+            {
+                if (ToUpperAscii(Bytes[Index + 1 + TokenIndex]) != static_cast<uint8>(Token[TokenIndex]))
                 {
                     bMatches = false;
                     break;
                 }
             }
 
-            if (bMatches)
+            if (!bMatches)
+            {
+                continue;
+            }
+
+            const uint8 Next = Bytes[Index + 1 + TokenLen];
+            if (Next == static_cast<uint8>(';') || Next == static_cast<uint8>('"') || Next == 0)
             {
                 return true;
             }
@@ -2988,7 +3002,7 @@ bool UGameManagerSubSystem::DoesAssetFileContainWheelTag(const FString& FilePath
         return false;
     };
 
-    return ContainsTag(";WHEL") || ContainsTag(";WHEEL");
+    return ContainsReservedToken("WHEEL");
 }
 
 FString UGameManagerSubSystem::GetAssetDisplayName(const FString& AssetPath) const

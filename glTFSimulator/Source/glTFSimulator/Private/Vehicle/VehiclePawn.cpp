@@ -1,6 +1,8 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
 #include "Vehicle/VehiclePawn.h"
+#include "RuntimeFramework/SimulatorGlTFRuntimeCacheLibrary.h"
+#include "RuntimeFramework/SimulatorNodeTokenLibrary.h"
 #include "Camera/CameraComponent.h"
 #include "CollisionShape.h"
 #include "Character/CharacterComponent.h"
@@ -45,26 +47,10 @@
 
 static bool IsVehicleWheelTaggedName(const FString& Name)
 {
-    if (Name.EndsWith(TEXT(";WHEL"), ESearchCase::IgnoreCase)
-        || Name.EndsWith(TEXT(";WHEEL"), ESearchCase::IgnoreCase))
-    {
-        return true;
-    }
-
-    const FString LowerName = Name.ToLower();
-    if (LowerName.Contains(TEXT("steering")))
-    {
-        return false;
-    }
-
-    return LowerName.Contains(TEXT(";wheel"))
-        || LowerName.StartsWith(TEXT("wheel_"))
-        || LowerName.Contains(TEXT("_wheel_"))
-        || LowerName.EndsWith(TEXT("_wheel"))
-        || LowerName.StartsWith(TEXT("tire_"))
-        || LowerName.Contains(TEXT("_tire"))
-        || LowerName.StartsWith(TEXT("tyre_"))
-        || LowerName.Contains(TEXT("_tyre"));
+    // Project-wide reserved directives are valid only as semicolon-delimited tokens.
+    // Legacy aliases such as wheel_, tyre_, _wheel_, and the old ;WHEL typo are intentionally
+    // not accepted because they can classify ordinary model names as semantic nodes.
+    return USimulatorNodeTokenLibrary::HasEffectiveToken(Name, FName(TEXT("WHEEL")));
 }
 
 static FTransform GetVehicleNodeWorldTransform(const TMap<int32, FglTFRuntimeNode>& NodeMap, const FglTFRuntimeNode& Node)
@@ -1683,7 +1669,7 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InFilePath, const FString& In
 
     FglTFRuntimeConfig LoaderConfig;
     LoaderConfig.bAllowExternalFiles = true;
-    GltfAsset = UglTFRuntimeFunctionLibrary::glTFLoadAssetFromFilename(SourceFilePath, false, LoaderConfig);
+    GltfAsset = USimulatorGlTFRuntimeCacheLibrary::LoadSharedAssetFromFilename(this, SourceFilePath, false, LoaderConfig);
     if (!IsValid(GltfAsset))
     {
         UE_LOG(LogTemp, Warning, TEXT("VehiclePawn: failed to load vehicle model %s"), *SourceFilePath);
