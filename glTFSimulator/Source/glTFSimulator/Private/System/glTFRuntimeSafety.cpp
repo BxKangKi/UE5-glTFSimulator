@@ -6,6 +6,7 @@
  * @brief Serialized native scheduling, cache lifetime barriers, and session quarantine.
  */
 #include "System/glTFRuntimeSafety.h"
+#include "HAL/CriticalSection.h"
 
 #include "Async/Async.h"
 #include "Async/TaskGraphInterfaces.h"

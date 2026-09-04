@@ -6,6 +6,7 @@
  * @brief Implements bounded JSON parsing, asynchronous file jobs, and recoverable atomic commits.
  */
 #include "System/SafeFileIO.h"
+#include "HAL/CriticalSection.h"
 
 #include "Async/Async.h"
 #include "Async/TaskGraphInterfaces.h"

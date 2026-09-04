@@ -2,6 +2,7 @@
 
 #include "System/GlbValidation.h"
 #include "System/SafeFileIO.h"
+#include "HAL/CriticalSection.h"
 
 #include "Dom/JsonObject.h"
 #include "HAL/FileManager.h"
