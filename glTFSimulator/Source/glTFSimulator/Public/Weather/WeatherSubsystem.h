@@ -16,7 +16,7 @@ class UWorldData;
  * Runtime owner for weather state and the editor-assigned weather effect actor.
  *
  * Design goals:
- * - level.json owns deterministic weather tick/range settings;
+ * - config.json owns deterministic weather tick/range settings;
  * - the subsystem owns no permanent world actor reference across level travel;
  * - clear weather destroys the spawned effect actor, releasing Niagara/material resources;
  * - all UObject work is game-thread only;

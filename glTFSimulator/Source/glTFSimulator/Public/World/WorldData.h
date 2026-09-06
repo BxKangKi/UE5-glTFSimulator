@@ -6,7 +6,7 @@
 #include "Dom/JsonObject.h"
 #include "WorldData.generated.h"
 
-#define LEVELNAME TEXT("WorldName")
+#define CONFIG_WORLD_NAME_FIELD TEXT("WorldName")
 #define LATITUDE TEXT("Latitude")
 #define LONGITUDE TEXT("Longitude")
 #define AXIAL_TILT TEXT("AxialTilt")
@@ -17,7 +17,7 @@
 #define PLAYER_X TEXT("X")
 #define PLAYER_Y TEXT("Y")
 #define PLAYER_Z TEXT("Z")
-#define LEVEL_FILE_NAME TEXT("/level.json")
+#define LEVEL_FILE_NAME TEXT("/config.json")
 
 USTRUCT(BlueprintType)
 struct GLTFSIMULATOR_API FLevelCloudSettings
@@ -140,7 +140,7 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level")
     FString WorldName;
 
-    /** Mutable runtime time. Persisted only in data/world.dat, never in level.json. */
+    /** Mutable runtime time. Persisted only in data/world.dat, never in config.json. */
     UPROPERTY(Transient, BlueprintReadWrite, Category="Level|Runtime")
     float WorldTime;
 

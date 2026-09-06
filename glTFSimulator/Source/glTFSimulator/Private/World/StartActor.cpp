@@ -880,13 +880,39 @@ void AStartActor::BuildLevelFolderNameMap()
             continue;
         }
 
-        const FString LevelJsonPath = FullSubFolderPath / LEVEL_FILE_NAME;
-        FString NameValue;
-        if (UFileFunctionLibrary::LoadJsonStringValue(LevelJsonPath, LEVELNAME, NameValue))
+        // A world is discoverable only through its config.json. The directory name is a stable
+        // filesystem identifier; the user-facing world name comes exclusively from WorldName.
+        const FString ConfigPath = FullSubFolderPath / LEVEL_FILE_NAME;
+        if (!FPaths::FileExists(ConfigPath))
         {
-            FolderNameMap.Add(SubFolderName, NameValue);
-            UE_LOG(LogTemp, Log, TEXT("Loaded Level: Folder=%s, Name=%s"), *SubFolderName, *NameValue);
+            continue;
         }
+
+        FString ConfiguredWorldName;
+        if (!UFileFunctionLibrary::LoadJsonStringValue(ConfigPath, CONFIG_WORLD_NAME_FIELD, ConfiguredWorldName))
+        {
+            UE_LOG(LogTemp, Error,
+                TEXT("[WorldSelection] Ignoring world folder '%s': config.json is invalid or has no string WorldName. Path=%s"),
+                *SubFolderName,
+                *ConfigPath);
+            continue;
+        }
+
+        ConfiguredWorldName.TrimStartAndEndInline();
+        if (ConfiguredWorldName.IsEmpty())
+        {
+            UE_LOG(LogTemp, Error,
+                TEXT("[WorldSelection] Ignoring world folder '%s': config.json WorldName is empty. Path=%s"),
+                *SubFolderName,
+                *ConfigPath);
+            continue;
+        }
+
+        FolderNameMap.Add(SubFolderName, ConfiguredWorldName);
+        UE_LOG(LogTemp, Log,
+            TEXT("[WorldSelection] Loaded world from config.json: Folder=%s, WorldName=%s"),
+            *SubFolderName,
+            *ConfiguredWorldName);
     }
 }
 

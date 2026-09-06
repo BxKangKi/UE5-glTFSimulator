@@ -25,7 +25,7 @@ struct GLTFSIMULATOR_API FModelCacheData
     bool IsSane() const;
 };
 
-/** Mutable world runtime state. User-authored level settings remain in level.json. */
+/** Mutable world runtime state. User-authored level settings remain in config.json. */
 struct GLTFSIMULATOR_API FWorldRuntimeData
 {
     float WorldTime = 0.0f;

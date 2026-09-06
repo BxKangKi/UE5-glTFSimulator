@@ -198,7 +198,7 @@ TSharedRef<FJsonObject> UWorldData::SerializeData(UWorldData *Data)
 
     TSharedRef<FJsonObject> Json = MakeShared<FJsonObject>();
     Json->SetStringField(JSON_VERSION_FIELD, !Data->Version.IsEmpty() ? Data->Version : FString(JSON_SCHEMA_VERSION));
-    Json->SetStringField(LEVELNAME, Data->WorldName);
+    Json->SetStringField(CONFIG_WORLD_NAME_FIELD, Data->WorldName);
     Json->SetNumberField(LATITUDE, Data->Latitude);
     Json->SetNumberField(LONGITUDE, Data->Longitude);
     Json->SetNumberField(AXIAL_TILT, Data->AxialTilt);
@@ -207,7 +207,7 @@ TSharedRef<FJsonObject> UWorldData::SerializeData(UWorldData *Data)
     Json->SetNumberField(TIME_SPEED, Data->TimeSpeed);
     Json->SetBoolField(OCEAN, Data->bOcean);
 
-    // Runtime time, selected player, and player transforms are intentionally omitted. level.json
+    // Runtime time, selected player, and player transforms are intentionally omitted. config.json
     // is map-author-owned read-only configuration; mutable state lives under data/*.dat.
 
     Json->SetObjectField(TEXT("Cloud"), Data->Cloud.ToJson());
@@ -222,7 +222,7 @@ bool UWorldData::DeserializeData(UWorldData *Data, TSharedPtr<FJsonObject> Json)
     {
         Data->Version = JSON_SCHEMA_VERSION;
         Json->TryGetStringField(JSON_VERSION_FIELD, Data->Version);
-        Json->TryGetStringField(LEVELNAME, Data->WorldName);
+        Json->TryGetStringField(CONFIG_WORLD_NAME_FIELD, Data->WorldName);
         Json->TryGetNumberField(LATITUDE, Data->Latitude);
         Json->TryGetNumberField(LONGITUDE, Data->Longitude);
         Json->TryGetNumberField(AXIAL_TILT, Data->AxialTilt);

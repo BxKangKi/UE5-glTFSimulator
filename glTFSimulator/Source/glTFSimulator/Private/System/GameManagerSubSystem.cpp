@@ -1565,7 +1565,7 @@ void UGameManagerSubSystem::LoadWorldData()
         return;
     }
 
-    // level.json belongs to the map author. It is loaded without backup recovery and is never
+    // config.json belongs to the map author. It is loaded without backup recovery and is never
     // rewritten by runtime code. Missing/invalid files simply leave UWorldData defaults active.
     const FString LevelJsonPath = GetWorldFilePath(LEVEL_FILE_NAME);
     FSafeJsonLimits JsonLimits;
@@ -1578,14 +1578,14 @@ void UGameManagerSubSystem::LoadWorldData()
         if (JsonResult.Status != ESafeFileIOStatus::Missing)
         {
             UE_LOG(LogTemp, Warning,
-                TEXT("level.json could not be loaded safely; using map-setting defaults. Path=%s Error=%s"),
+                TEXT("config.json could not be loaded safely; using map-setting defaults. Path=%s Error=%s"),
                 *LevelJsonPath,
                 *JsonResult.Error);
         }
         else
         {
             UE_LOG(LogTemp, Log,
-                TEXT("level.json does not exist; using map-setting defaults without creating JSON. Path=%s"),
+                TEXT("config.json does not exist; using map-setting defaults without creating JSON. Path=%s"),
                 *LevelJsonPath);
         }
     }
@@ -1604,7 +1604,7 @@ void UGameManagerSubSystem::LoadWorldData()
     }
     else
     {
-        // level.json is map-author input only. Runtime time and selected-player state never migrate
+        // config.json is map-author input only. Runtime time and selected-player state never migrate
         // from JSON; missing/corrupt world.dat starts from defaults and is rewritten transactionally.
         if (!DatError.IsEmpty())
         {
@@ -2202,7 +2202,7 @@ void UGameManagerSubSystem::ApplyGameplaySettings()
     if (!bRecognizedModeKey)
     {
         UE_LOG(LogTemp, Warning,
-            TEXT("[RuntimePlayMode] Unknown Runtime Play Mode Key '%s' in level.json. Using GameManagerActor default '%s'."),
+            TEXT("[RuntimePlayMode] Unknown Runtime Play Mode Key '%s' in config.json. Using GameManagerActor default '%s'."),
             *RuntimeModeKey,
             ConfiguredDefault == EPlayMode::Creator ? TEXT("Creator") : TEXT("RealLife"));
     }

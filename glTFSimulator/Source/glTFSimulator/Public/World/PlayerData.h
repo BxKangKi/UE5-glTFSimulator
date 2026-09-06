@@ -6,9 +6,6 @@
 #include "Dom/JsonObject.h"
 #include "PlayerData.generated.h"
 
-#define LEGACY_PLAYER_FILE_NAME TEXT("/player.json")
-#define LEGACY_PLAYERS_FILE_NAME TEXT("/players.json")
-
 /** Persistent per-player runtime record stored in data/players.dat. */
 USTRUCT(BlueprintType)
 struct GLTFSIMULATOR_API FWorldPlayerRecord

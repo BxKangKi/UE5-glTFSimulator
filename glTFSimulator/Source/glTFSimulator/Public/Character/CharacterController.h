@@ -108,7 +108,7 @@ public:
     float GetLoadProgress() const { return LoadProgress; }
     UFUNCTION(BlueprintPure, Category="Character|Loading")
     bool WasLastMeshLoadSuccessful() const { return bLastMeshLoadSucceeded; }
-    /** Current non-ragdoll body mass loaded from level.json Gameplay.PlayerMassKg. */
+    /** Current non-ragdoll body mass loaded from config.json Gameplay.PlayerMassKg. */
     UFUNCTION(BlueprintPure, Category="Character|Physics")
     float GetCharacterMassKg() const { return CharacterMassKg; }
     /** Sustained horizontal push-force limit derived from mass, gravity, and authored traction. */
