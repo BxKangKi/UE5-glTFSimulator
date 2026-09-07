@@ -22,6 +22,8 @@
 #include "System/GlbValidation.h"
 #include "System/SafeFileIO.h"
 #include "System/glTFRuntimeSafety.h"
+#include "Simulator/ModelDatabaseSubsystem.h"
+#include "System/StreamingMovementGateSubsystem.h"
 #include "TimerManager.h"
 #include "UObject/UObjectGlobals.h"
 #include "World/WaterActor.h"
@@ -32,6 +34,19 @@ namespace
     bool EnsureStreamActorGameThread(const TCHAR* FunctionName)
     {
         return ensureMsgf(IsInGameThread(), TEXT("%s must run on the game thread"), FunctionName);
+    }
+
+    FString ResolveModelCachePath(UObject* Context, const FString& GlbPath)
+    {
+        const UWorld* World = IsValid(Context) ? Context->GetWorld() : nullptr;
+        const UGameInstance* GameInstance = World ? World->GetGameInstance() : nullptr;
+        const UModelDatabaseSubsystem* Database = GameInstance
+            ? GameInstance->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
+        FGuid UUID;
+        FModelDefinition Definition;
+        FString CachePath;
+        return Database && Database->FindIdForGlb(GlbPath, UUID)
+            && Database->Resolve(UUID, Definition, CachePath) ? CachePath : FString();
     }
 }
 
@@ -97,7 +112,6 @@ void AglTFStreamActor::BeginPlay()
     LoadedNodes.Empty();
     LoadedWaterNodes.Empty();
     InstanceMap.Empty();
-    UnloadBoxMap.Empty();
     DynamicComponentMap.Empty();
     WaterActorMap.Empty();
     ModelMetadata = FModelData();
@@ -141,6 +155,8 @@ void AglTFStreamActor::ReleaseRuntimeResourcesForWorldExit()
     if (UWorld* World = GetWorld())
     {
         World->GetTimerManager().ClearAllTimersForObject(this);
+        if (UStreamingMovementGateSubsystem* Gate = World->GetSubsystem<UStreamingMovementGateSubsystem>())
+            Gate->ClearModelRegions(this);
     }
 
     UnregisterGameUpdate();
@@ -163,7 +179,6 @@ void AglTFStreamActor::ReleaseRuntimeResourcesForWorldExit()
     LoadedNodes.Empty();
     LoadedWaterNodes.Empty();
     InstanceMap.Empty();
-    UnloadBoxMap.Empty();
     DynamicComponentMap.Empty();
     WaterActorMap.Empty();
     ModelMetadata = FModelData();
@@ -432,7 +447,7 @@ void AglTFStreamActor::StartSizeScan(UglTFRuntimeAsset* Asset)
 
     const int32 SizeScanChunkSize = GetSizeScanChunkSize(Asset->GetNodes().Num());
     const FString JsonPath = FPaths::ChangeExtension(FilePath, TEXT("json"));
-    const FString SizeCachePath = FPaths::ChangeExtension(FilePath, TEXT("scz"));
+    const FString SizeCachePath = ResolveModelCachePath(this, FilePath);
 
     ULoadAsyncAction* AsyncAction = ULoadAsyncAction::LoadAsync(
         this,
@@ -441,8 +456,7 @@ void AglTFStreamActor::StartSizeScan(UglTFRuntimeAsset* Asset)
         SizeScanChunkSize,
         FilePath,
         JsonPath,
-        SizeCachePath,
-        !bMetadataBakeOnly);
+        SizeCachePath);
     ActiveSizeScanAction = AsyncAction;
     if (AsyncAction)
     {
@@ -510,14 +524,14 @@ void AglTFStreamActor::OnChunksLoaded(const FLoadAsyncWrapper& MapWrapper)
         *ModelMetadata.Center.ToCompactString(),
         *ModelMetadata.Size.ToCompactString()));
 
-    // In metadata-only mode ULoadAsyncAction does not report completion until a newly generated SCZ
+    // In metadata-only mode ULoadAsyncAction does not report completion until a newly generated cache
     // has finished its verified temp/primary/.bak transaction. A cache hit is also already durable.
     if (bMetadataBakeOnly)
     {
         bIsLoaded = true;
         bAsyncLoading = false;
         LoadingStatus = 1.0f;
-        const FString SizeCachePath = FPaths::ChangeExtension(FilePath, TEXT("scz"));
+        const FString SizeCachePath = ResolveModelCachePath(this, FilePath);
         FinishMetadataBake(bHasModelMetadata && FPaths::FileExists(SizeCachePath));
         return;
     }
@@ -647,11 +661,6 @@ void AglTFStreamActor::ReleaseStreamingResources()
     InstanceMap.Empty();
     LoadedNodes.Empty();
 
-    for (TPair<FName, TObjectPtr<UBoxComponent>>& Pair : UnloadBoxMap)
-    {
-        DestroyOwnedRuntimeComponent(Pair.Value.Get());
-    }
-    UnloadBoxMap.Empty();
 
     for (TPair<FName, FComponentGroup>& Pair : DynamicComponentMap)
     {
@@ -945,7 +954,6 @@ void AglTFStreamActor::UpdateProperties(const FStreamAsyncWrapper& Collection)
     LoadedNodes = Collection.LoadedNodes;
     LoadedWaterNodes = Collection.LoadedWaterNodes;
     InstanceMap = Collection.InstanceMap;
-    UnloadBoxMap = Collection.UnloadBoxMap;
     DynamicComponentMap = Collection.DynamicComponentMap;
     WaterActorMap = Collection.WaterActorMap;
 }

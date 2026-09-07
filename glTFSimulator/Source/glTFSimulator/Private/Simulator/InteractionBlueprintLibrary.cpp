@@ -1,6 +1,6 @@
-#include "RuntimeFramework/SimulatorInteractionBlueprintLibrary.h"
-#include "RuntimeFramework/SimulatorHeldPrefabPreviewActor.h"
-#include "RuntimeFramework/SimulatorInteractionAnimInstance.h"
+#include "Simulator/InteractionBlueprintLibrary.h"
+#include "Simulator/HeldPrefabPreviewActor.h"
+#include "Simulator/InteractionAnimInstance.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "GameFramework/Character.h"
 

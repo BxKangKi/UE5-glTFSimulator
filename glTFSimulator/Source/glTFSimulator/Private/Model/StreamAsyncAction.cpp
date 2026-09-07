@@ -19,6 +19,7 @@
 #include "Model/glTFStreamActor.h"
 #include "System/GlbValidation.h"
 #include "System/SafeFileIO.h"
+#include "System/StreamingMovementGateSubsystem.h"
 #include "Misc/ScopeExit.h"
 #include "Misc/FileHelper.h"
 #include "System/glTFRuntimeSafety.h"
@@ -171,7 +172,6 @@ UStreamAsyncAction *UStreamAsyncAction::StreamAsync(
         Action->MeshMap = Actor->GetAllMeshMapRef();
         Action->DecalLight = Actor->GetDecalLight();
         Action->DynamicComponentMap = Actor->GetDynamicComponentMapRef();
-        Action->UnloadBoxMap = Actor->GetUnloadBoxMapRef();
         Action->WaterActorMap = Actor->GetWaterActorMapRef();
         Action->LoadedNodes = Actor->GetLoadedNodesRef();
         Action->LoadedWaterNodes = Actor->GetLoadedWaterNodesRef();
@@ -282,7 +282,6 @@ void UStreamAsyncAction::AbortAndRelease(UStaticMesh* OrphanedMesh)
     InstanceMap.Empty();
     DynamicComponentMap.Empty();
     WaterActorMap.Empty();
-    UnloadBoxMap.Empty();
     PendingLoadNodes.Empty();
     PendingUnloadNodes.Empty();
     PendingLoadWaterNodes.Empty();
@@ -374,6 +373,15 @@ void UStreamAsyncAction::Activate()
         }
         else
         {
+            if (UWorld* World = OwnerActor->GetWorld())
+            {
+                if (UStreamingMovementGateSubsystem* Gate = World->GetSubsystem<UStreamingMovementGateSubsystem>())
+                {
+                    const FVector Extent = (MeshPtr->Size * 0.5f + BOX_BUFFER_SIZE).GetAbs();
+                    Gate->SetModelRegionAvailable(OwnerActor.Get(), NodePair.Key,
+                        FBox(-Extent, Extent).TransformBy(Info.Transform * OwnerActor->GetActorTransform()), false);
+                }
+            }
             if (CurrentDist <= CheckRadius && CurrentLoadingNode != NodePair.Key)
             {
                 PendingLoadNodes.Add(NodePair.Key);
@@ -773,7 +781,6 @@ void UStreamAsyncAction::ReleaseActionReferences()
     InstanceMap.Empty();
     DynamicComponentMap.Empty();
     WaterActorMap.Empty();
-    UnloadBoxMap.Empty();
     DecalLight = nullptr;
     CurrentLoadingNode = NAME_None;
     CurrentLoadingMesh = NAME_None;
@@ -877,7 +884,6 @@ void UStreamAsyncAction::ProcessChunk()
         Wrapper.LoadedNodes = MoveTemp(LoadedNodes);
         Wrapper.LoadedWaterNodes = MoveTemp(LoadedWaterNodes);
         Wrapper.InstanceMap = MoveTemp(InstanceMap);
-        Wrapper.UnloadBoxMap = MoveTemp(UnloadBoxMap); // Move data into the wrapper struct.
         Wrapper.DynamicComponentMap = MoveTemp(DynamicComponentMap); // Move data into the wrapper struct.
         Wrapper.WaterActorMap = MoveTemp(WaterActorMap);
 
@@ -1072,15 +1078,17 @@ void UStreamAsyncAction::ProcessUnloadNode(const FName &Name)
         return;
     }
 
-    // Use UnloadBoxMap to check targets and manage creation separately.
-    TObjectPtr<UBoxComponent> *UnloadBoxPtr = UnloadBoxMap.Find(Name);
-    if (!UnloadBoxPtr || !IsValid(*UnloadBoxPtr))
+    if (const FModelMeshData *Mesh = MeshMap.Find(Info->MeshName))
     {
-        if (const FModelMeshData *Mesh = MeshMap.Find(Info->MeshName))
+        if (UWorld* World = OwnerActor->GetWorld())
         {
-            FVector BoxExtent = Mesh->Size + BOX_BUFFER_SIZE;
-            UBoxComponent *NewBox = FActorHelper::AddBoxComponent(OwnerActor, Info->Transform, BoxExtent, TEXT("BlockAll"));
-            UnloadBoxMap.Emplace(Name, NewBox);
+            if (UStreamingMovementGateSubsystem* Gate = World->GetSubsystem<UStreamingMovementGateSubsystem>())
+            {
+                const FTransform WorldTransform = Info->Transform * OwnerActor->GetActorTransform();
+                const FVector Extent = (Mesh->Size * 0.5f + BOX_BUFFER_SIZE).GetAbs();
+                Gate->SetModelRegionAvailable(OwnerActor.Get(), Name,
+                    FBox(-Extent, Extent).TransformBy(WorldTransform), false);
+            }
         }
     }
 }
@@ -1514,12 +1522,10 @@ void UStreamAsyncAction::AddTrasnform(const FName &Name, UInstancedStaticMeshCom
             SpawnStreamComponents(Name, *NodeInfo, MeshData->Data);
         }
 
-        // The node is loaded, so remove and clean up any existing unload box.
-        TObjectPtr<UBoxComponent> *UnloadBoxPtr = UnloadBoxMap.Find(Name);
-        if (UnloadBoxPtr && IsValid(*UnloadBoxPtr))
+        if (UWorld* World = OwnerActor->GetWorld())
         {
-            FActorHelper::DestroyComponent(OwnerActor, *UnloadBoxPtr);
-            UnloadBoxMap.Remove(Name);
+            if (UStreamingMovementGateSubsystem* Gate = World->GetSubsystem<UStreamingMovementGateSubsystem>())
+                Gate->SetModelRegionAvailable(OwnerActor.Get(), Name, FBox(ForceInit), true);
         }
     }
     else

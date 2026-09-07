@@ -1,7 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "SimulatorInteractionTypes.generated.h"
+#include "InteractionTypes.generated.h"
 
 UENUM(BlueprintType)
 enum class ESimulatorHand : uint8

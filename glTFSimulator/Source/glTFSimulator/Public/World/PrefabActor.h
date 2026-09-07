@@ -4,7 +4,6 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
-#include "World/PlacementTypes.h"
 #include "PrefabActor.generated.h"
 
 class UBoxComponent;
@@ -56,9 +55,6 @@ public:
 
     UFUNCTION(BlueprintPure, Category="Prefab")
     bool IsRenderOnlyMode() const { return bRenderOnlyMode; }
-
-    UFUNCTION(BlueprintCallable, Category="Prefab")
-    FPlacedObjectRecord ToPlacementRecord() const;
 
     UFUNCTION(BlueprintCallable, Category="Prefab")
     FString GetObjectName() const { return ObjectName; }

@@ -2,7 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Subsystems/GameInstanceSubsystem.h"
-#include "SimulatorVehicleSelectionSubsystem.generated.h"
+#include "VehicleSelectionSubsystem.generated.h"
 
 UCLASS()
 class GLTFSIMULATOR_API USimulatorVehicleSelectionSubsystem : public UGameInstanceSubsystem

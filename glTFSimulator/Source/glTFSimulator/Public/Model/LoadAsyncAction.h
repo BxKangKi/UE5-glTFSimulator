@@ -29,10 +29,10 @@ class GLTFSIMULATOR_API ULoadAsyncAction : public UBlueprintAsyncActionBase
 public:
     /**
      * Asynchronously loads a glTF asset in chunks, merges read-only JSON settings, and uses the
-     * sibling program-owned SCZ extent cache when its source-model hash matches.
+     * program-owned binary extent cache when its source-model hash matches.
      * @param InSourceFilePath Absolute source .glb/.gltf path used for hash validation.
      * @param InJsonFilePath Read-only user settings path. A missing template may be created once.
-     * @param InSizeCacheFilePath Program-owned cache path including the .scz extension.
+     * @param InSizeCacheFilePath Program-owned extensionless /cache path.
      */
     UFUNCTION(BlueprintCallable, meta=(WorldContext="WorldContextObject"))
     static ULoadAsyncAction *LoadAsync(
@@ -42,8 +42,7 @@ public:
         const int32 ChunkSize,
         const FString& InSourceFilePath,
         const FString& InJsonFilePath,
-        const FString& InSizeCacheFilePath,
-        bool bInCreateMissingJsonTemplate);
+        const FString& InSizeCacheFilePath);
 
     UPROPERTY(BlueprintAssignable)
     FLoadAsyncCompleted Completed;  // Custom completion delegate.
@@ -104,9 +103,10 @@ private:
     FModelCacheData LoadedModelCache;
     FModelCacheData GeneratedModelCache;
     FString CurrentModelHash;
+    /** Immutable JSON snapshot copied on the worker and embedded in the binary cache. */
+    FString CurrentDefinitionJson;
     bool bUseCachedMeshExtents = false;
     bool bModelCacheDirty = false;
-    bool bCreateMissingJsonTemplate = true;
 
     // Immutable source/settings/cache paths used by asynchronous metadata processing.
     FString SourceFilePath;
@@ -127,7 +127,7 @@ private:
     void BroadcastProgressValue(float Value);
     void BroadcastNodeProgress();
 
-    // Functions that control read-only JSON settings and program-owned SCZ metadata.
+    // Functions that control read-only JSON settings and program-owned cache metadata.
     void LoadSettingsAndCacheAsync();
     void SanitizeParsedData();
     void RefreshGeneratedModelData();

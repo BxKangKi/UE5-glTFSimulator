@@ -2,8 +2,8 @@
 
 #include "CoreMinimal.h"
 #include "Kismet/BlueprintFunctionLibrary.h"
-#include "RuntimeFramework/SimulatorInteractionTypes.h"
-#include "SimulatorInteractionJsonLibrary.generated.h"
+#include "Simulator/InteractionTypes.h"
+#include "InteractionJsonLibrary.generated.h"
 
 UCLASS()
 class GLTFSIMULATOR_API USimulatorInteractionJsonLibrary final : public UBlueprintFunctionLibrary

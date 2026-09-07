@@ -20,12 +20,14 @@
 #include "System/SafeFileIO.h"
 #include "System/glTFRuntimeSafety.h"
 #include "System/MacroLibrary.h"
+#include "Simulator/ModelDefinitionJson.h"
+#include "Simulator/ModelDatabaseSubsystem.h"
+#include "System/BinaryDataStore.h"
 #include "TimerManager.h"
 #include "UObject/UObjectGlobals.h"
 
 namespace
 {
-    constexpr int64 MaxBoneMapJsonBytes = 16ll * 1024ll * 1024ll;
     constexpr int32 MaxSkeletonBonesForGeneratedSecondaryPhysics = 512;
 
     // Unity builds concatenate multiple .cpp files into one translation unit. The file-specific
@@ -340,40 +342,30 @@ void UCharacterLoadAsyncAction::LoadBoneMapAsync()
 
     TWeakObjectPtr<UCharacterLoadAsyncAction> WeakThis(this);
     const FString JsonPath = FPaths::ChangeExtension(FilePath, TEXT("json"));
+    const FString CharacterGlbPath = FilePath;
     bBoneMapLoadInFlight = true;
 
-    const bool bWorkerQueued = FSafeFileIO::RunTrackedWorker([WeakThis, JsonPath]()
+    const bool bWorkerQueued = FSafeFileIO::RunTrackedWorker([WeakThis, JsonPath, CharacterGlbPath]()
     {
         // BACKGROUND THREAD ONLY: bounded file I/O and plain JSON/string processing.
         TMap<FString, FString> LocalBoneMap;
-        FSafeJsonLimits Limits;
-        Limits.MaxFileBytes = MaxBoneMapJsonBytes;
-        Limits.MaxContainerEntries = 65536;
-        Limits.MaxValues = 131072;
-        Limits.bAllowBackupRecovery = false;
-        const FSafeJsonLoadResult JsonResult = FSafeFileIO::LoadJsonBlocking(JsonPath, Limits);
-        const TSharedPtr<FJsonObject>& Json = JsonResult.JsonObject;
-
-        if (Json.IsValid())
+        FString DefinitionError;
+        FModelDefinition Definition;
+        const bool bDefinitionValid = ModelDefinitionJson::LoadDefinition(
+            JsonPath, CharacterGlbPath, Definition, DefinitionError)
+            && Definition.ModelType == EModelDefinitionType::Character;
+        if (bDefinitionValid)
         {
-            for (const auto& Pair : Json->Values)
-            {
-                FString BoneValue;
-                const FString BoneKey = FString(Pair.Key).TrimStartAndEnd();
-                if (Pair.Value.IsValid() && Pair.Value->TryGetString(BoneValue))
-                {
-                    BoneValue = BoneValue.TrimStartAndEnd();
-                    if (!BoneKey.IsEmpty() && !BoneValue.IsEmpty())
-                    {
-                        // External glTF/bone names remain name-based by design.
-                        LocalBoneMap.Add(BoneValue, BoneKey);
-                    }
-                }
-            }
+            LocalBoneMap = MoveTemp(Definition.Bones);
+        }
+        else if (DefinitionError.IsEmpty())
+        {
+            DefinitionError = TEXT("ModelType must be Character");
         }
 
         if (!FSafeFileIO::DispatchTrackedGameThread(
-            [WeakThis, LocalBoneMap = MoveTemp(LocalBoneMap)]() mutable
+            [WeakThis, LocalBoneMap = MoveTemp(LocalBoneMap), bDefinitionValid,
+                DefinitionError = MoveTemp(DefinitionError)]() mutable
         {
             UCharacterLoadAsyncAction* StrongThis = WeakThis.Get();
             if (!IsValid(StrongThis))
@@ -390,6 +382,14 @@ void UCharacterLoadAsyncAction::LoadBoneMapAsync()
             if (!IsValid(StrongThis->CurrentLoadedAsset) || !StrongThis->OwnerCharacter.IsValid())
             {
                 StrongThis->FailLoad(TEXT("Character asset or owner became invalid before mesh creation"));
+                return;
+            }
+            if (!bDefinitionValid)
+            {
+                StrongThis->FailLoad(FString::Printf(
+                    TEXT("Character definition rejected. Path=%s Reason=%s"),
+                    *StrongThis->FilePath,
+                    *DefinitionError));
                 return;
             }
 
@@ -616,6 +616,37 @@ void UCharacterLoadAsyncAction::OnMeshLoaded(USkeletalMesh* SkeletalMesh)
 
     PendingSkeletalMesh = SkeletalMesh;
     ReleaseTransientRuntimeObject(PendingSkeletalMesh);
+
+    // Character caches use the same binary JSON+bounds payload as other models. The database
+    // maps this definition to /cache/<original JSON base filename>, without an extension.
+    if (UWorld* World = GetWorld())
+    {
+        UGameInstance* GameInstance = World->GetGameInstance();
+        UModelDatabaseSubsystem* Database = GameInstance
+            ? GameInstance->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
+        FGuid UUID;
+        FModelDefinition Definition;
+        FString CachePath;
+        if (Database && Database->FindIdForGlb(FilePath, UUID)
+            && Database->Resolve(UUID, Definition, CachePath))
+        {
+            const FBoxSphereBounds Bounds = SkeletalMesh->GetImportedBounds();
+            const FString SourcePath = FilePath;
+            const FString JsonPath = Definition.JsonPath;
+            FSafeFileIO::RunTrackedWorker([SourcePath, JsonPath, CachePath, Bounds]()
+            {
+                FModelCacheData Cache;
+                FString Error;
+                FFileHelper::LoadFileToString(Cache.DefinitionJson, *JsonPath);
+                if (FBinaryDataStore::ComputeFileSha1(SourcePath, Cache.ModelHash, Error))
+                {
+                    Cache.Center = Bounds.Origin;
+                    Cache.Extent = Bounds.BoxExtent.GetAbs();
+                    FBinaryDataStore::SaveModelCacheBlocking(CachePath, Cache);
+                }
+            });
+        }
+    }
     OnProgress.Broadcast(0.80f);
 
     // Split finalization across frames so the mesh finalizer, physics setup, and component swap

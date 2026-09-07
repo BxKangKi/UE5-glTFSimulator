@@ -1,4 +1,4 @@
-#include "RuntimeFramework/SimulatorAssetPathLibrary.h"
+#include "Simulator/AssetPathLibrary.h"
 #include "HAL/FileManager.h"
 #include "Misc/Paths.h"
 

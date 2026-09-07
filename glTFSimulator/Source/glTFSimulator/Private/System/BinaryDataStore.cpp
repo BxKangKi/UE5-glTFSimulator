@@ -15,25 +15,26 @@
 namespace BinaryDataStorePrivate
 {
     constexpr uint32 EnvelopeMagic = 0x44534647u; // "GFSD" in little-endian byte order.
-    constexpr uint16 SchemaVersion = 1;
+    constexpr uint16 SchemaVersion = 2;
     constexpr int32 HeaderBytes = 16;
     constexpr int32 MaxStringBytes = 4 * 1024 * 1024;
     constexpr int32 MaxPathBytes = 32768;
     constexpr int32 MaxNameBytes = 4096;
     constexpr int32 MaxModelMeshes = 500000;
-    constexpr int32 MaxEntities = 1000000;
     constexpr int32 MaxPlayers = 10000;
     constexpr int32 MaxItemsPerPlayer = 65536;
-    constexpr uint32 ModelSczMagic = 0x315A4353u; // "SCZ1" in little-endian byte order.
-    constexpr uint16 ModelSczVersion = 1;
-    constexpr uint16 ModelSczCodecZlib = 1;
+    constexpr int32 MaxChunkObjects = 1000000;
+    constexpr int32 MaxDatabaseEntries = 1000000;
+    constexpr uint32 ModelCacheMagic = 0x3148434Du; // "MCH1" in little-endian byte order.
+    constexpr uint16 ModelCacheVersion = 2;
+    constexpr uint16 ModelCacheCodecZlib = 1;
 
     enum class EDatKind : uint16
     {
         Model = 1,
-        Entities = 2,
-        Players = 3,
-        World = 4
+        WorldChunk = 2,
+        ModelDatabase = 3,
+        Level = 4
     };
 
     static bool IsFiniteVector(const FVector& Value)
@@ -163,6 +164,11 @@ namespace BinaryDataStorePrivate
             WriteVector(Value.GetLocation());
             WriteQuat(Value.GetRotation());
             WriteVector(Value.GetScale3D());
+        }
+
+        void WriteGuid(const FGuid& Value)
+        {
+            WriteU32(Value.A); WriteU32(Value.B); WriteU32(Value.C); WriteU32(Value.D);
         }
 
         void Append(const TArray<uint8>& Value)
@@ -302,6 +308,11 @@ namespace BinaryDataStorePrivate
                 }
             }
             return FTransform(Rotation, Location, Scale);
+        }
+
+        FGuid ReadGuid()
+        {
+            return FGuid(ReadU32(), ReadU32(), ReadU32(), ReadU32());
         }
 
         TArray<uint8> ReadBytes(const int32 Count)
@@ -521,7 +532,8 @@ namespace BinaryDataStorePrivate
 bool FModelCacheData::IsSane() const
 {
     using namespace BinaryDataStorePrivate;
-    if (ModelHash.IsEmpty() || ModelHash.Len() > 128 ||
+    if (ModelHash.IsEmpty() || ModelHash.Len() > 128 || DefinitionJson.IsEmpty()
+        || DefinitionJson.Len() > MaxStringBytes ||
         !IsFiniteVector(Center) || !IsFiniteVector(Extent) ||
         Extent.X < 0.0 || Extent.Y < 0.0 || Extent.Z < 0.0 ||
         MeshExtents.Num() < 0 || MeshExtents.Num() > MaxModelMeshes)
@@ -597,6 +609,7 @@ bool FBinaryDataStore::SerializeModelCache(const FModelCacheData& Cache, TArray<
     TArray<uint8> RawPayload;
     FWriter RawWriter(RawPayload);
     RawWriter.WriteString(Cache.ModelHash, 128);
+    RawWriter.WriteString(Cache.DefinitionJson, MaxStringBytes);
     RawWriter.WriteVector(Cache.Center);
     RawWriter.WriteVector(Cache.Extent);
 
@@ -627,9 +640,9 @@ bool FBinaryDataStore::SerializeModelCache(const FModelCacheData& Cache, TArray<
             CompressionBound,
             static_cast<int64>(RawPayload.Num()),
             0) ||
-        CompressionBound <= 0 || CompressionBound > MaxModelSczBytes || CompressionBound > MAX_int32)
+        CompressionBound <= 0 || CompressionBound > MaxModelCacheBytes || CompressionBound > MAX_int32)
     {
-        OutError = TEXT("Could not determine a safe zlib buffer size for the model SCZ cache");
+        OutError = TEXT("Could not determine a safe zlib buffer size for the model cache");
         return false;
     }
 
@@ -646,61 +659,61 @@ bool FBinaryDataStore::SerializeModelCache(const FModelCacheData& Cache, TArray<
             0) ||
         CompressedBytes <= 0 || CompressedBytes > CompressionBound || CompressedBytes > MAX_int32)
     {
-        OutError = TEXT("Zlib compression failed while building the model SCZ cache");
+        OutError = TEXT("Zlib compression failed while building the model cache");
         return false;
     }
     Compressed.SetNum(static_cast<int32>(CompressedBytes), EAllowShrinking::No);
 
-    TArray<uint8> SczPayload;
-    FWriter SczWriter(SczPayload);
-    SczWriter.WriteU32(ModelSczMagic);
-    SczWriter.WriteU16(ModelSczVersion);
-    SczWriter.WriteU16(ModelSczCodecZlib);
-    SczWriter.WriteU64(static_cast<uint64>(RawPayload.Num()));
-    SczWriter.WriteU64(static_cast<uint64>(Compressed.Num()));
-    SczWriter.WriteU32(FCrc::MemCrc32(RawPayload.GetData(), RawPayload.Num()));
-    SczWriter.Append(Compressed);
-    if (!SczWriter.IsOk() || static_cast<int64>(SczPayload.Num()) > MaxModelSczBytes)
+    TArray<uint8> CachePayload;
+    FWriter CacheWriter(CachePayload);
+    CacheWriter.WriteU32(ModelCacheMagic);
+    CacheWriter.WriteU16(ModelCacheVersion);
+    CacheWriter.WriteU16(ModelCacheCodecZlib);
+    CacheWriter.WriteU64(static_cast<uint64>(RawPayload.Num()));
+    CacheWriter.WriteU64(static_cast<uint64>(Compressed.Num()));
+    CacheWriter.WriteU32(FCrc::MemCrc32(RawPayload.GetData(), RawPayload.Num()));
+    CacheWriter.Append(Compressed);
+    if (!CacheWriter.IsOk() || static_cast<int64>(CachePayload.Num()) > MaxModelCacheBytes)
     {
-        OutError = TEXT("Compressed model SCZ payload exceeded its bounded file-size limit");
+        OutError = TEXT("Compressed model-cache payload exceeded its bounded file-size limit");
         return false;
     }
 
-    return BuildEnvelope(EDatKind::Model, SczPayload, OutBytes, OutError);
+    return BuildEnvelope(EDatKind::Model, CachePayload, OutBytes, OutError);
 }
 
 bool FBinaryDataStore::DeserializeModelCache(const TArray<uint8>& Bytes, FModelCacheData& OutCache, FString& OutError)
 {
     using namespace BinaryDataStorePrivate;
-    TArray<uint8> SczPayload;
-    if (!ExtractPayload(Bytes, EDatKind::Model, SczPayload, OutError))
+    TArray<uint8> CachePayload;
+    if (!ExtractPayload(Bytes, EDatKind::Model, CachePayload, OutError))
     {
         return false;
     }
 
-    FReader SczReader(SczPayload);
-    const uint32 SczMagic = SczReader.ReadU32();
-    const uint16 SczVersion = SczReader.ReadU16();
-    const uint16 SczCodec = SczReader.ReadU16();
-    const uint64 RawBytes64 = SczReader.ReadU64();
-    const uint64 CompressedBytes64 = SczReader.ReadU64();
-    const uint32 ExpectedRawCrc = SczReader.ReadU32();
-    if (!SczReader.IsOk() || SczMagic != ModelSczMagic || SczVersion != ModelSczVersion ||
-        SczCodec != ModelSczCodecZlib || RawBytes64 == 0 ||
+    FReader CacheReader(CachePayload);
+    const uint32 CacheMagic = CacheReader.ReadU32();
+    const uint16 CacheVersion = CacheReader.ReadU16();
+    const uint16 CacheCodec = CacheReader.ReadU16();
+    const uint64 RawBytes64 = CacheReader.ReadU64();
+    const uint64 CompressedBytes64 = CacheReader.ReadU64();
+    const uint32 ExpectedRawCrc = CacheReader.ReadU32();
+    if (!CacheReader.IsOk() || CacheMagic != ModelCacheMagic || CacheVersion != ModelCacheVersion ||
+        CacheCodec != ModelCacheCodecZlib || RawBytes64 == 0 ||
         RawBytes64 > static_cast<uint64>(MaxModelCacheRawBytes) ||
-        CompressedBytes64 == 0 || CompressedBytes64 > static_cast<uint64>(MaxModelSczBytes) ||
-        CompressedBytes64 != static_cast<uint64>(SczReader.Remaining()) ||
+        CompressedBytes64 == 0 || CompressedBytes64 > static_cast<uint64>(MaxModelCacheBytes) ||
+        CompressedBytes64 != static_cast<uint64>(CacheReader.Remaining()) ||
         RawBytes64 > static_cast<uint64>(MAX_int32) ||
         CompressedBytes64 > static_cast<uint64>(MAX_int32))
     {
-        OutError = TEXT("Model SCZ header, codec, or bounded size fields are invalid");
+        OutError = TEXT("Model-cache header, codec, or bounded size fields are invalid");
         return false;
     }
 
-    TArray<uint8> Compressed = SczReader.ReadBytes(static_cast<int32>(CompressedBytes64));
-    if (!SczReader.IsAtEnd())
+    TArray<uint8> Compressed = CacheReader.ReadBytes(static_cast<int32>(CompressedBytes64));
+    if (!CacheReader.IsAtEnd())
     {
-        OutError = TEXT("Model SCZ cache contains trailing or truncated compressed bytes");
+        OutError = TEXT("Model cache contains trailing or truncated compressed bytes");
         return false;
     }
 
@@ -715,19 +728,20 @@ bool FBinaryDataStore::DeserializeModelCache(const TArray<uint8>& Bytes, FModelC
             COMPRESS_NoFlags,
             0))
     {
-        OutError = TEXT("Zlib decompression failed for the model SCZ cache");
+        OutError = TEXT("Zlib decompression failed for the model cache");
         return false;
     }
     const uint32 ActualRawCrc = FCrc::MemCrc32(RawPayload.GetData(), RawPayload.Num());
     if (ActualRawCrc != ExpectedRawCrc)
     {
-        OutError = TEXT("Model SCZ raw-payload CRC validation failed");
+        OutError = TEXT("Model-cache raw-payload CRC validation failed");
         return false;
     }
 
     FReader Reader(RawPayload);
     FModelCacheData Parsed;
     Parsed.ModelHash = Reader.ReadString(128).ToUpper();
+    Parsed.DefinitionJson = Reader.ReadString(MaxStringBytes);
     Parsed.Center = Reader.ReadVector();
     Parsed.Extent = Reader.ReadVector();
     const uint32 Count = Reader.ReadU32();
@@ -772,7 +786,7 @@ bool FBinaryDataStore::LoadModelCache(
     OutCache = FModelCacheData();
     if (!BinaryDataStorePrivate::LoadValidatedDatWithBackup(
             CachePath,
-            MaxModelSczBytes,
+            MaxModelCacheBytes,
             [&OutCache](const TArray<uint8>& Bytes, FString& ValidationError)
             {
                 return FBinaryDataStore::DeserializeModelCache(Bytes, OutCache, ValidationError);
@@ -784,7 +798,7 @@ bool FBinaryDataStore::LoadModelCache(
     if (!ExpectedHash.IsEmpty() && !OutCache.ModelHash.Equals(ExpectedHash, ESearchCase::IgnoreCase))
     {
         bOutHashMismatch = true;
-        OutError = TEXT("Model hash differs from the cached SCZ hash");
+        OutError = TEXT("Model hash differs from the cached model hash");
         OutCache = FModelCacheData();
         return false;
     }
@@ -799,7 +813,7 @@ FSafeFileWriteResult FBinaryDataStore::SaveModelCacheBlocking(const FString& Cac
     {
         return BinaryDataStorePrivate::MakeSerializationFailure(CachePath, Error);
     }
-    return FSafeFileIO::SaveBinaryBlocking(Bytes, CachePath, MaxModelSczBytes);
+    return FSafeFileIO::SaveBinaryBlocking(Bytes, CachePath, MaxModelCacheBytes);
 }
 
 bool FBinaryDataStore::InvalidateCacheFile(const FString& CachePath, FString& OutError)
@@ -808,7 +822,7 @@ bool FBinaryDataStore::InvalidateCacheFile(const FString& CachePath, FString& Ou
     const FString Normalized = FSafeFileIO::NormalizeFilePath(CachePath);
     if (Normalized.IsEmpty())
     {
-        OutError = TEXT("SCZ cache path is empty");
+        OutError = TEXT("Model-cache path is empty");
         return false;
     }
 
@@ -820,7 +834,7 @@ bool FBinaryDataStore::InvalidateCacheFile(const FString& CachePath, FString& Ou
         if (FileManager.FileExists(*Path) && !FileManager.Delete(*Path, false, true, true))
         {
             bOk = false;
-            OutError += FString::Printf(TEXT("Failed to delete stale SCZ generation: %s\n"), *Path);
+            OutError += FString::Printf(TEXT("Failed to delete stale cache generation: %s\n"), *Path);
         }
     }
 
@@ -834,401 +848,396 @@ bool FBinaryDataStore::InvalidateCacheFile(const FString& CachePath, FString& Ou
         if (!FileManager.Delete(*FullPath, false, true, true))
         {
             bOk = false;
-            OutError += FString::Printf(TEXT("Failed to delete stale SCZ transaction: %s\n"), *FullPath);
+            OutError += FString::Printf(TEXT("Failed to delete stale cache transaction: %s\n"), *FullPath);
         }
     }
     OutError.TrimEndInline();
     return bOk;
 }
 
-bool FBinaryDataStore::SerializeEntities(const TArray<FPlacedObjectRecord>& Records, TArray<uint8>& OutBytes, FString& OutError)
+bool FBinaryDataStore::SerializeWorldChunk(
+    const TArray<FWorldChunkObject>& Objects,
+    TArray<uint8>& OutBytes,
+    FString& OutError)
 {
     using namespace BinaryDataStorePrivate;
-    if (Records.Num() < 0 || Records.Num() > MaxEntities)
+    if (Objects.Num() > MaxChunkObjects)
     {
-        OutError = TEXT("Entity count exceeds the safety limit");
+        OutError = TEXT("World chunk exceeds the object-count safety limit");
         return false;
     }
 
     TArray<uint8> Payload;
     FWriter Writer(Payload);
-    Writer.WriteU32(static_cast<uint32>(Records.Num()));
-    for (const FPlacedObjectRecord& Record : Records)
+    Writer.WriteU32(static_cast<uint32>(Objects.Num()));
+    for (const FWorldChunkObject& Object : Objects)
     {
-        if (Record.ObjectName.IsEmpty() || !IsFiniteTransform(Record.Transform) ||
-            (Record.Kind != EPlacedObjectKind::Prefab && Record.Kind != EPlacedObjectKind::Vehicle))
+        const bool bValid = Object.UUID.IsValid() && IsFiniteVector(Object.Location)
+            && IsFiniteQuat(Object.Rotation) && Object.Rotation.IsNormalized()
+            && IsFiniteVector(Object.Scale) && IsFiniteVector(Object.Velocity)
+            && IsFiniteVector(Object.AngularVelocity);
+        if (!bValid)
         {
-            OutError = TEXT("Entity record contains an unsupported kind, invalid transform, or empty name");
+            OutError = TEXT("World chunk contains an invalid UUID or transform/velocity");
             return false;
         }
-        Writer.WriteString(Record.ObjectName, MaxNameBytes);
-        Writer.WriteString(Record.BaseName, MaxNameBytes);
-        Writer.WriteString(Record.SourceFile, MaxPathBytes);
-        Writer.WriteU8(static_cast<uint8>(Record.Kind));
-        Writer.WriteTransform(Record.Transform);
+        Writer.WriteGuid(Object.UUID);
+        Writer.WriteVector(Object.Location);
+        Writer.WriteQuat(Object.Rotation);
+        Writer.WriteVector(Object.Scale);
+        Writer.WriteVector(Object.Velocity);
+        Writer.WriteVector(Object.AngularVelocity);
     }
     if (!Writer.IsOk())
     {
-        OutError = TEXT("Entity serialization exceeded a bounded field limit");
+        OutError = TEXT("World chunk serialization failed");
         return false;
     }
-    return BuildEnvelope(EDatKind::Entities, Payload, OutBytes, OutError);
+    return BuildEnvelope(EDatKind::WorldChunk, Payload, OutBytes, OutError);
 }
 
-bool FBinaryDataStore::DeserializeEntities(const TArray<uint8>& Bytes, TArray<FPlacedObjectRecord>& OutRecords, FString& OutError)
+bool FBinaryDataStore::DeserializeWorldChunk(
+    const TArray<uint8>& Bytes,
+    TArray<FWorldChunkObject>& OutObjects,
+    FString& OutError)
 {
     using namespace BinaryDataStorePrivate;
     TArray<uint8> Payload;
-    if (!ExtractPayload(Bytes, EDatKind::Entities, Payload, OutError))
+    if (!ExtractPayload(Bytes, EDatKind::WorldChunk, Payload, OutError))
     {
         return false;
     }
-
     FReader Reader(Payload);
     const uint32 Count = Reader.ReadU32();
-    if (!Reader.IsOk() || Count > static_cast<uint32>(MaxEntities))
+    if (!Reader.IsOk() || Count > static_cast<uint32>(MaxChunkObjects))
     {
-        OutError = TEXT("Entity count exceeds the safety limit");
+        OutError = TEXT("World chunk object count is invalid");
         return false;
     }
 
-    TArray<FPlacedObjectRecord> Parsed;
+    TArray<FWorldChunkObject> Parsed;
     Parsed.Reserve(static_cast<int32>(Count));
     for (uint32 Index = 0; Index < Count; ++Index)
     {
-        FPlacedObjectRecord Record;
-        Record.ObjectName = Reader.ReadString(MaxNameBytes).TrimStartAndEnd();
-        Record.BaseName = Reader.ReadString(MaxNameBytes).TrimStartAndEnd();
-        Record.SourceFile = Reader.ReadString(MaxPathBytes).TrimStartAndEnd();
-        Record.Kind = static_cast<EPlacedObjectKind>(Reader.ReadU8());
-        Record.Transform = Reader.ReadTransform();
-        if (!Reader.IsOk() || Record.ObjectName.IsEmpty() || !IsFiniteTransform(Record.Transform) ||
-            (Record.Kind != EPlacedObjectKind::Prefab && Record.Kind != EPlacedObjectKind::Vehicle))
+        FWorldChunkObject& Object = Parsed.AddDefaulted_GetRef();
+        Object.UUID = Reader.ReadGuid();
+        Object.Location = Reader.ReadVector();
+        Object.Rotation = Reader.ReadQuat();
+        Object.Scale = Reader.ReadVector();
+        Object.Velocity = Reader.ReadVector();
+        Object.AngularVelocity = Reader.ReadVector();
+        if (!Reader.IsOk() || !Object.UUID.IsValid() || !IsFiniteVector(Object.Location)
+            || !IsFiniteQuat(Object.Rotation) || !Object.Rotation.IsNormalized()
+            || !IsFiniteVector(Object.Scale) || !IsFiniteVector(Object.Velocity)
+            || !IsFiniteVector(Object.AngularVelocity))
         {
-            OutError = FString::Printf(TEXT("Invalid entity record at index %u"), Index);
+            OutError = FString::Printf(TEXT("Invalid world chunk object at index %u"), Index);
             return false;
         }
-        Parsed.Add(MoveTemp(Record));
     }
     if (!Reader.IsAtEnd())
     {
-        OutError = TEXT("Entity DAT is truncated or contains trailing data");
+        OutError = TEXT("World chunk is truncated or has trailing bytes");
         return false;
     }
-    OutRecords = MoveTemp(Parsed);
+    OutObjects = MoveTemp(Parsed);
     return true;
 }
 
-bool FBinaryDataStore::LoadEntities(const FString& DatPath, TArray<FPlacedObjectRecord>& OutRecords, FString& OutError)
+bool FBinaryDataStore::LoadWorldChunk(const FString& DatPath, TArray<FWorldChunkObject>& OutObjects, FString& OutError)
 {
-    OutRecords.Reset();
     return BinaryDataStorePrivate::LoadValidatedDatWithBackup(
-        DatPath,
-        MaxEntitiesDatBytes,
-        [&OutRecords](const TArray<uint8>& Bytes, FString& ValidationError)
+        DatPath, MaxWorldChunkDatBytes,
+        [&OutObjects](const TArray<uint8>& Bytes, FString& Error)
         {
-            return FBinaryDataStore::DeserializeEntities(Bytes, OutRecords, ValidationError);
-        },
-        OutError);
+            return DeserializeWorldChunk(Bytes, OutObjects, Error);
+        }, OutError);
 }
 
-FSafeFileWriteResult FBinaryDataStore::SaveEntitiesBlocking(const FString& DatPath, const TArray<FPlacedObjectRecord>& Records)
+void FBinaryDataStore::LoadWorldChunkAsync(
+    const FString& DatPath,
+    TFunction<void(bool, TArray<FWorldChunkObject>, FString)> Callback)
+{
+    const FString SafePath = FSafeFileIO::NormalizeFilePath(DatPath);
+    const bool bQueued = FSafeFileIO::RunTrackedWorker([SafePath, Callback]() mutable
+    {
+        TArray<FWorldChunkObject> Objects;
+        FString Error;
+        const bool bMissing = !IFileManager::Get().FileExists(*SafePath)
+            && !IFileManager::Get().FileExists(*(SafePath + TEXT(".bak")));
+        const bool bLoaded = bMissing || LoadWorldChunk(SafePath, Objects, Error);
+        FSafeFileIO::DispatchTrackedGameThread(
+            [Callback = MoveTemp(Callback), bLoaded, Objects = MoveTemp(Objects), Error = MoveTemp(Error)]() mutable
+            {
+                if (Callback) Callback(bLoaded, MoveTemp(Objects), MoveTemp(Error));
+            });
+    });
+    if (!bQueued && Callback)
+    {
+        Callback(false, TArray<FWorldChunkObject>(), TEXT("async I/O queue is shutting down"));
+    }
+}
+
+FSafeFileWriteResult FBinaryDataStore::SaveWorldChunkBlocking(const FString& DatPath, const TArray<FWorldChunkObject>& Objects)
 {
     TArray<uint8> Bytes;
     FString Error;
-    if (!SerializeEntities(Records, Bytes, Error))
+    if (!SerializeWorldChunk(Objects, Bytes, Error))
     {
         return BinaryDataStorePrivate::MakeSerializationFailure(DatPath, Error);
     }
-    return FSafeFileIO::SaveBinaryBlocking(Bytes, DatPath, MaxEntitiesDatBytes);
+    return FSafeFileIO::SaveBinaryBlocking(Bytes, DatPath, MaxWorldChunkDatBytes);
 }
 
-void FBinaryDataStore::SaveEntitiesAsync(
+void FBinaryDataStore::SaveWorldChunkAsync(
     const FString& DatPath,
-    const TArray<FPlacedObjectRecord>& Records,
+    const TArray<FWorldChunkObject>& Objects,
     FSafeFileIO::FWriteCallback Callback)
 {
     TArray<uint8> Bytes;
     FString Error;
-    if (!SerializeEntities(Records, Bytes, Error))
+    if (!SerializeWorldChunk(Objects, Bytes, Error))
     {
-        FSafeFileWriteResult Result = BinaryDataStorePrivate::MakeSerializationFailure(DatPath, Error);
-        if (Callback)
-        {
-            Callback(MoveTemp(Result));
-        }
+        if (Callback) Callback(BinaryDataStorePrivate::MakeSerializationFailure(DatPath, Error));
         return;
     }
-    FSafeFileIO::SaveBinaryAsync(Bytes, DatPath, MaxEntitiesDatBytes, MoveTemp(Callback));
+    FSafeFileIO::SaveBinaryAsync(Bytes, DatPath, MaxWorldChunkDatBytes, MoveTemp(Callback));
 }
 
-bool FBinaryDataStore::SerializePlayers(const UPlayerData* Data, TArray<uint8>& OutBytes, FString& OutError)
+bool FBinaryDataStore::SerializeModelDatabase(
+    const TArray<FModelDatabaseEntry>& Entries,
+    TArray<uint8>& OutBytes,
+    FString& OutError)
 {
     using namespace BinaryDataStorePrivate;
-    if (!IsValid(Data) || Data->Players.Num() < 0 || Data->Players.Num() > MaxPlayers)
+    if (Entries.Num() > MaxDatabaseEntries)
     {
-        OutError = TEXT("Player data is invalid or exceeds the player-count limit");
+        OutError = TEXT("Model database exceeds the row-count safety limit");
         return false;
     }
-
     TArray<uint8> Payload;
     FWriter Writer(Payload);
-    Writer.WriteString(Data->Version, MaxNameBytes);
-    Writer.WriteU32(static_cast<uint32>(Data->Players.Num()));
-    for (const FWorldPlayerRecord& Record : Data->Players)
+    Writer.WriteU32(static_cast<uint32>(Entries.Num()));
+    TSet<FGuid> Seen;
+    for (const FModelDatabaseEntry& Entry : Entries)
     {
-        if (Record.PlayerId.IsEmpty() || !IsFiniteVector(Record.Location) ||
-            !FMath::IsFinite(Record.Rotation.Pitch) || !FMath::IsFinite(Record.Rotation.Yaw) ||
-            !FMath::IsFinite(Record.Rotation.Roll) || !FMath::IsFinite(Record.Health) ||
-            Record.Items.Num() < 0 || Record.Items.Num() > MaxItemsPerPlayer)
+        if (!Entry.UUID.IsValid() || Seen.Contains(Entry.UUID) || Entry.Json.IsEmpty())
         {
-            OutError = TEXT("Player record contains invalid numeric data or too many items");
+            OutError = TEXT("Model database contains a duplicate/invalid UUID or empty JSON path");
             return false;
         }
-
-        Writer.WriteString(Record.PlayerId, MaxNameBytes);
-        Writer.WriteString(Record.DisplayName, MaxNameBytes);
-        Writer.WriteVector(Record.Location);
-        Writer.WriteDouble(Record.Rotation.Pitch);
-        Writer.WriteDouble(Record.Rotation.Yaw);
-        Writer.WriteDouble(Record.Rotation.Roll);
-        Writer.WriteFloat(Record.Health);
-        Writer.WriteI32(FMath::Max(1, Record.Level));
-        Writer.WriteString(Record.PlayerGameMode, MaxNameBytes);
-        Writer.WriteU32(static_cast<uint32>(Record.Items.Num()));
-        for (const FString& Item : Record.Items)
-        {
-            Writer.WriteString(Item, MaxPathBytes);
-        }
-
-        FString CustomText;
-        if (!JsonObjectToCompactString(Record.CustomJson, CustomText))
-        {
-            OutError = TEXT("Player Custom JSON could not be serialized into the binary record");
-            return false;
-        }
-        Writer.WriteString(CustomText, MaxStringBytes);
+        Seen.Add(Entry.UUID);
+        Writer.WriteGuid(Entry.UUID);
+        Writer.WriteString(Entry.Cache, MaxPathBytes);
+        Writer.WriteString(Entry.Json, MaxPathBytes);
     }
-    if (!Writer.IsOk())
-    {
-        OutError = TEXT("Player serialization exceeded a bounded field limit");
-        return false;
-    }
-    return BuildEnvelope(EDatKind::Players, Payload, OutBytes, OutError);
+    return Writer.IsOk() && BuildEnvelope(EDatKind::ModelDatabase, Payload, OutBytes, OutError);
 }
 
-bool FBinaryDataStore::DeserializePlayers(const TArray<uint8>& Bytes, UPlayerData* OutData, FString& OutError)
+bool FBinaryDataStore::DeserializeModelDatabase(
+    const TArray<uint8>& Bytes,
+    TArray<FModelDatabaseEntry>& OutEntries,
+    FString& OutError)
 {
     using namespace BinaryDataStorePrivate;
-    if (!IsValid(OutData))
-    {
-        OutError = TEXT("Destination UPlayerData is invalid");
-        return false;
-    }
-
     TArray<uint8> Payload;
-    if (!ExtractPayload(Bytes, EDatKind::Players, Payload, OutError))
-    {
-        return false;
-    }
-
+    if (!ExtractPayload(Bytes, EDatKind::ModelDatabase, Payload, OutError)) return false;
     FReader Reader(Payload);
-    FString ParsedVersion = Reader.ReadString(MaxNameBytes);
     const uint32 Count = Reader.ReadU32();
-    if (!Reader.IsOk() || Count > static_cast<uint32>(MaxPlayers))
+    if (!Reader.IsOk() || Count > static_cast<uint32>(MaxDatabaseEntries))
     {
-        OutError = TEXT("Player count exceeds the safety limit");
+        OutError = TEXT("Model database row count is invalid");
         return false;
     }
-
-    TArray<FWorldPlayerRecord> ParsedPlayers;
-    ParsedPlayers.Reserve(static_cast<int32>(Count));
-    TSet<FString> SeenIds;
+    TArray<FModelDatabaseEntry> Parsed;
+    TSet<FGuid> Seen;
+    Parsed.Reserve(static_cast<int32>(Count));
     for (uint32 Index = 0; Index < Count; ++Index)
     {
-        FWorldPlayerRecord Record;
-        Record.PlayerId = Reader.ReadString(MaxNameBytes).TrimStartAndEnd();
-        Record.DisplayName = Reader.ReadString(MaxNameBytes).TrimStartAndEnd();
-        Record.Location = Reader.ReadVector();
-        Record.Rotation = FRotator(Reader.ReadDouble(), Reader.ReadDouble(), Reader.ReadDouble()).GetNormalized();
-        Record.Health = Reader.ReadFloat();
-        Record.Level = Reader.ReadI32();
-        Record.PlayerGameMode = Reader.ReadString(MaxNameBytes);
-        const uint32 ItemCount = Reader.ReadU32();
-        if (!Reader.IsOk() || Record.PlayerId.IsEmpty() || SeenIds.Contains(Record.PlayerId.ToLower()) ||
-            ItemCount > static_cast<uint32>(MaxItemsPerPlayer) || !IsFiniteVector(Record.Location) ||
-            !FMath::IsFinite(Record.Rotation.Pitch) || !FMath::IsFinite(Record.Rotation.Yaw) ||
-            !FMath::IsFinite(Record.Rotation.Roll) || !FMath::IsFinite(Record.Health) || Record.Level < 1)
+        FModelDatabaseEntry& Entry = Parsed.AddDefaulted_GetRef();
+        Entry.UUID = Reader.ReadGuid();
+        Entry.Cache = Reader.ReadString(MaxPathBytes);
+        Entry.Json = Reader.ReadString(MaxPathBytes);
+        if (!Reader.IsOk() || !Entry.UUID.IsValid() || Seen.Contains(Entry.UUID) || Entry.Json.IsEmpty())
         {
-            OutError = FString::Printf(TEXT("Invalid player record at index %u"), Index);
+            OutError = FString::Printf(TEXT("Invalid model database row at index %u"), Index);
             return false;
         }
-
-        Record.Items.Reserve(static_cast<int32>(ItemCount));
-        for (uint32 ItemIndex = 0; ItemIndex < ItemCount; ++ItemIndex)
-        {
-            Record.Items.Add(Reader.ReadString(MaxPathBytes));
-        }
-        const FString CustomText = Reader.ReadString(MaxStringBytes);
-        if (!Reader.IsOk())
-        {
-            OutError = FString::Printf(TEXT("Truncated player record at index %u"), Index);
-            return false;
-        }
-
-        FSafeJsonLimits JsonLimits;
-        JsonLimits.MaxFileBytes = MaxStringBytes;
-        JsonLimits.MaxDepth = 32;
-        JsonLimits.MaxValues = 100000;
-        JsonLimits.MaxContainerEntries = 50000;
-        JsonLimits.MaxStringCharacters = MaxStringBytes;
-        const FSafeJsonLoadResult CustomResult = FSafeFileIO::ParseJsonText(
-            CustomText.IsEmpty() ? FString(TEXT("{}")) : CustomText,
-            FString::Printf(TEXT("players.dat Custom[%u]"), Index),
-            JsonLimits);
-        if (!CustomResult.IsSuccess())
-        {
-            OutError = FString::Printf(TEXT("Invalid embedded Custom JSON in player record %u: %s"), Index, *CustomResult.Error);
-            return false;
-        }
-        Record.CustomJson = CustomResult.JsonObject;
-        SeenIds.Add(Record.PlayerId.ToLower());
-        ParsedPlayers.Add(MoveTemp(Record));
+        Seen.Add(Entry.UUID);
     }
-
     if (!Reader.IsAtEnd())
     {
-        OutError = TEXT("Player DAT is truncated or contains trailing data");
+        OutError = TEXT("Model database is truncated or has trailing bytes");
         return false;
     }
-    OutData->Version = ParsedVersion.IsEmpty() ? FString(TEXT("1")) : MoveTemp(ParsedVersion);
-    OutData->Players = MoveTemp(ParsedPlayers);
+    OutEntries = MoveTemp(Parsed);
     return true;
 }
 
-bool FBinaryDataStore::LoadPlayers(const FString& DatPath, UPlayerData* OutData, FString& OutError)
+bool FBinaryDataStore::LoadModelDatabase(const FString& DatPath, TArray<FModelDatabaseEntry>& OutEntries, FString& OutError)
 {
     return BinaryDataStorePrivate::LoadValidatedDatWithBackup(
-        DatPath,
-        MaxPlayersDatBytes,
-        [OutData](const TArray<uint8>& Bytes, FString& ValidationError)
+        DatPath, MaxModelDatabaseDatBytes,
+        [&OutEntries](const TArray<uint8>& Bytes, FString& Error)
         {
-            return FBinaryDataStore::DeserializePlayers(Bytes, OutData, ValidationError);
-        },
-        OutError);
+            return DeserializeModelDatabase(Bytes, OutEntries, Error);
+        }, OutError);
 }
 
-FSafeFileWriteResult FBinaryDataStore::SavePlayersBlocking(const FString& DatPath, const UPlayerData* Data)
+FSafeFileWriteResult FBinaryDataStore::SaveModelDatabaseBlocking(const FString& DatPath, const TArray<FModelDatabaseEntry>& Entries)
 {
     TArray<uint8> Bytes;
     FString Error;
-    if (!SerializePlayers(Data, Bytes, Error))
-    {
+    if (!SerializeModelDatabase(Entries, Bytes, Error))
         return BinaryDataStorePrivate::MakeSerializationFailure(DatPath, Error);
-    }
-    return FSafeFileIO::SaveBinaryBlocking(Bytes, DatPath, MaxPlayersDatBytes);
+    return FSafeFileIO::SaveBinaryBlocking(Bytes, DatPath, MaxModelDatabaseDatBytes);
 }
 
-void FBinaryDataStore::SavePlayersAsync(
-    const FString& DatPath,
-    const UPlayerData* Data,
-    FSafeFileIO::FWriteCallback Callback)
+void FBinaryDataStore::SaveModelDatabaseAsync(const FString& DatPath, const TArray<FModelDatabaseEntry>& Entries, FSafeFileIO::FWriteCallback Callback)
 {
     TArray<uint8> Bytes;
     FString Error;
-    if (!SerializePlayers(Data, Bytes, Error))
+    if (!SerializeModelDatabase(Entries, Bytes, Error))
     {
-        FSafeFileWriteResult Result = BinaryDataStorePrivate::MakeSerializationFailure(DatPath, Error);
-        if (Callback)
-        {
-            Callback(MoveTemp(Result));
-        }
+        if (Callback) Callback(BinaryDataStorePrivate::MakeSerializationFailure(DatPath, Error));
         return;
     }
-    FSafeFileIO::SaveBinaryAsync(Bytes, DatPath, MaxPlayersDatBytes, MoveTemp(Callback));
+    FSafeFileIO::SaveBinaryAsync(Bytes, DatPath, MaxModelDatabaseDatBytes, MoveTemp(Callback));
 }
 
-bool FBinaryDataStore::SerializeWorldRuntime(const FWorldRuntimeData& Data, TArray<uint8>& OutBytes, FString& OutError)
+bool FBinaryDataStore::SerializeLevel(const FLevelRuntimeData& Data, TArray<uint8>& OutBytes, FString& OutError)
 {
     using namespace BinaryDataStorePrivate;
-    if (!FMath::IsFinite(Data.WorldTime))
+    if (!FMath::IsFinite(Data.WorldTime) || Data.Players.Num() > MaxPlayers)
     {
-        OutError = TEXT("World time is not finite");
+        OutError = TEXT("Level state contains invalid time or too many players");
         return false;
     }
-
     TArray<uint8> Payload;
     FWriter Writer(Payload);
     Writer.WriteFloat(Data.WorldTime);
     Writer.WriteString(Data.SelectedPlayer, MaxPathBytes);
-    if (!Writer.IsOk())
+    Writer.WriteU32(static_cast<uint32>(Data.Players.Num()));
+    TSet<FString> Seen;
+    for (const FWorldPlayerRecord& Player : Data.Players)
     {
-        OutError = TEXT("World runtime serialization exceeded a bounded field limit");
-        return false;
+        const FString Key = Player.PlayerId.ToLower();
+        if (Player.PlayerId.IsEmpty() || Seen.Contains(Key) || !IsFiniteVector(Player.Location)
+            || !FMath::IsFinite(Player.Rotation.Pitch) || !FMath::IsFinite(Player.Rotation.Yaw)
+            || !FMath::IsFinite(Player.Rotation.Roll) || !FMath::IsFinite(Player.Health)
+            || Player.Items.Num() > MaxItemsPerPlayer)
+        {
+            OutError = TEXT("Level state contains an invalid player record");
+            return false;
+        }
+        Seen.Add(Key);
+        Writer.WriteString(Player.PlayerId, MaxNameBytes);
+        Writer.WriteString(Player.DisplayName, MaxNameBytes);
+        Writer.WriteVector(Player.Location);
+        Writer.WriteDouble(Player.Rotation.Pitch);
+        Writer.WriteDouble(Player.Rotation.Yaw);
+        Writer.WriteDouble(Player.Rotation.Roll);
+        Writer.WriteFloat(Player.Health);
+        Writer.WriteI32(FMath::Max(1, Player.Level));
+        Writer.WriteString(Player.PlayerGameMode, MaxNameBytes);
+        Writer.WriteU32(static_cast<uint32>(Player.Items.Num()));
+        for (const FString& Item : Player.Items) Writer.WriteString(Item, MaxPathBytes);
+        FString Custom;
+        if (!JsonObjectToCompactString(Player.CustomJson, Custom))
+        {
+            OutError = TEXT("Player custom JSON cannot be serialized");
+            return false;
+        }
+        Writer.WriteString(Custom, MaxStringBytes);
     }
-    return BuildEnvelope(EDatKind::World, Payload, OutBytes, OutError);
+    return Writer.IsOk() && BuildEnvelope(EDatKind::Level, Payload, OutBytes, OutError);
 }
 
-bool FBinaryDataStore::DeserializeWorldRuntime(const TArray<uint8>& Bytes, FWorldRuntimeData& OutData, FString& OutError)
+bool FBinaryDataStore::DeserializeLevel(const TArray<uint8>& Bytes, FLevelRuntimeData& OutData, FString& OutError)
 {
     using namespace BinaryDataStorePrivate;
     TArray<uint8> Payload;
-    if (!ExtractPayload(Bytes, EDatKind::World, Payload, OutError))
+    if (!ExtractPayload(Bytes, EDatKind::Level, Payload, OutError)) return false;
+    FReader Reader(Payload);
+    FLevelRuntimeData Parsed;
+    Parsed.WorldTime = Reader.ReadFloat();
+    Parsed.SelectedPlayer = Reader.ReadString(MaxPathBytes);
+    const uint32 Count = Reader.ReadU32();
+    if (!Reader.IsOk() || !FMath::IsFinite(Parsed.WorldTime) || Count > static_cast<uint32>(MaxPlayers))
     {
+        OutError = TEXT("Level header is invalid");
         return false;
     }
-
-    FReader Reader(Payload);
-    FWorldRuntimeData Parsed;
-    Parsed.WorldTime = Reader.ReadFloat();
-    Parsed.SelectedPlayer = Reader.ReadString(MaxPathBytes).TrimStartAndEnd();
-    if (!Reader.IsAtEnd() || !FMath::IsFinite(Parsed.WorldTime))
+    TSet<FString> Seen;
+    Parsed.Players.Reserve(static_cast<int32>(Count));
+    for (uint32 Index = 0; Index < Count; ++Index)
     {
-        OutError = TEXT("World runtime DAT is invalid, truncated, or contains trailing data");
+        FWorldPlayerRecord& Player = Parsed.Players.AddDefaulted_GetRef();
+        Player.PlayerId = Reader.ReadString(MaxNameBytes);
+        Player.DisplayName = Reader.ReadString(MaxNameBytes);
+        Player.Location = Reader.ReadVector();
+        Player.Rotation = FRotator(Reader.ReadDouble(), Reader.ReadDouble(), Reader.ReadDouble()).GetNormalized();
+        Player.Health = Reader.ReadFloat();
+        Player.Level = Reader.ReadI32();
+        Player.PlayerGameMode = Reader.ReadString(MaxNameBytes);
+        const uint32 ItemCount = Reader.ReadU32();
+        if (!Reader.IsOk() || Player.PlayerId.IsEmpty() || Seen.Contains(Player.PlayerId.ToLower())
+            || ItemCount > static_cast<uint32>(MaxItemsPerPlayer) || !IsFiniteVector(Player.Location)
+            || !FMath::IsFinite(Player.Health) || Player.Level < 1)
+        {
+            OutError = FString::Printf(TEXT("Invalid level player at index %u"), Index);
+            return false;
+        }
+        Seen.Add(Player.PlayerId.ToLower());
+        for (uint32 ItemIndex = 0; ItemIndex < ItemCount; ++ItemIndex)
+            Player.Items.Add(Reader.ReadString(MaxPathBytes));
+        const FString Custom = Reader.ReadString(MaxStringBytes);
+        FSafeJsonLimits Limits;
+        Limits.MaxFileBytes = MaxStringBytes;
+        const FSafeJsonLoadResult Json = FSafeFileIO::ParseJsonText(Custom.IsEmpty() ? TEXT("{}") : Custom,
+            FString::Printf(TEXT("level.dat Player[%u]"), Index), Limits);
+        if (!Reader.IsOk() || !Json.IsSuccess())
+        {
+            OutError = FString::Printf(TEXT("Invalid custom data for player %u"), Index);
+            return false;
+        }
+        Player.CustomJson = Json.JsonObject;
+    }
+    if (!Reader.IsAtEnd())
+    {
+        OutError = TEXT("Level state is truncated or has trailing bytes");
         return false;
     }
     OutData = MoveTemp(Parsed);
     return true;
 }
 
-bool FBinaryDataStore::LoadWorldRuntime(const FString& DatPath, FWorldRuntimeData& OutData, FString& OutError)
+bool FBinaryDataStore::LoadLevel(const FString& DatPath, FLevelRuntimeData& OutData, FString& OutError)
 {
     return BinaryDataStorePrivate::LoadValidatedDatWithBackup(
-        DatPath,
-        MaxWorldDatBytes,
-        [&OutData](const TArray<uint8>& Bytes, FString& ValidationError)
+        DatPath, MaxLevelDatBytes,
+        [&OutData](const TArray<uint8>& Bytes, FString& Error)
         {
-            return FBinaryDataStore::DeserializeWorldRuntime(Bytes, OutData, ValidationError);
-        },
-        OutError);
+            return DeserializeLevel(Bytes, OutData, Error);
+        }, OutError);
 }
 
-FSafeFileWriteResult FBinaryDataStore::SaveWorldRuntimeBlocking(const FString& DatPath, const FWorldRuntimeData& Data)
+FSafeFileWriteResult FBinaryDataStore::SaveLevelBlocking(const FString& DatPath, const FLevelRuntimeData& Data)
 {
     TArray<uint8> Bytes;
     FString Error;
-    if (!SerializeWorldRuntime(Data, Bytes, Error))
-    {
-        return BinaryDataStorePrivate::MakeSerializationFailure(DatPath, Error);
-    }
-    return FSafeFileIO::SaveBinaryBlocking(Bytes, DatPath, MaxWorldDatBytes);
+    if (!SerializeLevel(Data, Bytes, Error)) return BinaryDataStorePrivate::MakeSerializationFailure(DatPath, Error);
+    return FSafeFileIO::SaveBinaryBlocking(Bytes, DatPath, MaxLevelDatBytes);
 }
 
-void FBinaryDataStore::SaveWorldRuntimeAsync(
-    const FString& DatPath,
-    const FWorldRuntimeData& Data,
-    FSafeFileIO::FWriteCallback Callback)
+void FBinaryDataStore::SaveLevelAsync(const FString& DatPath, const FLevelRuntimeData& Data, FSafeFileIO::FWriteCallback Callback)
 {
     TArray<uint8> Bytes;
     FString Error;
-    if (!SerializeWorldRuntime(Data, Bytes, Error))
+    if (!SerializeLevel(Data, Bytes, Error))
     {
-        FSafeFileWriteResult Result = BinaryDataStorePrivate::MakeSerializationFailure(DatPath, Error);
-        if (Callback)
-        {
-            Callback(MoveTemp(Result));
-        }
+        if (Callback) Callback(BinaryDataStorePrivate::MakeSerializationFailure(DatPath, Error));
         return;
     }
-    FSafeFileIO::SaveBinaryAsync(Bytes, DatPath, MaxWorldDatBytes, MoveTemp(Callback));
+    FSafeFileIO::SaveBinaryAsync(Bytes, DatPath, MaxLevelDatBytes, MoveTemp(Callback));
 }

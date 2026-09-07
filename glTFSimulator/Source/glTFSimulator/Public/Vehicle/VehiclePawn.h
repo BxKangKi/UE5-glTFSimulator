@@ -6,7 +6,6 @@
 #include "HAL/ThreadSafeCounter.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
-#include "World/PlacementTypes.h"
 #include "VehiclePawn.generated.h"
 
 class UBoxComponent;
@@ -78,9 +77,6 @@ public:
 
     UFUNCTION(BlueprintCallable, Category="Vehicle|Physics")
     void ResetVehiclePoseAboveGround();
-
-    UFUNCTION(BlueprintCallable, Category="Vehicle|Save")
-    FPlacedObjectRecord ToPlacementRecord(int32 VehicleRecordIndex = 0) const;
 
     struct FVehicleParallelControlInput
     {

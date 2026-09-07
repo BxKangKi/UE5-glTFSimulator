@@ -20,7 +20,7 @@ class UGameUpdateSubSystem;
 class AWaterActor;
 class AglTFStreamActor;
 
-/** Native completion signal used by the world-level SCZ bake queue. */
+/** Native completion signal used by the world-level model-cache bake queue. */
 DECLARE_MULTICAST_DELEGATE_TwoParams(FModelSizeCacheBakeFinished, AglTFStreamActor*, bool);
 struct FLoadAsyncWrapper;
 struct FStreamAsyncWrapper;
@@ -41,7 +41,7 @@ public:
     UFUNCTION(BlueprintCallable)
     void Init(const FString& Path);
 
-    /** Initializes a metadata-only model load that creates/validates the sibling .scz and never streams rendering. */
+    /** Initializes metadata-only loading and creates/validates the extensionless /cache entry. */
     void InitMetadataBake(const FString& Path);
 
     FModelSizeCacheBakeFinished OnModelSizeCacheBakeFinished;
@@ -78,7 +78,6 @@ public:
     const TSet<FName>& GetLoadedNodesRef() const { return LoadedNodes; }
     const TSet<FName>& GetLoadedWaterNodesRef() const { return LoadedWaterNodes; }
     const TMap<FName, TObjectPtr<UInstancedStaticMeshComponent>>& GetInstanceMapRef() const { return InstanceMap; }
-    const TMap<FName, TObjectPtr<UBoxComponent>>& GetUnloadBoxMapRef() const { return UnloadBoxMap; }
     const TMap<FName, FComponentGroup>& GetDynamicComponentMapRef() const { return DynamicComponentMap; }
     const TMap<FName, TObjectPtr<AWaterActor>>& GetWaterActorMapRef() const { return WaterActorMap; }
     UMaterialInterface* GetDecalLight() const { return DecalLight; }
@@ -155,9 +154,6 @@ private:
 
     UPROPERTY()
     TMap<FName, TObjectPtr<UInstancedStaticMeshComponent>> InstanceMap;
-
-    UPROPERTY()
-    TMap<FName, TObjectPtr<UBoxComponent>> UnloadBoxMap;
 
     UPROPERTY()
     TMap<FName, FComponentGroup> DynamicComponentMap;

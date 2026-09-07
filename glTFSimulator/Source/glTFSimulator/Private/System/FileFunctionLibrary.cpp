@@ -10,6 +10,7 @@
 #include "Serialization/JsonReader.h"
 #include "System/MacroLibrary.h"
 
+#include "Simulator/ModelDefinitionJson.h"
 namespace
 {
     constexpr int64 MAX_SAFE_JSON_FILE_BYTES = 64ll * 1024ll * 1024ll;
@@ -64,6 +65,10 @@ TArray<FString> UFileFunctionLibrary::GetFileNamesWithExtension(const FString &D
 
     // Enumerate once and compare extensions without case sensitivity. Literal "*.glb" patterns
     // can miss valid ".GLB" files on case-sensitive packaged platforms.
+    // Generate safe, non-loadable definitions before JSON enumeration.
+    // This is file-system work only; no UObject is accessed on the worker thread.
+    ModelDefinitionJson::EnsureMissingDefinitions(AbsoluteDirectory);
+
     IFileManager::Get().FindFilesRecursive(
         FoundFiles,
         *AbsoluteDirectory,

@@ -11,6 +11,8 @@
 #include "System/GlbValidation.h"
 #include "System/SafeFileIO.h"
 #include "System/glTFRuntimeSafety.h"
+#include "Simulator/ModelDefinitionJson.h"
+#include "Simulator/ModelDatabaseSubsystem.h"
 #include "glTFRuntimeAsset.h"
 #include "glTFRuntimeParser.h"
 #include "UObject/UObjectGlobals.h"
@@ -26,35 +28,16 @@ namespace
             return false;
         }
 
-        FSafeJsonLimits Limits;
-        Limits.MaxFileBytes = 64ll * 1024ll * 1024ll;
-        Limits.MaxDepth = 32;
-        Limits.MaxValues = 100000;
-        Limits.MaxContainerEntries = 100000;
-        Limits.MaxStringCharacters = 32768;
-        Limits.MaxPrimitiveCharacters = 1024;
-        Limits.bAllowBackupRecovery = false;
-
-        const FSafeJsonLoadResult LoadResult = FSafeFileIO::LoadJsonBlocking(JsonPath, Limits);
-        if (!LoadResult.IsSuccess() || !LoadResult.JsonObject.IsValid())
+        FModelDefinition Definition;
+        if (!ModelDefinitionJson::LoadDefinition(JsonPath, PrefabFilePath, Definition, OutReason))
         {
-            OutReason = FString::Printf(TEXT("prefab descriptor JSON is invalid: %s"), *LoadResult.Error);
             return false;
         }
-
-        FString AssetType;
-        if (!LoadResult.JsonObject->TryGetStringField(TEXT("AssetType"), AssetType))
-        {
-            OutReason = TEXT("prefab descriptor JSON has no AssetType field");
-            return false;
-        }
-
-        AssetType.TrimStartAndEndInline();
-        if (!AssetType.Equals(TEXT("prefab"), ESearchCase::IgnoreCase))
+        if (Definition.ModelType != EModelDefinitionType::Prefab)
         {
             OutReason = FString::Printf(
-                TEXT("prefab descriptor AssetType is '%s', expected 'prefab'"),
-                *AssetType);
+                TEXT("prefab reference requires ModelType=Prefab, got %s"),
+                *ModelDefinitionJson::ModelTypeToString(Definition.ModelType));
             return false;
         }
 
@@ -151,24 +134,23 @@ FString UglTFPrefabSubSystem::ResolvePrefabPath(
         return FString();
     }
 
-    const FString NormalizedModelPath = GlbValidation::NormalizePath(ModelFilePath);
-    if (NormalizedModelPath.IsEmpty())
+    if (GlbValidation::NormalizePath(ModelFilePath).IsEmpty())
     {
         return FString();
     }
-
-    const int32 StreamMarker = NormalizedModelPath.Find(
-        TEXT("/stream/"),
-        ESearchCase::IgnoreCase,
-        ESearchDir::FromEnd);
-    if (StreamMarker == INDEX_NONE)
+    const UModelDatabaseSubsystem* Database = GetGameInstance()
+        ? GetGameInstance()->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
+    if (!Database || !Database->IsReady())
     {
         return FString();
     }
-
-    const FString ModelRoot = NormalizedModelPath.Left(StreamMarker);
-    return GlbValidation::NormalizePath(
-        FPaths::Combine(ModelRoot, TEXT("prefab"), NormalizedName + TEXT(".glb")));
+    TArray<FModelDefinition> Definitions;
+    Database->GetDefinitions(Definitions);
+    for (const FModelDefinition& Definition : Definitions)
+        if (Definition.ModelType == EModelDefinitionType::Prefab
+            && Definition.Name.Equals(NormalizedName, ESearchCase::IgnoreCase))
+            return Definition.GlbPath;
+    return FString();
 }
 
 void UglTFPrefabSubSystem::AcquirePrefabReference(

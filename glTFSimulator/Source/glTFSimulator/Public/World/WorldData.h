@@ -104,7 +104,7 @@ struct GLTFSIMULATOR_API FLevelGameplaySettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level|Gameplay")
     bool bCheatsEnabled = false;
 
-    /** Map-author setting. Current player health is mutable state stored in data/players.dat. */
+    /** Map-author setting. Current player health is mutable state stored in data/level.dat. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level|Gameplay", meta=(ClampMin="1.0"))
     float PlayerMaxHealth = 100.0f;
 
@@ -140,7 +140,7 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level")
     FString WorldName;
 
-    /** Mutable runtime time. Persisted only in data/world.dat, never in config.json. */
+    /** Mutable runtime time. Persisted only in data/level.dat, never in config.json. */
     UPROPERTY(Transient, BlueprintReadWrite, Category="Level|Runtime")
     float WorldTime;
 
@@ -165,11 +165,11 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level")
     bool bOcean;
 
-    /** Runtime compatibility value. Player transforms persist in data/players.dat. */
+    /** Runtime player location mirror. All player transforms persist in data/level.dat. */
     UPROPERTY(Transient, BlueprintReadWrite, Category="Level|Runtime")
     FVector PlayerLocation;
 
-    /** Selected external player asset. Persisted only in data/world.dat. */
+    /** Selected external player asset. Persisted only in data/level.dat. */
     UPROPERTY(Transient, BlueprintReadWrite, Category="Level|Runtime")
     FString Player;
 

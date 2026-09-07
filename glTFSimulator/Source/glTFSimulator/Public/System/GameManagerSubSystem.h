@@ -250,9 +250,11 @@ public:
     UFUNCTION(BlueprintCallable, Category="Game|UI Actions")
     bool LoadSavedScene();
 
+    /** Called by the chunk streamer after a UUID-backed prefab/entity is instantiated. */
+    void TrackStreamedWorldObject(AActor* Actor);
+
     /**
-     * Writes data/entities.dat, data/players.dat, data/world.dat and validates/builds every sibling
-     * model .scz under the selected world. Designed to be mapped directly to a world-list UI button.
+     * Flushes dirty db_x_y_z.dat chunks, saves data/level.dat, and builds extensionless /cache files.
      */
     UFUNCTION(BlueprintCallable, Category="Game|Bake")
     void BakeWorldData();
@@ -263,7 +265,7 @@ public:
     UFUNCTION(BlueprintPure, Category="Game|Bake")
     float GetWorldBakeProgress() const { return WorldBakeProgressValue; }
 
-    /** Updates the selected player runtime record and persists it to data/world.dat. */
+    /** Updates the selected player runtime record and persists it to data/level.dat. */
     UFUNCTION(BlueprintCallable, Category="Game|World Data")
     void SetSelectedPlayerForRuntime(const FString& PlayerFileName);
 
@@ -440,7 +442,7 @@ public:
 
     /** Starts gameplay-owned model streaming and optional ocean actor creation. */
     UFUNCTION(BlueprintCallable, Category="Game|World")
-    void InitializeWorldSystems(UWorldData* InWorldData, const FString& InModelDirectory, const FString& InPlayerDirectory, const FString& InInitialPlayerName);
+    void InitializeWorldSystems(UWorldData* InWorldData, const FString& InModelDirectory, const FString& InInitialPlayerName);
 
     /** Stops world streaming and clears transient world actors created by this manager. */
     UFUNCTION(BlueprintCallable, Category="Game|World")
@@ -639,7 +641,7 @@ private:
     bool bSpawnedWorldEnvManager = false;
     bool bPendingMainWorldRuntimePurge = false;
     bool bOpenWorldSelectionMenuOnNextMainWorld = false;
-    /** Separate from the destination-menu request so compatibility code may pre-set that request safely. */
+    /** Separate from the destination-menu request so travel state cannot be applied twice. */
     bool bWorldSelectionMenuTravelInProgress = false;
     /** Menu world captured from the active StartActor; no name/path literal is used. */
     TSoftObjectPtr<UWorld> RegisteredWorldSelectionWorld;
@@ -657,8 +659,7 @@ private:
     enum class EInitialPlayerLocationSource : uint8
     {
         None,
-        LegacyWorldFile,
-        PlayerFile
+        LevelDat
     };
 
     EInitialPlayerLocationSource InitialPlayerLocationSource = EInitialPlayerLocationSource::None;
@@ -670,8 +671,7 @@ private:
     bool bPendingInitialWorldDataSave = false;
     bool bPendingInitialPlayerDataSave = false;
 
-    // Legacy placement distance kept so older Blueprint defaults do not lose the property.
-    // The center-crosshair cursor now uses CrosshairCollisionTraceDistance and FreeSpacePlacementDistance below.
+    // Runtime copy of the configured center-crosshair trace distance.
     UPROPERTY(Transient)
     float PlacementTraceDistance = 1000.0f;
 
@@ -737,15 +737,13 @@ private:
     bool bToolbarInitialized = false;
     FVector LastPreviewLocation = FVector::ZeroVector;
     FString LastSaveMessage;
-    /** True only after entities.dat was validated and its records were applied (or confirmed absent). */
+    /** True after the initial-radius db_x_y_z.dat set has been validated and applied. */
     bool bSavedSceneLoaded = false;
     bool bSavedSceneLoadInProgress = false;
-    /** Protects an unreadable entities.dat from being overwritten by an empty autosave. */
+    /** Records an initial chunk validation failure without modifying its committed generation. */
     bool bSavedSceneLoadFailed = false;
     int32 SavedSceneReadinessAttemptCount = 0;
     int32 SavedSceneDataAttemptCount = 0;
-    /** Last validated entity snapshot. Preserves records while actors are tearing down or temporarily unavailable. */
-    TArray<FPlacedObjectRecord> LastKnownSceneRecords;
     FVector LastTraceStart = FVector::ZeroVector;
     FVector LastTraceDirection = FVector::ForwardVector;
     FHitResult LastTraceHit;
@@ -788,21 +786,15 @@ private:
     void ScanAssetFolders();
     void EnsureAssetFolders() const;
     FString GetWorldRootPath() const;
-    FString GetPrefabDirectory() const;
-    FString GetItemsDirectory() const;
+    FString GetModelDirectory() const;
     FString GetDataDirectory() const;
-    FString GetManifestPath() const;
-    FString GetPlayersDatPath() const;
-    FString GetWorldDatPath() const;
-    FString MakePlacementSourcePathForSave(const FString& SourcePath) const;
-    FString ResolvePlacementSourcePath(const FString& SavedPath, EPlacedObjectKind Kind) const;
+    FString GetLevelDatPath() const;
     void ScheduleSavedSceneLoadRetry(const FString& Reason, bool bWaitingForWorldReadiness);
     bool TracePlacementLocation(FVector& OutLocation, FHitResult& OutHit);
     FVector ApplyGridSnap(const FVector& Location) const;
     bool ShouldShowPlacementGrid() const;
     void UpdatePlacementGrid();
     void RebuildPlacementGridMesh(const FVector& Center, float Radius);
-    bool DoesAssetFileContainWheelTag(const FString& FilePath) const;
     FString GetAssetDisplayName(const FString& AssetPath) const;
     void AutoSaveScene();
     void ClearPlacementGridMesh();
@@ -811,7 +803,6 @@ private:
     void PlaceCurrentPrefab(const FVector& Location);
     void PlaceVehicle(const FVector& Location, const FString& SourceFile);
     void TryEnterOrExitVehicle();
-    void CollectSceneRecords(TArray<FPlacedObjectRecord>& OutPlaced) const;
     void StartNextWorldBakeModel();
     void RefreshWorldBakeProgress();
     void HandleWorldBakeModelFinished(AglTFStreamActor* BakeActor, bool bSuccess);
@@ -825,7 +816,7 @@ private:
     int32 FindAvailableItemIndexMatching(const FToolbarItem& Item) const;
     bool ShouldSpawnOcean() const;
     void SpawnOcean();
-    void MainWorldStreaming(const FString& InModelDirectory, const FString& InPlayerDirectory, const FString& InInitialPlayerName);
+    void MainWorldStreaming(const FString& InModelDirectory, const FString& InInitialPlayerName);
     void InitializeWorldBootstrap();
     void SpawnWorldEnvManager();
     bool CheckWorldSystemsLoaded();

@@ -2,8 +2,8 @@
 
 #include "CoreMinimal.h"
 #include "Animation/AnimInstance.h"
-#include "RuntimeFramework/SimulatorInteractionTypes.h"
-#include "SimulatorInteractionAnimInstance.generated.h"
+#include "Simulator/InteractionTypes.h"
+#include "InteractionAnimInstance.generated.h"
 
 /**
  * Game-thread resolver for hand and body IK targets. The Animation Blueprint reads

@@ -1,4 +1,4 @@
-#include "RuntimeFramework/SimulatorBoundsCacheSubsystem.h"
+#include "Simulator/BoundsCacheSubsystem.h"
 #include "Components/PrimitiveComponent.h"
 #include "GameFramework/Actor.h"
 
@@ -9,13 +9,13 @@ bool USimulatorBoundsCacheSubsystem::TryGetBounds(const FString& ResourceKey, co
     OutBounds = *Entry; return true;
 }
 
-void USimulatorBoundsCacheSubsystem::StoreSCZBounds(const FString& ResourceKey, const FBox& LocalBox, const FString& SourceFingerprint, const int32 SchemaRevision)
+void USimulatorBoundsCacheSubsystem::StoreModelCacheBounds(const FString& ResourceKey, const FBox& LocalBox, const FString& SourceFingerprint, const int32 SchemaRevision)
 {
     if (ResourceKey.IsEmpty() || !LocalBox.IsValid) return;
     FSimulatorCachedBounds& Entry = Entries.FindOrAdd(ResourceKey);
     // A post-load runtime measurement is authoritative for this exact revision.
     if (Entry.bRuntimeValidated && Entry.SourceFingerprint == SourceFingerprint && Entry.SchemaRevision == SchemaRevision) return;
-    Entry.LocalBox = LocalBox; Entry.Source = ESimulatorBoundsSource::SCZ; Entry.SourceFingerprint = SourceFingerprint; Entry.SchemaRevision = SchemaRevision; Entry.bRuntimeValidated = false;
+    Entry.LocalBox = LocalBox; Entry.Source = ESimulatorBoundsSource::ModelCache; Entry.SourceFingerprint = SourceFingerprint; Entry.SchemaRevision = SchemaRevision; Entry.bRuntimeValidated = false;
 }
 
 FBox USimulatorBoundsCacheSubsystem::CalculateActorLocalBounds(AActor* Actor)

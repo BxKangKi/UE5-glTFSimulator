@@ -1,4 +1,4 @@
-#include "RuntimeFramework/SimulatorSharedResourceSubsystem.h"
+#include "Simulator/SharedResourceSubsystem.h"
 #include "Async/Async.h"
 #include "HAL/PlatformFileManager.h"
 #include "HAL/PlatformTime.h"

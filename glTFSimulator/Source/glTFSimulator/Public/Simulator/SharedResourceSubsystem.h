@@ -4,7 +4,7 @@
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "HAL/ThreadSafeCounter.h"
 #include "Templates/Function.h"
-#include "SimulatorSharedResourceSubsystem.generated.h"
+#include "SharedResourceSubsystem.generated.h"
 
 USTRUCT(BlueprintType)
 struct GLTFSIMULATOR_API FSimulatorResourceLease

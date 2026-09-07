@@ -117,10 +117,6 @@ private:
     UPROPERTY()
     TMap<FName, TObjectPtr<AWaterActor>> WaterActorMap;
 
-    // Uses a separate FName-keyed map to manage unload boxes.
-    UPROPERTY()
-    TMap<FName, TObjectPtr<UBoxComponent>> UnloadBoxMap;
-
     UPROPERTY()
     TObjectPtr<UMaterialInterface> DecalLight;
     UPROPERTY()

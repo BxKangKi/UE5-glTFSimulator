@@ -105,7 +105,7 @@ struct FModelData
     UPROPERTY()
     TMap<FName, FMeshData> MeshData;
 
-    /** Optional prefab name referenced by this model. The corresponding prefab JSON must declare AssetType="prefab". */
+    /** Optional prefab name whose strict sibling JSON declares ModelType=Prefab. */
     UPROPERTY()
     FString Prefab;
 
@@ -133,7 +133,7 @@ struct FModelMeshData
     UPROPERTY()
     FMeshData Data;
 
-    /** Unscaled local-space mesh half size loaded from or written to <model>.scz. */
+    /** Unscaled local-space mesh half size loaded from or written to the extensionless model cache. */
     UPROPERTY()
     FVector Extent = FVector::ZeroVector;
 
@@ -215,8 +215,6 @@ struct FStreamAsyncWrapper
     TMap<FName, FWaterStreamNodeData> WaterNodeMap;
     UPROPERTY()
     TMap<FName, TObjectPtr<UInstancedStaticMeshComponent>> InstanceMap;
-    UPROPERTY()
-    TMap<FName, TObjectPtr<UBoxComponent>> UnloadBoxMap;
     UPROPERTY()
     TMap<FName, FComponentGroup> DynamicComponentMap;
     UPROPERTY()

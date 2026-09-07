@@ -4,14 +4,16 @@
 
 #include "CoreMinimal.h"
 #include "System/SafeFileIO.h"
-#include "World/PlacementTypes.h"
 #include "World/PlayerData.h"
 
-/** Zlib-compressed program-owned size cache written beside one glTF/GLB source as <model>.scz. */
+/** One extensionless /cache/<JSON base filename> file. */
 struct GLTFSIMULATOR_API FModelCacheData
 {
     /** Upper-case SHA-1 of the source model bytes. */
     FString ModelHash;
+
+    /** Exact author JSON used to build this cache; db.dat UUID validation selects the file. */
+    FString DefinitionJson;
 
     /** Model-space center of the union of all renderable nodes. */
     FVector Center = FVector::ZeroVector;
@@ -25,17 +27,61 @@ struct GLTFSIMULATOR_API FModelCacheData
     bool IsSane() const;
 };
 
-/** Mutable world runtime state. User-authored level settings remain in config.json. */
-struct GLTFSIMULATOR_API FWorldRuntimeData
+/** 512 m voxel index. Coordinates are chunk numbers, never world-space metres. */
+struct GLTFSIMULATOR_API FWorldChunkCoordinate
+{
+    int32 X = 0;
+    int32 Y = 0;
+    int32 Z = 0;
+
+    bool operator==(const FWorldChunkCoordinate& Other) const
+    {
+        return X == Other.X && Y == Other.Y && Z == Other.Z;
+    }
+
+    FString ToFileName() const
+    {
+        return FString::Printf(TEXT("db_%d_%d_%d.dat"), X, Y, Z);
+    }
+};
+
+FORCEINLINE uint32 GetTypeHash(const FWorldChunkCoordinate& Value)
+{
+    return HashCombine(HashCombine(::GetTypeHash(Value.X), ::GetTypeHash(Value.Y)), ::GetTypeHash(Value.Z));
+}
+
+/** One static prefab or dynamic entity persisted in a db_x_y_z.dat chunk. */
+struct GLTFSIMULATOR_API FWorldChunkObject
+{
+    FGuid UUID;
+    FVector Location = FVector::ZeroVector;
+    FQuat Rotation = FQuat::Identity;
+    FVector Scale = FVector::OneVector;
+    FVector Velocity = FVector::ZeroVector;
+    /** Required to restore frozen physics without losing rotational motion. */
+    FVector AngularVelocity = FVector::ZeroVector;
+};
+
+/** db.dat row. Paths are world-root-relative and UUID maps one-to-one to JSON.ID. */
+struct GLTFSIMULATOR_API FModelDatabaseEntry
+{
+    FGuid UUID;
+    FString Cache;
+    FString Json;
+};
+
+/** Mutable state written atomically to data/level.dat. */
+struct GLTFSIMULATOR_API FLevelRuntimeData
 {
     float WorldTime = 0.0f;
     FString SelectedPlayer;
+    TArray<FWorldPlayerRecord> Players;
 };
 
 /**
- * Versioned binary persistence for program-owned .dat state files and .scz model-size caches.
+ * Versioned binary persistence for program-owned .dat state and extensionless model caches.
  *
- * Every payload has a magic, file-kind, schema version, exact byte count, and CRC32. Model .scz
+ * Every payload has a magic, file-kind, schema version, exact byte count, and CRC32. Model caches
  * payloads additionally carry a bounded zlib-compressed block with its own raw-size and CRC checks. Disk commits
  * use FSafeFileIO's verified temp/primary/.bak transaction. Deserializers validate every count,
  * string length, enum, number, and transform before publishing data to gameplay code.
@@ -43,13 +89,11 @@ struct GLTFSIMULATOR_API FWorldRuntimeData
 class GLTFSIMULATOR_API FBinaryDataStore
 {
 public:
-    static constexpr int64 MaxModelSczBytes = 128ll * 1024ll * 1024ll;
+    static constexpr int64 MaxModelCacheBytes = 128ll * 1024ll * 1024ll;
     static constexpr int64 MaxModelCacheRawBytes = 256ll * 1024ll * 1024ll;
-    /** Compatibility alias for external code compiled against the former model-DAT API. */
-    static constexpr int64 MaxModelDatBytes = MaxModelSczBytes;
-    static constexpr int64 MaxEntitiesDatBytes = 256ll * 1024ll * 1024ll;
-    static constexpr int64 MaxPlayersDatBytes = 64ll * 1024ll * 1024ll;
-    static constexpr int64 MaxWorldDatBytes = 1024ll * 1024ll;
+    static constexpr int64 MaxWorldChunkDatBytes = 256ll * 1024ll * 1024ll;
+    static constexpr int64 MaxModelDatabaseDatBytes = 64ll * 1024ll * 1024ll;
+    static constexpr int64 MaxLevelDatBytes = 64ll * 1024ll * 1024ll;
 
     /** Streams a file through SHA-1 without loading the whole model into memory. Worker-thread safe. */
     static bool ComputeFileSha1(const FString& FilePath, FString& OutHash, FString& OutError);
@@ -66,64 +110,32 @@ public:
         const FString& CachePath,
         const FModelCacheData& Cache);
 
-    /** Removes the primary, backup, and abandoned transaction files for a stale .scz cache. */
+    /** Removes the primary, backup, and abandoned transaction files for a stale cache. */
     static bool InvalidateCacheFile(const FString& CachePath, FString& OutError);
 
-    /** Backward-compatible name; model caches now use .scz and call InvalidateCacheFile(). */
-    static bool InvalidateDatFile(const FString& CachePath, FString& OutError)
-    {
-        return InvalidateCacheFile(CachePath, OutError);
-    }
-
-    static bool LoadEntities(
-        const FString& DatPath,
-        TArray<FPlacedObjectRecord>& OutRecords,
-        FString& OutError);
-
-    static FSafeFileWriteResult SaveEntitiesBlocking(
-        const FString& DatPath,
-        const TArray<FPlacedObjectRecord>& Records);
-
-    static void SaveEntitiesAsync(
-        const FString& DatPath,
-        const TArray<FPlacedObjectRecord>& Records,
+    static bool LoadWorldChunk(const FString& DatPath, TArray<FWorldChunkObject>& OutObjects, FString& OutError);
+    static void LoadWorldChunkAsync(const FString& DatPath, TFunction<void(bool, TArray<FWorldChunkObject>, FString)> Callback);
+    static FSafeFileWriteResult SaveWorldChunkBlocking(const FString& DatPath, const TArray<FWorldChunkObject>& Objects);
+    static void SaveWorldChunkAsync(const FString& DatPath, const TArray<FWorldChunkObject>& Objects,
         FSafeFileIO::FWriteCallback Callback = FSafeFileIO::FWriteCallback());
 
-    static bool LoadPlayers(
-        const FString& DatPath,
-        UPlayerData* OutData,
-        FString& OutError);
-
-    static FSafeFileWriteResult SavePlayersBlocking(
-        const FString& DatPath,
-        const UPlayerData* Data);
-
-    static void SavePlayersAsync(
-        const FString& DatPath,
-        const UPlayerData* Data,
+    static bool LoadModelDatabase(const FString& DatPath, TArray<FModelDatabaseEntry>& OutEntries, FString& OutError);
+    static FSafeFileWriteResult SaveModelDatabaseBlocking(const FString& DatPath, const TArray<FModelDatabaseEntry>& Entries);
+    static void SaveModelDatabaseAsync(const FString& DatPath, const TArray<FModelDatabaseEntry>& Entries,
         FSafeFileIO::FWriteCallback Callback = FSafeFileIO::FWriteCallback());
 
-    static bool LoadWorldRuntime(
-        const FString& DatPath,
-        FWorldRuntimeData& OutData,
-        FString& OutError);
-
-    static FSafeFileWriteResult SaveWorldRuntimeBlocking(
-        const FString& DatPath,
-        const FWorldRuntimeData& Data);
-
-    static void SaveWorldRuntimeAsync(
-        const FString& DatPath,
-        const FWorldRuntimeData& Data,
+    static bool LoadLevel(const FString& DatPath, FLevelRuntimeData& OutData, FString& OutError);
+    static FSafeFileWriteResult SaveLevelBlocking(const FString& DatPath, const FLevelRuntimeData& Data);
+    static void SaveLevelAsync(const FString& DatPath, const FLevelRuntimeData& Data,
         FSafeFileIO::FWriteCallback Callback = FSafeFileIO::FWriteCallback());
 
 private:
     static bool SerializeModelCache(const FModelCacheData& Cache, TArray<uint8>& OutBytes, FString& OutError);
     static bool DeserializeModelCache(const TArray<uint8>& Bytes, FModelCacheData& OutCache, FString& OutError);
-    static bool SerializeEntities(const TArray<FPlacedObjectRecord>& Records, TArray<uint8>& OutBytes, FString& OutError);
-    static bool DeserializeEntities(const TArray<uint8>& Bytes, TArray<FPlacedObjectRecord>& OutRecords, FString& OutError);
-    static bool SerializePlayers(const UPlayerData* Data, TArray<uint8>& OutBytes, FString& OutError);
-    static bool DeserializePlayers(const TArray<uint8>& Bytes, UPlayerData* OutData, FString& OutError);
-    static bool SerializeWorldRuntime(const FWorldRuntimeData& Data, TArray<uint8>& OutBytes, FString& OutError);
-    static bool DeserializeWorldRuntime(const TArray<uint8>& Bytes, FWorldRuntimeData& OutData, FString& OutError);
+    static bool SerializeWorldChunk(const TArray<FWorldChunkObject>& Objects, TArray<uint8>& OutBytes, FString& OutError);
+    static bool DeserializeWorldChunk(const TArray<uint8>& Bytes, TArray<FWorldChunkObject>& OutObjects, FString& OutError);
+    static bool SerializeModelDatabase(const TArray<FModelDatabaseEntry>& Entries, TArray<uint8>& OutBytes, FString& OutError);
+    static bool DeserializeModelDatabase(const TArray<uint8>& Bytes, TArray<FModelDatabaseEntry>& OutEntries, FString& OutError);
+    static bool SerializeLevel(const FLevelRuntimeData& Data, TArray<uint8>& OutBytes, FString& OutError);
+    static bool DeserializeLevel(const TArray<uint8>& Bytes, FLevelRuntimeData& OutData, FString& OutError);
 };

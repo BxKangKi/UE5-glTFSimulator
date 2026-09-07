@@ -1,5 +1,5 @@
-#include "RuntimeFramework/SimulatorHeldPrefabPreviewActor.h"
-#include "RuntimeFramework/SimulatorRuntimeAssetSource.h"
+#include "Simulator/HeldPrefabPreviewActor.h"
+#include "Simulator/RuntimeAssetSource.h"
 #include "Components/PrimitiveComponent.h"
 #include "Components/SceneComponent.h"
 #include "Components/SkeletalMeshComponent.h"

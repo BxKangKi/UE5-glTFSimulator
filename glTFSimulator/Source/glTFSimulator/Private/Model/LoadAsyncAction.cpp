@@ -2,7 +2,7 @@
 // Copyright © 2025 Epic Games, Inc. All rights reserved.
 
 #include "Model/LoadAsyncAction.h"
-#include "RuntimeFramework/SimulatorNodeTokenLibrary.h"
+#include "Simulator/NodeTokenLibrary.h"
 #include "System/GameManagerSubSystem.h"
 
 #include "Dom/JsonObject.h"
@@ -10,6 +10,7 @@
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
 #include "Misc/Paths.h"
+#include "Misc/FileHelper.h"
 #include "Misc/ScopeExit.h"
 #include "System/FileFunctionLibrary.h"
 #include "System/JsonHelper.h"
@@ -29,7 +30,7 @@ namespace
     constexpr int32 MAX_MODEL_NODE_COUNT = 500000;
 
     // Loading progress is staged so parsing, cache validation, every parsed node, bounds assembly,
-    // and the verified SCZ commit all occupy visible portions of the loading bar.
+    // and the verified model-cache commit all occupy visible portions of the loading bar.
     constexpr float MODEL_PROGRESS_METADATA_STARTED = 0.02f;
     constexpr float MODEL_PROGRESS_NODE_SCAN_STARTED = 0.10f;
     constexpr float MODEL_PROGRESS_NODE_SCAN_FINISHED = 0.90f;
@@ -80,6 +81,7 @@ namespace
         FModelData ModelData;
         FModelCacheData ModelCache;
         FString ModelHash;
+        FString DefinitionJson;
         bool bCacheValid = false;
         bool bCacheDirty = false;
         TArray<FString> Warnings;
@@ -94,8 +96,7 @@ ULoadAsyncAction *ULoadAsyncAction::LoadAsync(
     const int32 ChunkSize,
     const FString& InSourceFilePath,
     const FString& InJsonFilePath,
-    const FString& InSizeCacheFilePath,
-    const bool bInCreateMissingJsonTemplate)
+    const FString& InSizeCacheFilePath)
 {
     if (!EnsureLoadActionGameThread(TEXT("ULoadAsyncAction::LoadAsync")))
     {
@@ -114,7 +115,6 @@ ULoadAsyncAction *ULoadAsyncAction::LoadAsync(
     Action->SourceFilePath = FSafeFileIO::NormalizeFilePath(InSourceFilePath);
     Action->JsonFilePath = FSafeFileIO::NormalizeFilePath(InJsonFilePath);
     Action->SizeCacheFilePath = FSafeFileIO::NormalizeFilePath(InSizeCacheFilePath);
-    Action->bCreateMissingJsonTemplate = bInCreateMissingJsonTemplate;
     Action->RegisterWithGameInstance(WorldContextObject);
     return Action;
 }
@@ -201,34 +201,16 @@ void ULoadAsyncAction::LoadSettingsAndCacheAsync()
     const FString LocalSourcePath = SourceFilePath;
     const FString LocalJsonPath = JsonFilePath;
     const FString LocalCachePath = SizeCacheFilePath;
-    const bool bLocalCreateMissingJsonTemplate = bCreateMissingJsonTemplate;
     TWeakObjectPtr<ULoadAsyncAction> WeakThis(this);
 
     const bool bWorkerQueued = FSafeFileIO::RunTrackedWorker(
-        [WeakThis, LocalSourcePath, LocalJsonPath, LocalCachePath, bLocalCreateMissingJsonTemplate]()
+        [WeakThis, LocalSourcePath, LocalJsonPath, LocalCachePath]()
     {
         FModelMetadataWorkerResult WorkerResult;
 
-        // The editable JSON document is application read-only. A missing skeleton is created once,
-        // but an existing file is never rewritten and JSON backup recovery is intentionally disabled.
-        if (bLocalCreateMissingJsonTemplate && !FPaths::FileExists(LocalJsonPath))
-        {
-            FModelData EmptyData;
-            const FSafeFileWriteResult TemplateResult = FSafeFileIO::CreateJsonIfMissingBlocking(
-                EmptyData.Serialization(),
-                LocalJsonPath,
-                MAX_MODEL_JSON_BYTES);
-            if (!TemplateResult.IsSuccess())
-            {
-                WorkerResult.Warnings.Add(FString::Printf(
-                    TEXT("Failed to create the read-only model settings template. Path=%s Reason=%s"),
-                    *LocalJsonPath,
-                    *TemplateResult.Error));
-            }
-        }
-
         if (FPaths::FileExists(LocalJsonPath))
         {
+            FFileHelper::LoadFileToString(WorkerResult.DefinitionJson, *LocalJsonPath);
             FSafeJsonLimits JsonLimits;
             JsonLimits.MaxFileBytes = MAX_MODEL_JSON_BYTES;
             JsonLimits.MaxContainerEntries = MAX_MODEL_NODE_COUNT;
@@ -238,26 +220,6 @@ void ULoadAsyncAction::LoadSettingsAndCacheAsync()
             {
                 const TSharedPtr<FJsonObject>& JsonObject = LoadResult.JsonObject;
                 WorkerResult.ModelData.Deserialization(JsonObject);
-
-                if (WorkerResult.ModelData.MeshData.Num() == 0)
-                {
-                    // Read-only compatibility for the old MeshData array format. Runtime never writes it back.
-                    const TArray<TSharedPtr<FJsonValue>>* JsonArrayPtr = nullptr;
-                    if (JsonObject->TryGetArrayField(TEXT("MeshData"), JsonArrayPtr) && JsonArrayPtr)
-                    {
-                        for (const TSharedPtr<FJsonValue>& Value : *JsonArrayPtr)
-                        {
-                            if (Value.IsValid() && Value->Type == EJson::Object)
-                            {
-                                FMeshData MeshData;
-                                if (MeshData.Deserialization(Value->AsObject()))
-                                {
-                                    WorkerResult.ModelData.MeshData.Add(NAME_None, MeshData);
-                                }
-                            }
-                        }
-                    }
-                }
             }
             else
             {
@@ -272,7 +234,7 @@ void ULoadAsyncAction::LoadSettingsAndCacheAsync()
         if (!FBinaryDataStore::ComputeFileSha1(LocalSourcePath, WorkerResult.ModelHash, HashError))
         {
             WorkerResult.Warnings.Add(FString::Printf(
-                TEXT("Model SCZ cache disabled because hashing failed. Path=%s Reason=%s"),
+                TEXT("Model cache disabled because hashing failed. Path=%s Reason=%s"),
                 *LocalSourcePath,
                 *HashError));
         }
@@ -287,7 +249,15 @@ void ULoadAsyncAction::LoadSettingsAndCacheAsync()
                     CacheError,
                     bHashMismatch))
             {
-                WorkerResult.bCacheValid = true;
+                WorkerResult.bCacheValid = !WorkerResult.DefinitionJson.IsEmpty()
+                    && WorkerResult.ModelCache.DefinitionJson == WorkerResult.DefinitionJson;
+                if (!WorkerResult.bCacheValid)
+                {
+                    WorkerResult.bCacheDirty = true;
+                    CacheError = TEXT("definition JSON changed for this UUID/model");
+                    FString DeleteError;
+                    FBinaryDataStore::InvalidateCacheFile(LocalCachePath, DeleteError);
+                }
             }
             else
             {
@@ -300,12 +270,12 @@ void ULoadAsyncAction::LoadSettingsAndCacheAsync()
                     if (!FBinaryDataStore::InvalidateCacheFile(LocalCachePath, DeleteError))
                     {
                         WorkerResult.Warnings.Add(FString::Printf(
-                            TEXT("Failed to remove stale/corrupt model SCZ. Path=%s Reason=%s"),
+                            TEXT("Failed to remove stale/corrupt model cache. Path=%s Reason=%s"),
                             *LocalCachePath,
                             *DeleteError));
                     }
                     WorkerResult.Warnings.Add(FString::Printf(
-                        TEXT("Model SCZ invalidated (%s). Extents will be recalculated. Path=%s Reason=%s"),
+                        TEXT("Model cache invalidated (%s). Extents will be recalculated. Path=%s Reason=%s"),
                         bHashMismatch ? TEXT("source hash changed") : TEXT("cache validation failed"),
                         *LocalCachePath,
                         *CacheError));
@@ -337,6 +307,7 @@ void ULoadAsyncAction::LoadSettingsAndCacheAsync()
             StrongThis->LoadedJsonModelData = MoveTemp(WorkerResult.ModelData);
             StrongThis->LoadedModelCache = MoveTemp(WorkerResult.ModelCache);
             StrongThis->CurrentModelHash = MoveTemp(WorkerResult.ModelHash);
+            StrongThis->CurrentDefinitionJson = MoveTemp(WorkerResult.DefinitionJson);
             StrongThis->bUseCachedMeshExtents = WorkerResult.bCacheValid;
             StrongThis->bModelCacheDirty = WorkerResult.bCacheDirty;
             StrongThis->BroadcastProgressValue(MODEL_PROGRESS_NODE_SCAN_STARTED);
@@ -400,7 +371,7 @@ void ULoadAsyncAction::ProcessChunk()
         PendingCompletionWrapper.ModelData = GeneratedModelData;
         BroadcastProgressValue(MODEL_PROGRESS_BOUNDS_READY);
 
-        // Completion is intentionally delayed until a newly generated SCZ has been durably committed.
+        // Completion is intentionally delayed until a newly generated cache has been durably committed.
         // This lets the world-bake UI treat the completion event as a real on-disk cache guarantee.
         SaveGeneratedCacheThenComplete();
     }
@@ -485,9 +456,9 @@ void ULoadAsyncAction::ReleaseActionReferences()
     GeneratedModelCache = FModelCacheData();
     PendingCompletionWrapper = FLoadAsyncWrapper();
     CurrentModelHash.Reset();
+    CurrentDefinitionJson.Reset();
     bUseCachedMeshExtents = false;
     bModelCacheDirty = false;
-    bCreateMissingJsonTemplate = true;
     CurrentMeshName = NAME_None;
     CurrentIndex = 0;
     MaxCount = 0;
@@ -517,10 +488,6 @@ void ULoadAsyncAction::SanitizeParsedData()
         if (const FMeshData* ParsedMeshData = LoadedJsonModelData.MeshData.Find(It.Key()))
         {
             RuntimeMeshData.Data = *ParsedMeshData;
-        }
-        else if (const FMeshData* LegacyDefault = LoadedJsonModelData.MeshData.Find(NAME_None))
-        {
-            RuntimeMeshData.Data = *LegacyDefault;
         }
     }
 
@@ -568,6 +535,7 @@ void ULoadAsyncAction::RefreshGeneratedModelData()
     GeneratedModelData = LoadedJsonModelData;
     GeneratedModelCache = FModelCacheData();
     GeneratedModelCache.ModelHash = CurrentModelHash;
+    GeneratedModelCache.DefinitionJson = CurrentDefinitionJson;
 
     FBox Bounds(ForceInit);
     for (const TPair<FName, FModelNodeData>& Pair : NodeMap)
@@ -617,7 +585,7 @@ void ULoadAsyncAction::RefreshGeneratedModelData()
     }
 
     WriteLogAsync(FString::Printf(
-        TEXT("Model bounds ready. SCZ=%s Cache=%s Center=%s Extent=%s"),
+        TEXT("Model bounds ready. CachePath=%s Result=%s Center=%s Extent=%s"),
         *SizeCacheFilePath,
         bUseCachedMeshExtents && !bModelCacheDirty ? TEXT("hit") : TEXT("rebuilt"),
         *GeneratedModelCache.Center.ToCompactString(),
@@ -664,7 +632,7 @@ void ULoadAsyncAction::SaveGeneratedCacheThenComplete()
             if (!Result.IsSuccess())
             {
                 StrongThis->WriteLogAsync(FString::Printf(
-                    TEXT("Failed to save model SCZ cache. Path=%s Reason=%s"),
+                    TEXT("Failed to save model cache. Path=%s Reason=%s"),
                     *LocalCachePath,
                     *Result.Error));
             }
@@ -684,7 +652,7 @@ void ULoadAsyncAction::SaveGeneratedCacheThenComplete()
     {
         bCacheSaveInFlight = false;
         WriteLogAsync(FString::Printf(
-            TEXT("Model SCZ save worker could not be queued. Path=%s"),
+            TEXT("Model cache save worker could not be queued. Path=%s"),
             *LocalCachePath));
         FinalizeCompletion();
     }
@@ -806,7 +774,7 @@ void ULoadAsyncAction::CalculateSize()
             return;
         }
 
-        // A missing, stale, or invalid SCZ loads each unique base mesh once and calculates its
+        // A missing, stale, or invalid cache loads each unique base mesh once and calculates its
         // unscaled local extent from UStaticMesh::GetBoundingBox(). The generated cache is committed
         // only after every parsed node (including skipped nodes) has advanced the loading progress.
         bModelCacheDirty = !CurrentModelHash.IsEmpty();

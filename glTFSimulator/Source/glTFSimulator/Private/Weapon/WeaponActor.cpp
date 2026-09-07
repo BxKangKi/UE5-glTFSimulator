@@ -1,7 +1,7 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
 #include "Weapon/WeaponActor.h"
-#include "RuntimeFramework/SimulatorGlTFRuntimeCacheLibrary.h"
+#include "Simulator/GlTFRuntimeCacheLibrary.h"
 
 #include "Camera/CameraComponent.h"
 #include "Components/SkeletalMeshComponent.h"
@@ -288,7 +288,12 @@ bool AWeaponActor::SaveDefaultConfigJson(const FString& JsonPath) const
 
     TSharedRef<FJsonObject> RootObject = MakeShared<FJsonObject>();
     RootObject->SetStringField(JSON_VERSION_FIELD, JSON_SCHEMA_VERSION);
-    RootObject->SetStringField(TEXT("AssetType"), TEXT("Weapon"));
+    const FString Name = FPaths::GetBaseFilename(JsonPath);
+    RootObject->SetStringField(TEXT("ID"), FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower));
+    RootObject->SetStringField(TEXT("Name"), Name);
+    RootObject->SetStringField(TEXT("DisplayName"), Name);
+    RootObject->SetStringField(TEXT("ModelType"), TEXT("Item"));
+    RootObject->SetStringField(TEXT("ItemType"), TEXT("Weapon"));
     RootObject->SetStringField(TEXT("AttachSocketName"), Config.AttachSocketName.ToString());
     RootObject->SetObjectField(TEXT("HoldTransform"), MakeTransformJson(Config.HoldTransform));
     RootObject->SetObjectField(TEXT("RightHandIK"), MakeTransformJson(Config.RightHandIK));

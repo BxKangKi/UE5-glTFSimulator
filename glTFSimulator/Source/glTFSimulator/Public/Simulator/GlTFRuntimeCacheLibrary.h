@@ -3,8 +3,8 @@
 #include "CoreMinimal.h"
 #include "Kismet/BlueprintFunctionLibrary.h"
 #include "glTFRuntimeFunctionLibrary.h"
-#include "RuntimeFramework/SimulatorSharedResourceSubsystem.h"
-#include "SimulatorGlTFRuntimeCacheLibrary.generated.h"
+#include "Simulator/SharedResourceSubsystem.h"
+#include "GlTFRuntimeCacheLibrary.generated.h"
 
 /** Exact-version adapter around the bundled UglTFRuntimeFunctionLibrary filename API. */
 UCLASS()

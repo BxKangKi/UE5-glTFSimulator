@@ -6,7 +6,7 @@
 #include "Dom/JsonObject.h"
 #include "PlayerData.generated.h"
 
-/** Persistent per-player runtime record stored in data/players.dat. */
+/** Persistent per-player runtime record stored with game time in data/level.dat. */
 USTRUCT(BlueprintType)
 struct GLTFSIMULATOR_API FWorldPlayerRecord
 {
@@ -39,8 +39,6 @@ struct GLTFSIMULATOR_API FWorldPlayerRecord
     /** Arbitrary user/project JSON payload serialized under the Custom field. */
     TSharedPtr<FJsonObject> CustomJson;
 
-    TSharedRef<FJsonObject> ToJson() const;
-    bool FromJson(const TSharedPtr<FJsonObject>& Json);
 };
 
 UCLASS(BlueprintType)
@@ -61,7 +59,4 @@ public:
     const FWorldPlayerRecord* FindPlayer(const FString& PlayerId) const;
     FWorldPlayerRecord& FindOrAddPlayer(const FString& PlayerId);
 
-    /** Legacy migration helpers. Runtime saves never write player JSON. */
-    static TSharedRef<FJsonObject> SerializeData(const UPlayerData* Data);
-    static bool DeserializeData(UPlayerData* Data, const TSharedPtr<FJsonObject>& Json);
 };

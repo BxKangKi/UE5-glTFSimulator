@@ -31,7 +31,7 @@ public:
 
     virtual void Deinitialize() override;
 
-    void StartMainWorldStreaming(AActor* InOwnerActor, TSubclassOf<AglTFStreamActor> InSpawnActorClass, const FString& InModelDirectory, const FString& InPlayerDirectory, const FString& InInitialPlayerName, bool bInRenderOnlyStreaming = false);
+    void StartMainWorldStreaming(AActor* InOwnerActor, TSubclassOf<AglTFStreamActor> InSpawnActorClass, const FString& InModelDirectory, const FString& InInitialPlayerName, bool bInRenderOnlyStreaming = false);
     void StopMainWorldStreaming();
 
     bool AreInitialModelsReady() const;
@@ -76,7 +76,6 @@ private:
     mutable uint64 LastLoadingProgressFrame = ~uint64(0);
 
     FString ModelDirectory;
-    FString PlayerDirectory;
     FString InitialPlayerName;
     FString CurrentPlayerPath;
     FString PendingPlayerPath;

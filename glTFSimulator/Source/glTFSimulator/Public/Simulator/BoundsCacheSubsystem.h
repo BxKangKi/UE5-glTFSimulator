@@ -2,13 +2,13 @@
 
 #include "CoreMinimal.h"
 #include "Subsystems/GameInstanceSubsystem.h"
-#include "SimulatorBoundsCacheSubsystem.generated.h"
+#include "BoundsCacheSubsystem.generated.h"
 
 UENUM(BlueprintType)
 enum class ESimulatorBoundsSource : uint8
 {
     None,
-    SCZ,
+    ModelCache,
     RuntimeMeasured
 };
 
@@ -25,7 +25,7 @@ struct GLTFSIMULATOR_API FSimulatorCachedBounds
 };
 
 /**
- * Bounds policy: use SCZ metadata before loading, measure registered primitive
+ * Bounds policy: use the binary model cache before loading, measure registered primitive
  * components once after loading, then cache by source fingerprint/revision.
  * No caller needs to recalculate bounds every frame.
  */
@@ -39,7 +39,7 @@ public:
     bool TryGetBounds(const FString& ResourceKey, const FString& SourceFingerprint, int32 SchemaRevision, FSimulatorCachedBounds& OutBounds) const;
 
     UFUNCTION(BlueprintCallable, Category="glTF|Bounds")
-    void StoreSCZBounds(const FString& ResourceKey, const FBox& LocalBox, const FString& SourceFingerprint, int32 SchemaRevision);
+    void StoreModelCacheBounds(const FString& ResourceKey, const FBox& LocalBox, const FString& SourceFingerprint, int32 SchemaRevision);
 
     UFUNCTION(BlueprintCallable, Category="glTF|Bounds")
     bool MeasureActorBoundsOnce(const FString& ResourceKey, AActor* LoadedActor, const FString& SourceFingerprint, int32 SchemaRevision, FSimulatorCachedBounds& OutBounds);

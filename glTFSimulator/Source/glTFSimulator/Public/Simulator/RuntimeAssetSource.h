@@ -2,7 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "UObject/Interface.h"
-#include "SimulatorRuntimeAssetSource.generated.h"
+#include "RuntimeAssetSource.generated.h"
 
 UINTERFACE(BlueprintType)
 class GLTFSIMULATOR_API USimulatorRuntimeAssetSource : public UInterface

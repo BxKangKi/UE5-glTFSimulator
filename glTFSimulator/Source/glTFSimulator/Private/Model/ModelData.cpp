@@ -122,7 +122,7 @@ TSharedRef<FJsonObject> FModelData::Serialization() const
     }
 
     // JSON is external, user-authored, and read-only at runtime. Program-owned bounds are stored
-    // only in the sibling .scz cache and must never be mixed into this settings document.
+    // only in the extensionless /cache binary and must never be mixed into this settings document.
     // Automates TMap struct serialization without duplicate loops.
     FJsonHelper::SetMap<FMeshData>(Json, TEXT("MeshData"), MeshData, [](const FMeshData &Item)
                                           { return Item.Serialization(); });

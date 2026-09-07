@@ -1,8 +1,8 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
 #include "Vehicle/VehiclePawn.h"
-#include "RuntimeFramework/SimulatorGlTFRuntimeCacheLibrary.h"
-#include "RuntimeFramework/SimulatorNodeTokenLibrary.h"
+#include "Simulator/GlTFRuntimeCacheLibrary.h"
+#include "Simulator/NodeTokenLibrary.h"
 #include "Camera/CameraComponent.h"
 #include "CollisionShape.h"
 #include "Character/CharacterComponent.h"
@@ -17,6 +17,7 @@
 #include "GameFramework/PlayerController.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
+#include "Engine/GameInstance.h"
 #include "GameFramework/SpringArmComponent.h"
 #include "Interface/WaterInteract.h"
 #include "PhysicalMaterials/PhysicalMaterial.h"
@@ -27,6 +28,7 @@
 #include "HAL/FileManager.h"
 #include "HAL/PlatformTime.h"
 #include "Misc/Paths.h"
+#include "Misc/FileHelper.h"
 #include "Model/InstancedEntitySubsystem.h"
 #include "Model/glTFMaterialOverrideUtils.h"
 #include "Setting/GameSettings.h"
@@ -38,6 +40,8 @@
 #include "System/MacroLibrary.h"
 #include "System/PhysicsHelper.h"
 #include "System/SafeFileIO.h"
+#include "System/BinaryDataStore.h"
+#include "Simulator/ModelDatabaseSubsystem.h"
 #include "System/MultiplayerWorldSubSystem.h"
 #include "System/glTFRuntimeSafety.h"
 #include "Net/UnrealNetwork.h"
@@ -81,6 +85,31 @@ struct FVehicleWheelVisual
 
 namespace
 {
+    void CacheVehicleBoundsAsync(UObject* Context, const FString& SourcePath, const FBox& Bounds)
+    {
+        const UWorld* World = IsValid(Context) ? Context->GetWorld() : nullptr;
+        const UGameInstance* GameInstance = World ? World->GetGameInstance() : nullptr;
+        const UModelDatabaseSubsystem* Database = GameInstance
+            ? GameInstance->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
+        FGuid UUID;
+        FModelDefinition Definition;
+        FString CachePath;
+        if (!Bounds.IsValid || !Database || !Database->FindIdForGlb(SourcePath, UUID)
+            || !Database->Resolve(UUID, Definition, CachePath)) return;
+        const FString JsonPath = Definition.JsonPath;
+        FSafeFileIO::RunTrackedWorker([SourcePath, JsonPath, CachePath, Bounds]()
+        {
+            FModelCacheData Cache;
+            FString Error;
+            FFileHelper::LoadFileToString(Cache.DefinitionJson, *JsonPath);
+            if (FBinaryDataStore::ComputeFileSha1(SourcePath, Cache.ModelHash, Error))
+            {
+                Cache.Center = Bounds.GetCenter();
+                Cache.Extent = Bounds.GetExtent();
+                FBinaryDataStore::SaveModelCacheBlocking(CachePath, Cache);
+            }
+        });
+    }
     constexpr float LoadedWheelGroundContactBuffer = 0.05f;
     constexpr float LoadedVisualBodyGroundClearance = 1.0f;
     constexpr float LoadedPhysicsBodyGroundClearance = 2.0f;
@@ -1337,9 +1366,12 @@ bool AVehiclePawn::SaveVehicleTuningJsonTemplate(const FString& JsonPath) const
     TSharedRef<FJsonObject> RootObject = MakeShared<FJsonObject>();
     RootObject->SetStringField(JSON_VERSION_FIELD, JSON_SCHEMA_VERSION);
     RootObject->SetStringField(TEXT("Schema"), TEXT("glTFSimulator.VehicleTuning.v3"));
-    RootObject->SetStringField(TEXT("AssetType"), TEXT("Vehicle"));
+    RootObject->SetStringField(TEXT("ID"), FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower));
+    RootObject->SetStringField(TEXT("Name"), BaseName.IsEmpty() ? TEXT("Vehicle") : BaseName);
+    RootObject->SetStringField(TEXT("ModelType"), TEXT("Entity"));
+    RootObject->SetStringField(TEXT("EntityType"), TEXT("Vehicle"));
     RootObject->SetStringField(TEXT("DisplayName"), ObjectName.IsEmpty() ? BaseName : ObjectName);
-    RootObject->SetStringField(TEXT("Notes"), TEXT("User-authored read-only vehicle settings. Runtime geometry/hash caches are stored in the sibling .scz file. Positive RideHeightOffset raises the chassis; negative lowers it."));
+    RootObject->SetStringField(TEXT("Notes"), TEXT("Runtime JSON and mesh bounds are cached as /cache/<JSON filename without extension>. Positive RideHeightOffset raises the chassis; negative lowers it."));
 
     RootObject->SetNumberField(TEXT("MaxSpeedForward"), MaxSpeedForward);
     RootObject->SetNumberField(TEXT("EngineForce"), EngineForce);
@@ -1881,6 +1913,7 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InFilePath, const FString& In
     VehicleTemplateData.WheelVisualRestBounds = LoadedWheelVisualRestBounds;
     VehicleTemplateData.CombinedLocalBounds = CombinedLocalBounds;
     VehicleTemplateData.RuntimeWheelRadius = RuntimeWheelRadius;
+    CacheVehicleBoundsAsync(this, SourceFilePath, CombinedLocalBounds);
     if (!InstancedEntities->StoreVehicleTemplateData(SourceFilePath, VehicleTemplateData))
     {
         UE_LOG(LogTemp, Warning,
@@ -2949,19 +2982,6 @@ void AVehiclePawn::ApplyStableVehicleGrounding(float DeltaSeconds)
     // Intentionally disabled. Snap-grounding can inject artificial vertical motion.
     // Runtime driving uses UpdateStableWheelVehicle.
     (void)DeltaSeconds;
-}
-
-FPlacedObjectRecord AVehiclePawn::ToPlacementRecord(int32 VehicleRecordIndex) const
-{
-    FPlacedObjectRecord Record;
-    Record.ObjectName = ObjectName.IsEmpty()
-        ? (VehicleRecordIndex == 0 ? TEXT("Vehicle") : TEXT("Vehicle;INST"))
-        : ObjectName;
-    Record.BaseName = BaseName.IsEmpty() ? TEXT("Vehicle") : BaseName;
-    Record.SourceFile = SourceFilePath;
-    Record.Kind = EPlacedObjectKind::Vehicle;
-    Record.Transform = GetActorTransform();
-    return Record;
 }
 
 bool AVehiclePawn::EnterVehicle(APlayerController* PlayerController, APawn* PreviousPawn)
@@ -4996,5 +5016,3 @@ void AVehiclePawn::UpdateWheelVisuals(float DeltaSeconds)
             WheelLocalTransform);
     }
 }
-
-

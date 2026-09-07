@@ -2,8 +2,8 @@
 
 #include "CoreMinimal.h"
 #include "Kismet/BlueprintFunctionLibrary.h"
-#include "RuntimeFramework/SimulatorInteractionTypes.h"
-#include "SimulatorInteractionBlueprintLibrary.generated.h"
+#include "Simulator/InteractionTypes.h"
+#include "InteractionBlueprintLibrary.generated.h"
 
 class ACharacter;
 class ASimulatorHeldPrefabPreviewActor;

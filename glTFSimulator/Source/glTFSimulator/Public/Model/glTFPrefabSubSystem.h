@@ -34,9 +34,8 @@ public:
     virtual void Deinitialize() override;
 
     /**
-     * Acquires one node reference to a prefab named by the model JSON. The model path determines
-     * the model root, and the prefab is resolved only from <model root>/prefab/<name>.glb.
-     * The paired prefab JSON must declare AssetType="prefab".
+     * Acquires one node reference to a prefab named by the model JSON. The recursive model database
+     * resolves the name independently of subfolder layout; the paired JSON must be ModelType=Prefab.
      */
     void AcquirePrefabReference(
         const FString& ModelFilePath,

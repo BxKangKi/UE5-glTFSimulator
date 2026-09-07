@@ -1,11 +1,12 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
 #include "World/PrefabActor.h"
-#include "RuntimeFramework/SimulatorGlTFRuntimeCacheLibrary.h"
+#include "Simulator/GlTFRuntimeCacheLibrary.h"
 
 #include "Components/BoxComponent.h"
 #include "Dom/JsonObject.h"
 #include "Engine/StaticMesh.h"
+#include "Engine/GameInstance.h"
 #include "glTFRuntimeAsset.h"
 #include "glTFRuntimeFunctionLibrary.h"
 #include "HAL/FileManager.h"
@@ -23,10 +24,39 @@
 #include "System/MacroLibrary.h"
 #include "System/MultiplayerWorldSubSystem.h"
 #include "System/glTFRuntimeSafety.h"
+#include "Simulator/ModelDatabaseSubsystem.h"
+#include "System/BinaryDataStore.h"
+#include "System/SafeFileIO.h"
 
 namespace
 {
     constexpr int32 MaxRuntimePrefabNodeCount = 500000;
+
+    void CachePrefabBoundsAsync(UObject* Context, const FString& SourcePath, const FBox& Bounds)
+    {
+        const UWorld* World = IsValid(Context) ? Context->GetWorld() : nullptr;
+        const UGameInstance* GameInstance = World ? World->GetGameInstance() : nullptr;
+        const UModelDatabaseSubsystem* Database = GameInstance
+            ? GameInstance->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
+        FGuid UUID;
+        FModelDefinition Definition;
+        FString CachePath;
+        if (!Bounds.IsValid || !Database || !Database->FindIdForGlb(SourcePath, UUID)
+            || !Database->Resolve(UUID, Definition, CachePath)) return;
+        const FString JsonPath = Definition.JsonPath;
+        FSafeFileIO::RunTrackedWorker([SourcePath, JsonPath, CachePath, Bounds]()
+        {
+            FModelCacheData Cache;
+            FString Error;
+            FFileHelper::LoadFileToString(Cache.DefinitionJson, *JsonPath);
+            if (FBinaryDataStore::ComputeFileSha1(SourcePath, Cache.ModelHash, Error))
+            {
+                Cache.Center = Bounds.GetCenter();
+                Cache.Extent = Bounds.GetExtent();
+                FBinaryDataStore::SaveModelCacheBlocking(CachePath, Cache);
+            }
+        });
+    }
 
     static FVector MakeSafeOriginCenteredBoxExtent(const FBox& Bounds)
     {
@@ -584,6 +614,7 @@ bool APrefabActor::LoadPrefab(const FString& InFilePath, const FString& InObject
         LocalBounds);
     bLoaded = InstancedRegistrationId != INDEX_NONE;
     LoadedLocalBounds = LocalBounds;
+    CachePrefabBoundsAsync(this, SourceFilePath, LoadedLocalBounds);
 
     // The shared ISM actor now owns the generated meshes. The parser and per-entity cache can be released.
     MeshCache.Empty();
@@ -607,15 +638,4 @@ bool APrefabActor::LoadPrefab(const FString& InFilePath, const FString& InObject
         ForceNetUpdate();
     }
     return true;
-}
-
-FPlacedObjectRecord APrefabActor::ToPlacementRecord() const
-{
-    FPlacedObjectRecord Record;
-    Record.ObjectName = ObjectName;
-    Record.BaseName = BaseName;
-    Record.SourceFile = SourceFilePath;
-    Record.Kind = EPlacedObjectKind::Prefab;
-    Record.Transform = GetActorTransform();
-    return Record;
 }

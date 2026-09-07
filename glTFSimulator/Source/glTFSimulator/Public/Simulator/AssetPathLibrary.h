@@ -2,7 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Kismet/BlueprintFunctionLibrary.h"
-#include "SimulatorAssetPathLibrary.generated.h"
+#include "AssetPathLibrary.generated.h"
 
 UCLASS()
 class GLTFSIMULATOR_API USimulatorAssetPathLibrary final : public UBlueprintFunctionLibrary

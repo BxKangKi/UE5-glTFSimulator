@@ -1,4 +1,4 @@
-#include "RuntimeFramework/SimulatorNodeTokenLibrary.h"
+#include "Simulator/NodeTokenLibrary.h"
 #include "Misc/AutomationTest.h"
 
 #if WITH_DEV_AUTOMATION_TESTS

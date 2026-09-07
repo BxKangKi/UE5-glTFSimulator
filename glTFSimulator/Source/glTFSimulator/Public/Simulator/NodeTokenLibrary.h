@@ -2,7 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Kismet/BlueprintFunctionLibrary.h"
-#include "SimulatorNodeTokenLibrary.generated.h"
+#include "NodeTokenLibrary.generated.h"
 
 USTRUCT(BlueprintType)
 struct GLTFSIMULATOR_API FSimulatorEffectiveNodeToken

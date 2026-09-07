@@ -2,8 +2,8 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
-#include "RuntimeFramework/SimulatorInteractionTypes.h"
-#include "SimulatorHeldPrefabPreviewActor.generated.h"
+#include "Simulator/InteractionTypes.h"
+#include "HeldPrefabPreviewActor.generated.h"
 
 class USceneComponent;
 class ACharacter;

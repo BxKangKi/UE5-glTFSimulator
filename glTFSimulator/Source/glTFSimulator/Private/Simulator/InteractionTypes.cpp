@@ -1,4 +1,4 @@
-#include "RuntimeFramework/SimulatorInteractionTypes.h"
+#include "Simulator/InteractionTypes.h"
 
 void FSimulatorFingerPose::Clamp()
 {

@@ -13,6 +13,7 @@
 #include "HAL/FileManager.h"
 #include "HAL/PlatformTime.h"
 #include "Misc/Paths.h"
+#include "Misc/FileHelper.h"
 #include "Model/glTFStreamActor.h"
 #include "System/ActorHelper.h"
 #include "System/BinaryDataStore.h"
@@ -23,6 +24,7 @@
 #include "System/MacroLibrary.h"
 #include "System/SafeFileIO.h"
 #include "TimerManager.h"
+#include "Simulator/ModelDatabaseSubsystem.h"
 
 namespace
 {
@@ -150,14 +152,14 @@ bool UglTFStreamSubSystem::IsActiveForWorld(const UWorld* World) const
     return bActive && World && IsValid(OwnerActor) && OwnerActor->GetWorld() == World;
 }
 
-void UglTFStreamSubSystem::StartMainWorldStreaming(AActor* InOwnerActor, TSubclassOf<AglTFStreamActor> InSpawnActorClass, const FString& InModelDirectory, const FString& InPlayerDirectory, const FString& InInitialPlayerName, bool bInRenderOnlyStreaming)
+void UglTFStreamSubSystem::StartMainWorldStreaming(AActor* InOwnerActor, TSubclassOf<AglTFStreamActor> InSpawnActorClass, const FString& InModelDirectory, const FString& InInitialPlayerName, bool bInRenderOnlyStreaming)
 {
     if (!IsInGameThread())
     {
         TWeakObjectPtr<UglTFStreamSubSystem> WeakThis(this);
         TWeakObjectPtr<AActor> WeakOwner(InOwnerActor);
         FSafeFileIO::DispatchTrackedGameThread(
-            [WeakThis, WeakOwner, InSpawnActorClass, InModelDirectory, InPlayerDirectory,
+            [WeakThis, WeakOwner, InSpawnActorClass, InModelDirectory,
                 InInitialPlayerName, bInRenderOnlyStreaming]()
             {
                 if (UglTFStreamSubSystem* StrongThis = WeakThis.Get())
@@ -166,7 +168,6 @@ void UglTFStreamSubSystem::StartMainWorldStreaming(AActor* InOwnerActor, TSubcla
                         WeakOwner.Get(),
                         InSpawnActorClass,
                         InModelDirectory,
-                        InPlayerDirectory,
                         InInitialPlayerName,
                         bInRenderOnlyStreaming);
                 }
@@ -185,7 +186,6 @@ void UglTFStreamSubSystem::StartMainWorldStreaming(AActor* InOwnerActor, TSubcla
     OwnerActor = InOwnerActor;
     SpawnActorClass = InSpawnActorClass;
     ModelDirectory = InModelDirectory;
-    PlayerDirectory = InPlayerDirectory;
     InitialPlayerName = InInitialPlayerName;
     bRenderOnlyStreaming = bInRenderOnlyStreaming;
     bActive = true;
@@ -218,9 +218,18 @@ void UglTFStreamSubSystem::StartMainWorldStreaming(AActor* InOwnerActor, TSubcla
     ModelMetadataMap.Empty();
     SpawnActorMap.Empty();
 
-    const FString StreamDirectory = GlbValidation::NormalizePath(
-        FPaths::Combine(ModelDirectory, TEXT("stream")));
-    GlbFilePaths = UFileFunctionLibrary::GetFileNamesWithExtension(StreamDirectory, TEXT("glb"));
+    GlbFilePaths.Empty();
+    if (const UGameInstance* GameInstance = GetWorld() ? GetWorld()->GetGameInstance() : nullptr)
+    {
+        if (const UModelDatabaseSubsystem* Database = GameInstance->GetSubsystem<UModelDatabaseSubsystem>())
+        {
+            TArray<FModelDefinition> Definitions;
+            Database->GetDefinitions(Definitions);
+            for (const FModelDefinition& Definition : Definitions)
+                if (Definition.ModelType == EModelDefinitionType::Scene)
+                    GlbFilePaths.Add(Definition.GlbPath);
+        }
+    }
     NormalizeAndDeduplicatePaths(GlbFilePaths);
     InitialPathProgress.Reserve(GlbFilePaths.Num());
     for (const FString& GlbPath : GlbFilePaths)
@@ -229,11 +238,9 @@ void UglTFStreamSubSystem::StartMainWorldStreaming(AActor* InOwnerActor, TSubcla
     }
     DiscoverPlayerPaths();
 
-    WriteLogAsync(FString::Printf(TEXT("glTFStreamSubSystem started. ModelDirectory=%s StreamDirectory=%s GLBCount=%d PlayerDirectory=%s PlayerCount=%d InitialPlayer=%s RenderOnly=%s"),
+    WriteLogAsync(FString::Printf(TEXT("glTFStreamSubSystem started. ModelDirectory=%s GLBCount=%d PlayerCount=%d InitialPlayer=%s RenderOnly=%s"),
         *ModelDirectory,
-        *StreamDirectory,
         GlbFilePaths.Num(),
-        *PlayerDirectory,
         PlayerGlbFilePaths.Num(),
         *InitialPlayerName,
         bRenderOnlyStreaming ? TEXT("true") : TEXT("false")));
@@ -293,7 +300,6 @@ void UglTFStreamSubSystem::StopMainWorldStreaming()
     ModelDirectory.Reset();
     CurrentPlayerPath.Reset();
     PendingPlayerPath.Reset();
-    PlayerDirectory.Reset();
     InitialPlayerName.Reset();
     CompletedInitialPaths.Empty();
     MissingFilePaths.Empty();
@@ -541,18 +547,29 @@ void UglTFStreamSubSystem::StartInitialPathPreflight(
 {
     check(IsInGameThread());
 
+    FString SizeCachePath;
+    if (const UGameInstance* GameInstance = GetWorld() ? GetWorld()->GetGameInstance() : nullptr)
+    {
+        if (const UModelDatabaseSubsystem* Database = GameInstance->GetSubsystem<UModelDatabaseSubsystem>())
+        {
+            FGuid UUID;
+            FModelDefinition Definition;
+            Database->FindIdForGlb(GlbPath, UUID);
+            Database->Resolve(UUID, Definition, SizeCachePath);
+        }
+    }
+
     TWeakObjectPtr<UglTFStreamSubSystem> WeakThis(this);
     const bool bQueued = FSafeFileIO::RunTrackedWorker(
-        [WeakThis, GlbPath, ScanGeneration]()
+        [WeakThis, GlbPath, SizeCachePath, ScanGeneration]()
         {
-            // WORKER THREAD ONLY: model validation, hashing, and SCZ parsing are pure-data work.
+            // WORKER THREAD ONLY: model validation, hashing, and cache parsing are pure-data work.
             // User-authored JSON never participates in the streaming-bounds cache.
             FInitialModelPreflightResult Result;
             Result.bGlbValid = GlbValidation::ValidateFile(GlbPath, Result.Reason);
 
             if (Result.bGlbValid)
             {
-                const FString SizeCachePath = FPaths::ChangeExtension(GlbPath, TEXT("scz"));
                 Result.bSizeCacheExists = IFileManager::Get().FileExists(*SizeCachePath) ||
                     IFileManager::Get().FileExists(*(SizeCachePath + TEXT(".bak")));
 
@@ -576,18 +593,27 @@ void UglTFStreamSubSystem::StartInitialPathPreflight(
                         CacheError,
                         bHashMismatch))
                     {
+                        FString DefinitionJson;
+                        FFileHelper::LoadFileToString(DefinitionJson, *FPaths::ChangeExtension(GlbPath, TEXT("json")));
+                        if (DefinitionJson.IsEmpty() || Cache.DefinitionJson != DefinitionJson)
+                        {
+                            Result.Reason = TEXT("Model definition JSON changed; cache rebuild required");
+                            Result.bSizeCacheExists = false;
+                            FString Ignored;
+                            FBinaryDataStore::InvalidateCacheFile(SizeCachePath, Ignored);
+                        }
                         Result.Metadata.Center = Cache.Center;
                         Result.Metadata.Size = Cache.Extent * 2.0;
-                        Result.bMetadataValid = IsUsableModelMetadata(Result.Metadata);
+                        Result.bMetadataValid = Result.bSizeCacheExists && IsUsableModelMetadata(Result.Metadata);
                         if (!Result.bMetadataValid)
                         {
-                            Result.Reason = TEXT("Model SCZ contains invalid or empty bounds");
+                            Result.Reason = TEXT("Model cache contains invalid or empty bounds");
                         }
                     }
                     else
                     {
                         Result.Reason = CacheError.IsEmpty()
-                            ? TEXT("Model SCZ could not be loaded safely")
+                            ? TEXT("Model cache could not be loaded safely")
                             : CacheError;
 
                         // A source hash change makes every cached extent stale. Remove all DAT
@@ -599,7 +625,7 @@ void UglTFStreamSubSystem::StartInitialPathPreflight(
                                 !InvalidateError.IsEmpty())
                             {
                                 Result.Reason += FString::Printf(
-                                    TEXT("; stale SCZ cleanup failed: %s"),
+                                    TEXT("; stale cache cleanup failed: %s"),
                                     *InvalidateError);
                             }
                             Result.bSizeCacheExists = false;
@@ -608,7 +634,7 @@ void UglTFStreamSubSystem::StartInitialPathPreflight(
                 }
                 else
                 {
-                    Result.Reason = TEXT("Model SCZ does not exist");
+                    Result.Reason = TEXT("Model cache does not exist");
                 }
             }
 
@@ -654,7 +680,7 @@ void UglTFStreamSubSystem::StartInitialPathPreflight(
                             StrongThis->MetadataUnavailablePaths.Remove(GlbPath);
                             StrongThis->ModelMetadataMap.Add(GlbPath, Result.Metadata);
                             StrongThis->WriteLogAsync(FString::Printf(
-                                TEXT("Valid model SCZ loaded safely. GLB=%s Center=%s Size=%s"),
+                                TEXT("Valid model cache loaded safely. GLB=%s Center=%s Size=%s"),
                                 *GlbPath,
                                 *Result.Metadata.Center.ToCompactString(),
                                 *Result.Metadata.Size.ToCompactString()));
@@ -674,7 +700,7 @@ void UglTFStreamSubSystem::StartInitialPathPreflight(
                         {
                             StrongThis->MetadataUnavailablePaths.Add(GlbPath);
                             StrongThis->WriteLogAsync(FString::Printf(
-                                TEXT("Model SCZ unavailable; bounds will be calculated by a dedicated stream actor. GLB=%s SczExists=%s Reason=%s"),
+                                TEXT("Model cache unavailable; bounds will be calculated by a dedicated stream actor. GLB=%s CacheExists=%s Reason=%s"),
                                 *GlbPath,
                                 Result.bSizeCacheExists ? TEXT("true") : TEXT("false"),
                                 *Result.Reason));
@@ -922,16 +948,21 @@ void UglTFStreamSubSystem::DiscoverPlayerPaths()
     }
 
     PlayerGlbFilePaths.Empty();
-    if (!PlayerDirectory.IsEmpty())
+    if (const UGameInstance* GameInstance = GetWorld() ? GetWorld()->GetGameInstance() : nullptr)
     {
-        // This scans file names only. Character GLB contents are not parsed or loaded here.
-        PlayerGlbFilePaths = UFileFunctionLibrary::GetFileNamesWithExtension(PlayerDirectory, TEXT("glb"));
-        NormalizeAndDeduplicatePaths(PlayerGlbFilePaths);
+        if (const UModelDatabaseSubsystem* Database = GameInstance->GetSubsystem<UModelDatabaseSubsystem>())
+        {
+            TArray<FModelDefinition> Definitions;
+            Database->GetDefinitions(Definitions);
+            for (const FModelDefinition& Definition : Definitions)
+                if (Definition.ModelType == EModelDefinitionType::Character)
+                    PlayerGlbFilePaths.Add(Definition.GlbPath);
+        }
     }
+    NormalizeAndDeduplicatePaths(PlayerGlbFilePaths);
 
     WriteLogAsync(FString::Printf(
-        TEXT("Player GLB path scan completed without loading character assets. Directory=%s Count=%d"),
-        *PlayerDirectory,
+        TEXT("Character ModelType scan completed without loading character assets. Count=%d"),
         PlayerGlbFilePaths.Num()));
 }
 
@@ -1043,21 +1074,6 @@ bool UglTFStreamSubSystem::ResolveInitialPlayerIndex()
         {
             PreferredIndex = Index;
             break;
-        }
-    }
-
-    if (PreferredIndex == INDEX_NONE)
-    {
-        const FString CombinedPath = GlbValidation::NormalizePath(
-            FPaths::Combine(PlayerDirectory, InitialPlayerName));
-        if (IFileManager::Get().FileExists(*CombinedPath))
-        {
-            PlayerGlbFilePaths.AddUnique(CombinedPath);
-            PlayerGlbFilePaths.Sort([](const FString& A, const FString& B)
-            {
-                return A.Compare(B, ESearchCase::IgnoreCase) < 0;
-            });
-            PreferredIndex = PlayerGlbFilePaths.IndexOfByKey(CombinedPath);
         }
     }
 
@@ -1482,7 +1498,7 @@ void UglTFStreamSubSystem::PersistCurrentPlayerSelection()
         const FString SelectedPlayer = FPaths::GetCleanFilename(CurrentPlayerPath);
         GameSystem->SetSelectedPlayerForRuntime(SelectedPlayer);
         WriteLogAsync(FString::Printf(
-            TEXT("Current player selection saved to data/world.dat. Player=%s"),
+            TEXT("Current player selection saved to data/level.dat. Player=%s"),
             *SelectedPlayer));
     }
 }
