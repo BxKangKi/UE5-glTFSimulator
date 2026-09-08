@@ -43,6 +43,16 @@ public:
         const FglTFRuntimeConfig& Config);
 
     /**
+     * Runs one short, synchronous glTFRuntime call on the game thread.
+     *
+     * This is the only entry point used by synchronous vehicle, prefab, and weapon loading. It
+     * shares the same process-wide gate as parser construction, queued mesh finalization, and
+     * ClearCache. The call is rejected instead of blocking the game thread when asynchronous
+     * native work already owns the gate.
+     */
+    static bool ExecuteSynchronousOperation(const FString& Label, TFunctionRef<void()> Operation);
+
+    /**
      * Enqueues one game-thread glTFRuntime operation for Asset.
      *
      * Start receives a ticket that the caller must return through CompleteOperation from every
@@ -98,6 +108,7 @@ public:
     static int32 GetPendingOperationCount();
 
 private:
+    static void NotifyGateAvailable_GameThread();
     static void PumpQueue_GameThread();
     static void ProcessPendingAssetReleases_GameThread();
     static bool TickWatchdog(float DeltaSeconds);

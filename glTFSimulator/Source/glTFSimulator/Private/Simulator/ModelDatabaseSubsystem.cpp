@@ -6,6 +6,7 @@
 #include "HAL/FileManager.h"
 #include "Misc/Paths.h"
 #include "System/BinaryDataStore.h"
+#include "System/FileFunctionLibrary.h"
 #include "System/SafeFileIO.h"
 
 namespace
@@ -14,7 +15,7 @@ namespace
     {
         TMap<FGuid, FModelDefinition> Definitions;
         TMap<FGuid, FString> CachePaths;
-        TMap<FString, FGuid> GlbToId;
+        TMap<FString, FGuid> GlbToUUID;
         TArray<FModelDatabaseEntry> Rows;
         FString Error;
     };
@@ -57,7 +58,21 @@ void UModelDatabaseSubsystem::InitializeForWorld(const FString& InWorldRoot, FMo
 {
     check(IsInGameThread());
     Stop();
+    if (InWorldRoot.TrimStartAndEnd().IsEmpty())
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("Model database initialization aborted because the explicit world root is empty."));
+        Completion.ExecuteIfBound(false, TEXT("explicit world root is empty"));
+        return;
+    }
     WorldRoot = FSafeFileIO::NormalizeFilePath(InWorldRoot);
+    if (WorldRoot.IsEmpty())
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("Model database initialization aborted because the explicit world root is invalid."));
+        Completion.ExecuteIfBound(false, TEXT("explicit world root is invalid"));
+        return;
+    }
     const FString RequestedRoot = WorldRoot;
     const uint64 RequestedGeneration = ++Generation;
     TWeakObjectPtr<UModelDatabaseSubsystem> WeakThis(this);
@@ -102,15 +117,21 @@ void UModelDatabaseSubsystem::InitializeForWorld(const FString& InWorldRoot, FMo
                 FParsedDefinitionResult& Parsed = ParsedDefinitions[Index];
                 if (!Parsed.bValid)
                 {
-                    UE_LOG(LogTemp, Error, TEXT("Model definition rejected and will not load. JSON=%s Reason=%s"),
+                    const FString Message = FString::Printf(
+                        TEXT("Model definition rejected and will not load. JSON=%s Reason=%s"),
                         *JsonPath, *Parsed.Error);
+                    UE_LOG(LogTemp, Error, TEXT("%s"), *Message);
+                    UFileFunctionLibrary::WriteSimulatorLogAsync(TEXT("ModelUUID"), Message);
                     continue;
                 }
                 FModelDefinition& Definition = Parsed.Definition;
-                if (Result.Definitions.Contains(Definition.Id))
+                if (Result.Definitions.Contains(Definition.UUID))
                 {
-                    UE_LOG(LogTemp, Error, TEXT("Duplicate model JSON ID rejected. ID=%s JSON=%s"),
-                        *Definition.Id.ToString(), *JsonPath);
+                    const FString Message = FString::Printf(
+                        TEXT("Duplicate model JSON UUID rejected. UUID=%s JSON=%s"),
+                        *Definition.UUID.ToString(), *JsonPath);
+                    UE_LOG(LogTemp, Error, TEXT("%s"), *Message);
+                    UFileFunctionLibrary::WriteSimulatorLogAsync(TEXT("ModelUUID"), Message);
                     continue;
                 }
 
@@ -118,27 +139,32 @@ void UModelDatabaseSubsystem::InitializeForWorld(const FString& InWorldRoot, FMo
                 const FString CacheKey = FSafeFileIO::NormalizeFilePath(CachePath).ToLower();
                 if (const FString* ExistingJson = CacheOwnerByPath.Find(CacheKey))
                 {
-                    UE_LOG(LogTemp, Error,
+                    const FString Message = FString::Printf(
                         TEXT("Duplicate JSON filename rejected because extensionless cache paths must be unique. First=%s Rejected=%s Cache=%s"),
                         **ExistingJson, *JsonPath, *CachePath);
+                    UE_LOG(LogTemp, Error, TEXT("%s"), *Message);
+                    UFileFunctionLibrary::WriteSimulatorLogAsync(TEXT("ModelDatabase"), Message);
                     continue;
                 }
                 CacheOwnerByPath.Add(CacheKey, JsonPath);
                 FModelDatabaseEntry& Row = Result.Rows.AddDefaulted_GetRef();
-                Row.UUID = Definition.Id;
+                Row.UUID = Definition.UUID;
                 Row.Cache = RelativeToRoot(CachePath, RequestedRoot);
                 Row.Json = RelativeToRoot(JsonPath, RequestedRoot);
-                Result.CachePaths.Add(Definition.Id, CachePath);
-                Result.GlbToId.Add(FSafeFileIO::NormalizeFilePath(GlbPath).ToLower(), Definition.Id);
-                Result.Definitions.Add(Definition.Id, MoveTemp(Definition));
+                Result.CachePaths.Add(Definition.UUID, CachePath);
+                Result.GlbToUUID.Add(FSafeFileIO::NormalizeFilePath(GlbPath).ToLower(), Definition.UUID);
+                Result.Definitions.Add(Definition.UUID, MoveTemp(Definition));
             }
 
             // The recursive JSON scan is authoritative. Rewriting db.dat also repairs an old UUID
-            // row whose Json path no longer matches the definition carrying that ID.
+            // row whose Json path no longer matches the definition carrying that UUID.
             const FSafeFileWriteResult Saved = FBinaryDataStore::SaveModelDatabaseBlocking(DatabasePath, Result.Rows);
             if (!Saved.IsSuccess())
             {
                 Result.Error = Result.Error.IsEmpty() ? Saved.Error : Result.Error + TEXT("; ") + Saved.Error;
+                UFileFunctionLibrary::WriteSimulatorLogAsync(
+                    TEXT("ModelDatabase"),
+                    FString::Printf(TEXT("db.dat save failed. Path=%s Reason=%s"), *DatabasePath, *Saved.Error));
             }
 
             FSafeFileIO::DispatchTrackedGameThread(
@@ -152,7 +178,7 @@ void UModelDatabaseSubsystem::InitializeForWorld(const FString& InWorldRoot, FMo
                     }
                     StrongThis->Definitions = MoveTemp(Result.Definitions);
                     StrongThis->CachePaths = MoveTemp(Result.CachePaths);
-                    StrongThis->GlbToId = MoveTemp(Result.GlbToId);
+                    StrongThis->GlbToUUID = MoveTemp(Result.GlbToUUID);
                     StrongThis->bReady = Result.Error.IsEmpty();
                     Completion.ExecuteIfBound(StrongThis->bReady, Result.Error);
                 });
@@ -172,7 +198,7 @@ void UModelDatabaseSubsystem::Stop()
     bReady = false;
     Definitions.Empty();
     CachePaths.Empty();
-    GlbToId.Empty();
+    GlbToUUID.Empty();
     WorldRoot.Reset();
 }
 
@@ -191,11 +217,49 @@ bool UModelDatabaseSubsystem::ResolveLoadable(const FGuid& UUID, FModelDefinitio
     return Resolve(UUID, OutDefinition, OutCachePath) && OutDefinition.IsLoadable();
 }
 
-bool UModelDatabaseSubsystem::FindIdForGlb(const FString& GlbPath, FGuid& OutUUID) const
+bool UModelDatabaseSubsystem::FindUUIDForGlb(const FString& GlbPath, FGuid& OutUUID) const
 {
-    const FGuid* Found = GlbToId.Find(FSafeFileIO::NormalizeFilePath(GlbPath).ToLower());
+    const FGuid* Found = GlbToUUID.Find(FSafeFileIO::NormalizeFilePath(GlbPath).ToLower());
     if (!Found) return false;
     OutUUID = *Found;
+    return true;
+}
+
+bool UModelDatabaseSubsystem::FindPrefabUUIDByName(
+    const FString& PrefabName,
+    FGuid& OutUUID,
+    FString& OutError) const
+{
+    OutUUID = FGuid();
+    OutError.Reset();
+    if (PrefabName.IsEmpty())
+    {
+        OutError = TEXT("placement node has an empty prefab name");
+        return false;
+    }
+
+    for (const TPair<FGuid, FModelDefinition>& Pair : Definitions)
+    {
+        const FModelDefinition& Definition = Pair.Value;
+        if (Definition.ModelType != EModelDefinitionType::Prefab ||
+            !Definition.Name.Equals(PrefabName, ESearchCase::CaseSensitive))
+        {
+            continue;
+        }
+        if (OutUUID.IsValid())
+        {
+            OutUUID = FGuid();
+            OutError = FString::Printf(TEXT("prefab name is ambiguous: %s"), *PrefabName);
+            return false;
+        }
+        OutUUID = Definition.UUID;
+    }
+
+    if (!OutUUID.IsValid())
+    {
+        OutError = FString::Printf(TEXT("no prefab has the exact name '%s'"), *PrefabName);
+        return false;
+    }
     return true;
 }
 

@@ -1,6 +1,5 @@
 #include "Simulator/InteractionBlueprintLibrary.h"
 #include "Simulator/HeldPrefabPreviewActor.h"
-#include "Simulator/InteractionAnimInstance.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "GameFramework/Character.h"
 
@@ -13,14 +12,11 @@ bool USimulatorInteractionBlueprintLibrary::EquipActor(ACharacter* Character, AA
     if (!Character->GetMesh()->DoesSocketExist(Socket)) { OutError = FString::Printf(TEXT("Character socket '%s' does not exist"), *Socket.ToString()); return false; }
     Equipment->AttachToComponent(Character->GetMesh(), FAttachmentTransformRules::SnapToTargetNotIncludingScale, Socket);
     Equipment->SetActorRelativeTransform(Grip ? Grip->AttachmentOffset : FTransform::Identity);
-    USimulatorInteractionAnimInstance* Anim = Cast<USimulatorInteractionAnimInstance>(Character->GetMesh()->GetAnimInstance());
-    if (!Anim) { Equipment->DetachFromActor(FDetachmentTransformRules::KeepWorldTransform); OutError = TEXT("Character AnimInstance is not SimulatorInteractionAnimInstance"); return false; }
-    Anim->SetCharacterInteractionConfig(CharacterConfig); Anim->EquipInteractionActor(Equipment, Config); OutError.Reset(); return true;
+    OutError.Reset(); return true;
 }
 
 void USimulatorInteractionBlueprintLibrary::UnequipActor(ACharacter* Character, AActor* Equipment, const bool bDestroyEquipment)
 {
-    if (IsValid(Character) && IsValid(Character->GetMesh())) if (USimulatorInteractionAnimInstance* Anim = Cast<USimulatorInteractionAnimInstance>(Character->GetMesh()->GetAnimInstance())) Anim->ClearInteractionActor();
     if (IsValid(Equipment)) { Equipment->DetachFromActor(FDetachmentTransformRules::KeepWorldTransform); if (bDestroyEquipment) Equipment->Destroy(); }
 }
 

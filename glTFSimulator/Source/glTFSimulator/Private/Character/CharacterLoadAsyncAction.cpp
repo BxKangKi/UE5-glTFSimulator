@@ -21,8 +21,6 @@
 #include "System/glTFRuntimeSafety.h"
 #include "System/MacroLibrary.h"
 #include "Simulator/ModelDefinitionJson.h"
-#include "Simulator/ModelDatabaseSubsystem.h"
-#include "System/BinaryDataStore.h"
 #include "TimerManager.h"
 #include "UObject/UObjectGlobals.h"
 
@@ -617,36 +615,6 @@ void UCharacterLoadAsyncAction::OnMeshLoaded(USkeletalMesh* SkeletalMesh)
     PendingSkeletalMesh = SkeletalMesh;
     ReleaseTransientRuntimeObject(PendingSkeletalMesh);
 
-    // Character caches use the same binary JSON+bounds payload as other models. The database
-    // maps this definition to /cache/<original JSON base filename>, without an extension.
-    if (UWorld* World = GetWorld())
-    {
-        UGameInstance* GameInstance = World->GetGameInstance();
-        UModelDatabaseSubsystem* Database = GameInstance
-            ? GameInstance->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
-        FGuid UUID;
-        FModelDefinition Definition;
-        FString CachePath;
-        if (Database && Database->FindIdForGlb(FilePath, UUID)
-            && Database->Resolve(UUID, Definition, CachePath))
-        {
-            const FBoxSphereBounds Bounds = SkeletalMesh->GetImportedBounds();
-            const FString SourcePath = FilePath;
-            const FString JsonPath = Definition.JsonPath;
-            FSafeFileIO::RunTrackedWorker([SourcePath, JsonPath, CachePath, Bounds]()
-            {
-                FModelCacheData Cache;
-                FString Error;
-                FFileHelper::LoadFileToString(Cache.DefinitionJson, *JsonPath);
-                if (FBinaryDataStore::ComputeFileSha1(SourcePath, Cache.ModelHash, Error))
-                {
-                    Cache.Center = Bounds.Origin;
-                    Cache.Extent = Bounds.BoxExtent.GetAbs();
-                    FBinaryDataStore::SaveModelCacheBlocking(CachePath, Cache);
-                }
-            });
-        }
-    }
     OnProgress.Broadcast(0.80f);
 
     // Split finalization across frames so the mesh finalizer, physics setup, and component swap

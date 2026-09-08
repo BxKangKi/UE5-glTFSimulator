@@ -760,12 +760,13 @@ namespace SafeFileIOPrivate
         return Result;
     }
 
-    /** Writes bytes, fully flushes them, verifies the temporary file, and commits recoverably. */
+    /** Writes bytes, fully flushes them, verifies the temporary file, and commits transactionally. */
     FSafeFileWriteResult CommitBytesUnlocked(
         const TArray<uint8>& Data,
         const FString& Path,
         const int64 MaxOutputBytes,
-        const uint64 WriteSequence = 0)
+        const uint64 WriteSequence = 0,
+        const bool bKeepPersistentBackup = true)
     {
         FSafeFileWriteResult Result;
         Result.Path = Path;
@@ -813,7 +814,6 @@ namespace SafeFileIOPrivate
 
         const FString TemporaryPath = GetTemporaryPath(Path);
         const FString PreviousTargetPath = TemporaryPath + TEXT(".previous");
-        const FString BackupPath = GetBackupPath(Path);
         PlatformFile.DeleteFile(*TemporaryPath);
         PlatformFile.DeleteFile(*PreviousTargetPath);
 
@@ -881,8 +881,7 @@ namespace SafeFileIOPrivate
 
         if (!PlatformFile.MoveFile(*Path, *TemporaryPath))
         {
-            // Keep the old .bak untouched until the new primary exists. This guarantees that a
-            // rename failure cannot destroy the last known-good generation.
+            // Restore the previous primary from the short-lived journal if final promotion fails.
             if (bTargetExisted && PlatformFile.FileExists(*PreviousTargetPath) && !PlatformFile.FileExists(*Path))
             {
                 PlatformFile.MoveFile(*Path, *PreviousTargetPath);
@@ -895,20 +894,26 @@ namespace SafeFileIOPrivate
 
         if (bTargetExisted && PlatformFile.FileExists(*PreviousTargetPath))
         {
-            // The new primary is already durable. Rotate the previous primary into .bak only now,
-            // so a crash during the earlier rename window always leaves a recoverable generation.
-            PlatformFile.DeleteFile(*BackupPath);
-            if (!PlatformFile.MoveFile(*BackupPath, *PreviousTargetPath))
+            if (!bKeepPersistentBackup)
             {
-                // Do not fail a successful primary commit. Leave the journal file for startup
-                // cleanup/recovery and report the degraded backup rotation in the log.
-                UE_LOG(LogTemp, Warning,
-                    TEXT("Committed primary data but could not rotate its previous generation to backup. Path=%s Journal=%s"),
-                    *Path,
-                    *PreviousTargetPath);
+                // Binary state keeps only its verified primary. The previous generation is a
+                // short-lived rollback journal and is removed after the new commit succeeds.
+                PlatformFile.DeleteFile(*PreviousTargetPath);
+            }
+            else
+            {
+                // JSON may opt into persistent recovery. Rotate only after the new primary exists.
+                const FString BackupPath = GetBackupPath(Path);
+                PlatformFile.DeleteFile(*BackupPath);
+                if (!PlatformFile.MoveFile(*BackupPath, *PreviousTargetPath))
+                {
+                    UE_LOG(LogTemp, Warning,
+                        TEXT("Committed primary data but could not rotate its previous generation to backup. Path=%s Journal=%s"),
+                        *Path,
+                        *PreviousTargetPath);
+                }
             }
         }
-
         Result.Status = ESafeFileIOStatus::Success;
         Result.BytesWritten = Data.Num();
         return Result;
@@ -1387,19 +1392,8 @@ FSafeBinaryLoadResult FSafeFileIO::LoadBinaryBlocking(const FString& Path, const
         return Primary;
     }
 
-    // Binary payloads cannot be semantically validated like JSON, so only the last fully committed
-    // backup is eligible for recovery; uncommitted temporary bytes are never trusted.
-    FSafeBinaryLoadResult Backup = SafeFileIOPrivate::ReadBytesUnlocked(
-        SafeFileIOPrivate::GetBackupPath(NormalizedPath),
-        MaxBytes);
-    if (Backup.IsSuccess())
-    {
-        Backup.Path = NormalizedPath;
-        Backup.Status = ESafeFileIOStatus::RecoveredFromBackup;
-        Backup.Error = FString::Printf(TEXT("Recovered binary payload from backup after primary failure: %s"),
-            *Primary.Error);
-        return Backup;
-    }
+    // DAT/model-cache callers perform schema, length, and CRC validation after this bounded
+    // primary-file read. Binary state has no alternate-generation recovery path.
     return Primary;
 }
 
@@ -1447,7 +1441,8 @@ FSafeFileWriteResult FSafeFileIO::SaveBinaryBlocking(
     const TSharedRef<FCriticalSection, ESPMode::ThreadSafe> PathLock =
         SafeFileIOPrivate::GetPathLock(NormalizedPath);
     FScopeLock ScopeLock(&PathLock.Get());
-    return SafeFileIOPrivate::CommitBytesUnlocked(Data, NormalizedPath, MaxOutputBytes, WriteSequence);
+    return SafeFileIOPrivate::CommitBytesUnlocked(
+        Data, NormalizedPath, MaxOutputBytes, WriteSequence, false);
 }
 
 void FSafeFileIO::SaveBinaryAsync(
@@ -1487,7 +1482,7 @@ void FSafeFileIO::SaveBinaryAsync(
                 SafeFileIOPrivate::GetPathLock(NormalizedPath);
             FScopeLock ScopeLock(&PathLock.Get());
             FSafeFileWriteResult Result = SafeFileIOPrivate::CommitBytesUnlocked(
-                Data, NormalizedPath, MaxOutputBytes, WriteSequence);
+                Data, NormalizedPath, MaxOutputBytes, WriteSequence, false);
             SafeFileIOPrivate::DispatchWriteCallback(
                 MoveTemp(Callback), MoveTemp(Result), TrackedOperation);
         });
@@ -1763,13 +1758,11 @@ void FSafeFileIO::CleanupStaleTemporaryFiles(const FString& RootDirectory, const
             continue;
         }
 
-        // Preserve an orphan transaction when neither the primary nor backup exists. It may be
+        // Preserve an orphan transaction when the primary does not exist. It may be
         // the only fully flushed copy left after a power loss during the first save.
         const int32 TmpMarker = TemporaryFile.Find(TEXT(".tmp."), ESearchCase::IgnoreCase, ESearchDir::FromEnd);
         const FString TargetPath = TmpMarker == INDEX_NONE ? FString() : TemporaryFile.Left(TmpMarker);
-        if (TargetPath.IsEmpty() ||
-            (!IFileManager::Get().FileExists(*TargetPath) &&
-             !IFileManager::Get().FileExists(*(TargetPath + TEXT(".bak")))))
+        if (TargetPath.IsEmpty() || !IFileManager::Get().FileExists(*TargetPath))
         {
             continue;
         }

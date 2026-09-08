@@ -27,7 +27,9 @@ public:
 
     bool Resolve(const FGuid& UUID, FModelDefinition& OutDefinition, FString& OutCachePath) const;
     bool ResolveLoadable(const FGuid& UUID, FModelDefinition& OutDefinition, FString& OutCachePath) const;
-    bool FindIdForGlb(const FString& GlbPath, FGuid& OutUUID) const;
+    bool FindUUIDForGlb(const FString& GlbPath, FGuid& OutUUID) const;
+    /** Resolves one exact, unique prefab Name used by <PrefabName>;INST placement nodes. */
+    bool FindPrefabUUIDByName(const FString& PrefabName, FGuid& OutUUID, FString& OutError) const;
     void GetDefinitions(TArray<FModelDefinition>& OutDefinitions) const;
     bool IsReady() const { return bReady; }
 
@@ -35,7 +37,7 @@ private:
     FString WorldRoot;
     TMap<FGuid, FModelDefinition> Definitions;
     TMap<FGuid, FString> CachePaths;
-    TMap<FString, FGuid> GlbToId;
+    TMap<FString, FGuid> GlbToUUID;
     uint64 Generation = 0;
     bool bReady = false;
 };

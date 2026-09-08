@@ -10,11 +10,61 @@
 #include "Misc/Paths.h"
 #include "World/PrefabActor.h"
 #include "Simulator/ModelDatabaseSubsystem.h"
+#include "Simulator/NodeTokenLibrary.h"
 #include "System/MultiplayerWorldSubSystem.h"
 #include "System/GameManagerSubSystem.h"
+#include "System/FileFunctionLibrary.h"
 #include "System/SafeFileIO.h"
 #include "System/StreamingMovementGateSubsystem.h"
+#include "System/GlbValidation.h"
+#include "System/glTFRuntimeSafety.h"
 #include "Vehicle/VehiclePawn.h"
+#include "glTFRuntimeAsset.h"
+#include "glTFRuntimeFunctionLibrary.h"
+
+namespace
+{
+    FTransform ResolvePlacementNodeTransform(
+        const TMap<int32, FglTFRuntimeNode>& NodeMap,
+        const FglTFRuntimeNode& Node,
+        bool& bOutValid)
+    {
+        FTransform Result = Node.Transform;
+        int32 ParentIndex = Node.ParentIndex;
+        TSet<int32> Visited;
+        bOutValid = !Result.ContainsNaN();
+        while (bOutValid)
+        {
+            const FglTFRuntimeNode* Parent = NodeMap.Find(ParentIndex);
+            if (!Parent) break;
+            if (Visited.Contains(ParentIndex) || Parent->Transform.ContainsNaN())
+            {
+                bOutValid = false;
+                break;
+            }
+            Visited.Add(ParentIndex);
+            Result = Result * Parent->Transform;
+            ParentIndex = Parent->ParentIndex;
+        }
+
+        const FVector Location = Result.GetLocation();
+        const FVector Scale = Result.GetScale3D();
+        const FQuat Rotation = Result.GetRotation();
+        bOutValid = bOutValid && !Result.ContainsNaN() &&
+            FMath::IsFinite(Location.X) && FMath::IsFinite(Location.Y) && FMath::IsFinite(Location.Z) &&
+            FMath::IsFinite(Scale.X) && FMath::IsFinite(Scale.Y) && FMath::IsFinite(Scale.Z) &&
+            !Scale.IsNearlyZero() && Rotation.IsNormalized();
+        return Result;
+    }
+
+    bool IsDuplicatePlacement(const FWorldChunkObject& A, const FWorldChunkObject& B)
+    {
+        return A.UUID == B.UUID &&
+            A.Location.Equals(B.Location, 0.01) &&
+            A.Rotation.Equals(B.Rotation, 0.00001) &&
+            A.Scale.Equals(B.Scale, 0.00001);
+    }
+}
 
 TStatId UWorldObjectStreamingSubsystem::GetStatId() const
 {
@@ -46,18 +96,48 @@ FWorldChunkCoordinate UWorldObjectStreamingSubsystem::ToChunk(const FVector& Loc
         ToChunkAxis(Location.Z)};
 }
 
-FString UWorldObjectStreamingSubsystem::ChunkPath(const FWorldChunkCoordinate& Coordinate) const
+FString UWorldObjectStreamingSubsystem::PrefabChunkPath(const FWorldChunkCoordinate& Coordinate) const
 {
-    return FPaths::Combine(DataRoot, Coordinate.ToFileName());
+    return FPaths::Combine(PrefabDataRoot, Coordinate.ToPrefabFileName());
+}
+
+FString UWorldObjectStreamingSubsystem::EntityChunkPath(const FWorldChunkCoordinate& Coordinate) const
+{
+    return FPaths::Combine(EntityDataRoot, Coordinate.ToEntityFileName());
 }
 
 void UWorldObjectStreamingSubsystem::Start(const FString& InWorldRoot, const float InLoadRadiusMeters)
 {
     check(IsInGameThread());
     Stop();
+    if (InWorldRoot.TrimStartAndEnd().IsEmpty())
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("World-object loading aborted because the explicit world root is empty; no relative data paths will be used."));
+        return;
+    }
     WorldRoot = FSafeFileIO::NormalizeFilePath(InWorldRoot);
-    DataRoot = FPaths::Combine(WorldRoot, TEXT("data"));
-    IFileManager::Get().MakeDirectory(*DataRoot, true);
+    if (WorldRoot.IsEmpty())
+    {
+        UE_LOG(LogTemp, Error, TEXT("World-object loading aborted because the explicit world root is invalid."));
+        return;
+    }
+    PrefabDataRoot = FPaths::Combine(WorldRoot, TEXT("data"), TEXT("chunks"));
+    EntityDataRoot = FPaths::Combine(WorldRoot, TEXT("data"), TEXT("entities"));
+    if (!IFileManager::Get().MakeDirectory(*PrefabDataRoot, true) ||
+        !IFileManager::Get().MakeDirectory(*EntityDataRoot, true))
+    {
+        UE_LOG(LogTemp, Error, TEXT("World-object loading aborted because chunk directories could not be created. Root=%s"), *WorldRoot);
+        WorldRoot.Reset();
+        PrefabDataRoot.Reset();
+        EntityDataRoot.Reset();
+        return;
+    }
+    if (!ImportPlacementFilesBlocking())
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("One or more .inst.glb placement files were preserved because import failed. Valid files remain retryable."));
+    }
     LoadRadiusCentimeters = FMath::Max(51200.0f, InLoadRadiusMeters * 100.0f);
     ++Generation;
     bRunning = true;
@@ -72,6 +152,7 @@ void UWorldObjectStreamingSubsystem::Stop()
     ++Generation;
     bRunning = false;
     PendingLoads.Empty();
+    PendingRegistrations.Empty();
     LoadingChunks.Empty();
     DesiredChunks.Empty();
     ActiveLoads = 0;
@@ -83,15 +164,32 @@ void UWorldObjectStreamingSubsystem::Stop()
         FRuntimeChunk& Chunk = Pair.Value;
         for (int32 Index = 0; Index < Chunk.Actors.Num() && Index < Chunk.Objects.Num(); ++Index)
             if (AActor* Actor = Chunk.Actors[Index].Get())
-                Chunk.Objects[Index] = SnapshotActor(Actor, Chunk.Objects[Index].UUID);
+                Chunk.Objects[Index] = SnapshotActor(Actor, Chunk.Objects[Index].UUID, Chunk.Objects[Index].StorageKind);
         if (HasPersistenceAuthority() && (Chunk.bDirty || Chunk.Revision != Chunk.SavingRevision))
-            FBinaryDataStore::SaveWorldChunkAsync(ChunkPath(Pair.Key), Chunk.Objects);
+        {
+            TArray<FWorldChunkObject> Prefabs;
+            TArray<FWorldChunkObject> Entities;
+            for (const FWorldChunkObject& Object : Chunk.Objects)
+            {
+                if (Object.StorageKind == EWorldObjectStorageKind::Prefab)
+                {
+                    Prefabs.Add(Object);
+                }
+                else
+                {
+                    Entities.Add(Object);
+                }
+            }
+            FBinaryDataStore::SaveWorldChunkAsync(PrefabChunkPath(Pair.Key), Prefabs);
+            FBinaryDataStore::SaveWorldChunkAsync(EntityChunkPath(Pair.Key), Entities);
+        }
         for (const TWeakObjectPtr<AActor>& Actor : Chunk.Actors)
             if (Actor.IsValid()) Actor->Destroy();
     }
     LoadedChunks.Empty();
     WorldRoot.Reset();
-    DataRoot.Reset();
+    PrefabDataRoot.Reset();
+    EntityDataRoot.Reset();
     DesiredRefreshAccumulator = 0.0f;
 }
 
@@ -170,19 +268,39 @@ void UWorldObjectStreamingSubsystem::PumpLoads()
         ++ActiveLoads;
         const uint64 RequestGeneration = Generation;
         TWeakObjectPtr<UWorldObjectStreamingSubsystem> WeakThis(this);
-        FBinaryDataStore::LoadWorldChunkAsync(ChunkPath(Request.Coordinate),
+        const FString PrefabPath = PrefabChunkPath(Request.Coordinate);
+        const FString EntityPath = EntityChunkPath(Request.Coordinate);
+        FBinaryDataStore::LoadWorldChunkAsync(PrefabPath,
             [WeakThis, Coordinate = Request.Coordinate, bTransient = Request.bTransientBoundaryLoad,
-                RequestGeneration](bool bSuccess, TArray<FWorldChunkObject> Objects, FString Error) mutable
+                RequestGeneration, EntityPath](bool bPrefabSuccess, TArray<FWorldChunkObject> Prefabs, FString PrefabError) mutable
             {
-                if (UWorldObjectStreamingSubsystem* StrongThis = WeakThis.Get())
-                    StrongThis->FinishLoad(Coordinate, bTransient, bSuccess, MoveTemp(Objects), MoveTemp(Error), RequestGeneration);
+                UWorldObjectStreamingSubsystem* StrongThis = WeakThis.Get();
+                if (!IsValid(StrongThis)) return;
+                if (!bPrefabSuccess)
+                {
+                    StrongThis->FinishLoad(Coordinate, bTransient, false, MoveTemp(Prefabs),
+                        TArray<FWorldChunkObject>(),
+                        MoveTemp(PrefabError), RequestGeneration);
+                    return;
+                }
+                FBinaryDataStore::LoadWorldChunkAsync(EntityPath,
+                    [WeakThis, Coordinate, bTransient, RequestGeneration, Prefabs = MoveTemp(Prefabs)](
+                        bool bEntitySuccess, TArray<FWorldChunkObject> Entities, FString EntityError) mutable
+                    {
+                        if (UWorldObjectStreamingSubsystem* Current = WeakThis.Get())
+                        {
+                            Current->FinishLoad(Coordinate, bTransient, bEntitySuccess,
+                                MoveTemp(Prefabs), MoveTemp(Entities), MoveTemp(EntityError), RequestGeneration);
+                        }
+                    });
             });
     }
 }
 
 void UWorldObjectStreamingSubsystem::FinishLoad(
     const FWorldChunkCoordinate& Coordinate, const bool bTransient, const bool bSuccess,
-    TArray<FWorldChunkObject>&& Objects, FString&& Error, const uint64 RequestGeneration)
+    TArray<FWorldChunkObject>&& Prefabs, TArray<FWorldChunkObject>&& Entities,
+    FString&& Error, const uint64 RequestGeneration)
 {
     check(IsInGameThread());
     ActiveLoads = FMath::Max(0, ActiveLoads - 1);
@@ -190,17 +308,42 @@ void UWorldObjectStreamingSubsystem::FinishLoad(
     if (!bRunning || Generation != RequestGeneration) return;
     if (!bSuccess)
     {
-        UE_LOG(LogTemp, Error, TEXT("World chunk rejected. File=%s Reason=%s"), *ChunkPath(Coordinate), *Error);
+        UE_LOG(LogTemp, Error, TEXT("World chunk pair rejected. Prefab=%s Entity=%s Reason=%s"),
+            *PrefabChunkPath(Coordinate), *EntityChunkPath(Coordinate), *Error);
         PumpLoads();
         return;
     }
 
     FRuntimeChunk& Chunk = LoadedChunks.Add(Coordinate);
-    Chunk.Objects = MoveTemp(Objects);
+    for (FWorldChunkObject& Object : Prefabs) Object.StorageKind = EWorldObjectStorageKind::Prefab;
+    for (FWorldChunkObject& Object : Entities) Object.StorageKind = EWorldObjectStorageKind::Entity;
+    Chunk.Objects = MoveTemp(Prefabs);
+    Chunk.Objects.Append(MoveTemp(Entities));
     Chunk.Actors.SetNum(Chunk.Objects.Num());
     Chunk.bTransientBoundaryLoad = bTransient && !DesiredChunks.Contains(Coordinate);
     for (int32 Index = 0; Index < Chunk.Objects.Num(); ++Index)
         Chunk.Actors[Index] = SpawnObject(Chunk.Objects[Index]);
+
+    // Register objects that were placed while this file was still loading. Accepting the request
+    // up front prevents a one-shot placement from being lost and guarantees a dirty chunk commit.
+    for (int32 Index = PendingRegistrations.Num() - 1; Index >= 0; --Index)
+    {
+        const FPendingRegistration& Pending = PendingRegistrations[Index];
+        if (!(Pending.Coordinate == Coordinate)) continue;
+        if (AActor* Actor = Pending.Actor.Get())
+        {
+            Chunk.Objects.Add(SnapshotActor(Actor, Pending.UUID, Pending.StorageKind));
+            Chunk.Actors.Add(Actor);
+            Chunk.bDirty = true;
+            ++Chunk.Revision;
+            if (UStreamingMovementGateSubsystem* Gate = GetWorld()
+                ? GetWorld()->GetSubsystem<UStreamingMovementGateSubsystem>() : nullptr)
+            {
+                Gate->RegisterMovable(Actor);
+            }
+        }
+        PendingRegistrations.RemoveAtSwap(Index, 1, EAllowShrinking::No);
+    }
     PumpLoads();
 }
 
@@ -214,6 +357,11 @@ AActor* UWorldObjectStreamingSubsystem::SpawnObject(const FWorldChunkObject& Obj
     if (!World || !Database || !Database->ResolveLoadable(Object.UUID, Definition, CachePath))
     {
         // Missing UUIDs are deliberately preserved in the chunk and ignored at runtime.
+        const FString Message = FString::Printf(
+            TEXT("Chunk object skipped because UUID is absent, invalid, or not loadable. UUID=%s"),
+            *Object.UUID.ToString(EGuidFormats::DigitsWithHyphensLower));
+        UE_LOG(LogTemp, Error, TEXT("%s"), *Message);
+        UFileFunctionLibrary::WriteSimulatorLogAsync(TEXT("ModelUUID"), Message);
         return nullptr;
     }
     if (Definition.ModelType == EModelDefinitionType::None
@@ -261,10 +409,14 @@ AActor* UWorldObjectStreamingSubsystem::SpawnObject(const FWorldChunkObject& Obj
     return Spawned;
 }
 
-FWorldChunkObject UWorldObjectStreamingSubsystem::SnapshotActor(AActor* Actor, const FGuid& UUID) const
+FWorldChunkObject UWorldObjectStreamingSubsystem::SnapshotActor(
+    AActor* Actor,
+    const FGuid& UUID,
+    const EWorldObjectStorageKind StorageKind) const
 {
     FWorldChunkObject Result;
     Result.UUID = UUID;
+    Result.StorageKind = StorageKind;
     if (!IsValid(Actor)) return Result;
     const FTransform Transform = Actor->GetActorTransform();
     Result.Location = Transform.GetLocation();
@@ -280,19 +432,274 @@ FWorldChunkObject UWorldObjectStreamingSubsystem::SnapshotActor(AActor* Actor, c
     return Result;
 }
 
+EWorldObjectStorageKind UWorldObjectStreamingSubsystem::ResolveStorageKind(
+    const FGuid& UUID,
+    bool& bOutValid) const
+{
+    bOutValid = false;
+    const UWorld* World = GetWorld();
+    const UGameInstance* GameInstance = World ? World->GetGameInstance() : nullptr;
+    const UModelDatabaseSubsystem* Database = GameInstance
+        ? GameInstance->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
+    FModelDefinition Definition;
+    FString CachePath;
+    if (!Database || !Database->ResolveLoadable(UUID, Definition, CachePath))
+    {
+        return EWorldObjectStorageKind::Entity;
+    }
+
+    bOutValid = Definition.ModelType == EModelDefinitionType::Prefab ||
+        Definition.ModelType == EModelDefinitionType::Entity ||
+        Definition.ModelType == EModelDefinitionType::Item;
+    return Definition.ModelType == EModelDefinitionType::Prefab
+        ? EWorldObjectStorageKind::Prefab
+        : EWorldObjectStorageKind::Entity;
+}
+
+bool UWorldObjectStreamingSubsystem::ImportPlacementFilesBlocking()
+{
+    check(IsInGameThread());
+    if (!HasPersistenceAuthority()) return true;
+
+    UGameInstance* GameInstance = GetWorld() ? GetWorld()->GetGameInstance() : nullptr;
+    UModelDatabaseSubsystem* Database = GameInstance
+        ? GameInstance->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
+    if (!Database || !Database->IsReady())
+    {
+        UE_LOG(LogTemp, Error, TEXT("Placement import skipped because the model database is not ready."));
+        return false;
+    }
+
+    TArray<FString> PlacementFiles;
+    IFileManager::Get().FindFilesRecursive(
+        PlacementFiles,
+        *FPaths::Combine(WorldRoot, TEXT("model")),
+        TEXT("*.inst.glb"),
+        true,
+        false,
+        false);
+    PlacementFiles.Sort();
+    bool bAllImported = true;
+
+    for (FString PlacementPath : PlacementFiles)
+    {
+        PlacementPath = GlbValidation::NormalizePath(PlacementPath);
+        FString ValidationError;
+        if (!GlbValidation::ValidateFile(PlacementPath, ValidationError))
+        {
+            bAllImported = false;
+            const FString Message = FString::Printf(
+                TEXT("Placement source preserved: invalid .inst.glb container. File=%s Reason=%s"),
+                *PlacementPath, *ValidationError);
+            UE_LOG(LogTemp, Error, TEXT("%s"), *Message);
+            UFileFunctionLibrary::WriteSimulatorLogAsync(TEXT("PlacementImport"), Message);
+            continue;
+        }
+
+        UglTFRuntimeAsset* PlacementAsset = nullptr;
+        TArray<FglTFRuntimeNode> Nodes;
+        FglTFRuntimeConfig Config;
+        Config.bAllowExternalFiles = false;
+        const bool bParsed = FglTFRuntimeSafety::ExecuteSynchronousOperation(
+            FString::Printf(TEXT("Placement import %s"), *FPaths::GetCleanFilename(PlacementPath)),
+            [&PlacementAsset, &Nodes, &Config, &PlacementPath]()
+            {
+                PlacementAsset = UglTFRuntimeFunctionLibrary::glTFLoadAssetFromFilename(
+                    PlacementPath, false, Config);
+                if (IsValid(PlacementAsset))
+                {
+                    // Placement files are node-transform manifests. No mesh API is called here.
+                    Nodes = PlacementAsset->GetNodes();
+                }
+            });
+        if (!bParsed || !IsValid(PlacementAsset))
+        {
+            bAllImported = false;
+            const FString Message = FString::Printf(
+                TEXT("Placement source preserved: parser creation failed. File=%s"), *PlacementPath);
+            UE_LOG(LogTemp, Error, TEXT("%s"), *Message);
+            UFileFunctionLibrary::WriteSimulatorLogAsync(TEXT("PlacementImport"), Message);
+            continue;
+        }
+
+        TMap<int32, FglTFRuntimeNode> NodeMap;
+        for (const FglTFRuntimeNode& Node : Nodes)
+        {
+            if (Node.Index >= 0 && !NodeMap.Contains(Node.Index)) NodeMap.Add(Node.Index, Node);
+        }
+
+        TMap<FWorldChunkCoordinate, TArray<FWorldChunkObject>> PlacementsByChunk;
+        bool bSourceValid = true;
+        int32 PlacementCount = 0;
+        for (const FglTFRuntimeNode& Node : Nodes)
+        {
+            const FSimulatorParsedNodeName ParsedName = USimulatorNodeTokenLibrary::ParseNodeName(Node.Name);
+            const bool bHasInstanceToken = ParsedName.HasEffectiveToken(FName(TEXT("INST")));
+            const bool bLooksLikeInstance = Node.Name.Contains(TEXT(";INST"), ESearchCase::IgnoreCase);
+            if (!bHasInstanceToken)
+            {
+                if (bLooksLikeInstance)
+                {
+                    bSourceValid = false;
+                    const FString Message = FString::Printf(
+                        TEXT("Placement source preserved: malformed instance node name. File=%s Node=%s Expected=<PrefabName>;INST"),
+                        *PlacementPath, *Node.Name);
+                    UE_LOG(LogTemp, Error, TEXT("%s"), *Message);
+                    UFileFunctionLibrary::WriteSimulatorLogAsync(TEXT("PlacementImport"), Message);
+                    break;
+                }
+                continue;
+            }
+            ++PlacementCount;
+
+            if (!Node.Name.Equals(ParsedName.BaseName + TEXT(";INST"), ESearchCase::CaseSensitive))
+            {
+                bSourceValid = false;
+                const FString Message = FString::Printf(
+                    TEXT("Placement source preserved: instance node name is not exactly <PrefabName>;INST. File=%s Node=%s"),
+                    *PlacementPath, *Node.Name);
+                UE_LOG(LogTemp, Error, TEXT("%s"), *Message);
+                UFileFunctionLibrary::WriteSimulatorLogAsync(TEXT("PlacementImport"), Message);
+                break;
+            }
+
+            FGuid UUID;
+            FString NameError;
+            bool bTransformValid = false;
+            const FTransform Transform = ResolvePlacementNodeTransform(NodeMap, Node, bTransformValid);
+            if (!Database->FindPrefabUUIDByName(ParsedName.BaseName, UUID, NameError) || !bTransformValid)
+            {
+                bSourceValid = false;
+                const FString Message = FString::Printf(
+                    TEXT("Placement source preserved: invalid PrefabName;INST node. File=%s Node=%s Reason=%s"),
+                    *PlacementPath, *Node.Name,
+                    bTransformValid ? *NameError : TEXT("invalid transform or parent hierarchy"));
+                UE_LOG(LogTemp, Error, TEXT("%s"), *Message);
+                UFileFunctionLibrary::WriteSimulatorLogAsync(TEXT("PlacementImport"), Message);
+                break;
+            }
+
+            FWorldChunkObject Object;
+            Object.UUID = UUID;
+            Object.Location = Transform.GetLocation();
+            Object.Rotation = Transform.GetRotation().GetNormalized();
+            Object.Scale = Transform.GetScale3D();
+            Object.StorageKind = EWorldObjectStorageKind::Prefab;
+            PlacementsByChunk.FindOrAdd(ToChunk(Object.Location)).Add(Object);
+        }
+
+        FglTFRuntimeSafety::RequestAssetRelease(PlacementAsset);
+        PlacementAsset = nullptr;
+        if (!bSourceValid || PlacementCount == 0)
+        {
+            bAllImported = false;
+            if (PlacementCount == 0)
+            {
+                const FString Message = FString::Printf(
+                    TEXT("Placement source preserved: no valid PrefabName;INST nodes were found. File=%s"),
+                    *PlacementPath);
+                UE_LOG(LogTemp, Error, TEXT("%s"), *Message);
+                UFileFunctionLibrary::WriteSimulatorLogAsync(TEXT("PlacementImport"), Message);
+            }
+            continue;
+        }
+
+        bool bAllChunkSavesSucceeded = true;
+        for (const TPair<FWorldChunkCoordinate, TArray<FWorldChunkObject>>& Pair : PlacementsByChunk)
+        {
+            const FString TargetPath = PrefabChunkPath(Pair.Key);
+            TArray<FWorldChunkObject> Merged;
+            FString LoadError;
+            if (IFileManager::Get().FileExists(*TargetPath) &&
+                !FBinaryDataStore::LoadWorldChunk(TargetPath, Merged, LoadError))
+            {
+                bAllChunkSavesSucceeded = false;
+                const FString Message = FString::Printf(
+                    TEXT("Placement source preserved: destination chunk could not be validated. File=%s Chunk=%s Reason=%s"),
+                    *PlacementPath, *TargetPath, *LoadError);
+                UE_LOG(LogTemp, Error, TEXT("%s"), *Message);
+                UFileFunctionLibrary::WriteSimulatorLogAsync(TEXT("PlacementImport"), Message);
+                break;
+            }
+
+            for (const FWorldChunkObject& Incoming : Pair.Value)
+            {
+                if (!Merged.ContainsByPredicate(
+                    [&Incoming](const FWorldChunkObject& Existing)
+                    {
+                        return IsDuplicatePlacement(Existing, Incoming);
+                    }))
+                {
+                    Merged.Add(Incoming);
+                }
+            }
+            const FSafeFileWriteResult Saved = FBinaryDataStore::SaveWorldChunkBlocking(TargetPath, Merged);
+            if (!Saved.IsSuccess())
+            {
+                bAllChunkSavesSucceeded = false;
+                const FString Message = FString::Printf(
+                    TEXT("Placement source preserved: destination chunk save failed. File=%s Chunk=%s Reason=%s"),
+                    *PlacementPath, *TargetPath, *Saved.Error);
+                UE_LOG(LogTemp, Error, TEXT("%s"), *Message);
+                UFileFunctionLibrary::WriteSimulatorLogAsync(TEXT("PlacementImport"), Message);
+                break;
+            }
+        }
+
+        if (!bAllChunkSavesSucceeded || !IFileManager::Get().Delete(*PlacementPath, false, true, true))
+        {
+            bAllImported = false;
+            const FString Message = FString::Printf(
+                TEXT("Placement source preserved or could not be deleted after import. File=%s AllChunksSaved=%s"),
+                *PlacementPath, bAllChunkSavesSucceeded ? TEXT("true") : TEXT("false"));
+            UE_LOG(LogTemp, Error, TEXT("%s"), *Message);
+            UFileFunctionLibrary::WriteSimulatorLogAsync(TEXT("PlacementImport"), Message);
+        }
+    }
+    return bAllImported;
+}
+
 bool UWorldObjectStreamingSubsystem::RegisterPlacedObject(AActor* Actor, const FGuid& ModelUUID)
 {
     check(IsInGameThread());
-    if (!bRunning || !HasPersistenceAuthority() || !IsValid(Actor) || !ModelUUID.IsValid()) return false;
+    if (!bRunning || !HasPersistenceAuthority() || !IsValid(Actor) || !ModelUUID.IsValid())
+    {
+        if (!ModelUUID.IsValid())
+        {
+            const FString Message = FString::Printf(
+                TEXT("Placed object registration rejected because its model UUID is invalid. Actor=%s"),
+                *GetNameSafe(Actor));
+            UE_LOG(LogTemp, Error, TEXT("%s"), *Message);
+            UFileFunctionLibrary::WriteSimulatorLogAsync(TEXT("ModelUUID"), Message);
+        }
+        return false;
+    }
+    bool bStorageValid = false;
+    const EWorldObjectStorageKind StorageKind = ResolveStorageKind(ModelUUID, bStorageValid);
+    if (!bStorageValid)
+    {
+        const FString Message = FString::Printf(
+            TEXT("Placed object registration rejected because UUID does not resolve to a prefab, entity, or item. UUID=%s"),
+            *ModelUUID.ToString(EGuidFormats::DigitsWithHyphensLower));
+        UE_LOG(LogTemp, Error, TEXT("%s"), *Message);
+        UFileFunctionLibrary::WriteSimulatorLogAsync(TEXT("ModelUUID"), Message);
+        return false;
+    }
     const FWorldChunkCoordinate Coordinate = ToChunk(Actor->GetActorLocation());
     FRuntimeChunk* Chunk = LoadedChunks.Find(Coordinate);
     if (!Chunk)
     {
+        const bool bAlreadyPending = PendingRegistrations.ContainsByPredicate(
+            [Actor](const FPendingRegistration& Pending) { return Pending.Actor.Get() == Actor; });
+        if (!bAlreadyPending)
+        {
+            PendingRegistrations.Add({Actor, ModelUUID, Coordinate, StorageKind});
+        }
         QueueLoad(Coordinate, true);
         PumpLoads();
-        return false;
+        return true;
     }
-    Chunk->Objects.Add(SnapshotActor(Actor, ModelUUID));
+    Chunk->Objects.Add(SnapshotActor(Actor, ModelUUID, StorageKind));
     Chunk->Actors.Add(Actor);
     Chunk->bDirty = true;
     ++Chunk->Revision;
@@ -304,6 +711,9 @@ bool UWorldObjectStreamingSubsystem::RegisterPlacedObject(AActor* Actor, const F
 void UWorldObjectStreamingSubsystem::UnregisterObject(AActor* Actor, const bool bKeepPersistentRecord)
 {
     check(IsInGameThread());
+    PendingRegistrations.RemoveAllSwap(
+        [Actor](const FPendingRegistration& Pending) { return Pending.Actor.Get() == Actor; },
+        EAllowShrinking::No);
     for (TPair<FWorldChunkCoordinate, FRuntimeChunk>& Pair : LoadedChunks)
     {
         FRuntimeChunk& Chunk = Pair.Value;
@@ -311,7 +721,7 @@ void UWorldObjectStreamingSubsystem::UnregisterObject(AActor* Actor, const bool 
             if (Chunk.Actors[Index].Get() == Actor)
             {
                 if (bKeepPersistentRecord && Chunk.Objects.IsValidIndex(Index))
-                    Chunk.Objects[Index] = SnapshotActor(Actor, Chunk.Objects[Index].UUID);
+                    Chunk.Objects[Index] = SnapshotActor(Actor, Chunk.Objects[Index].UUID, Chunk.Objects[Index].StorageKind);
                 else
                 {
                     Chunk.Actors.RemoveAtSwap(Index, 1, EAllowShrinking::No);
@@ -349,7 +759,8 @@ void UWorldObjectStreamingSubsystem::UpdateObjectsAndCrossings()
         {
             AActor* Actor = Chunk.Actors[Index].Get();
             if (!IsValid(Actor)) continue;
-            const FWorldChunkObject Snapshot = SnapshotActor(Actor, Chunk.Objects[Index].UUID);
+            const FWorldChunkObject Snapshot = SnapshotActor(
+                Actor, Chunk.Objects[Index].UUID, Chunk.Objects[Index].StorageKind);
             const FWorldChunkCoordinate Destination = ToChunk(Snapshot.Location);
             if (!(Destination == Pair.Key))
             {
@@ -381,7 +792,8 @@ void UWorldObjectStreamingSubsystem::UpdateObjectsAndCrossings()
         FRuntimeChunk* To = LoadedChunks.Find(Destination);
         if (!From || !To || !From->Actors.IsValidIndex(Index) || !From->Objects.IsValidIndex(Index)) continue;
         AActor* Actor = From->Actors[Index].Get();
-        To->Objects.Add(SnapshotActor(Actor, From->Objects[Index].UUID));
+        To->Objects.Add(SnapshotActor(
+            Actor, From->Objects[Index].UUID, From->Objects[Index].StorageKind));
         To->Actors.Add(Actor);
         From->Actors.RemoveAtSwap(Index, 1, EAllowShrinking::No);
         From->Objects.RemoveAtSwap(Index, 1, EAllowShrinking::No);
@@ -397,27 +809,64 @@ void UWorldObjectStreamingSubsystem::BeginSave(const FWorldChunkCoordinate& Coor
     Chunk.bSaving = true;
     Chunk.bDirty = false;
     Chunk.SavingRevision = Chunk.Revision;
+    Chunk.PendingSaveParts = 2;
+    Chunk.bSaveBatchFailed = false;
     const uint64 SavedRevision = Chunk.SavingRevision;
     const uint64 SavedGeneration = Generation;
-    TWeakObjectPtr<UWorldObjectStreamingSubsystem> WeakThis(this);
-    FBinaryDataStore::SaveWorldChunkAsync(ChunkPath(Coordinate), Chunk.Objects,
-        [WeakThis, Coordinate, SavedRevision, SavedGeneration](FSafeFileWriteResult Result)
+    TArray<FWorldChunkObject> Prefabs;
+    TArray<FWorldChunkObject> Entities;
+    for (const FWorldChunkObject& Object : Chunk.Objects)
+    {
+        if (Object.StorageKind == EWorldObjectStorageKind::Prefab)
         {
-            UWorldObjectStreamingSubsystem* StrongThis = WeakThis.Get();
-            if (!IsValid(StrongThis) || StrongThis->Generation != SavedGeneration) return;
-            FRuntimeChunk* Current = StrongThis->LoadedChunks.Find(Coordinate);
-            if (!Current) return;
-            Current->bSaving = false;
-            if (!Result.IsSuccess())
-            {
-                Current->bDirty = true;
-                UE_LOG(LogTemp, Error, TEXT("Chunk save failed without replacing the prior generation. File=%s Reason=%s"),
-                    *Result.Path, *Result.Error);
-                return;
-            }
-            if (Current->Revision != SavedRevision) Current->bDirty = true;
-            else if (Current->bUnloadAfterSave) StrongThis->FinalizeUnload(Coordinate);
-        });
+            Prefabs.Add(Object);
+        }
+        else
+        {
+            Entities.Add(Object);
+        }
+    }
+    TWeakObjectPtr<UWorldObjectStreamingSubsystem> WeakThis(this);
+    const auto CompletePart = [WeakThis, Coordinate, SavedRevision, SavedGeneration](FSafeFileWriteResult Result)
+    {
+        if (UWorldObjectStreamingSubsystem* StrongThis = WeakThis.Get())
+        {
+            StrongThis->CompleteSavePart(Coordinate, SavedRevision, SavedGeneration, Result);
+        }
+    };
+    FBinaryDataStore::SaveWorldChunkAsync(PrefabChunkPath(Coordinate), Prefabs, CompletePart);
+    FBinaryDataStore::SaveWorldChunkAsync(EntityChunkPath(Coordinate), Entities, CompletePart);
+}
+
+void UWorldObjectStreamingSubsystem::CompleteSavePart(
+    const FWorldChunkCoordinate& Coordinate,
+    const uint64 SavedRevision,
+    const uint64 SavedGeneration,
+    const FSafeFileWriteResult& Result)
+{
+    if (Generation != SavedGeneration) return;
+    FRuntimeChunk* Current = LoadedChunks.Find(Coordinate);
+    if (!Current || Current->SavingRevision != SavedRevision) return;
+    if (!Result.IsSuccess())
+    {
+        Current->bSaveBatchFailed = true;
+        UE_LOG(LogTemp, Error,
+            TEXT("Chunk save failed without replacing the prior generation. File=%s Reason=%s"),
+            *Result.Path, *Result.Error);
+    }
+    Current->PendingSaveParts = FMath::Max(0, Current->PendingSaveParts - 1);
+    if (Current->PendingSaveParts > 0) return;
+
+    Current->bSaving = false;
+    if (Current->bSaveBatchFailed || Current->Revision != SavedRevision)
+    {
+        Current->bDirty = true;
+        return;
+    }
+    if (Current->bUnloadAfterSave)
+    {
+        FinalizeUnload(Coordinate);
+    }
 }
 
 void UWorldObjectStreamingSubsystem::RequestUnload(const FWorldChunkCoordinate& Coordinate)

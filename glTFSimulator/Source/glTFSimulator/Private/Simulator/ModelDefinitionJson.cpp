@@ -21,7 +21,7 @@ namespace
 
         const FString BaseName = FPaths::GetBaseFilename(GlbPath);
         const TSharedRef<FJsonObject> RootObject = MakeShared<FJsonObject>();
-        RootObject->SetStringField(TEXT("ID"),
+        RootObject->SetStringField(TEXT("UUID"),
             FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower));
         RootObject->SetStringField(TEXT("Name"), BaseName);
         RootObject->SetStringField(TEXT("DisplayName"), BaseName);
@@ -177,11 +177,11 @@ bool ModelDefinitionJson::LoadDefinition(
     }
 
     const TSharedPtr<FJsonObject>& Root = Loaded.JsonObject;
-    FString IdText;
+    FString UUIDText;
     FString TypeText;
-    if (!Root->TryGetStringField(TEXT("ID"), IdText) || !FGuid::Parse(IdText, OutDefinition.Id))
+    if (!Root->TryGetStringField(TEXT("UUID"), UUIDText) || !FGuid::Parse(UUIDText, OutDefinition.UUID))
     {
-        OutError = TEXT("required ID is missing or is not a UUID");
+        OutError = TEXT("required UUID is missing or is not a valid UUID");
         return false;
     }
     if (!Root->TryGetStringField(TEXT("Name"), OutDefinition.Name) || OutDefinition.Name.TrimStartAndEnd().IsEmpty()

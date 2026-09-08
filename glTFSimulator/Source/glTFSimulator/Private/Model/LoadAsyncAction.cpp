@@ -21,11 +21,6 @@
 
 namespace
 {
-    static bool IsValidModelBounds(const FModelData& ModelData)
-    {
-        return !ModelData.Size.IsNearlyZero(0.001f);
-    }
-
     constexpr int64 MAX_MODEL_JSON_BYTES = 64ll * 1024ll * 1024ll;
     constexpr int32 MAX_MODEL_NODE_COUNT = 500000;
 
@@ -262,8 +257,7 @@ void ULoadAsyncAction::LoadSettingsAndCacheAsync()
             else
             {
                 WorkerResult.bCacheDirty = true;
-                const bool bHadCacheGeneration = FPaths::FileExists(LocalCachePath) ||
-                    FPaths::FileExists(LocalCachePath + TEXT(".bak"));
+                const bool bHadCacheGeneration = FPaths::FileExists(LocalCachePath);
                 if (bHadCacheGeneration)
                 {
                     FString DeleteError;
@@ -308,7 +302,7 @@ void ULoadAsyncAction::LoadSettingsAndCacheAsync()
             StrongThis->LoadedModelCache = MoveTemp(WorkerResult.ModelCache);
             StrongThis->CurrentModelHash = MoveTemp(WorkerResult.ModelHash);
             StrongThis->CurrentDefinitionJson = MoveTemp(WorkerResult.DefinitionJson);
-            StrongThis->bUseCachedMeshExtents = WorkerResult.bCacheValid;
+            StrongThis->bUseCachedMeshSizes = WorkerResult.bCacheValid;
             StrongThis->bModelCacheDirty = WorkerResult.bCacheDirty;
             StrongThis->BroadcastProgressValue(MODEL_PROGRESS_NODE_SCAN_STARTED);
             StrongThis->ProcessChunk();
@@ -457,7 +451,7 @@ void ULoadAsyncAction::ReleaseActionReferences()
     PendingCompletionWrapper = FLoadAsyncWrapper();
     CurrentModelHash.Reset();
     CurrentDefinitionJson.Reset();
-    bUseCachedMeshExtents = false;
+    bUseCachedMeshSizes = false;
     bModelCacheDirty = false;
     CurrentMeshName = NAME_None;
     CurrentIndex = 0;
@@ -570,8 +564,8 @@ void ULoadAsyncAction::RefreshGeneratedModelData()
     }
     else
     {
-        GeneratedModelData.Center = bUseCachedMeshExtents ? LoadedModelCache.Center : FVector::ZeroVector;
-        GeneratedModelData.Size = bUseCachedMeshExtents ? LoadedModelCache.Extent * 2.0f : FVector::ZeroVector;
+        GeneratedModelData.Center = bUseCachedMeshSizes ? LoadedModelCache.Center : FVector::ZeroVector;
+        GeneratedModelData.Size = bUseCachedMeshSizes ? LoadedModelCache.Extent * 2.0f : FVector::ZeroVector;
     }
 
     GeneratedModelCache.Center = GeneratedModelData.Center;
@@ -580,14 +574,14 @@ void ULoadAsyncAction::RefreshGeneratedModelData()
     {
         if (!Pair.Key.IsNone() && !Pair.Value.Extent.ContainsNaN())
         {
-            GeneratedModelCache.MeshExtents.Add(Pair.Key, Pair.Value.Extent.GetAbs());
+            GeneratedModelCache.MeshSizes.Add(Pair.Key, Pair.Value.Size.GetAbs());
         }
     }
 
     WriteLogAsync(FString::Printf(
         TEXT("Model bounds ready. CachePath=%s Result=%s Center=%s Extent=%s"),
         *SizeCacheFilePath,
-        bUseCachedMeshExtents && !bModelCacheDirty ? TEXT("hit") : TEXT("rebuilt"),
+        bUseCachedMeshSizes && !bModelCacheDirty ? TEXT("hit") : TEXT("rebuilt"),
         *GeneratedModelCache.Center.ToCompactString(),
         *GeneratedModelCache.Extent.ToCompactString()));
 }
@@ -750,15 +744,15 @@ void ULoadAsyncAction::CalculateSize()
     }
     else
     {
-        if (bUseCachedMeshExtents)
+        if (bUseCachedMeshSizes)
         {
-            if (const FVector* CachedExtent = LoadedModelCache.MeshExtents.Find(CurrentMeshName))
+            if (const FVector* CachedSize = LoadedModelCache.MeshSizes.Find(CurrentMeshName))
             {
-                if (!CachedExtent->ContainsNaN() && CachedExtent->GetMin() >= 0.0)
+                if (!CachedSize->ContainsNaN() && CachedSize->GetMin() >= 0.0)
                 {
                     Info.LOD0 = CurrentNode.MeshIndex;
-                    Info.Extent = CachedExtent->GetAbs();
-                    Info.Size = Info.Extent * 2.0f;
+                    Info.Size = CachedSize->GetAbs();
+                    Info.Extent = Info.Size * 0.5f;
                     UpdateModelNodeData();
                     return;
                 }

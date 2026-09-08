@@ -1,7 +1,6 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
 #include "World/PrefabActor.h"
-#include "Simulator/GlTFRuntimeCacheLibrary.h"
 
 #include "Components/BoxComponent.h"
 #include "Dom/JsonObject.h"
@@ -24,39 +23,10 @@
 #include "System/MacroLibrary.h"
 #include "System/MultiplayerWorldSubSystem.h"
 #include "System/glTFRuntimeSafety.h"
-#include "Simulator/ModelDatabaseSubsystem.h"
-#include "System/BinaryDataStore.h"
-#include "System/SafeFileIO.h"
 
 namespace
 {
     constexpr int32 MaxRuntimePrefabNodeCount = 500000;
-
-    void CachePrefabBoundsAsync(UObject* Context, const FString& SourcePath, const FBox& Bounds)
-    {
-        const UWorld* World = IsValid(Context) ? Context->GetWorld() : nullptr;
-        const UGameInstance* GameInstance = World ? World->GetGameInstance() : nullptr;
-        const UModelDatabaseSubsystem* Database = GameInstance
-            ? GameInstance->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
-        FGuid UUID;
-        FModelDefinition Definition;
-        FString CachePath;
-        if (!Bounds.IsValid || !Database || !Database->FindIdForGlb(SourcePath, UUID)
-            || !Database->Resolve(UUID, Definition, CachePath)) return;
-        const FString JsonPath = Definition.JsonPath;
-        FSafeFileIO::RunTrackedWorker([SourcePath, JsonPath, CachePath, Bounds]()
-        {
-            FModelCacheData Cache;
-            FString Error;
-            FFileHelper::LoadFileToString(Cache.DefinitionJson, *JsonPath);
-            if (FBinaryDataStore::ComputeFileSha1(SourcePath, Cache.ModelHash, Error))
-            {
-                Cache.Center = Bounds.GetCenter();
-                Cache.Extent = Bounds.GetExtent();
-                FBinaryDataStore::SaveModelCacheBlocking(CachePath, Cache);
-            }
-        });
-    }
 
     static FVector MakeSafeOriginCenteredBoxExtent(const FBox& Bounds)
     {
@@ -160,6 +130,38 @@ namespace
             ParentIndex = Parent->ParentIndex;
         }
         return WorldTransform.ContainsNaN() ? FTransform::Identity : WorldTransform;
+    }
+
+    static void ResetCommonPrefabRootTransform(
+        TMap<int32, FglTFRuntimeNode>& NodeMap,
+        const TArray<FglTFRuntimeNode>& Nodes,
+        const int32 MeshCount)
+    {
+        int32 CommonRootIndex = INDEX_NONE;
+        for (const FglTFRuntimeNode& Node : Nodes)
+        {
+            if (Node.MeshIndex < 0 || Node.MeshIndex >= MeshCount || Node.Index < 0) continue;
+            int32 RootIndex = Node.Index;
+            int32 ParentIndex = Node.ParentIndex;
+            TSet<int32> Visited;
+            while (const FglTFRuntimeNode* Parent = NodeMap.Find(ParentIndex))
+            {
+                if (Visited.Contains(ParentIndex)) return;
+                Visited.Add(ParentIndex);
+                RootIndex = Parent->Index;
+                ParentIndex = Parent->ParentIndex;
+            }
+            if (CommonRootIndex == INDEX_NONE) CommonRootIndex = RootIndex;
+            else if (CommonRootIndex != RootIndex) return;
+        }
+
+        if (FglTFRuntimeNode* CommonRoot = NodeMap.Find(CommonRootIndex))
+        {
+            // The reusable prefab template is identity-rooted. World placement translation and
+            // rotation live only in the chunk object's actor transform; authored local scale stays.
+            CommonRoot->Transform.SetLocation(FVector::ZeroVector);
+            CommonRoot->Transform.SetRotation(FQuat::Identity);
+        }
     }
 
     static FBox TransformBounds(const FBox& LocalBounds, const FTransform& Transform)
@@ -446,7 +448,17 @@ UStaticMesh* APrefabActor::LoadMeshByIndex(int32 MeshIndex)
     MeshConfig.bBuildNavCollision = false;
     MeshConfig.CollisionComplexity = ECollisionTraceFlag::CTF_UseDefault;
 
-    UStaticMesh* Mesh = GltfAsset->LoadStaticMesh(MeshIndex, MeshConfig);
+    UStaticMesh* Mesh = nullptr;
+    const bool bExecuted = FglTFRuntimeSafety::ExecuteSynchronousOperation(
+        FString::Printf(TEXT("Prefab LoadStaticMesh %d"), MeshIndex),
+        [this, MeshIndex, &MeshConfig, &Mesh]()
+        {
+            Mesh = GltfAsset->LoadStaticMesh(MeshIndex, MeshConfig);
+        });
+    if (!bExecuted)
+    {
+        return nullptr;
+    }
     if (IsValid(Mesh))
     {
         MeshCache.Add(MeshIndex, Mesh);
@@ -527,7 +539,18 @@ bool APrefabActor::LoadPrefab(const FString& InFilePath, const FString& InObject
 
     FglTFRuntimeConfig LoaderConfig;
     LoaderConfig.bAllowExternalFiles = true;
-    GltfAsset = USimulatorGlTFRuntimeCacheLibrary::LoadSharedAssetFromFilename(this, SourceFilePath, false, LoaderConfig);
+    const bool bAssetLoadExecuted = FglTFRuntimeSafety::ExecuteSynchronousOperation(
+        TEXT("Prefab parser creation"),
+        [this, &LoaderConfig]()
+        {
+            GltfAsset = UglTFRuntimeFunctionLibrary::glTFLoadAssetFromFilename(
+                SourceFilePath, false, LoaderConfig);
+        });
+    if (!bAssetLoadExecuted)
+    {
+        ClearLoadedComponents();
+        return false;
+    }
     if (!IsValid(GltfAsset))
     {
         const FString FailedPath = SourceFilePath;
@@ -555,6 +578,7 @@ bool APrefabActor::LoadPrefab(const FString& InFilePath, const FString& InObject
     }
 
     const int32 MeshCount = GltfAsset->GetNumMeshes();
+    ResetCommonPrefabRootTransform(NodeMap, Nodes, MeshCount);
     TArray<FInstancedEntityMeshPart> MeshParts;
     FBox LocalBounds(ForceInit);
     for (const FglTFRuntimeNode& Node : Nodes)
@@ -570,7 +594,9 @@ bool APrefabActor::LoadPrefab(const FString& InFilePath, const FString& InObject
             continue;
         }
 
-        FTransform PartTransform = GetPrefabNodeWorldTransform(NodeMap, Node);
+        const FglTFRuntimeNode* NormalizedNode = NodeMap.Find(Node.Index);
+        if (!NormalizedNode) continue;
+        FTransform PartTransform = GetPrefabNodeWorldTransform(NodeMap, *NormalizedNode);
         if (Config.bOverrideLocalTransform)
         {
             PartTransform = PartTransform * Config.LocalTransform;
@@ -614,7 +640,6 @@ bool APrefabActor::LoadPrefab(const FString& InFilePath, const FString& InObject
         LocalBounds);
     bLoaded = InstancedRegistrationId != INDEX_NONE;
     LoadedLocalBounds = LocalBounds;
-    CachePrefabBoundsAsync(this, SourceFilePath, LoadedLocalBounds);
 
     // The shared ISM actor now owns the generated meshes. The parser and per-entity cache can be released.
     MeshCache.Empty();

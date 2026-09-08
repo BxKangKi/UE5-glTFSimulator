@@ -1,7 +1,6 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
 #include "Vehicle/VehiclePawn.h"
-#include "Simulator/GlTFRuntimeCacheLibrary.h"
 #include "Simulator/NodeTokenLibrary.h"
 #include "Camera/CameraComponent.h"
 #include "CollisionShape.h"
@@ -40,8 +39,6 @@
 #include "System/MacroLibrary.h"
 #include "System/PhysicsHelper.h"
 #include "System/SafeFileIO.h"
-#include "System/BinaryDataStore.h"
-#include "Simulator/ModelDatabaseSubsystem.h"
 #include "System/MultiplayerWorldSubSystem.h"
 #include "System/glTFRuntimeSafety.h"
 #include "Net/UnrealNetwork.h"
@@ -85,31 +82,6 @@ struct FVehicleWheelVisual
 
 namespace
 {
-    void CacheVehicleBoundsAsync(UObject* Context, const FString& SourcePath, const FBox& Bounds)
-    {
-        const UWorld* World = IsValid(Context) ? Context->GetWorld() : nullptr;
-        const UGameInstance* GameInstance = World ? World->GetGameInstance() : nullptr;
-        const UModelDatabaseSubsystem* Database = GameInstance
-            ? GameInstance->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
-        FGuid UUID;
-        FModelDefinition Definition;
-        FString CachePath;
-        if (!Bounds.IsValid || !Database || !Database->FindIdForGlb(SourcePath, UUID)
-            || !Database->Resolve(UUID, Definition, CachePath)) return;
-        const FString JsonPath = Definition.JsonPath;
-        FSafeFileIO::RunTrackedWorker([SourcePath, JsonPath, CachePath, Bounds]()
-        {
-            FModelCacheData Cache;
-            FString Error;
-            FFileHelper::LoadFileToString(Cache.DefinitionJson, *JsonPath);
-            if (FBinaryDataStore::ComputeFileSha1(SourcePath, Cache.ModelHash, Error))
-            {
-                Cache.Center = Bounds.GetCenter();
-                Cache.Extent = Bounds.GetExtent();
-                FBinaryDataStore::SaveModelCacheBlocking(CachePath, Cache);
-            }
-        });
-    }
     constexpr float LoadedWheelGroundContactBuffer = 0.05f;
     constexpr float LoadedVisualBodyGroundClearance = 1.0f;
     constexpr float LoadedPhysicsBodyGroundClearance = 2.0f;
@@ -1366,7 +1338,7 @@ bool AVehiclePawn::SaveVehicleTuningJsonTemplate(const FString& JsonPath) const
     TSharedRef<FJsonObject> RootObject = MakeShared<FJsonObject>();
     RootObject->SetStringField(JSON_VERSION_FIELD, JSON_SCHEMA_VERSION);
     RootObject->SetStringField(TEXT("Schema"), TEXT("glTFSimulator.VehicleTuning.v3"));
-    RootObject->SetStringField(TEXT("ID"), FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower));
+    RootObject->SetStringField(TEXT("UUID"), FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower));
     RootObject->SetStringField(TEXT("Name"), BaseName.IsEmpty() ? TEXT("Vehicle") : BaseName);
     RootObject->SetStringField(TEXT("ModelType"), TEXT("Entity"));
     RootObject->SetStringField(TEXT("EntityType"), TEXT("Vehicle"));
@@ -1515,7 +1487,17 @@ UStaticMesh* AVehiclePawn::LoadMeshByIndex(int32 MeshIndex)
     MeshConfig.bBuildNavCollision = false;
     MeshConfig.CollisionComplexity = ECollisionTraceFlag::CTF_UseDefault;
 
-    UStaticMesh* Mesh = GltfAsset->LoadStaticMesh(MeshIndex, MeshConfig);
+    UStaticMesh* Mesh = nullptr;
+    const bool bExecuted = FglTFRuntimeSafety::ExecuteSynchronousOperation(
+        FString::Printf(TEXT("Vehicle LoadStaticMesh %d"), MeshIndex),
+        [this, MeshIndex, &MeshConfig, &Mesh]()
+        {
+            Mesh = GltfAsset->LoadStaticMesh(MeshIndex, MeshConfig);
+        });
+    if (!bExecuted)
+    {
+        return nullptr;
+    }
     if (IsValid(Mesh))
     {
         MeshCache.Add(MeshIndex, Mesh);
@@ -1701,7 +1683,18 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InFilePath, const FString& In
 
     FglTFRuntimeConfig LoaderConfig;
     LoaderConfig.bAllowExternalFiles = true;
-    GltfAsset = USimulatorGlTFRuntimeCacheLibrary::LoadSharedAssetFromFilename(this, SourceFilePath, false, LoaderConfig);
+    const bool bAssetLoadExecuted = FglTFRuntimeSafety::ExecuteSynchronousOperation(
+        TEXT("Vehicle parser creation"),
+        [this, &LoaderConfig]()
+        {
+            GltfAsset = UglTFRuntimeFunctionLibrary::glTFLoadAssetFromFilename(
+                SourceFilePath, false, LoaderConfig);
+        });
+    if (!bAssetLoadExecuted)
+    {
+        ClearLoadedVehicleModel();
+        return false;
+    }
     if (!IsValid(GltfAsset))
     {
         UE_LOG(LogTemp, Warning, TEXT("VehiclePawn: failed to load vehicle model %s"), *SourceFilePath);
@@ -1913,7 +1906,6 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InFilePath, const FString& In
     VehicleTemplateData.WheelVisualRestBounds = LoadedWheelVisualRestBounds;
     VehicleTemplateData.CombinedLocalBounds = CombinedLocalBounds;
     VehicleTemplateData.RuntimeWheelRadius = RuntimeWheelRadius;
-    CacheVehicleBoundsAsync(this, SourceFilePath, CombinedLocalBounds);
     if (!InstancedEntities->StoreVehicleTemplateData(SourceFilePath, VehicleTemplateData))
     {
         UE_LOG(LogTemp, Warning,

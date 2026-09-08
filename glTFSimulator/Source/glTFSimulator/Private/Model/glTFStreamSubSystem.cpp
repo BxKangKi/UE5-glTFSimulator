@@ -152,14 +152,14 @@ bool UglTFStreamSubSystem::IsActiveForWorld(const UWorld* World) const
     return bActive && World && IsValid(OwnerActor) && OwnerActor->GetWorld() == World;
 }
 
-void UglTFStreamSubSystem::StartMainWorldStreaming(AActor* InOwnerActor, TSubclassOf<AglTFStreamActor> InSpawnActorClass, const FString& InModelDirectory, const FString& InInitialPlayerName, bool bInRenderOnlyStreaming)
+void UglTFStreamSubSystem::StartMainWorldStreaming(AActor* InOwnerActor, TSubclassOf<AglTFStreamActor> InSpawnActorClass, const FString& InWorldRoot, const FString& InInitialPlayerName, bool bInRenderOnlyStreaming)
 {
     if (!IsInGameThread())
     {
         TWeakObjectPtr<UglTFStreamSubSystem> WeakThis(this);
         TWeakObjectPtr<AActor> WeakOwner(InOwnerActor);
         FSafeFileIO::DispatchTrackedGameThread(
-            [WeakThis, WeakOwner, InSpawnActorClass, InModelDirectory,
+            [WeakThis, WeakOwner, InSpawnActorClass, InWorldRoot,
                 InInitialPlayerName, bInRenderOnlyStreaming]()
             {
                 if (UglTFStreamSubSystem* StrongThis = WeakThis.Get())
@@ -167,7 +167,7 @@ void UglTFStreamSubSystem::StartMainWorldStreaming(AActor* InOwnerActor, TSubcla
                     StrongThis->StartMainWorldStreaming(
                         WeakOwner.Get(),
                         InSpawnActorClass,
-                        InModelDirectory,
+                        InWorldRoot,
                         InInitialPlayerName,
                         bInRenderOnlyStreaming);
                 }
@@ -175,17 +175,19 @@ void UglTFStreamSubSystem::StartMainWorldStreaming(AActor* InOwnerActor, TSubcla
         return;
     }
 
-    if (!IsValid(InOwnerActor) || !InSpawnActorClass)
+    StopMainWorldStreaming();
+    const FString NormalizedWorldRoot = FSafeFileIO::NormalizeFilePath(InWorldRoot);
+    if (!IsValid(InOwnerActor) || !InSpawnActorClass || InWorldRoot.TrimStartAndEnd().IsEmpty() ||
+        NormalizedWorldRoot.IsEmpty())
     {
-        WriteLogAsync(TEXT("StartMainWorldStreaming skipped: owner actor or SpawnActorClass is invalid"));
+        WriteLogAsync(TEXT("StartMainWorldStreaming aborted: owner, SpawnActorClass, or explicit world root is invalid"));
         return;
     }
 
-    StopMainWorldStreaming();
-
     OwnerActor = InOwnerActor;
     SpawnActorClass = InSpawnActorClass;
-    ModelDirectory = InModelDirectory;
+    WorldRoot = NormalizedWorldRoot;
+    ModelDirectory = FPaths::Combine(WorldRoot, TEXT("model"));
     InitialPlayerName = InInitialPlayerName;
     bRenderOnlyStreaming = bInRenderOnlyStreaming;
     bActive = true;
@@ -216,6 +218,14 @@ void UglTFStreamSubSystem::StartMainWorldStreaming(AActor* InOwnerActor, TSubcla
     FailedPlayerPaths.Empty();
     MetadataUnavailablePaths.Empty();
     ModelMetadataMap.Empty();
+    SceneDatabaseEntries.Empty();
+    ScenePathByUUID.Empty();
+    SceneUUIDByPath.Empty();
+    bSceneDatabaseReady = false;
+    bSceneDatabaseDirty = false;
+    bSceneDatabaseSaving = false;
+    SceneDatabaseRevision = 0;
+    SceneDatabaseSavingRevision = 0;
     SpawnActorMap.Empty();
 
     GlbFilePaths.Empty();
@@ -226,8 +236,16 @@ void UglTFStreamSubSystem::StartMainWorldStreaming(AActor* InOwnerActor, TSubcla
             TArray<FModelDefinition> Definitions;
             Database->GetDefinitions(Definitions);
             for (const FModelDefinition& Definition : Definitions)
+            {
                 if (Definition.ModelType == EModelDefinitionType::Scene)
+                {
                     GlbFilePaths.Add(Definition.GlbPath);
+                    ScenePathByUUID.Add(Definition.UUID, Definition.GlbPath);
+                    SceneUUIDByPath.Add(
+                        GlbValidation::NormalizePath(Definition.GlbPath).ToLower(),
+                        Definition.UUID);
+                }
+            }
         }
     }
     NormalizeAndDeduplicatePaths(GlbFilePaths);
@@ -249,7 +267,7 @@ void UglTFStreamSubSystem::StartMainWorldStreaming(AActor* InOwnerActor, TSubcla
     // concurrency, while each completed preflight creates its stream actor on the game thread. The
     // glTFRuntime safety coordinator remains the final native-operation barrier, so actors can all
     // enter their loading lifecycle without racing parser/cache teardown or UObject mutation.
-    ScheduleProcessNextPath();
+    LoadSceneDatabaseIndexAsync();
 }
 
 void UglTFStreamSubSystem::StopMainWorldStreaming()
@@ -298,6 +316,7 @@ void UglTFStreamSubSystem::StopMainWorldStreaming()
     GlbFilePaths.Empty();
     PlayerGlbFilePaths.Empty();
     ModelDirectory.Reset();
+    WorldRoot.Reset();
     CurrentPlayerPath.Reset();
     PendingPlayerPath.Reset();
     InitialPlayerName.Reset();
@@ -307,6 +326,9 @@ void UglTFStreamSubSystem::StopMainWorldStreaming()
     FailedPlayerPaths.Empty();
     MetadataUnavailablePaths.Empty();
     ModelMetadataMap.Empty();
+    SceneDatabaseEntries.Empty();
+    ScenePathByUUID.Empty();
+    SceneUUIDByPath.Empty();
     InitialPathProgress.Empty();
     LastReportedLoadingStatus = 0.0f;
     LastLoadingProgressFrame = ~uint64(0);
@@ -320,6 +342,11 @@ void UglTFStreamSubSystem::StopMainWorldStreaming()
     bWaitingForPlayerLoad = false;
     bPlayerActivated = false;
     bPendingPlayerIsInitialLoad = false;
+    bSceneDatabaseReady = false;
+    bSceneDatabaseDirty = false;
+    bSceneDatabaseSaving = false;
+    SceneDatabaseRevision = 0;
+    SceneDatabaseSavingRevision = 0;
     PlayerActorWaitStartedAt = 0.0;
     PlayerLoadStartedAt = 0.0;
     NextModelFileAuditTime = 0.0;
@@ -341,7 +368,7 @@ bool UglTFStreamSubSystem::AreInitialModelsReady() const
         return true;
     }
 
-    if (!bInitialPathScanComplete || CompletedInitialPaths.Num() < GlbFilePaths.Num())
+    if (!bSceneDatabaseReady || !bInitialPathScanComplete || CompletedInitialPaths.Num() < GlbFilePaths.Num())
     {
         return false;
     }
@@ -507,6 +534,146 @@ float UglTFStreamSubSystem::GetLoadingStatus() const
     return FMath::Clamp(LastReportedLoadingStatus, 0.0f, 1.0f);
 }
 
+void UglTFStreamSubSystem::LoadSceneDatabaseIndexAsync()
+{
+    check(IsInGameThread());
+    if (!bActive || !IsValid(OwnerActor)) return;
+
+    const int32 RequestedGeneration = InitialScanGeneration;
+    if (WorldRoot.IsEmpty())
+    {
+        WriteLogAsync(TEXT("scenes.dat load aborted because the explicit world root is empty"));
+        return;
+    }
+    const FString ScenesPath = FPaths::Combine(WorldRoot, TEXT("data"), TEXT("scenes.dat"));
+    TWeakObjectPtr<UglTFStreamSubSystem> WeakThis(this);
+    FBinaryDataStore::LoadSceneDatabaseAsync(ScenesPath,
+        [WeakThis, RequestedGeneration](const bool bSuccess, const bool bWasMissing,
+            TArray<FSceneDatabaseEntry> Entries, FString Error) mutable
+        {
+            UglTFStreamSubSystem* StrongThis = WeakThis.Get();
+            if (!IsValid(StrongThis) || !StrongThis->bActive
+                || StrongThis->InitialScanGeneration != RequestedGeneration)
+            {
+                return;
+            }
+
+            StrongThis->SceneDatabaseEntries.Empty();
+            bool bDiscardedStaleRows = false;
+            if (!bSuccess)
+            {
+                StrongThis->WriteLogAsync(FString::Printf(
+                    TEXT("scenes.dat validation failed; Scene bounds will be rebuilt. Reason=%s"),
+                    *Error));
+            }
+            else
+            {
+                for (const FSceneDatabaseEntry& Entry : Entries)
+                {
+                    const FString* GlbPath = StrongThis->ScenePathByUUID.Find(Entry.UUID);
+                    if (!GlbPath)
+                    {
+                        bDiscardedStaleRows = true;
+                        continue;
+                    }
+                    FModelData Metadata;
+                    Metadata.Center = Entry.Location;
+                    Metadata.Size = Entry.Size;
+                    if (!StrongThis->IsValidModelMetadata(Metadata))
+                    {
+                        bDiscardedStaleRows = true;
+                        continue;
+                    }
+                    StrongThis->SceneDatabaseEntries.Add(Entry.UUID, Entry);
+                    StrongThis->ModelMetadataMap.Add(*GlbPath, Metadata);
+                }
+            }
+
+            StrongThis->bSceneDatabaseReady = true;
+            if (!bSuccess || bWasMissing || bDiscardedStaleRows)
+            {
+                StrongThis->bSceneDatabaseDirty = true;
+                ++StrongThis->SceneDatabaseRevision;
+                StrongThis->BeginSceneDatabaseSave();
+            }
+            StrongThis->WriteLogAsync(FString::Printf(
+                TEXT("Scene bounds database ready. File=data/scenes.dat Rows=%d Source=%s"),
+                StrongThis->SceneDatabaseEntries.Num(),
+                bWasMissing ? TEXT("new") : (bSuccess ? TEXT("validated") : TEXT("rebuild"))));
+            StrongThis->ScheduleProcessNextPath();
+        });
+}
+
+void UglTFStreamSubSystem::UpdateSceneDatabaseEntry(
+    const FString& GlbPath,
+    const FModelData& Metadata)
+{
+    check(IsInGameThread());
+    if (!bSceneDatabaseReady || !IsValidModelMetadata(Metadata)) return;
+
+    const FString Key = GlbValidation::NormalizePath(GlbPath).ToLower();
+    const FGuid* UUID = SceneUUIDByPath.Find(Key);
+    if (!UUID) return;
+
+    FSceneDatabaseEntry& Entry = SceneDatabaseEntries.FindOrAdd(*UUID);
+    const FVector NewLocation = Metadata.Center;
+    const FVector NewSize = Metadata.Size.GetAbs();
+    if (Entry.UUID == *UUID && Entry.Location.Equals(NewLocation, 0.01)
+        && Entry.Size.Equals(NewSize, 0.01))
+    {
+        return;
+    }
+
+    Entry.UUID = *UUID;
+    Entry.Location = NewLocation;
+    Entry.Size = NewSize;
+    bSceneDatabaseDirty = true;
+    ++SceneDatabaseRevision;
+    BeginSceneDatabaseSave();
+}
+
+void UglTFStreamSubSystem::BeginSceneDatabaseSave()
+{
+    check(IsInGameThread());
+    if (!bActive || !bSceneDatabaseReady || !bSceneDatabaseDirty || bSceneDatabaseSaving) return;
+
+    TArray<FSceneDatabaseEntry> Snapshot;
+    SceneDatabaseEntries.GenerateValueArray(Snapshot);
+    if (WorldRoot.IsEmpty())
+    {
+        bSceneDatabaseDirty = true;
+        WriteLogAsync(TEXT("scenes.dat save aborted because the explicit world root is empty"));
+        return;
+    }
+    const FString ScenesPath = FPaths::Combine(WorldRoot, TEXT("data"), TEXT("scenes.dat"));
+    bSceneDatabaseDirty = false;
+    bSceneDatabaseSaving = true;
+    SceneDatabaseSavingRevision = SceneDatabaseRevision;
+    const uint64 SavedRevision = SceneDatabaseSavingRevision;
+    const int32 SavedGeneration = InitialScanGeneration;
+    TWeakObjectPtr<UglTFStreamSubSystem> WeakThis(this);
+    FBinaryDataStore::SaveSceneDatabaseAsync(ScenesPath, Snapshot,
+        [WeakThis, SavedRevision, SavedGeneration](FSafeFileWriteResult Result)
+        {
+            UglTFStreamSubSystem* StrongThis = WeakThis.Get();
+            if (!IsValid(StrongThis) || StrongThis->InitialScanGeneration != SavedGeneration) return;
+            StrongThis->bSceneDatabaseSaving = false;
+            if (!Result.IsSuccess())
+            {
+                StrongThis->bSceneDatabaseDirty = true;
+                StrongThis->WriteLogAsync(FString::Printf(
+                    TEXT("scenes.dat save failed without replacing the prior generation. Reason=%s"),
+                    *Result.Error));
+                return;
+            }
+            if (StrongThis->SceneDatabaseRevision != SavedRevision)
+            {
+                StrongThis->bSceneDatabaseDirty = true;
+                StrongThis->BeginSceneDatabaseSave();
+            }
+        });
+}
+
 void UglTFStreamSubSystem::ProcessNextPathAsync()
 {
     if (!EnsureStreamSubsystemGameThread(TEXT("UglTFStreamSubSystem::ProcessNextPathAsync")))
@@ -514,7 +681,7 @@ void UglTFStreamSubSystem::ProcessNextPathAsync()
         return;
     }
 
-    if (!bActive || !IsValid(OwnerActor))
+    if (!bActive || !bSceneDatabaseReady || !IsValid(OwnerActor))
     {
         return;
     }
@@ -528,6 +695,16 @@ void UglTFStreamSubSystem::ProcessNextPathAsync()
         const FString GlbPath = GlbFilePaths[CurrentPathIndex++];
         if (CompletedInitialPaths.Contains(GlbPath))
         {
+            SetInitialPathProgress(GlbPath, 1.0f);
+            continue;
+        }
+
+        // scenes.dat is the authoritative coarse index. Far scenes do not touch the GLB or cache
+        // during bootstrap; the periodic streamer validates and loads them only when approached.
+        if (const FModelData* SceneBounds = ModelMetadataMap.Find(GlbPath);
+            SceneBounds && !IsPlayerInsideModelRange(*SceneBounds))
+        {
+            CompletedInitialPaths.Add(GlbPath);
             SetInitialPathProgress(GlbPath, 1.0f);
             continue;
         }
@@ -548,15 +725,25 @@ void UglTFStreamSubSystem::StartInitialPathPreflight(
     check(IsInGameThread());
 
     FString SizeCachePath;
+    bool bUUIDResolved = false;
     if (const UGameInstance* GameInstance = GetWorld() ? GetWorld()->GetGameInstance() : nullptr)
     {
         if (const UModelDatabaseSubsystem* Database = GameInstance->GetSubsystem<UModelDatabaseSubsystem>())
         {
             FGuid UUID;
             FModelDefinition Definition;
-            Database->FindIdForGlb(GlbPath, UUID);
-            Database->Resolve(UUID, Definition, SizeCachePath);
+            bUUIDResolved = Database->FindUUIDForGlb(GlbPath, UUID)
+                && UUID.IsValid()
+                && Database->Resolve(UUID, Definition, SizeCachePath);
         }
+    }
+    if (!bUUIDResolved)
+    {
+        const FString Message = FString::Printf(
+            TEXT("Scene GLB has no resolvable UUID mapping and cannot use its model cache. GLB=%s"),
+            *GlbPath);
+        UE_LOG(LogTemp, Error, TEXT("%s"), *Message);
+        UFileFunctionLibrary::WriteSimulatorLogAsync(TEXT("ModelUUID"), Message);
     }
 
     TWeakObjectPtr<UglTFStreamSubSystem> WeakThis(this);
@@ -570,8 +757,7 @@ void UglTFStreamSubSystem::StartInitialPathPreflight(
 
             if (Result.bGlbValid)
             {
-                Result.bSizeCacheExists = IFileManager::Get().FileExists(*SizeCachePath) ||
-                    IFileManager::Get().FileExists(*(SizeCachePath + TEXT(".bak")));
+                Result.bSizeCacheExists = IFileManager::Get().FileExists(*SizeCachePath);
 
                 FString ModelHash;
                 FString HashError;
@@ -616,7 +802,7 @@ void UglTFStreamSubSystem::StartInitialPathPreflight(
                             ? TEXT("Model cache could not be loaded safely")
                             : CacheError;
 
-                        // A source hash change makes every cached extent stale. Remove all DAT
+                        // A source hash change makes every cached full mesh size stale. Remove all DAT
                         // generations now so the stream actor can rebuild one clean cache.
                         if (bHashMismatch)
                         {
@@ -679,6 +865,7 @@ void UglTFStreamSubSystem::StartInitialPathPreflight(
                         {
                             StrongThis->MetadataUnavailablePaths.Remove(GlbPath);
                             StrongThis->ModelMetadataMap.Add(GlbPath, Result.Metadata);
+                            StrongThis->UpdateSceneDatabaseEntry(GlbPath, Result.Metadata);
                             StrongThis->WriteLogAsync(FString::Printf(
                                 TEXT("Valid model cache loaded safely. GLB=%s Center=%s Size=%s"),
                                 *GlbPath,
@@ -936,6 +1123,7 @@ void UglTFStreamSubSystem::UpdateStreamingAsync()
         EnsureSpawnActor(GlbPath);
     }
 
+    BeginSceneDatabaseSave();
     ScheduleUpdateStreaming();
 }
 
@@ -1651,6 +1839,7 @@ void UglTFStreamSubSystem::CacheActorMetadata(const FString& GlbPath, const AglT
     if (IsValidModelMetadata(Metadata))
     {
         ModelMetadataMap.Add(GlbPath, Metadata);
+        UpdateSceneDatabaseEntry(GlbPath, Metadata);
         WriteLogAsync(FString::Printf(TEXT("Actor metadata cached. GLB=%s Center=%s Size=%s"),
             *GlbPath,
             *Metadata.Center.ToCompactString(),

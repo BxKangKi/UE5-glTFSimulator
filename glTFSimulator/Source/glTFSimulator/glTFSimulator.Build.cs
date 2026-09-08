@@ -12,7 +12,6 @@ public class glTFSimulator : ModuleRules
         PublicDependencyModuleNames.AddRange(
             new string[]
             {
-                "JsonUtilities",
                 "Core",
                 "CoreUObject",
                 "Engine",
@@ -28,16 +27,13 @@ public class glTFSimulator : ModuleRules
         PrivateDependencyModuleNames.AddRange(
             new string[]
             {
-                "IKRig",
                 "Niagara",
+                "JsonUtilities",
                 "RHI",
                 "ProceduralMeshComponent",
                 "PhysicsCore",
-                "ImageWrapper",
                 // MoviePlayer renders a pure-Slate loading screen while blocking map loads run.
-                "MoviePlayer",
-                "RenderCore",
-                "ShaderLibrary"
+                "MoviePlayer"
             });
 
         if (Target.bBuildEditor)

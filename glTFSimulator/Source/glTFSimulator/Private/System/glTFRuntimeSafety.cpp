@@ -83,10 +83,12 @@ namespace glTFRuntimeSafetyPrivate
 
     struct FState
     {
-        // Parser construction is worker-thread-only and globally serialized. This avoids overlapping
-        // third-party parser allocations while several model files are discovered during map entry.
-        FCriticalSection ParserGateLock;
-        int32 ActiveParserCreations = 0;
+        // One logical native gate covers parser construction, synchronous loads, asynchronous mesh
+        // finalization, and parser cache teardown. The mutex protects the phase; it is never held
+        // while third-party code executes.
+        FCriticalSection NativeGateLock;
+        enum class ENativePhase : uint8 { Idle, ParserCreation, MeshOperation, SynchronousOperation, CacheClear };
+        ENativePhase NativePhase = ENativePhase::Idle;
 
         // Failure records are queried by both game and worker threads.
         FCriticalSection FailureLock;
@@ -116,7 +118,6 @@ namespace glTFRuntimeSafetyPrivate
 
     constexpr int32 MaximumQueuedOperations = 4096;
     constexpr int32 MaximumConcurrentNativeOperations = 1;
-    constexpr int32 MaximumConcurrentParserCreations = 1;
 
     bool IsShuttingDown()
     {
@@ -230,7 +231,37 @@ namespace glTFRuntimeSafetyPrivate
         return Removed;
     }
 
-    /** Worker-thread RAII token for the serialized parser-construction gate. */
+    bool TryEnterNativePhase(const FState::ENativePhase Phase)
+    {
+        FState& State = GetState();
+        FScopeLock Lock(&State.NativeGateLock);
+        if (State.NativePhase != FState::ENativePhase::Idle)
+        {
+            return false;
+        }
+        State.NativePhase = Phase;
+        return true;
+    }
+
+    void LeaveNativePhase(const FState::ENativePhase Phase)
+    {
+        FState& State = GetState();
+        FScopeLock Lock(&State.NativeGateLock);
+        ensureMsgf(State.NativePhase == Phase, TEXT("glTFRuntime native gate phase mismatch"));
+        if (State.NativePhase == Phase)
+        {
+            State.NativePhase = FState::ENativePhase::Idle;
+        }
+    }
+
+    bool IsNativeGateIdle()
+    {
+        FState& State = GetState();
+        FScopeLock Lock(&State.NativeGateLock);
+        return State.NativePhase == FState::ENativePhase::Idle;
+    }
+
+    /** Worker-thread RAII token for the single process-wide native gate. */
     class FParserCreationSlot
     {
     public:
@@ -238,14 +269,10 @@ namespace glTFRuntimeSafetyPrivate
         {
             while (!IsShuttingDown() && !IsCircuitOpen())
             {
+                if (TryEnterNativePhase(FState::ENativePhase::ParserCreation))
                 {
-                    FScopeLock Lock(&GetState().ParserGateLock);
-                    if (GetState().ActiveParserCreations < MaximumConcurrentParserCreations)
-                    {
-                        ++GetState().ActiveParserCreations;
-                        bHeld = true;
-                        return true;
-                    }
+                    bHeld = true;
+                    return true;
                 }
 
                 // Parser creation is already performed on the shared worker pool. A short sleep
@@ -257,11 +284,14 @@ namespace glTFRuntimeSafetyPrivate
 
         ~FParserCreationSlot()
         {
-            if (bHeld)
-            {
-                FScopeLock Lock(&GetState().ParserGateLock);
-                GetState().ActiveParserCreations = FMath::Max(0, GetState().ActiveParserCreations - 1);
-            }
+            Release();
+        }
+
+        void Release()
+        {
+            if (!bHeld) return;
+            LeaveNativePhase(FState::ENativePhase::ParserCreation);
+            bHeld = false;
         }
 
     private:
@@ -316,7 +346,42 @@ TSharedPtr<FglTFRuntimeParser> FglTFRuntimeSafety::CreateParserSafely(
     {
         return nullptr;
     }
-    return FglTFRuntimeParser::FromFilename(FilePath, Config);
+    TSharedPtr<FglTFRuntimeParser> Parser = FglTFRuntimeParser::FromFilename(FilePath, Config);
+    ParserSlot.Release();
+    AsyncTask(ENamedThreads::GameThread, []()
+    {
+        FglTFRuntimeSafety::NotifyGateAvailable_GameThread();
+    });
+    return Parser;
+}
+
+bool FglTFRuntimeSafety::ExecuteSynchronousOperation(
+    const FString& Label,
+    TFunctionRef<void()> Operation)
+{
+    if (!ensureMsgf(IsInGameThread(), TEXT("Synchronous glTFRuntime work must run on the game thread")))
+    {
+        return false;
+    }
+    FString Reason;
+    if (glTFRuntimeSafetyPrivate::IsShuttingDown() ||
+        glTFRuntimeSafetyPrivate::IsCircuitOpen(&Reason) ||
+        !glTFRuntimeSafetyPrivate::TryEnterNativePhase(
+            glTFRuntimeSafetyPrivate::FState::ENativePhase::SynchronousOperation))
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("Rejected synchronous glTFRuntime operation because the global native gate is busy. Label=%s Reason=%s"),
+            *Label, Reason.IsEmpty() ? TEXT("another native operation is active") : *Reason);
+        return false;
+    }
+
+    ON_SCOPE_EXIT
+    {
+        glTFRuntimeSafetyPrivate::LeaveNativePhase(
+            glTFRuntimeSafetyPrivate::FState::ENativePhase::SynchronousOperation);
+    };
+    Operation();
+    return true;
 }
 
 uint64 FglTFRuntimeSafety::EnqueueOperation(
@@ -409,6 +474,8 @@ void FglTFRuntimeSafety::CompleteOperation(const uint64 Ticket)
     }
 
     State.ActiveOperations.Remove(Ticket);
+    glTFRuntimeSafetyPrivate::LeaveNativePhase(
+        glTFRuntimeSafetyPrivate::FState::ENativePhase::MeshOperation);
 
     // A release requested during the callback is finalized before another job can reuse that parser.
     ProcessPendingAssetReleases_GameThread();
@@ -513,8 +580,14 @@ void FglTFRuntimeSafety::ProcessPendingAssetReleases_GameThread()
             continue;
         }
 
-        // ClearCache touches the parser's mutable cache and must never overlap native work for the
-        // same asset. Removing legacy root/standalone flags here also centralizes every final release.
+        if (!glTFRuntimeSafetyPrivate::TryEnterNativePhase(
+            glTFRuntimeSafetyPrivate::FState::ENativePhase::CacheClear))
+        {
+            return;
+        }
+
+        // ClearCache touches the parser's mutable cache and shares the process-wide native gate
+        // with every parser constructor and mesh operation.
         Asset->ClearCache();
         if (Asset->IsRooted())
         {
@@ -522,7 +595,16 @@ void FglTFRuntimeSafety::ProcessPendingAssetReleases_GameThread()
         }
         Asset->ClearFlags(RF_Public | RF_Standalone);
         State.PendingAssetReleases.RemoveAtSwap(Index, 1, EAllowShrinking::No);
+        glTFRuntimeSafetyPrivate::LeaveNativePhase(
+            glTFRuntimeSafetyPrivate::FState::ENativePhase::CacheClear);
     }
+}
+
+void FglTFRuntimeSafety::NotifyGateAvailable_GameThread()
+{
+    check(IsInGameThread());
+    ProcessPendingAssetReleases_GameThread();
+    PumpQueue_GameThread();
 }
 
 void FglTFRuntimeSafety::ReportRecoverableFailure(
@@ -653,6 +735,7 @@ bool FglTFRuntimeSafety::TickWatchdog(const float DeltaSeconds)
     {
         return false;
     }
+    NotifyGateAvailable_GameThread();
     if (glTFRuntimeSafetyPrivate::IsCircuitOpen() || State.ActiveOperations.IsEmpty())
     {
         return true;
@@ -708,7 +791,8 @@ void FglTFRuntimeSafety::PumpQueue_GameThread()
         State.bPumpingQueue = false;
     };
 
-    while (State.ActiveOperations.Num() < glTFRuntimeSafetyPrivate::MaximumConcurrentNativeOperations)
+    while (State.ActiveOperations.Num() < glTFRuntimeSafetyPrivate::MaximumConcurrentNativeOperations &&
+        glTFRuntimeSafetyPrivate::IsNativeGateIdle())
     {
         int32 SelectedIndex = INDEX_NONE;
         TArray<glTFRuntimeSafetyPrivate::FQueuedOperation> RejectedBeforeStart;
@@ -745,6 +829,21 @@ void FglTFRuntimeSafety::PumpQueue_GameThread()
             // Callbacks are user code and may otherwise mutate Queue and invalidate SelectedIndex.
             Operation = MoveTemp(State.Queue[SelectedIndex]);
             State.Queue.RemoveAt(SelectedIndex, 1, EAllowShrinking::No);
+
+            if (!glTFRuntimeSafetyPrivate::TryEnterNativePhase(
+                glTFRuntimeSafetyPrivate::FState::ENativePhase::MeshOperation))
+            {
+                // A worker parser acquired the gate between the idle probe and this claim.
+                // Restore queue order; parser completion will pump the queue on the game thread.
+                State.Queue.Insert(MoveTemp(Operation), 0);
+                for (glTFRuntimeSafetyPrivate::FQueuedOperation& Rejected : RejectedBeforeStart)
+                {
+                    glTFRuntimeSafetyPrivate::RejectOperation(
+                        Rejected,
+                        TEXT("Operation owner/asset expired or the asset entered safe release before execution"));
+                }
+                return;
+            }
 
             glTFRuntimeSafetyPrivate::FActiveOperation Active(
                 Operation.Ticket,

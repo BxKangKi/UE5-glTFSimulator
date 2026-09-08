@@ -45,7 +45,7 @@ namespace
         FGuid UUID;
         FModelDefinition Definition;
         FString CachePath;
-        return Database && Database->FindIdForGlb(GlbPath, UUID)
+        return Database && Database->FindUUIDForGlb(GlbPath, UUID)
             && Database->Resolve(UUID, Definition, CachePath) ? CachePath : FString();
     }
 }
@@ -525,7 +525,7 @@ void AglTFStreamActor::OnChunksLoaded(const FLoadAsyncWrapper& MapWrapper)
         *ModelMetadata.Size.ToCompactString()));
 
     // In metadata-only mode ULoadAsyncAction does not report completion until a newly generated cache
-    // has finished its verified temp/primary/.bak transaction. A cache hit is also already durable.
+    // has finished its verified temporary-file/primary transaction. A cache hit is also durable.
     if (bMetadataBakeOnly)
     {
         bIsLoaded = true;

@@ -65,7 +65,6 @@
 #include "Engine/GameInstance.h"
 
 static constexpr int32 ToolbarSlotCount = 7;
-#define MODEL_DIRECTORY TEXT("/model/")
 
 namespace
 {
@@ -73,40 +72,6 @@ namespace
     constexpr int32 MaxSavedSceneDataAttempts = 20; // Allow transient model-registration failures to settle for up to five seconds.
     constexpr float SavedSceneLoadRetryDelaySeconds = 0.25f;
 
-    FString NormalizeFullPathForWorldData(const FString& Path)
-    {
-        FString Normalized = Path.TrimStartAndEnd();
-        if (Normalized.IsEmpty())
-        {
-            return FString();
-        }
-
-        Normalized = FPaths::ConvertRelativePathToFull(Normalized);
-        FPaths::NormalizeFilename(Normalized);
-        if (!FPaths::CollapseRelativeDirectories(Normalized))
-        {
-            return FString();
-        }
-        return Normalized;
-    }
-
-    bool IsPathInsideDirectory(const FString& CandidatePath, const FString& DirectoryPath)
-    {
-        const FString Candidate = NormalizeFullPathForWorldData(CandidatePath);
-        FString Directory = NormalizeFullPathForWorldData(DirectoryPath);
-        if (Candidate.IsEmpty() || Directory.IsEmpty())
-        {
-            return false;
-        }
-
-        while (Directory.EndsWith(TEXT("/")))
-        {
-            Directory.LeftChopInline(1, EAllowShrinking::No);
-        }
-        const FString Prefix = Directory + TEXT("/");
-        return Candidate.Equals(Directory, ESearchCase::IgnoreCase) ||
-            Candidate.StartsWith(Prefix, ESearchCase::IgnoreCase);
-    }
     /**
      * Resolves the external world JSON play-mode key without letting a previous world's value leak
      * through the GameInstance subsystem. Empty/Default/SinglePlayer means use the map's directly
@@ -167,98 +132,6 @@ namespace
             && FMath::IsFinite(Rotation.Roll);
     }
 
-    /**
-     * All three fields are required. In particular, a zero vector is accepted while a missing,
-     * non-numeric, non-finite, or out-of-world component is rejected.
-     */
-    bool TryReadSavedLocation(
-        const TSharedPtr<FJsonObject>& Json,
-        const FString& Prefix,
-        FVector& OutLocation)
-    {
-        if (!Json.IsValid())
-        {
-            return false;
-        }
-
-        double X = 0.0;
-        double Y = 0.0;
-        double Z = 0.0;
-        if (!Json->TryGetNumberField(Prefix + TEXT("X"), X)
-            || !Json->TryGetNumberField(Prefix + TEXT("Y"), Y)
-            || !Json->TryGetNumberField(Prefix + TEXT("Z"), Z)
-            || !IsFiniteWorldCoordinate(X)
-            || !IsFiniteWorldCoordinate(Y)
-            || !IsFiniteWorldCoordinate(Z))
-        {
-            return false;
-        }
-
-        OutLocation = FVector(X, Y, Z);
-        return true;
-    }
-
-    bool TryReadSavedRotation(
-        const TSharedPtr<FJsonObject>& Json,
-        const FString& Prefix,
-        FRotator& OutRotation)
-    {
-        if (!Json.IsValid())
-        {
-            return false;
-        }
-
-        double Pitch = 0.0;
-        double Yaw = 0.0;
-        double Roll = 0.0;
-        if (!Json->TryGetNumberField(Prefix + TEXT("Pitch"), Pitch)
-            || !Json->TryGetNumberField(Prefix + TEXT("Yaw"), Yaw)
-            || !Json->TryGetNumberField(Prefix + TEXT("Roll"), Roll)
-            || !FMath::IsFinite(Pitch)
-            || !FMath::IsFinite(Yaw)
-            || !FMath::IsFinite(Roll))
-        {
-            return false;
-        }
-
-        OutRotation = FRotator(Pitch, Yaw, Roll).GetNormalized();
-        return IsFiniteRotation(OutRotation);
-    }
-
-    TSharedPtr<FJsonObject> FindSerializedPlayerRecord(
-        const TSharedPtr<FJsonObject>& RootJson,
-        const FString& PlayerId)
-    {
-        if (!RootJson.IsValid())
-        {
-            return nullptr;
-        }
-
-        const TArray<TSharedPtr<FJsonValue>>* PlayerValues = nullptr;
-        if (!RootJson->TryGetArrayField(TEXT("Players"), PlayerValues) || !PlayerValues)
-        {
-            return nullptr;
-        }
-
-        for (const TSharedPtr<FJsonValue>& Value : *PlayerValues)
-        {
-            if (!Value.IsValid() || Value->Type != EJson::Object)
-            {
-                continue;
-            }
-
-            const TSharedPtr<FJsonObject> PlayerJson = Value->AsObject();
-            FString SerializedPlayerId;
-            if (PlayerJson.IsValid()
-                && PlayerJson->TryGetStringField(TEXT("PlayerId"), SerializedPlayerId)
-                && SerializedPlayerId.Equals(PlayerId, ESearchCase::IgnoreCase))
-            {
-                return PlayerJson;
-            }
-        }
-
-        return nullptr;
-    }
 }
 
 
@@ -266,7 +139,6 @@ UGameManagerSubSystem::UGameManagerSubSystem()
 {
     bIsGamePaused = false;
     bIsWorldLoading = false;
-    bIsGamePaused = false;
     LoadingStatus = 0.0f;
     TotalSumFPS = 0;
     TotalCountFPS = 0;
@@ -907,6 +779,13 @@ void UGameManagerSubSystem::StartGameManager(AGameManagerActor* InConfigActor)
             *GetWorldRootPath(),
             *GetDataDirectory());
 
+        if (GetWorldRootPath().IsEmpty())
+        {
+            UE_LOG(LogTemp, Error,
+                TEXT("GameManager startup aborted: no explicit world root was resolved; no relative data paths will be used."));
+            return;
+        }
+
         if (World->GetNetMode() != NM_Standalone && World->GetNetMode() != NM_Client)
         {
             AMultiplayerWorldStateActor::SpawnOrUpdateForWorld(this, CurrentWorldName);
@@ -1067,19 +946,6 @@ void UGameManagerSubSystem::PrepareForMenuLevelTravelRequest()
         bEntitySaveCompleted ? TEXT("success") : TEXT("preserved-previous-generation"));
     RequestPostLoadRuntimeMemoryCleanup();
     SetGamePaused(false);
-}
-
-void UGameManagerSubSystem::PrepareForReturnToMenuLevel()
-{
-    // Backward-compatible Blueprint/C++ entry point. It is deliberately non-destructive so legacy
-    // Exit-button listeners cannot freeze the UI before OpenLevel has even been requested.
-    PrepareForMenuLevelTravelRequest();
-}
-
-void UGameManagerSubSystem::PrepareForReturnToMainWorld()
-{
-    // MainWorld/menu entry point. The cleanup path is shared by menu and world-selection level travel.
-    PrepareForReturnToMenuLevel();
 }
 
 void UGameManagerSubSystem::RequestWorldSelectionMenuOnNextMainWorld()
@@ -1324,14 +1190,14 @@ void UGameManagerSubSystem::RunPostLoadRuntimeMemoryCleanup()
 }
 
 
-void UGameManagerSubSystem::InitializeWorldSystems(UWorldData* InWorldData, const FString& InModelDirectory, const FString& InInitialPlayerName)
+void UGameManagerSubSystem::InitializeWorldSystems(UWorldData* InWorldData, const FString& InWorldRoot, const FString& InInitialPlayerName)
 {
     ActiveWorldData = InWorldData;
     ApplyLevelSettings();
 
     // Keep gameplay-owned world actors centralized here: water and streamed GLB actors are not rendering concerns.
     SpawnOcean();
-    MainWorldStreaming(InModelDirectory, InInitialPlayerName);
+    MainWorldStreaming(InWorldRoot, InInitialPlayerName);
 }
 
 void UGameManagerSubSystem::StopWorldSystems()
@@ -1513,7 +1379,7 @@ void UGameManagerSubSystem::LoadWorldData()
                     StrongThis->WorldEnvManagerActor->InitializeRendering(StrongThis->ActiveWorldData);
                 StrongThis->InitializeWorldSystems(
                     StrongThis->ActiveWorldData,
-                    StrongThis->GetWorldFilePath(MODEL_DIRECTORY),
+                    StrongThis->GetWorldRootPath(),
                     StrongThis->ActivePlayerId);
                 StrongThis->LoadWorldAsync();
             });
@@ -2099,8 +1965,8 @@ void UGameManagerSubSystem::UpdateWorldTime(float DeltaSeconds)
 
 FString UGameManagerSubSystem::GetWorldFilePath(const FString& FileName) const
 {
-    const FString WorldName = CurrentWorldName.IsEmpty() ? FString(TEXT("New World")) : CurrentWorldName;
-    return FPaths::Combine(PATH_ROOT, WorldName).Append(FileName);
+    const FString WorldRootPath = GetWorldRootPath();
+    return WorldRootPath.IsEmpty() ? FString() : WorldRootPath + FileName;
 }
 
 void UGameManagerSubSystem::ShowLoadingWidget()
@@ -2154,7 +2020,7 @@ void UGameManagerSubSystem::SpawnOcean()
     OceanActor = World->SpawnActor<AActor>(WaterClass, OceanTransform, SpawnParams);
 }
 
-void UGameManagerSubSystem::MainWorldStreaming(const FString& InModelDirectory, const FString& InInitialPlayerName)
+void UGameManagerSubSystem::MainWorldStreaming(const FString& InWorldRoot, const FString& InInitialPlayerName)
 {
     UWorld* World = GetWorld();
     if (!World)
@@ -2179,7 +2045,7 @@ void UGameManagerSubSystem::MainWorldStreaming(const FString& InModelDirectory, 
     StreamSubSystem->StartMainWorldStreaming(
         ConfigActor.Get(),
         EffectiveSpawnClass,
-        InModelDirectory,
+        InWorldRoot,
         InInitialPlayerName,
         bRenderOnlyStreaming);
 }
@@ -2299,6 +2165,11 @@ void UGameManagerSubSystem::ClearTransientRuntimeReferences()
 
 void UGameManagerSubSystem::EnsureAssetFolders() const
 {
+    if (GetWorldRootPath().IsEmpty())
+    {
+        UE_LOG(LogTemp, Error, TEXT("Asset-folder creation skipped because the explicit world root is empty."));
+        return;
+    }
     IFileManager::Get().MakeDirectory(*GetModelDirectory(), true);
     IFileManager::Get().MakeDirectory(*GetDataDirectory(), true);
     IFileManager::Get().MakeDirectory(*FPaths::Combine(GetWorldRootPath(), TEXT("cache")), true);
@@ -2306,23 +2177,27 @@ void UGameManagerSubSystem::EnsureAssetFolders() const
 
 FString UGameManagerSubSystem::GetWorldRootPath() const
 {
-    const FString WorldName = CurrentWorldName.IsEmpty() ? FString(TEXT("New World")) : CurrentWorldName;
-    return FPaths::Combine(PATH_ROOT, WorldName);
+    FString WorldName = CurrentWorldName;
+    WorldName.TrimStartAndEndInline();
+    return WorldName.IsEmpty() ? FString() : FPaths::Combine(PATH_ROOT, WorldName);
 }
 
 FString UGameManagerSubSystem::GetModelDirectory() const
 {
-    return FPaths::Combine(GetWorldRootPath(), TEXT("model"));
+    const FString WorldRootPath = GetWorldRootPath();
+    return WorldRootPath.IsEmpty() ? FString() : FPaths::Combine(WorldRootPath, TEXT("model"));
 }
 
 FString UGameManagerSubSystem::GetDataDirectory() const
 {
-    return FPaths::Combine(GetWorldRootPath(), TEXT("data"));
+    const FString WorldRootPath = GetWorldRootPath();
+    return WorldRootPath.IsEmpty() ? FString() : FPaths::Combine(WorldRootPath, TEXT("data"));
 }
 
 FString UGameManagerSubSystem::GetLevelDatPath() const
 {
-    return FPaths::Combine(GetDataDirectory(), TEXT("level.dat"));
+    const FString DataDirectory = GetDataDirectory();
+    return DataDirectory.IsEmpty() ? FString() : FPaths::Combine(DataDirectory, TEXT("level.dat"));
 }
 void UGameManagerSubSystem::ScheduleSavedSceneLoadRetry(
     const FString& Reason,
@@ -2347,7 +2222,7 @@ void UGameManagerSubSystem::ScheduleSavedSceneLoadRetry(
         // replacing an unreadable/non-applied chunk with an empty generation during shutdown.
         bSavedSceneLoadFailed = true;
         UE_LOG(LogTemp, Error,
-            TEXT("Entity DAT restore failed after %d attempts. World=%s Phase=%s Reason=%s"),
+            TEXT("World-object DAT restore failed after %d attempts. World=%s Phase=%s Reason=%s"),
             AttemptCount,
             *GetWorldRootPath(),
             bWaitingForWorldReadiness ? TEXT("world-readiness") : TEXT("DAT-validation/apply"),
@@ -2360,7 +2235,7 @@ void UGameManagerSubSystem::ScheduleSavedSceneLoadRetry(
     {
         bSavedSceneLoadFailed = true;
         UE_LOG(LogTemp, Error,
-            TEXT("Entity DAT load could not be retried because the world is unavailable: %s"),
+            TEXT("World-object DAT load could not be retried because the world is unavailable: %s"),
             *Reason);
         return;
     }
@@ -2379,7 +2254,7 @@ void UGameManagerSubSystem::ScheduleSavedSceneLoadRetry(
         SavedSceneLoadRetryDelaySeconds,
         false);
     UE_LOG(LogTemp, Warning,
-        TEXT("Entity DAT load will retry. Phase=%s Attempt=%d/%d Reason=%s"),
+        TEXT("World-object DAT load will retry. Phase=%s Attempt=%d/%d Reason=%s"),
         bWaitingForWorldReadiness ? TEXT("world-readiness") : TEXT("DAT-validation/apply"),
         AttemptCount,
         MaximumAttempts,
@@ -3449,12 +3324,6 @@ FString UGameManagerSubSystem::MakeObjectName(const FString& BaseName, EPlacedOb
     }
     return FString::Printf(TEXT("%s;INST_%d"), *SafeBaseName, ExistingCount);
 }
-void UGameManagerSubSystem::InputPrimaryAction()
-{
-    InputPrimaryPressed();
-    InputPrimaryReleased();
-}
-
 void UGameManagerSubSystem::InputPrimaryPressed()
 {
     if (bItemListWindowOpen)
@@ -3527,11 +3396,6 @@ void UGameManagerSubSystem::InputPrimaryPressed()
     NotifyStateChanged();
 }
 
-void UGameManagerSubSystem::InputPrimaryReleased()
-{
-    // Stable endpoint retained for existing input mappings. Placement is edge-triggered on press.
-}
-
 void UGameManagerSubSystem::InputSecondaryAction()
 {
     // Stable endpoint retained for existing input mappings.
@@ -3595,7 +3459,7 @@ void UGameManagerSubSystem::InputVehicleSteeringAction(float Steering)
 
 void UGameManagerSubSystem::SelectCurrentTraceLocation()
 {
-    InputPrimaryAction();
+    InputPrimaryPressed();
 }
 
 void UGameManagerSubSystem::ConfirmCurrentPendingLocation()
@@ -3646,7 +3510,7 @@ void UGameManagerSubSystem::PlaceCurrentPrefab(const FVector& Location)
             ? GetGameInstance()->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
         UWorldObjectStreamingSubsystem* Chunks = GetWorld()
             ? GetWorld()->GetSubsystem<UWorldObjectStreamingSubsystem>() : nullptr;
-        if (!Database || !Chunks || !Database->FindIdForGlb(SourceFile, UUID)
+        if (!Database || !Chunks || !Database->FindUUIDForGlb(SourceFile, UUID)
             || !Chunks->RegisterPlacedObject(Actor, UUID))
         {
             Actor->Destroy();
@@ -3723,7 +3587,7 @@ void UGameManagerSubSystem::PlaceVehicle(const FVector& Location, const FString&
         ? GetGameInstance()->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
     UWorldObjectStreamingSubsystem* Chunks = GetWorld()
         ? GetWorld()->GetSubsystem<UWorldObjectStreamingSubsystem>() : nullptr;
-    if (!Database || !Chunks || !Database->FindIdForGlb(NormalizedSourceFile, UUID)
+    if (!Database || !Chunks || !Database->FindUUIDForGlb(NormalizedSourceFile, UUID)
         || !Chunks->RegisterPlacedObject(Vehicle, UUID))
     {
         SpawnedVehicles.Pop(EAllowShrinking::No);
@@ -4059,7 +3923,7 @@ bool UGameManagerSubSystem::LoadSavedScene()
         return false;
     }
     if (!Chunks->IsInitialAreaReady()) return false;
-    // Missing UUIDs remain in db_x_y_z.dat and are intentionally ignored, never deleted.
+    // Missing UUIDs remain in their prefab/entity DAT files and are intentionally ignored.
     bSavedSceneLoadInProgress = false;
     bSavedSceneLoaded = true;
     bSavedSceneLoadFailed = false;

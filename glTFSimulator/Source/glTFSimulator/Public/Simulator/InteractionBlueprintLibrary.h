@@ -13,7 +13,7 @@ class GLTFSIMULATOR_API USimulatorInteractionBlueprintLibrary final : public UBl
 {
     GENERATED_BODY()
 public:
-    /** Attaches equipment to the resolved hand and updates SimulatorInteractionAnimInstance. */
+    /** Attaches equipment directly to the resolved character hand socket. */
     UFUNCTION(BlueprintCallable, Category="Interaction|Equipment")
     static bool EquipActor(ACharacter* Character, AActor* Equipment, const FSimulatorCharacterInteractionConfig& CharacterConfig,
         const FSimulatorEquipmentInteractionConfig& EquipmentConfig, FString& OutError);

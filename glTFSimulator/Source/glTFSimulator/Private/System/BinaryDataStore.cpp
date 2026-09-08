@@ -26,7 +26,7 @@ namespace BinaryDataStorePrivate
     constexpr int32 MaxChunkObjects = 1000000;
     constexpr int32 MaxDatabaseEntries = 1000000;
     constexpr uint32 ModelCacheMagic = 0x3148434Du; // "MCH1" in little-endian byte order.
-    constexpr uint16 ModelCacheVersion = 2;
+    constexpr uint16 ModelCacheVersion = 3;
     constexpr uint16 ModelCacheCodecZlib = 1;
 
     enum class EDatKind : uint16
@@ -34,7 +34,8 @@ namespace BinaryDataStorePrivate
         Model = 1,
         WorldChunk = 2,
         ModelDatabase = 3,
-        Level = 4
+        Level = 4,
+        SceneDatabase = 5
     };
 
     static bool IsFiniteVector(const FVector& Value)
@@ -51,20 +52,6 @@ namespace BinaryDataStorePrivate
             FMath::IsFinite(Value.Y) &&
             FMath::IsFinite(Value.Z) &&
             FMath::IsFinite(Value.W);
-    }
-
-    static bool IsFiniteTransform(const FTransform& Value)
-    {
-        const FQuat Rotation = Value.GetRotation();
-        const FVector Scale = Value.GetScale3D();
-        return !Value.ContainsNaN() &&
-            IsFiniteVector(Value.GetLocation()) &&
-            IsFiniteVector(Scale) &&
-            IsFiniteQuat(Rotation) &&
-            Rotation.IsNormalized() &&
-            FMath::Abs(Scale.X) <= 1000000.0 &&
-            FMath::Abs(Scale.Y) <= 1000000.0 &&
-            FMath::Abs(Scale.Z) <= 1000000.0;
     }
 
     class FWriter
@@ -157,13 +144,6 @@ namespace BinaryDataStorePrivate
             WriteDouble(Value.Y);
             WriteDouble(Value.Z);
             WriteDouble(Value.W);
-        }
-
-        void WriteTransform(const FTransform& Value)
-        {
-            WriteVector(Value.GetLocation());
-            WriteQuat(Value.GetRotation());
-            WriteVector(Value.GetScale3D());
         }
 
         void WriteGuid(const FGuid& Value)
@@ -288,26 +268,6 @@ namespace BinaryDataStorePrivate
             const double Z = ReadDouble();
             const double W = ReadDouble();
             return FQuat(X, Y, Z, W);
-        }
-
-        FTransform ReadTransform()
-        {
-            const FVector Location = ReadVector();
-            FQuat Rotation = ReadQuat();
-            const FVector Scale = ReadVector();
-            if (bOk)
-            {
-                if (!IsFiniteQuat(Rotation) || Rotation.SizeSquared() <= SMALL_NUMBER)
-                {
-                    bOk = false;
-                    Rotation = FQuat::Identity;
-                }
-                else if (!Rotation.IsNormalized())
-                {
-                    Rotation.Normalize();
-                }
-            }
-            return FTransform(Rotation, Location, Scale);
         }
 
         FGuid ReadGuid()
@@ -439,40 +399,9 @@ namespace BinaryDataStorePrivate
         return Result;
     }
 
-    static void RestoreValidatedDatPrimaryBestEffort(
-        const FString& NormalizedPath,
-        const TArray<uint8>& ValidatedBytes,
-        const int64 MaxBytes)
-    {
-        IFileManager& FileManager = IFileManager::Get();
-        if (FileManager.FileExists(*NormalizedPath) &&
-            !FileManager.Delete(*NormalizedPath, false, true, true))
-        {
-            UE_LOG(LogTemp, Warning,
-                TEXT("Validated DAT backup was loaded but the corrupt primary could not be removed. Path=%s"),
-                *NormalizedPath);
-            return;
-        }
-
-        const FSafeFileWriteResult RestoreResult =
-            FSafeFileIO::SaveBinaryBlocking(ValidatedBytes, NormalizedPath, MaxBytes);
-        if (!RestoreResult.IsSuccess())
-        {
-            UE_LOG(LogTemp, Warning,
-                TEXT("Validated DAT backup was loaded but could not be restored as the primary. Path=%s Reason=%s"),
-                *NormalizedPath,
-                *RestoreResult.Error);
-        }
-    }
-
-    /**
-     * FSafeFileIO can recover a binary backup when the primary cannot be read. DAT files also have
-     * a schema and CRC, so a readable-but-corrupt primary needs one additional semantic fallback.
-     * Every deserializer used here publishes its destination only after complete validation, making
-     * it safe to call the parser again with the backup bytes.
-     */
+    /** Reads exactly one primary DAT and publishes data only after schema/length/CRC validation. */
     template <typename ParseFunction>
-    static bool LoadValidatedDatWithBackup(
+    static bool LoadValidatedDat(
         const FString& DatPath,
         const int64 MaxBytes,
         ParseFunction&& Parse,
@@ -485,47 +414,7 @@ namespace BinaryDataStorePrivate
             OutError = Primary.Error;
             return false;
         }
-
-        FString PrimaryValidationError;
-        if (Parse(Primary.Data, PrimaryValidationError))
-        {
-            if (Primary.Status == ESafeFileIOStatus::RecoveredFromBackup)
-            {
-                RestoreValidatedDatPrimaryBestEffort(NormalizedPath, Primary.Data, MaxBytes);
-            }
-            OutError.Reset();
-            return true;
-        }
-
-        // LoadBinaryBlocking already returned the backup when the primary read itself failed.
-        // In that case there is no other committed generation to try.
-        if (Primary.Status == ESafeFileIOStatus::RecoveredFromBackup)
-        {
-            OutError = FString::Printf(
-                TEXT("Recovered DAT backup also failed semantic validation: %s"),
-                *PrimaryValidationError);
-            return false;
-        }
-
-        const FString BackupPath = NormalizedPath + TEXT(".bak");
-        const FSafeBinaryLoadResult Backup = FSafeFileIO::LoadBinaryBlocking(BackupPath, MaxBytes);
-        FString BackupValidationError;
-        if (Backup.IsSuccess() && Parse(Backup.Data, BackupValidationError))
-        {
-            UE_LOG(LogTemp, Warning,
-                TEXT("Primary DAT failed validation and the last committed backup was used. Path=%s Reason=%s"),
-                *NormalizedPath,
-                *PrimaryValidationError);
-            RestoreValidatedDatPrimaryBestEffort(NormalizedPath, Backup.Data, MaxBytes);
-            OutError.Reset();
-            return true;
-        }
-
-        OutError = FString::Printf(
-            TEXT("Primary DAT validation failed (%s); backup validation failed (%s)"),
-            *PrimaryValidationError,
-            Backup.IsSuccess() ? *BackupValidationError : *Backup.Error);
-        return false;
+        return Parse(Primary.Data, OutError);
     }
 }
 
@@ -536,12 +425,12 @@ bool FModelCacheData::IsSane() const
         || DefinitionJson.Len() > MaxStringBytes ||
         !IsFiniteVector(Center) || !IsFiniteVector(Extent) ||
         Extent.X < 0.0 || Extent.Y < 0.0 || Extent.Z < 0.0 ||
-        MeshExtents.Num() < 0 || MeshExtents.Num() > MaxModelMeshes)
+        MeshSizes.Num() < 0 || MeshSizes.Num() > MaxModelMeshes)
     {
         return false;
     }
 
-    for (const TPair<FName, FVector>& Pair : MeshExtents)
+    for (const TPair<FName, FVector>& Pair : MeshSizes)
     {
         if (Pair.Key.IsNone() || !IsFiniteVector(Pair.Value) ||
             Pair.Value.X < 0.0 || Pair.Value.Y < 0.0 || Pair.Value.Z < 0.0)
@@ -614,7 +503,7 @@ bool FBinaryDataStore::SerializeModelCache(const FModelCacheData& Cache, TArray<
     RawWriter.WriteVector(Cache.Extent);
 
     TArray<FName> Keys;
-    Cache.MeshExtents.GetKeys(Keys);
+    Cache.MeshSizes.GetKeys(Keys);
     Keys.Sort([](const FName A, const FName B)
     {
         return A.LexicalLess(B);
@@ -623,7 +512,7 @@ bool FBinaryDataStore::SerializeModelCache(const FModelCacheData& Cache, TArray<
     for (const FName Key : Keys)
     {
         RawWriter.WriteString(Key.ToString(), MaxNameBytes);
-        RawWriter.WriteVector(Cache.MeshExtents.FindChecked(Key));
+        RawWriter.WriteVector(Cache.MeshSizes.FindChecked(Key));
     }
     if (!RawWriter.IsOk() || RawPayload.IsEmpty() ||
         static_cast<int64>(RawPayload.Num()) > MaxModelCacheRawBytes)
@@ -751,19 +640,19 @@ bool FBinaryDataStore::DeserializeModelCache(const TArray<uint8>& Bytes, FModelC
         return false;
     }
 
-    Parsed.MeshExtents.Reserve(static_cast<int32>(Count));
+    Parsed.MeshSizes.Reserve(static_cast<int32>(Count));
     for (uint32 Index = 0; Index < Count; ++Index)
     {
         const FString Name = Reader.ReadString(MaxNameBytes).TrimStartAndEnd();
-        const FVector Extent = Reader.ReadVector();
+        const FVector Size = Reader.ReadVector();
         const FName Key(*Name);
-        if (!Reader.IsOk() || Key.IsNone() || Parsed.MeshExtents.Contains(Key) ||
-            !IsFiniteVector(Extent) || Extent.X < 0.0 || Extent.Y < 0.0 || Extent.Z < 0.0)
+        if (!Reader.IsOk() || Key.IsNone() || Parsed.MeshSizes.Contains(Key) ||
+            !IsFiniteVector(Size) || Size.X < 0.0 || Size.Y < 0.0 || Size.Z < 0.0)
         {
-            OutError = TEXT("Model cache contains an invalid or duplicate mesh extent entry");
+            OutError = TEXT("Model cache contains an invalid or duplicate full mesh-size entry");
             return false;
         }
-        Parsed.MeshExtents.Add(Key, Extent);
+        Parsed.MeshSizes.Add(Key, Size);
     }
 
     if (!Reader.IsAtEnd() || !Parsed.IsSane())
@@ -784,7 +673,7 @@ bool FBinaryDataStore::LoadModelCache(
 {
     bOutHashMismatch = false;
     OutCache = FModelCacheData();
-    if (!BinaryDataStorePrivate::LoadValidatedDatWithBackup(
+    if (!BinaryDataStorePrivate::LoadValidatedDat(
             CachePath,
             MaxModelCacheBytes,
             [&OutCache](const TArray<uint8>& Bytes, FString& ValidationError)
@@ -828,7 +717,7 @@ bool FBinaryDataStore::InvalidateCacheFile(const FString& CachePath, FString& Ou
 
     IFileManager& FileManager = IFileManager::Get();
     bool bOk = true;
-    const TArray<FString> DirectPaths = { Normalized, Normalized + TEXT(".bak") };
+    const TArray<FString> DirectPaths = { Normalized };
     for (const FString& Path : DirectPaths)
     {
         if (FileManager.FileExists(*Path) && !FileManager.Delete(*Path, false, true, true))
@@ -946,7 +835,7 @@ bool FBinaryDataStore::DeserializeWorldChunk(
 
 bool FBinaryDataStore::LoadWorldChunk(const FString& DatPath, TArray<FWorldChunkObject>& OutObjects, FString& OutError)
 {
-    return BinaryDataStorePrivate::LoadValidatedDatWithBackup(
+    return BinaryDataStorePrivate::LoadValidatedDat(
         DatPath, MaxWorldChunkDatBytes,
         [&OutObjects](const TArray<uint8>& Bytes, FString& Error)
         {
@@ -963,8 +852,7 @@ void FBinaryDataStore::LoadWorldChunkAsync(
     {
         TArray<FWorldChunkObject> Objects;
         FString Error;
-        const bool bMissing = !IFileManager::Get().FileExists(*SafePath)
-            && !IFileManager::Get().FileExists(*(SafePath + TEXT(".bak")));
+        const bool bMissing = !IFileManager::Get().FileExists(*SafePath);
         const bool bLoaded = bMissing || LoadWorldChunk(SafePath, Objects, Error);
         FSafeFileIO::DispatchTrackedGameThread(
             [Callback = MoveTemp(Callback), bLoaded, Objects = MoveTemp(Objects), Error = MoveTemp(Error)]() mutable
@@ -1076,7 +964,7 @@ bool FBinaryDataStore::DeserializeModelDatabase(
 
 bool FBinaryDataStore::LoadModelDatabase(const FString& DatPath, TArray<FModelDatabaseEntry>& OutEntries, FString& OutError)
 {
-    return BinaryDataStorePrivate::LoadValidatedDatWithBackup(
+    return BinaryDataStorePrivate::LoadValidatedDat(
         DatPath, MaxModelDatabaseDatBytes,
         [&OutEntries](const TArray<uint8>& Bytes, FString& Error)
         {
@@ -1103,6 +991,154 @@ void FBinaryDataStore::SaveModelDatabaseAsync(const FString& DatPath, const TArr
         return;
     }
     FSafeFileIO::SaveBinaryAsync(Bytes, DatPath, MaxModelDatabaseDatBytes, MoveTemp(Callback));
+}
+
+bool FBinaryDataStore::SerializeSceneDatabase(
+    const TArray<FSceneDatabaseEntry>& Entries,
+    TArray<uint8>& OutBytes,
+    FString& OutError)
+{
+    using namespace BinaryDataStorePrivate;
+    if (Entries.Num() > MaxDatabaseEntries)
+    {
+        OutError = TEXT("Scene database exceeds the row-count safety limit");
+        return false;
+    }
+
+    TArray<FSceneDatabaseEntry> Sorted = Entries;
+    Sorted.Sort([](const FSceneDatabaseEntry& A, const FSceneDatabaseEntry& B)
+    {
+        return A.UUID.ToString(EGuidFormats::Digits).Compare(
+            B.UUID.ToString(EGuidFormats::Digits), ESearchCase::CaseSensitive) < 0;
+    });
+
+    TArray<uint8> Payload;
+    FWriter Writer(Payload);
+    Writer.WriteU32(static_cast<uint32>(Sorted.Num()));
+    TSet<FGuid> Seen;
+    for (const FSceneDatabaseEntry& Entry : Sorted)
+    {
+        if (!Entry.UUID.IsValid() || Seen.Contains(Entry.UUID)
+            || !IsFiniteVector(Entry.Location) || !IsFiniteVector(Entry.Size)
+            || Entry.Size.X < 0.0 || Entry.Size.Y < 0.0 || Entry.Size.Z < 0.0
+            || Entry.Size.IsNearlyZero(0.001))
+        {
+            OutError = TEXT("Scene database contains a duplicate UUID or invalid bounds");
+            return false;
+        }
+        Seen.Add(Entry.UUID);
+        Writer.WriteGuid(Entry.UUID);
+        Writer.WriteVector(Entry.Location);
+        Writer.WriteVector(Entry.Size);
+    }
+    return Writer.IsOk() && BuildEnvelope(EDatKind::SceneDatabase, Payload, OutBytes, OutError);
+}
+
+bool FBinaryDataStore::DeserializeSceneDatabase(
+    const TArray<uint8>& Bytes,
+    TArray<FSceneDatabaseEntry>& OutEntries,
+    FString& OutError)
+{
+    using namespace BinaryDataStorePrivate;
+    TArray<uint8> Payload;
+    if (!ExtractPayload(Bytes, EDatKind::SceneDatabase, Payload, OutError)) return false;
+
+    FReader Reader(Payload);
+    const uint32 Count = Reader.ReadU32();
+    if (!Reader.IsOk() || Count > static_cast<uint32>(MaxDatabaseEntries))
+    {
+        OutError = TEXT("Scene database row count is invalid");
+        return false;
+    }
+
+    TArray<FSceneDatabaseEntry> Parsed;
+    TSet<FGuid> Seen;
+    Parsed.Reserve(static_cast<int32>(Count));
+    for (uint32 Index = 0; Index < Count; ++Index)
+    {
+        FSceneDatabaseEntry& Entry = Parsed.AddDefaulted_GetRef();
+        Entry.UUID = Reader.ReadGuid();
+        Entry.Location = Reader.ReadVector();
+        Entry.Size = Reader.ReadVector();
+        if (!Reader.IsOk() || !Entry.UUID.IsValid() || Seen.Contains(Entry.UUID)
+            || !IsFiniteVector(Entry.Location) || !IsFiniteVector(Entry.Size)
+            || Entry.Size.X < 0.0 || Entry.Size.Y < 0.0 || Entry.Size.Z < 0.0
+            || Entry.Size.IsNearlyZero(0.001))
+        {
+            OutError = FString::Printf(TEXT("Invalid scene database row at index %u"), Index);
+            return false;
+        }
+        Seen.Add(Entry.UUID);
+    }
+    if (!Reader.IsAtEnd())
+    {
+        OutError = TEXT("Scene database is truncated or has trailing bytes");
+        return false;
+    }
+    OutEntries = MoveTemp(Parsed);
+    return true;
+}
+
+bool FBinaryDataStore::LoadSceneDatabase(
+    const FString& DatPath,
+    TArray<FSceneDatabaseEntry>& OutEntries,
+    FString& OutError)
+{
+    return BinaryDataStorePrivate::LoadValidatedDat(
+        DatPath, MaxSceneDatabaseDatBytes,
+        [&OutEntries](const TArray<uint8>& Bytes, FString& Error)
+        {
+            return DeserializeSceneDatabase(Bytes, OutEntries, Error);
+        }, OutError);
+}
+
+void FBinaryDataStore::LoadSceneDatabaseAsync(
+    const FString& DatPath,
+    TFunction<void(bool, bool, TArray<FSceneDatabaseEntry>, FString)> Callback)
+{
+    const FString SafePath = FSafeFileIO::NormalizeFilePath(DatPath);
+    const bool bQueued = FSafeFileIO::RunTrackedWorker([SafePath, Callback]() mutable
+    {
+        TArray<FSceneDatabaseEntry> Entries;
+        FString Error;
+        const bool bMissing = !IFileManager::Get().FileExists(*SafePath);
+        const bool bLoaded = bMissing || LoadSceneDatabase(SafePath, Entries, Error);
+        FSafeFileIO::DispatchTrackedGameThread(
+            [Callback = MoveTemp(Callback), bLoaded, bMissing, Entries = MoveTemp(Entries), Error = MoveTemp(Error)]() mutable
+            {
+                if (Callback) Callback(bLoaded, bMissing, MoveTemp(Entries), MoveTemp(Error));
+            });
+    });
+    if (!bQueued && Callback)
+    {
+        Callback(false, false, TArray<FSceneDatabaseEntry>(), TEXT("async I/O queue is shutting down"));
+    }
+}
+
+FSafeFileWriteResult FBinaryDataStore::SaveSceneDatabaseBlocking(
+    const FString& DatPath,
+    const TArray<FSceneDatabaseEntry>& Entries)
+{
+    TArray<uint8> Bytes;
+    FString Error;
+    if (!SerializeSceneDatabase(Entries, Bytes, Error))
+        return BinaryDataStorePrivate::MakeSerializationFailure(DatPath, Error);
+    return FSafeFileIO::SaveBinaryBlocking(Bytes, DatPath, MaxSceneDatabaseDatBytes);
+}
+
+void FBinaryDataStore::SaveSceneDatabaseAsync(
+    const FString& DatPath,
+    const TArray<FSceneDatabaseEntry>& Entries,
+    FSafeFileIO::FWriteCallback Callback)
+{
+    TArray<uint8> Bytes;
+    FString Error;
+    if (!SerializeSceneDatabase(Entries, Bytes, Error))
+    {
+        if (Callback) Callback(BinaryDataStorePrivate::MakeSerializationFailure(DatPath, Error));
+        return;
+    }
+    FSafeFileIO::SaveBinaryAsync(Bytes, DatPath, MaxSceneDatabaseDatBytes, MoveTemp(Callback));
 }
 
 bool FBinaryDataStore::SerializeLevel(const FLevelRuntimeData& Data, TArray<uint8>& OutBytes, FString& OutError)
@@ -1214,7 +1250,7 @@ bool FBinaryDataStore::DeserializeLevel(const TArray<uint8>& Bytes, FLevelRuntim
 
 bool FBinaryDataStore::LoadLevel(const FString& DatPath, FLevelRuntimeData& OutData, FString& OutError)
 {
-    return BinaryDataStorePrivate::LoadValidatedDatWithBackup(
+    return BinaryDataStorePrivate::LoadValidatedDat(
         DatPath, MaxLevelDatBytes,
         [&OutData](const TArray<uint8>& Bytes, FString& Error)
         {

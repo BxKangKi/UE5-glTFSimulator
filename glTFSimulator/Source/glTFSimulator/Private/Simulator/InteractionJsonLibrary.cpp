@@ -6,21 +6,6 @@ namespace
 {
     constexpr int32 SupportedInteractionSchemaVersion = 1;
 
-    void SanitizeFullBodyIK(FSimulatorFullBodyIKConfig& Config)
-    {
-        Config.TransformInterpSpeed = FMath::Max(0.001f, Config.TransformInterpSpeed);
-        Config.AlphaInterpSpeed = FMath::Max(0.001f, Config.AlphaInterpSpeed);
-        Config.MaxArmStretchRatio = FMath::Clamp(Config.MaxArmStretchRatio, 0.0f, 2.0f);
-        Config.MaxSpineYawDegrees = FMath::Clamp(Config.MaxSpineYawDegrees, 0.0f, 90.0f);
-        Config.MaxSpinePitchDegrees = FMath::Clamp(Config.MaxSpinePitchDegrees, 0.0f, 90.0f);
-        Config.MaxTurnLeanDegrees = FMath::Clamp(Config.MaxTurnLeanDegrees, 0.0f, 45.0f);
-        Config.MaxMoveLeanDegrees = FMath::Clamp(Config.MaxMoveLeanDegrees, 0.0f, 45.0f);
-        Config.PelvisWeight = FMath::Clamp(Config.PelvisWeight, 0.0f, 1.0f);
-        Config.SpineWeight = FMath::Clamp(Config.SpineWeight, 0.0f, 1.0f);
-        Config.ShoulderWeight = FMath::Clamp(Config.ShoulderWeight, 0.0f, 1.0f);
-        Config.MaxYawRateForFullLean = FMath::Max(0.0f, Config.MaxYawRateForFullLean);
-    }
-
     bool ValidateSchemaVersion(const int32 SchemaVersion, FString& OutError)
     {
         if (SchemaVersion <= 0)
@@ -86,7 +71,6 @@ bool USimulatorInteractionJsonLibrary::ParseCharacterInteractionJson(
         return false;
     }
 
-    SanitizeFullBodyIK(Parsed.FullBodyIK);
     OutConfig = MoveTemp(Parsed);
     return true;
 }
@@ -108,7 +92,6 @@ bool USimulatorInteractionJsonLibrary::ParseEquipmentInteractionJson(
     }
 
     Parsed.Sanitize();
-    SanitizeFullBodyIK(Parsed.FullBodyIK);
     OutConfig = MoveTemp(Parsed);
     return true;
 }
@@ -122,7 +105,6 @@ bool USimulatorInteractionJsonLibrary::CharacterInteractionToJson(
     {
         Sanitized.SchemaVersion = SupportedInteractionSchemaVersion;
     }
-    SanitizeFullBodyIK(Sanitized.FullBodyIK);
     return StructToJson(Sanitized, OutJson);
 }
 
@@ -136,6 +118,5 @@ bool USimulatorInteractionJsonLibrary::EquipmentInteractionToJson(
         Sanitized.SchemaVersion = SupportedInteractionSchemaVersion;
     }
     Sanitized.Sanitize();
-    SanitizeFullBodyIK(Sanitized.FullBodyIK);
     return StructToJson(Sanitized, OutJson);
 }

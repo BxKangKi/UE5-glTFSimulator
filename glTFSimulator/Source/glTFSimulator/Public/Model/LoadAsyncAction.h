@@ -105,7 +105,7 @@ private:
     FString CurrentModelHash;
     /** Immutable JSON snapshot copied on the worker and embedded in the binary cache. */
     FString CurrentDefinitionJson;
-    bool bUseCachedMeshExtents = false;
+    bool bUseCachedMeshSizes = false;
     bool bModelCacheDirty = false;
 
     // Immutable source/settings/cache paths used by asynchronous metadata processing.

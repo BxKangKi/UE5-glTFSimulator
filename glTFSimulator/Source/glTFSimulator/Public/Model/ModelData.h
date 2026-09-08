@@ -133,7 +133,7 @@ struct FModelMeshData
     UPROPERTY()
     FMeshData Data;
 
-    /** Unscaled local-space mesh half size loaded from or written to the extensionless model cache. */
+    /** Unscaled local-space mesh half size; the cache stores the corresponding full Size. */
     UPROPERTY()
     FVector Extent = FVector::ZeroVector;
 

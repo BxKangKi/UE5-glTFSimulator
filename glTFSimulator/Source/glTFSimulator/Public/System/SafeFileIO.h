@@ -100,8 +100,7 @@ struct GLTFSIMULATOR_API FSafeBinaryLoadResult
 
     bool IsSuccess() const
     {
-        return Status == ESafeFileIOStatus::Success ||
-            Status == ESafeFileIOStatus::RecoveredFromBackup;
+        return Status == ESafeFileIOStatus::Success;
     }
 };
 
@@ -188,7 +187,7 @@ public:
     /** Reads a bounded binary file on a worker and returns on the game thread. */
     static void LoadBinaryAsync(const FString& Path, int64 MaxBytes, FBinaryLoadCallback Callback);
 
-    /** Atomically commits arbitrary bytes using the same temp + backup transaction as JSON. */
+    /** Commits arbitrary bytes through a flushed, verified temporary file without creating .bak. */
     static FSafeFileWriteResult SaveBinaryBlocking(
         const TArray<uint8>& Data,
         const FString& Path,

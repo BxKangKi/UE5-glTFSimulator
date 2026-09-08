@@ -254,7 +254,7 @@ public:
     void TrackStreamedWorldObject(AActor* Actor);
 
     /**
-     * Flushes dirty db_x_y_z.dat chunks, saves data/level.dat, and builds extensionless /cache files.
+     * Flushes dirty prefab/entity chunk files, saves data/level.dat, and builds extensionless /cache files.
      */
     UFUNCTION(BlueprintCallable, Category="Game|Bake")
     void BakeWorldData();
@@ -281,17 +281,9 @@ public:
     UFUNCTION(BlueprintCallable, Category="Game|UI Actions")
     bool SetCurrentWeaponIndex(int32 NewIndex);
 
-    /** Compatibility short-click action for the currently selected placement/equipment item. */
-    UFUNCTION(BlueprintCallable, Category="Game|Input")
-    void InputPrimaryAction();
-
     /** Left mouse pressed. Executes the selected placement/equipment action once. */
     UFUNCTION(BlueprintCallable, Category="Game|Input")
     void InputPrimaryPressed();
-
-    /** Left mouse released. Retained as a stable input-mapping endpoint. */
-    UFUNCTION(BlueprintCallable, Category="Game|Input")
-    void InputPrimaryReleased();
 
     /** Secondary action endpoint retained for project input mappings. */
     UFUNCTION(BlueprintCallable, Category="Game|Input")
@@ -442,19 +434,11 @@ public:
 
     /** Starts gameplay-owned model streaming and optional ocean actor creation. */
     UFUNCTION(BlueprintCallable, Category="Game|World")
-    void InitializeWorldSystems(UWorldData* InWorldData, const FString& InModelDirectory, const FString& InInitialPlayerName);
+    void InitializeWorldSystems(UWorldData* InWorldData, const FString& InWorldRoot, const FString& InInitialPlayerName);
 
     /** Stops world streaming and clears transient world actors created by this manager. */
     UFUNCTION(BlueprintCallable, Category="Game|World")
     void StopWorldSystems();
-
-    /** Saves the active scene, stops runtime streaming, and marks a full purge for menu/world-selection level travel. */
-    UFUNCTION(BlueprintCallable, Category="Game|Lifecycle")
-    void PrepareForReturnToMenuLevel();
-
-    /** MainWorld-specific entry point that shares the common menu-travel cleanup path. */
-    UFUNCTION(BlueprintCallable, Category="Game|Lifecycle")
-    void PrepareForReturnToMainWorld();
 
     /** Releases runtime main-world actors/assets that can otherwise survive a level transition through GameInstance subsystems. */
     UFUNCTION(BlueprintCallable, Category="Game|Lifecycle")
@@ -737,7 +721,7 @@ private:
     bool bToolbarInitialized = false;
     FVector LastPreviewLocation = FVector::ZeroVector;
     FString LastSaveMessage;
-    /** True after the initial-radius db_x_y_z.dat set has been validated and applied. */
+    /** True after the initial-radius prefab/entity chunk pairs have been validated and applied. */
     bool bSavedSceneLoaded = false;
     bool bSavedSceneLoadInProgress = false;
     /** Records an initial chunk validation failure without modifying its committed generation. */
@@ -816,7 +800,7 @@ private:
     int32 FindAvailableItemIndexMatching(const FToolbarItem& Item) const;
     bool ShouldSpawnOcean() const;
     void SpawnOcean();
-    void MainWorldStreaming(const FString& InModelDirectory, const FString& InInitialPlayerName);
+    void MainWorldStreaming(const FString& InWorldRoot, const FString& InInitialPlayerName);
     void InitializeWorldBootstrap();
     void SpawnWorldEnvManager();
     bool CheckWorldSystemsLoaded();

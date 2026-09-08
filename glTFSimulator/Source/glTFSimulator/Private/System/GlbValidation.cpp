@@ -1386,9 +1386,10 @@ bool GlbValidation::ValidateFile(const FString& FilePath, FString& OutReason)
         OutReason = TEXT("empty path");
         return false;
     }
-    if (!FPaths::GetExtension(NormalizedPath).Equals(TEXT("glb"), ESearchCase::IgnoreCase))
+    if (!FPaths::GetExtension(NormalizedPath).Equals(TEXT("glb"), ESearchCase::IgnoreCase) &&
+        !NormalizedPath.EndsWith(TEXT(".inst.glb"), ESearchCase::IgnoreCase))
     {
-        OutReason = TEXT("file extension is not .glb");
+        OutReason = TEXT("file extension is not .glb or .inst.glb");
         return false;
     }
 
@@ -1483,6 +1484,11 @@ bool GlbValidation::ValidateFile(const FString& FilePath, FString& OutReason)
 bool GlbValidation::ValidateRuntimeMeshFile(const FString& FilePath, FString& OutReason)
 {
     const FString NormalizedPath = NormalizePath(FilePath);
+    if (NormalizedPath.EndsWith(TEXT(".inst.glb"), ESearchCase::IgnoreCase))
+    {
+        OutReason = TEXT("placement-only .inst.glb files are forbidden from mesh generation");
+        return false;
+    }
     const FString ValidationCacheKey = MakeRuntimeValidationCacheKey(NormalizedPath);
     const int64 FileSize = IFileManager::Get().FileSize(*NormalizedPath);
     const FDateTime Timestamp = IFileManager::Get().GetTimeStamp(*NormalizedPath);

@@ -10,7 +10,7 @@ namespace GlbValidation
     /** Converts a supplied file path to a normalized absolute path. */
     GLTFSIMULATOR_API FString NormalizePath(const FString& FilePath);
 
-    /** Validates the outer GLB container and every chunk boundary without parsing mesh data. */
+    /** Validates the outer .glb or placement-only .inst.glb container without parsing mesh data. */
     GLTFSIMULATOR_API bool ValidateFile(const FString& FilePath, FString& OutReason);
 
     /**

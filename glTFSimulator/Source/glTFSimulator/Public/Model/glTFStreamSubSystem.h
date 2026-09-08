@@ -5,6 +5,7 @@
 
 #include "CoreMinimal.h"
 #include "Model/ModelData.h"
+#include "System/SceneDatabaseTypes.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "Templates/SubclassOf.h"
 #include "TimerManager.h"
@@ -31,7 +32,7 @@ public:
 
     virtual void Deinitialize() override;
 
-    void StartMainWorldStreaming(AActor* InOwnerActor, TSubclassOf<AglTFStreamActor> InSpawnActorClass, const FString& InModelDirectory, const FString& InInitialPlayerName, bool bInRenderOnlyStreaming = false);
+    void StartMainWorldStreaming(AActor* InOwnerActor, TSubclassOf<AglTFStreamActor> InSpawnActorClass, const FString& InWorldRoot, const FString& InInitialPlayerName, bool bInRenderOnlyStreaming = false);
     void StopMainWorldStreaming();
 
     bool AreInitialModelsReady() const;
@@ -69,6 +70,10 @@ private:
     TMap<FString, FFailedPlayerFileState> FailedPlayerPaths;
     TSet<FString> MetadataUnavailablePaths;
     TMap<FString, FModelData> ModelMetadataMap;
+    /** Scene UUID bounds loaded from and coalesced back to data/scenes.dat. */
+    TMap<FGuid, FSceneDatabaseEntry> SceneDatabaseEntries;
+    TMap<FGuid, FString> ScenePathByUUID;
+    TMap<FString, FGuid> SceneUUIDByPath;
     /** Monotonic preflight/actor progress for every discovered model path. */
     TMap<FString, float> InitialPathProgress;
     /** UI-facing progress is rate-limited once per frame so cached/skipped work remains visible. */
@@ -76,6 +81,8 @@ private:
     mutable uint64 LastLoadingProgressFrame = ~uint64(0);
 
     FString ModelDirectory;
+    /** Explicit normalized root; every runtime DAT path is derived from this value only. */
+    FString WorldRoot;
     FString InitialPlayerName;
     FString CurrentPlayerPath;
     FString PendingPlayerPath;
@@ -90,6 +97,11 @@ private:
     bool bPlayerActivated = false;
     bool bPendingPlayerIsInitialLoad = false;
     bool bRenderOnlyStreaming = false;
+    bool bSceneDatabaseReady = false;
+    bool bSceneDatabaseDirty = false;
+    bool bSceneDatabaseSaving = false;
+    uint64 SceneDatabaseRevision = 0;
+    uint64 SceneDatabaseSavingRevision = 0;
     /** Invalidates worker completions from a stopped/restarted streaming session. */
     int32 InitialScanGeneration = 0;
     /** Pure-data GLB/JSON preflight jobs currently running on the worker pool. */
@@ -108,6 +120,9 @@ private:
     FTimerHandle TimerHandle_WaitPlayer;
 
     void ProcessNextPathAsync();
+    void LoadSceneDatabaseIndexAsync();
+    void UpdateSceneDatabaseEntry(const FString& GlbPath, const FModelData& Metadata);
+    void BeginSceneDatabaseSave();
     void StartInitialPathPreflight(const FString& GlbPath, int32 ScanGeneration);
     void WaitForCurrentActorAsync();
     void UpdateStreamingAsync();

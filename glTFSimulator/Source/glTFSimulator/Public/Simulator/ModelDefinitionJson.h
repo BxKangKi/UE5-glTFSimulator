@@ -31,7 +31,7 @@ enum class EModelItemType : uint8
 /** Strict, immutable view of one author-owned model JSON document. */
 struct GLTFSIMULATOR_API FModelDefinition
 {
-    FGuid Id;
+    FGuid UUID;
     FString Name;
     FString DisplayName;
     FString GlbPath;
@@ -69,7 +69,7 @@ namespace ModelDefinitionJson
     GLTFSIMULATOR_API bool IsLoadableModelType(const FString& ModelType);
 
     /**
-     * Strictly validates a definition. Unknown/missing ModelType, invalid ID, mismatched subtype,
+     * Strictly validates a definition. Unknown/missing ModelType, invalid UUID, mismatched subtype,
      * and a character without a Bones object are rejected and logged by the caller.
      */
     GLTFSIMULATOR_API bool LoadDefinition(

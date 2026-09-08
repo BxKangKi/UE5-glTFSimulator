@@ -1045,7 +1045,6 @@ void APlayerCharacterController::BindFallbackKeyInputs()
     if (bBindMouseButtons)
     {
         InputComponent->BindKey(EKeys::LeftMouseButton, IE_Pressed, this, &APlayerCharacterController::Input_PrimaryPressed);
-        InputComponent->BindKey(EKeys::LeftMouseButton, IE_Released, this, &APlayerCharacterController::Input_PrimaryReleased);
         InputComponent->BindKey(EKeys::RightMouseButton, IE_Pressed, this, &APlayerCharacterController::Input_SecondaryPressed);
     }
 
@@ -1362,19 +1361,6 @@ void APlayerCharacterController::Input_PrimaryPressed()
     if (UGameManagerSubSystem* Manager = GetGameManager())
     {
         Manager->InputPrimaryPressed();
-    }
-}
-
-void APlayerCharacterController::Input_PrimaryReleased()
-{
-    if (bUIInputMode)
-    {
-        return;
-    }
-
-    if (UGameManagerSubSystem* Manager = GetGameManager())
-    {
-        Manager->InputPrimaryReleased();
     }
 }
 

@@ -3220,6 +3220,12 @@ void UCharacterComponent::DeactiveRagdoll(ACharacterController *InOwner, USkelet
 
     CapturedMeshLocation = UCharacterFunctionLibrary::GetBoneLocation(*SkeletalMesh, BONE_HIPS);
     CapturedMeshRotation = UCharacterFunctionLibrary::GetBoneRotation(*SkeletalMesh, BONE_HIPS);
+    bIsLieOnBack = CheckIfLieOnBack(SkeletalMesh);
+    const FRotator CurrentActorYaw = MakeFlatYawRotation(InOwner->GetActorRotation().Yaw);
+    const FRotator CurrentPoseRecoveryRotation = MakeFlatYawRotationNear(
+        GetMeshForwardYaw(bIsLieOnBack, SkeletalMesh, CurrentActorYaw.Yaw),
+        CurrentActorYaw);
+    ActorTargetRotation = CurrentPoseRecoveryRotation;
 
     AnimInst->SavePoseSnapshot(CharacterRagdollTuning::PoseSnapshotName);
 
@@ -3254,16 +3260,12 @@ void UCharacterComponent::DeactiveRagdoll(ACharacterController *InOwner, USkelet
         GetUpActiveTime = 0.0f;
         WaterRagdollRecoveryElapsed = 0.0f;
 
-        bIsLieOnBack = CheckIfLieOnBack(SkeletalMesh);
         WaterRecoveryActorStartLocation = InOwner->GetActorLocation();
         WaterRecoveryActorStartRotation = MakeFlatYawRotation(InOwner->GetActorRotation().Yaw);
         WaterRecoveryActorTargetLocation = GetRagdollRecoveryActorLocationFromHips(CapturedMeshLocation, true);
-        // Underwater recovery has no grounded "get-up" facing direction.  Using the floating body yaw here
-        // can flip 180 degrees when the hips/head vector rolls in water, so keep the pre-ragdoll actor yaw
-        // and let the mesh pose/relative rotation blend back to the normal swimming basis.
-        WaterRecoveryActorTargetRotation = bHasRagdollPrePhysicsActorRotation
-            ? MakeFlatYawRotationNear(RagdollPrePhysicsActorRotation.Yaw, WaterRecoveryActorStartRotation)
-            : WaterRecoveryActorStartRotation;
+        WaterRecoveryActorTargetRotation = MakeFlatYawRotationNear(
+            CurrentPoseRecoveryRotation.Yaw,
+            WaterRecoveryActorStartRotation);
 
         // Water recovery should start from the exact current actor/mesh transform and then blend,
         // matching the land recovery feel.  Snapping the actor to the hips target here is what made
@@ -3293,10 +3295,12 @@ void UCharacterComponent::DeactiveRagdoll(ACharacterController *InOwner, USkelet
 
         const FVector DesiredRecoveryLocation = GetRagdollRecoveryActorLocationFromHips(CapturedMeshLocation, false);
         const FVector SafeRecoveryLocation = ResolveRagdollRecoveryGroundPenetration(DesiredRecoveryLocation);
-        if (!SafeRecoveryLocation.Equals(InOwner->GetActorLocation(), KINDA_SMALL_NUMBER))
-        {
-            InOwner->SetActorLocation(SafeRecoveryLocation, false, nullptr, ETeleportType::TeleportPhysics);
-        }
+        InOwner->SetActorLocationAndRotation(
+            SafeRecoveryLocation,
+            CurrentPoseRecoveryRotation,
+            false,
+            nullptr,
+            ETeleportType::TeleportPhysics);
 
         UCharacterFunctionLibrary::DisableRagdollPhysicsButKeepSecondary(*SkeletalMesh);
         RestoreRagdollCapsuleCollision();
@@ -3560,9 +3564,9 @@ void UCharacterComponent::UpdateRagdoll(const float DeltaTime, ACharacterControl
                 WaterRecoveryActorStartLocation = InOwner->GetActorLocation();
                 WaterRecoveryActorStartRotation = MakeFlatYawRotation(InOwner->GetActorRotation().Yaw);
                 WaterRecoveryActorTargetLocation = GetRagdollRecoveryActorLocationFromHips(UCharacterFunctionLibrary::GetBoneLocation(*SkeletalMesh, BONE_HIPS), true);
-                WaterRecoveryActorTargetRotation = bHasRagdollPrePhysicsActorRotation
-                    ? MakeFlatYawRotationNear(RagdollPrePhysicsActorRotation.Yaw, WaterRecoveryActorStartRotation)
-                    : WaterRecoveryActorStartRotation;
+                WaterRecoveryActorTargetRotation = MakeFlatYawRotationNear(
+                    ActorTargetRotation.Yaw,
+                    WaterRecoveryActorStartRotation);
                 if (SkeletalMesh->GetAttachParent() != InOwner->GetCapsuleComponent())
                 {
                     FActorHelper::AttachParent(SkeletalMesh, InOwner->GetCapsuleComponent(), FAttachmentTransformRules::KeepWorldTransform);
@@ -3777,16 +3781,32 @@ bool UCharacterComponent::CheckIfLieOnBack(const USkeletalMeshComponent *Skeleta
     return T.X < 0.0f;
 }
 
-float UCharacterComponent::GetMeshForwardYaw(const bool Back, const USkeletalMeshComponent *SkeletalMesh)
+float UCharacterComponent::GetMeshForwardYaw(
+    const bool Back,
+    const USkeletalMeshComponent *SkeletalMesh,
+    const float FallbackYaw)
 {
     if (!SkeletalMesh)
-        return 0.0f;
+        return FRotator::NormalizeAxis(FallbackYaw);
     const FVector Head = UCharacterFunctionLibrary::GetBoneLocation(*SkeletalMesh, BONE_HEAD);
     const FVector Hips = UCharacterFunctionLibrary::GetBoneLocation(*SkeletalMesh, BONE_HIPS);
-    const FVector Direction = (Head - Hips).GetSafeNormal2D();
+    FVector Direction = (Head - Hips).GetSafeNormal2D();
 
-    float Result = FMath::Atan2(Direction.Y, Direction.X) * (180.0f / PI);
-    return Back ? Result + 180.0f : Result;
+    // A nearly vertical pose has an unstable horizontal head-to-pelvis projection. Use the
+    // current simulated pelvis orientation before falling back to the actor's current yaw.
+    if (Direction.IsNearlyZero())
+    {
+        Direction = UCharacterFunctionLibrary::GetBoneRotation(*SkeletalMesh, BONE_HIPS)
+            .Vector()
+            .GetSafeNormal2D();
+    }
+    if (Direction.IsNearlyZero() || Direction.ContainsNaN())
+    {
+        return FRotator::NormalizeAxis(FallbackYaw);
+    }
+
+    const float Result = FMath::RadiansToDegrees(FMath::Atan2(Direction.Y, Direction.X));
+    return FRotator::NormalizeAxis(Back ? Result + 180.0f : Result);
 }
 
 void UCharacterComponent::SetSkeletalMeshLocationAndRotation(USkeletalMeshComponent *SkeletalMesh, const FVector &Location, const FRotator &Rotation, const float InvTime)

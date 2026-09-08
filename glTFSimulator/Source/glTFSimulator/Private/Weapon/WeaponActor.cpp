@@ -1,7 +1,6 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
 #include "Weapon/WeaponActor.h"
-#include "Simulator/GlTFRuntimeCacheLibrary.h"
 
 #include "Camera/CameraComponent.h"
 #include "Components/SkeletalMeshComponent.h"
@@ -289,7 +288,7 @@ bool AWeaponActor::SaveDefaultConfigJson(const FString& JsonPath) const
     TSharedRef<FJsonObject> RootObject = MakeShared<FJsonObject>();
     RootObject->SetStringField(JSON_VERSION_FIELD, JSON_SCHEMA_VERSION);
     const FString Name = FPaths::GetBaseFilename(JsonPath);
-    RootObject->SetStringField(TEXT("ID"), FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower));
+    RootObject->SetStringField(TEXT("UUID"), FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower));
     RootObject->SetStringField(TEXT("Name"), Name);
     RootObject->SetStringField(TEXT("DisplayName"), Name);
     RootObject->SetStringField(TEXT("ModelType"), TEXT("Item"));
@@ -408,7 +407,17 @@ UStaticMesh* AWeaponActor::LoadMeshByIndex(int32 MeshIndex)
     MeshConfig.bBuildSimpleCollision = false;
     MeshConfig.bBuildComplexCollision = false;
 
-    UStaticMesh* Mesh = GltfAsset->LoadStaticMesh(MeshIndex, MeshConfig);
+    UStaticMesh* Mesh = nullptr;
+    const bool bExecuted = FglTFRuntimeSafety::ExecuteSynchronousOperation(
+        FString::Printf(TEXT("Weapon LoadStaticMesh %d"), MeshIndex),
+        [this, MeshIndex, &MeshConfig, &Mesh]()
+        {
+            Mesh = GltfAsset->LoadStaticMesh(MeshIndex, MeshConfig);
+        });
+    if (!bExecuted)
+    {
+        return nullptr;
+    }
     if (IsValid(Mesh))
     {
         MeshCache.Add(MeshIndex, Mesh);
@@ -430,7 +439,17 @@ bool AWeaponActor::LoadWeaponMesh()
 
     FglTFRuntimeConfig LoaderConfig;
     LoaderConfig.bAllowExternalFiles = true;
-    GltfAsset = USimulatorGlTFRuntimeCacheLibrary::LoadSharedAssetFromFilename(this, SourceFilePath, false, LoaderConfig);
+    const bool bAssetLoadExecuted = FglTFRuntimeSafety::ExecuteSynchronousOperation(
+        TEXT("Weapon parser creation"),
+        [this, &LoaderConfig]()
+        {
+            GltfAsset = UglTFRuntimeFunctionLibrary::glTFLoadAssetFromFilename(
+                SourceFilePath, false, LoaderConfig);
+        });
+    if (!bAssetLoadExecuted)
+    {
+        return false;
+    }
     if (!IsValid(GltfAsset))
     {
         return false;
