@@ -381,7 +381,7 @@ void UBuildStatusWidget::AppendOutputLine(const FString& Line)
     const int32 SafeMaxLines = FMath::Clamp(MaxOutputLines, 1, 512);
     if (OutputLines.Num() > SafeMaxLines)
     {
-        OutputLines.RemoveAt(0, OutputLines.Num() - SafeMaxLines, false);
+        OutputLines.RemoveAt(0, OutputLines.Num() - SafeMaxLines, EAllowShrinking::No);
     }
 
     RebuildOutputText();
