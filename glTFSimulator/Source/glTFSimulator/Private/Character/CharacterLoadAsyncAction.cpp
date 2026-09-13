@@ -3,15 +3,16 @@
 
 /**
  * @file CharacterLoadAsyncAction.cpp
- * 역할: 캐릭터 모델의 비동기 로드를 조정합니다.
- * 핵심 기능: 런타임 모델 해석, 로드 완료 통지, 취소·수명 관리.
- * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
  */
 
 #include "Character/CharacterLoadAsyncAction.h"
 
 #include "Animation/Skeleton.h"
 #include "Character/CharacterController.h"
+#include "Character/CharacterBoneSchema.h"
 #include "Character/CharacterFunctionLibrary.h"
 #include "Engine/SkeletalMesh.h"
 #include "Engine/World.h"
@@ -30,6 +31,8 @@
 namespace
 {
     constexpr int32 MaxSkeletonBonesForGeneratedSecondaryPhysics = 512;
+    constexpr int32 MaxModelDatabaseResolveRetries = 120;
+    constexpr float ModelDatabaseResolveRetrySeconds = 0.05f;
 
     // Unity builds concatenate multiple .cpp files into one translation unit. The file-specific
     // prefix prevents this helper from colliding with similarly named model-loading validators.
@@ -116,6 +119,7 @@ void UCharacterLoadAsyncAction::Activate()
     PendingSkeletalMesh = nullptr;
     PendingRuntimePhysicsAsset = nullptr;
     PendingBoneMap.Empty();
+    ModelDatabaseRetryCount = 0;
     OnProgress.Broadcast(0.0f);
 
     if (!OwnerCharacter.IsValid())
@@ -124,18 +128,66 @@ void UCharacterLoadAsyncAction::Activate()
         return;
     }
 
+    ResolveAndLoadModel();
+}
+
+void UCharacterLoadAsyncAction::ResolveAndLoadModel()
+{
+    if (!ensureMsgf(IsInGameThread(), TEXT("ResolveAndLoadModel must run on the game thread")))
+    {
+        return;
+    }
+
+    GameThreadStageTimer.Invalidate();
+    if (bCancelled || bFinished)
+    {
+        TryFinishCancelledRequest();
+        return;
+    }
+    if (!OwnerCharacter.IsValid())
+    {
+        FailLoad(TEXT("Character owner became invalid while waiting for the built-model database"));
+        return;
+    }
+
     FResolvedRuntimeModel Model;
     FString ResolveError;
-    if (!FRuntimeModelResolver::Resolve(this, FilePath, Model, ResolveError)
-        || Model.Definition.ModelType != EModelDefinitionType::Character)
+    if (!FRuntimeModelResolver::Resolve(this, FilePath, Model, ResolveError))
     {
+        const bool bDatabaseNotReady = ResolveError.Equals(
+            TEXT("a verified .gwd model database is not open"), ESearchCase::IgnoreCase);
+        if (bDatabaseNotReady && ModelDatabaseRetryCount < MaxModelDatabaseResolveRetries)
+        {
+            ++ModelDatabaseRetryCount;
+            OnProgress.Broadcast(0.01f);
+            ScheduleModelDatabaseRetry();
+            return;
+        }
+
         FailLoad(FString::Printf(
             TEXT("Character built-model lookup failed. Reference=%s Reason=%s"),
             *FilePath, *ResolveError));
         return;
     }
+
+    if (Model.Definition.ModelType != EModelDefinitionType::Character)
+    {
+        FailLoad(FString::Printf(
+            TEXT("Character built-model lookup resolved a non-character model. Reference=%s"),
+            *FilePath));
+        return;
+    }
+
     FilePath = Model.Reference;
     PendingBoneMap = MoveTemp(Model.Definition.Bones);
+    FString BoneMapError;
+    if (!CharacterBoneSchema::ValidateSourceToCanonicalMap(PendingBoneMap, BoneMapError))
+    {
+        FailLoad(FString::Printf(
+            TEXT("Character archive contains an invalid canonical bone map: %s"),
+            *BoneMapError));
+        return;
+    }
 
     // This creates only the lightweight baked-world facade and reads its node/range tables.
     // No source GLB bytes are opened, parsed, or retained on the gameplay path.
@@ -148,6 +200,29 @@ void UCharacterLoadAsyncAction::Activate()
         return;
     }
     OnBakedAssetLoaded(Asset);
+}
+
+void UCharacterLoadAsyncAction::ScheduleModelDatabaseRetry()
+{
+    ClearGameThreadStageTimer();
+    ACharacterController* Owner = OwnerCharacter.Get();
+    UWorld* World = IsValid(Owner) ? Owner->GetWorld() : nullptr;
+    if (!IsValid(World))
+    {
+        FailLoad(TEXT("Character owner world became invalid while waiting for the built-model database"));
+        return;
+    }
+
+    TWeakObjectPtr<UCharacterLoadAsyncAction> WeakThis(this);
+    FTimerDelegate Delegate = FTimerDelegate::CreateLambda([WeakThis]()
+    {
+        if (UCharacterLoadAsyncAction* StrongThis = WeakThis.Get())
+        {
+            StrongThis->ResolveAndLoadModel();
+        }
+    });
+    World->GetTimerManager().SetTimer(
+        GameThreadStageTimer, Delegate, ModelDatabaseResolveRetrySeconds, false);
 }
 
 void UCharacterLoadAsyncAction::OnBakedAssetLoaded(UWorldBakedModelAsset* Asset)
@@ -236,6 +311,14 @@ void UCharacterLoadAsyncAction::BeginSkeletalMeshLoad_GameThread()
     if (!IsValid(DefaultSkeleton) || !IsValid(Material))
     {
         FailLoad(TEXT("Character default skeleton or material is not assigned"));
+        return;
+    }
+    FString SkeletonError;
+    if (!CharacterBoneSchema::ValidateCanonicalSkeleton(DefaultSkeleton, SkeletonError))
+    {
+        FailLoad(FString::Printf(
+            TEXT("Default character skeleton does not match the canonical bone schema: %s"),
+            *SkeletonError));
         return;
     }
 
@@ -341,6 +424,24 @@ void UCharacterLoadAsyncAction::OnMeshLoaded(USkeletalMesh* SkeletalMesh)
         FailLoad(FString::Printf(
             TEXT("glTFRuntime returned an invalid character mesh. Path=%s"),
             *FilePath));
+        return;
+    }
+
+    const USkeleton* TargetSkeleton = SourceSkeletonReferenceGuard.Get();
+    FString HierarchyError;
+    if (!IsValid(TargetSkeleton)
+        || !CharacterBoneSchema::ValidateCanonicalHierarchyMatches(
+            SkeletalMesh->GetRefSkeleton(),
+            TargetSkeleton->GetReferenceSkeleton(),
+            HierarchyError))
+    {
+        ReleaseTransientRuntimeObject(SkeletalMesh);
+        FglTFRuntimeSafety::ReportRecoverableFailure(
+            FilePath,
+            FString::Printf(TEXT("canonical character skeleton hierarchy mismatch: %s"), *HierarchyError));
+        FailLoad(FString::Printf(
+            TEXT("Character mesh skeleton does not match the canonical target hierarchy: %s"),
+            *HierarchyError));
         return;
     }
 

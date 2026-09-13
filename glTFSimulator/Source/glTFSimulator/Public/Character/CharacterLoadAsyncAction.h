@@ -3,9 +3,9 @@
 
 /**
  * @file CharacterLoadAsyncAction.h
- * 역할: 캐릭터 모델의 비동기 로드를 조정합니다.
- * 핵심 기능: 런타임 모델 해석, 로드 완료 통지, 취소·수명 관리.
- * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * Declares interface, lifetime, and data-ownership contracts; see the matching implementation for behavior.
  */
 
 #pragma once
@@ -81,10 +81,14 @@ private:
     bool bFinished = false;
     /** A requested .dat bundle read / mesh finalizer is active. Game-thread owned. */
     bool bMeshLoadInFlight = false;
+    int32 ModelDatabaseRetryCount = 0;
 
     /** Mesh/skin pair selected from the baked node table. */
     int32 DetectedMeshIndex = INDEX_NONE;
     int32 DetectedSkinIndex = INDEX_NONE;
+
+    void ResolveAndLoadModel();
+    void ScheduleModelDatabaseRetry();
 
     UFUNCTION()
     void OnBakedAssetLoaded(UWorldBakedModelAsset *Asset);

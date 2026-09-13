@@ -2,8 +2,8 @@
 
 /**
  * @file WorldSelectionWidget.h
- * 역할: 월드 목록을 구성하고 선택된 월드를 여는 UI를 관리합니다.
- * 공통 생성 버튼 스타일·레이아웃·수명 관리는 USelectionWidgetBase가 담당합니다.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * USelectionWidgetBase owns generated WBP entry creation and lifetime behavior.
  */
 
 #pragma once

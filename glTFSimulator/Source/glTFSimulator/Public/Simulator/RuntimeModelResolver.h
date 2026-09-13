@@ -2,9 +2,9 @@
 
 /**
  * @file RuntimeModelResolver.h
- * 역할: 런타임 모델 참조를 활성 아카이브에서 해석합니다.
- * 핵심 기능: UUID 조회, immutable 모델 정의·리더 전달.
- * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * Declares interface, lifetime, and data-ownership contracts; see the matching implementation for behavior.
  */
 
 #pragma once

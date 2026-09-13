@@ -3,16 +3,15 @@
 
 /**
  * @file WorldSceneStreamAction.h
- * 역할: 월드 씬 메시의 비동기 생성 요청을 처리합니다.
- * 핵심 기능: 메시 생성·충돌 최종화, 월드 참조 보호, 완료·취소 통지.
- * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * Declares interface, lifetime, and data-ownership contracts; see the matching implementation for behavior.
  */
 
 #pragma once
 
 #include "CoreMinimal.h"
 #include "HAL/ThreadSafeCounter.h"
-#include "Kismet/BlueprintAsyncActionBase.h"
 #include "Model/ModelData.h"
 #include "glTFRuntimeAsset.h"
 #include "WorldSceneStreamAction.generated.h"
@@ -66,7 +65,7 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(
     float, Progress);
 
 UCLASS()
-class GLTFSIMULATOR_API UWorldSceneStreamAction : public UBlueprintAsyncActionBase
+class GLTFSIMULATOR_API UWorldSceneStreamAction : public UObject
 {
     GENERATED_BODY()
 
@@ -90,7 +89,8 @@ public:
         bool bInWaterGroup = false,
         float InUnloadDistanceMultiplier = 1.0f);
 
-    virtual void Activate() override;
+    UFUNCTION(BlueprintCallable, Category="World Streaming")
+    void Activate();
 
     void CancelAndRelease();
 

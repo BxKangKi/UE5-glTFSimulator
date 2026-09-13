@@ -2,9 +2,9 @@
 
 /**
  * @file GlbValidation.h
- * 역할: 외부 GLB 파일의 구조와 읽기 범위를 검사합니다.
- * 핵심 기능: 헤더·청크·크기 검증, 경로 정규화, 잘못된 입력 거부.
- * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * Declares interface, lifetime, and data-ownership contracts; see the matching implementation for behavior.
  */
 
 #pragma once

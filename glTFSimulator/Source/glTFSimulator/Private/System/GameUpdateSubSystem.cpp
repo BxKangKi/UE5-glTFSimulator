@@ -2,9 +2,9 @@
 
 /**
  * @file GameUpdateSubSystem.cpp
- * 역할: 게임 객체의 업데이트 콜백을 통합 실행합니다.
- * 핵심 기능: 우선순위 정렬, 등록·해제, 공통 업데이트 배포.
- * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
  */
 
 #include "System/GameUpdateSubSystem.h"

@@ -2,9 +2,9 @@
 
 /**
  * @file ModelDatabaseSubsystem.h
- * 역할: 선택 월드의 모델 인덱스를 관리합니다.
- * 핵심 기능: gwd 디렉터리 읽기, 취소 가능한 소스 검사, 4개 이하 병렬 검사, 정의 LRU.
- * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * Declares interface, lifetime, and data-ownership contracts; see the matching implementation for behavior.
  */
 
 #pragma once
@@ -82,6 +82,9 @@ public:
         return ArchiveReader;
     }
 
+    /** Returns the archive that physically owns this UUID (base .gwd or an allowed external .gasset). */
+    TSharedPtr<FGWorldArchiveReader, ESPMode::ThreadSafe> GetArchiveReaderForModel(const FGuid& UUID) const;
+
     bool IsReady() const { return bReady; }
     bool IsBuiltWorld() const { return bReady && ArchiveReader.IsValid(); }
     const FString& GetWorldRoot() const { return WorldRoot; }
@@ -104,6 +107,9 @@ private:
     /** Populated only while authoring sources are being baked; built JSON remains on disk. */
     TMap<FGuid, FString> SourceDefinitionJson;
     TSharedPtr<FGWorldArchiveReader, ESPMode::ThreadSafe> ArchiveReader;
+    /** Per-model ownership keeps external packs independent from the base world archive. */
+    TMap<FGuid, TSharedPtr<FGWorldArchiveReader, ESPMode::ThreadSafe>> ModelArchiveReaders;
+    TArray<TSharedPtr<FGWorldArchiveReader, ESPMode::ThreadSafe>> ExternalArchiveReaders;
     /** Bounded runtime-only LRU; source mode already owns its temporary authoring snapshots. */
     mutable TMap<FGuid, FCachedDefinitionDetails> DefinitionDetailsCache;
     mutable int64 CachedDefinitionBytes = 0;

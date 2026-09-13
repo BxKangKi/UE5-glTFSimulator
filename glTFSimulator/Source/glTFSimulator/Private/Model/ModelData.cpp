@@ -3,9 +3,9 @@
 
 /**
  * @file ModelData.cpp
- * 역할: 모델·메시·노드의 런타임 데이터 구조를 정의합니다.
- * 핵심 기능: JSON 설정 변환, 메시 속성, 경계·노드·LOD 데이터.
- * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
  */
 
 #include "Model/ModelData.h"

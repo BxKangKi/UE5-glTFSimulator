@@ -2,9 +2,9 @@
 
 /**
  * @file InstancedEntityRenderActor.h
- * 역할: 동일 모델의 동적 객체를 ISM으로 모아 렌더링합니다.
- * 핵심 기능: 모델별 인스턴스 추가·갱신·제거, 렌더 컴포넌트 관리.
- * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * Declares interface, lifetime, and data-ownership contracts; see the matching implementation for behavior.
  */
 
 #pragma once

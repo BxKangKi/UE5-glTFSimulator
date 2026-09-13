@@ -2,9 +2,9 @@
 
 /**
  * @file GlbValidation.cpp
- * 역할: 외부 GLB 파일의 구조와 읽기 범위를 검사합니다.
- * 핵심 기능: 헤더·청크·크기 검증, 경로 정규화, 잘못된 입력 거부.
- * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
  */
 
 #include "System/GlbValidation.h"

@@ -3,9 +3,9 @@
 
 /**
  * @file CharacterController.cpp
- * 역할: 런타임 캐릭터 액터와 메시·입력 상태를 연결합니다.
- * 핵심 기능: 캐릭터 로드, 컴포넌트 초기화, 장비·충돌·상태 관리.
- * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
  */
 
 #include "Character/CharacterController.h"
@@ -22,6 +22,7 @@
 #include "Components/SkeletalMeshComponent.h"
 #include "Camera/CameraComponent.h"
 #include "GameFramework/CharacterMovementComponent.h"
+#include "AI/Navigation/NavigationTypes.h"
 #include "GameFramework/PlayerController.h"
 #include "Kismet/GameplayStatics.h"
 #include "NiagaraFunctionLibrary.h"
@@ -73,6 +74,49 @@ ACharacterController::ACharacterController()
     FollowCamera = CreateDefaultSubobject<UCameraComponent>(TEXT("FollowCamera"));
     FollowCamera->SetupAttachment(SpringArm);
     FollowCamera->bUsePawnControlRotation = false;
+
+    // Match the movement defaults authored in the original BP_CharacterController.
+    // Keeping these native defaults aligned with the Blueprint makes dynamically created
+    // characters behave the same even when a Blueprint subclass does not override them.
+    bUseControllerRotationYaw = false;
+
+    if (UCapsuleComponent* Capsule = GetCapsuleComponent())
+    {
+        Capsule->InitCapsuleSize(35.0f, 90.0f);
+    }
+
+    if (UCharacterMovementComponent* MovementDefaults = GetCharacterMovement())
+    {
+        MovementDefaults->GravityScale = 1.75f;
+        MovementDefaults->JumpZVelocity = 700.0f;
+        MovementDefaults->SetWalkableFloorAngle(35.0f);
+        MovementDefaults->MaxWalkSpeed = 200.0f;
+        MovementDefaults->MaxWalkSpeedCrouched = 100.0f;
+        MovementDefaults->MaxAcceleration = 1000.0f;
+        MovementDefaults->MinAnalogWalkSpeed = 20.0f;
+        MovementDefaults->BrakingFrictionFactor = 1.0f;
+        MovementDefaults->BrakingFriction = 0.01f;
+        MovementDefaults->BrakingDecelerationWalking = 1000.0f;
+        MovementDefaults->BrakingDecelerationFalling = 2.0f;
+        MovementDefaults->BrakingDecelerationSwimming = 200.0f;
+        MovementDefaults->BrakingDecelerationFlying = 10000.0f;
+        MovementDefaults->AirControl = 0.35f;
+        MovementDefaults->FallingLateralFriction = 0.02f;
+        MovementDefaults->PerchRadiusThreshold = 15.0f;
+        MovementDefaults->RotationRate = FRotator(0.0f, 500.0f, 0.0f);
+        MovementDefaults->bOrientRotationToMovement = true;
+        MovementDefaults->bUseControllerDesiredRotation = false;
+        if (FNavMovementProperties* NavMovementProps = MovementDefaults->GetNavMovementProperties())
+        {
+            NavMovementProps->bUseAccelerationForPaths = true;
+            NavMovementProps->bUseFixedBrakingDistanceForPaths = true;
+            NavMovementProps->FixedPathBrakingDistance = 200.0f;
+        }
+
+        FNavAgentProperties& NavAgentProps = MovementDefaults->GetNavAgentPropertiesRef();
+        NavAgentProps.bCanCrouch = true;
+        NavAgentProps.bCanFly = true;
+    }
 
     SkeletalMeshBuoyancyComponent = CreateDefaultSubobject<UBuoyancyComponent>(TEXT("SkeletalMeshBuoyancy"));
     if (SkeletalMeshBuoyancyComponent)
@@ -1113,35 +1157,13 @@ void ACharacterController::Activate(bool bValue)
 void ACharacterController::MovementInput(const float X, const float Y)
 {
     constexpr float MovementInputDeadZone = 0.01f;
-    const bool bHadPlanarInput = !FMath::IsNearlyZero(RawMoveInput.X, MovementInputDeadZone)
-        || !FMath::IsNearlyZero(RawMoveInput.Y, MovementInputDeadZone);
     const float ClampedX = FMath::Clamp(X, -1.0f, 1.0f);
     const float ClampedY = FMath::Clamp(Y, -1.0f, 1.0f);
     RawMoveInput.X = FMath::IsNearlyZero(ClampedX, MovementInputDeadZone) ? 0.0f : ClampedX;
     RawMoveInput.Y = FMath::IsNearlyZero(ClampedY, MovementInputDeadZone) ? 0.0f : ClampedY;
-    const bool bHasPlanarInput = !FMath::IsNearlyZero(RawMoveInput.X, MovementInputDeadZone)
-        || !FMath::IsNearlyZero(RawMoveInput.Y, MovementInputDeadZone);
 
-    if (bHadPlanarInput && !bHasPlanarInput)
-    {
-        if (IsValid(Component.Get()))
-        {
-            Component->ReleasePlanarMovementInput();
-        }
-        if (IsValid(Movement))
-        {
-            Movement->ConsumeInputVector();
-            // Flying has very little implicit drag. Clear the released planar velocity so turning
-            // the camera cannot keep steering an old velocity vector after WASD is released.
-            if (Movement->IsFlying())
-            {
-                FVector Velocity = Movement->Velocity;
-                Velocity.X = 0.0f;
-                Velocity.Y = 0.0f;
-                Movement->Velocity = Velocity;
-            }
-        }
-    }
+    // Do not zero CharacterMovement velocity when input is released. Ground movement uses the
+    // movement component's normal braking, while flying intentionally eases out over time.
 }
 
 void ACharacterController::ClearTransientInputState()
@@ -1184,14 +1206,6 @@ void ACharacterController::Jumping(bool bDoJump)
     else
     {
         RawMoveInput.Z = FMath::Min(0.0f, RawMoveInput.Z);
-        if (FMath::IsNearlyZero(RawMoveInput.Z) && IsValid(Component.Get()))
-        {
-            Component->ReleaseVerticalMovementInput();
-        }
-        if (FMath::IsNearlyZero(RawMoveInput.Z) && IsValid(Movement) && Movement->IsFlying())
-        {
-            Movement->Velocity.Z = 0.0f;
-        }
         StopJumping();
         CharacterStateBit &= ~STATE_JUMPING;
     }
@@ -1215,14 +1229,6 @@ void ACharacterController::Crouching(bool Value)
     else
     {
         RawMoveInput.Z = FMath::Max(0.0f, RawMoveInput.Z);
-        if (FMath::IsNearlyZero(RawMoveInput.Z) && IsValid(Component.Get()))
-        {
-            Component->ReleaseVerticalMovementInput();
-        }
-        if (FMath::IsNearlyZero(RawMoveInput.Z) && IsValid(Movement) && Movement->IsFlying())
-        {
-            Movement->Velocity.Z = 0.0f;
-        }
         CharacterStateBit &= ~STATE_CROUCH;
     }
 }

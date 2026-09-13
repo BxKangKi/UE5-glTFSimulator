@@ -13,6 +13,7 @@
 #include "System/GlTFSimulatorGameInstance.h"
 #include "UI/BuildStatusWidget.h"
 #include "System/MacroLibrary.h"
+#include "System/ProjectConfig.h"
 #include "UI/StartWorldWidget.h"
 #include "World/WorldData.h"
 
@@ -33,8 +34,8 @@ void UProjectSelectionWidget::NativeDestruct()
     UnbindNavigationButtons();
     if (IsValid(BuildStatusWidget))
     {
-        BuildStatusWidget->OnCloseRequested.RemoveDynamic(
-            this, &UProjectSelectionWidget::HandleBuildStatusCloseRequested);
+        BuildStatusWidget->OnConfirmed.RemoveDynamic(
+            this, &UProjectSelectionWidget::HandleBuildStatusConfirmed);
         BuildStatusWidget->StopObservingBuild();
     }
 
@@ -99,16 +100,16 @@ void UProjectSelectionWidget::SetBuildStatusWidget(UBuildStatusWidget* InWidget)
     }
     if (IsValid(BuildStatusWidget))
     {
-        BuildStatusWidget->OnCloseRequested.RemoveDynamic(
-            this, &UProjectSelectionWidget::HandleBuildStatusCloseRequested);
+        BuildStatusWidget->OnConfirmed.RemoveDynamic(
+            this, &UProjectSelectionWidget::HandleBuildStatusConfirmed);
     }
     BuildStatusWidget = InWidget;
     if (IsValid(BuildStatusWidget))
     {
-        BuildStatusWidget->OnCloseRequested.RemoveDynamic(
-            this, &UProjectSelectionWidget::HandleBuildStatusCloseRequested);
-        BuildStatusWidget->OnCloseRequested.AddDynamic(
-            this, &UProjectSelectionWidget::HandleBuildStatusCloseRequested);
+        BuildStatusWidget->OnConfirmed.RemoveDynamic(
+            this, &UProjectSelectionWidget::HandleBuildStatusConfirmed);
+        BuildStatusWidget->OnConfirmed.AddDynamic(
+            this, &UProjectSelectionWidget::HandleBuildStatusConfirmed);
         BuildStatusWidget->SetVisibility(ESlateVisibility::Collapsed);
     }
 }
@@ -159,7 +160,7 @@ void UProjectSelectionWidget::ShowBuildStatus(const FString& ProjectName)
     }
 }
 
-void UProjectSelectionWidget::HandleBuildStatusCloseRequested()
+void UProjectSelectionWidget::HandleBuildStatusConfirmed()
 {
     if (IsValid(BuildStatusWidget))
     {
@@ -238,18 +239,21 @@ void UProjectSelectionWidget::RefreshProjects()
             continue;
         }
 
-        FString DisplayName;
-        if (!UFileFunctionLibrary::LoadJsonStringValue(
-                ConfigPath, CONFIG_WORLD_NAME_FIELD, DisplayName)
-            || DisplayName.TrimStartAndEnd().IsEmpty())
+        FGlTFSimulatorProjectConfig ProjectConfig;
+        FString ConfigError;
+        if (!GlTFSimulatorProjectConfig::Load(
+                ConfigPath, SafeName, ProjectConfig, nullptr, ConfigError))
         {
             UE_LOG(LogTemp, Warning,
-                TEXT("Project '%s' is hidden because config.json has no valid WorldName."),
-                *SafeName);
+                TEXT("Project '%s' is hidden because config.json is invalid: %s"),
+                *SafeName, *ConfigError);
             continue;
         }
 
-        DisplayName.TrimStartAndEndInline();
+        const FString DisplayName = FString::Printf(
+            TEXT("%s [%s]"),
+            *ProjectConfig.GetDisplayName(SafeName),
+            *GlTFSimulatorProjectConfig::ToString(ProjectConfig.ProjectType));
         if (!IsValid(AddGeneratedSelectionEntry(SafeName, DisplayName)))
         {
             UE_LOG(LogTemp, Warning,
@@ -267,6 +271,47 @@ bool UProjectSelectionWidget::BuildProjectByName(const FString& ProjectName)
     }
 
     UE_LOG(LogTemp, Error, TEXT("Project build failed because GameManagerSubSystem is unavailable."));
+    return false;
+}
+
+
+bool UProjectSelectionWidget::GetProjectConfiguration(
+    const FString& ProjectName,
+    EGlTFSimulatorProjectType& OutProjectType,
+    bool& bOutAllowExternalAssets,
+    FString& OutDisplayName) const
+{
+    if (const UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(this))
+    {
+        return Manager->GetProjectConfigurationByName(
+            ProjectName, OutProjectType, bOutAllowExternalAssets, OutDisplayName);
+    }
+    return false;
+}
+
+bool UProjectSelectionWidget::SetProjectType(
+    const FString& ProjectName,
+    const EGlTFSimulatorProjectType ProjectType)
+{
+    if (UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(this))
+    {
+        const bool bChanged = Manager->SetProjectTypeByName(ProjectName, ProjectType);
+        if (bChanged) RefreshProjects();
+        return bChanged;
+    }
+    return false;
+}
+
+bool UProjectSelectionWidget::SetWorldExternalAssetsAllowed(
+    const FString& ProjectName,
+    const bool bAllowed)
+{
+    if (UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(this))
+    {
+        const bool bChanged = Manager->SetWorldExternalAssetsAllowedByName(ProjectName, bAllowed);
+        if (bChanged) RefreshProjects();
+        return bChanged;
+    }
     return false;
 }
 

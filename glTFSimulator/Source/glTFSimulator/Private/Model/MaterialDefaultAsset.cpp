@@ -2,9 +2,9 @@
 
 /**
  * @file MaterialDefaultAsset.cpp
- * 역할: glTFRuntime용 기본 머티리얼 에셋을 보관합니다.
- * 핵심 기능: 에디터 설정, 공통 머티리얼 참조, 비동기 요청의 GC 보호.
- * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
  */
 
 #include "Model/MaterialDefaultAsset.h"

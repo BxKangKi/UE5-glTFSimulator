@@ -3,8 +3,8 @@
 
 /**
  * @file glTFSimulator.Build.cs
- * 역할: Unreal 모듈 빌드 의존성을 정의합니다.
- * 핵심 기능: 엔진·플러그인 모듈 의존성, 빌드 설정.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
  */
 
 using UnrealBuildTool;

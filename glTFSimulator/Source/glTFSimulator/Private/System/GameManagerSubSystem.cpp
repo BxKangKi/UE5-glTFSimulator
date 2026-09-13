@@ -3,9 +3,9 @@
 
 /**
  * @file GameManagerSubSystem.cpp
- * 역할: GameMode가 시작한 월드 빌드·실행 세션의 서비스 상태를 관리합니다.
- * 핵심 기능: 경로 해석, DB→bake→streaming, 배치·저장·세션 종료. 생명주기는 GameMode가 소유합니다.
- * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
  */
 
 #include "System/GameManagerSubSystem.h"
@@ -182,6 +182,14 @@ void UGameManagerSubSystem::Initialize(FSubsystemCollectionBase &Collection)
 {
     Super::Initialize(Collection);
     GameSettings = UGameSettings::CreateSettingsData(this);
+
+    // Keep the installable external-asset directory present even before a world is opened so
+    // users can drop Character/Dynamic .gasset packs into it from the Projects workflow.
+    const FString ExternalResourcesRoot = FSafeFileIO::NormalizeFilePath(PATH_RESOURCES);
+    if (!ExternalResourcesRoot.IsEmpty())
+    {
+        IFileManager::Get().MakeDirectory(*ExternalResourcesRoot, true);
+    }
 
     if (!PostLoadMapCleanupHandle.IsValid())
     {
@@ -936,7 +944,7 @@ void UGameManagerSubSystem::StartGameplaySessionInternal(
 
     if (ResolvedWorldRoot.IsEmpty())
     {
-        FailWorldStartup(TEXT("월드 시작 실패: 명시적인 월드 폴더를 찾지 못했습니다."));
+        FailWorldStartup(TEXT("World startup failed: no explicit world folder could be resolved."));
         return;
     }
 
@@ -978,7 +986,7 @@ void UGameManagerSubSystem::StartGameplaySessionInternal(
                 if (!bSuccess)
                 {
                     StrongThis->FailWorldStartup(FString::Printf(
-                        TEXT("월드 모델 인덱스를 열지 못했습니다: %s"), *Error));
+                        TEXT("Failed to open the world model index: %s"), *Error));
                     return;
                 }
                 UModelDatabaseSubsystem* ReadyDatabase = StrongThis->GetGameInstance()
@@ -986,7 +994,7 @@ void UGameManagerSubSystem::StartGameplaySessionInternal(
                 if (!ReadyDatabase || !ReadyDatabase->IsBuiltWorld())
                 {
                     StrongThis->FailWorldStartup(
-                        TEXT("월드 시작 실패: 런타임은 Worlds/*.gwd만 사용합니다. MainWorld의 Projects UI에서 먼저 빌드하십시오."));
+                        TEXT("World startup failed: runtime uses Worlds/*.gwd only. Build the project first from the Projects UI in MainWorld."));
                     return;
                 }
                 StrongThis->ContinueWorldStartupAfterDatabase();
@@ -994,7 +1002,7 @@ void UGameManagerSubSystem::StartGameplaySessionInternal(
     }
     else
     {
-        FailWorldStartup(TEXT("월드 시작 실패: 모델 데이터베이스 서브시스템을 사용할 수 없습니다."));
+        FailWorldStartup(TEXT("World startup failed: the model database subsystem is unavailable."));
     }
 
     UE_LOG(LogTemp, Display, TEXT("[Gameplay] Session active. Owner=%s GameMode=%s"),
@@ -1013,7 +1021,7 @@ void UGameManagerSubSystem::ContinueWorldStartupAfterDatabase()
     if (!Database || !Database->IsBuiltWorld())
     {
         FailWorldStartup(
-            TEXT("월드 시작 실패: 검증된 .gwd 아카이브가 열려 있지 않습니다."));
+            TEXT("World startup failed: no verified .gwd archive is open."));
         return;
     }
 
@@ -1726,7 +1734,7 @@ void UGameManagerSubSystem::LoadWorldData()
         Database ? Database->GetArchiveReader() : nullptr;
     if (!ArchiveReader.IsValid())
     {
-        FailWorldStartup(TEXT("월드 시작 실패: config.json을 읽을 .gwd reader가 없습니다."));
+        FailWorldStartup(TEXT("World startup failed: no .gwd reader is available for config.json."));
         return;
     }
     TWeakObjectPtr<UGameManagerSubSystem> WeakThis(this);
@@ -1776,7 +1784,7 @@ void UGameManagerSubSystem::LoadWorldData()
                         || !IsValid(Manager->ActivePlayerData))
                     {
                         Manager->FailWorldStartup(
-                            TEXT("월드 시작 실패: 런타임 월드 상태를 할당하지 못했습니다."));
+                            TEXT("World startup failed: runtime world state could not be allocated."));
                         return;
                     }
 
@@ -1845,7 +1853,7 @@ void UGameManagerSubSystem::LoadWorldData()
     if (!bQueued)
     {
         FailWorldStartup(
-            TEXT("월드 시작 실패: 비동기 파일 I/O가 종료 중이라 config.json을 읽을 수 없습니다."));
+            TEXT("World startup failed: config.json cannot be read because asynchronous file I/O is shutting down."));
     }
 }
 
@@ -2564,14 +2572,14 @@ void UGameManagerSubSystem::StartGameplayWorldStreaming(const FString& InWorldRo
     UWorld* World = GetWorld();
     if (!World)
     {
-        FailWorldStartup(TEXT("월드 시작 실패: 스트리밍에 사용할 UWorld가 없습니다."));
+        FailWorldStartup(TEXT("World startup failed: no UWorld is available for streaming."));
         return;
     }
 
     StreamSubSystem = UWorldSceneStreamingSubsystem::Get(this);
     if (!IsValid(StreamSubSystem))
     {
-        FailWorldStartup(TEXT("월드 시작 실패: 월드 스트리밍 서브시스템을 만들 수 없습니다."));
+        FailWorldStartup(TEXT("World startup failed: the world streaming subsystem could not be created."));
         return;
     }
 
@@ -2589,7 +2597,7 @@ void UGameManagerSubSystem::StartGameplayWorldStreaming(const FString& InWorldRo
     {
         StreamSubSystem = nullptr;
         FailWorldStartup(
-            TEXT("월드 시작 실패: 검증된 .gwd 스트리밍 세션을 시작하지 못했습니다."));
+            TEXT("World startup failed: the verified .gwd streaming session could not be started."));
     }
 }
 
@@ -3019,7 +3027,7 @@ bool UGameManagerSubSystem::SetToolbarSlotFromAvailableItem(int32 SlotIndex, int
 {
     if (!ToolbarSlots.IsValidIndex(SlotIndex) || !AvailableItems.IsValidIndex(AvailableItemIndex))
     {
-        LastSaveMessage = TEXT("툴바에 넣을 아이템 인덱스가 유효하지 않습니다.");
+        LastSaveMessage = TEXT("The item index for the toolbar is invalid.");
         NotifyStateChanged();
         return false;
     }
@@ -3057,7 +3065,7 @@ void UGameManagerSubSystem::SetItemListWindowOpen(bool bOpen)
     }
 
     bItemListWindowOpen = bOpen;
-    LastSaveMessage = bItemListWindowOpen ? TEXT("전체 아이템 목록 열림") : TEXT("전체 아이템 목록 닫힘");
+    LastSaveMessage = bItemListWindowOpen ? TEXT("Item list opened") : TEXT("Item list closed");
 
     if (APlayerCharacterController* PlayerController = Cast<APlayerCharacterController>(GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr))
     {
@@ -3104,11 +3112,11 @@ void UGameManagerSubSystem::ApplySelectedToolbarItem(bool bBroadcastChange)
             CurrentStaticIndex = Item.ModelIndex;
         }
         CurrentMode = EToolMode::PlaceStatic;
-        LastSaveMessage = FString::Printf(TEXT("Static 선택: %s"), *GetCurrentStaticName());
+        LastSaveMessage = FString::Printf(TEXT("Static selected: %s"), *GetCurrentStaticName());
         break;
     case EToolbarItemKind::Vehicle:
         CurrentMode = EToolMode::PlaceVehicle;
-        LastSaveMessage = TEXT("차량 만들기: 중앙 십자가 위치에 좌클릭으로 차량을 설치합니다.");
+        LastSaveMessage = TEXT("Vehicle tool: left-click to place a vehicle at the center crosshair.");
         break;
     case EToolbarItemKind::Weapon:
         if (Item.bAvailable && WeaponReferences.IsValidIndex(Item.ModelIndex))
@@ -3124,7 +3132,7 @@ void UGameManagerSubSystem::ApplySelectedToolbarItem(bool bBroadcastChange)
     case EToolbarItemKind::None:
     default:
         CurrentMode = EToolMode::None;
-        LastSaveMessage = TEXT("툴바 슬롯이 비어 있습니다.");
+        LastSaveMessage = TEXT("The toolbar slot is empty.");
         break;
     }
 
@@ -3236,13 +3244,13 @@ AActor* UGameManagerSubSystem::GetCrosshairHitActor() const
 FString UGameManagerSubSystem::GetCurrentStaticName() const
 {
     return StaticReferences.IsValidIndex(CurrentStaticIndex)
-        ? GetAssetDisplayName(StaticReferences[CurrentStaticIndex]) : TEXT("없음");
+        ? GetAssetDisplayName(StaticReferences[CurrentStaticIndex]) : TEXT("None");
 }
 
 FString UGameManagerSubSystem::GetCurrentWeaponName() const
 {
     return WeaponReferences.IsValidIndex(CurrentWeaponIndex)
-        ? GetAssetDisplayName(WeaponReferences[CurrentWeaponIndex]) : TEXT("없음");
+        ? GetAssetDisplayName(WeaponReferences[CurrentWeaponIndex]) : TEXT("None");
 }
 
 void UGameManagerSubSystem::SelectPreviousStatic()
@@ -3252,11 +3260,11 @@ void UGameManagerSubSystem::SelectPreviousStatic()
     if (StaticReferences.Num() > 0)
     {
         CurrentStaticIndex = (CurrentStaticIndex - 1 + StaticReferences.Num()) % StaticReferences.Num();
-        LastSaveMessage = FString::Printf(TEXT("Static 선택: %s"), *GetCurrentStaticName());
+        LastSaveMessage = FString::Printf(TEXT("Static selected: %s"), *GetCurrentStaticName());
     }
     else
     {
-        LastSaveMessage = TEXT("빌드된 Static 모델이 없습니다.");
+        LastSaveMessage = TEXT("No built Static models are available.");
     }
     NotifyStateChanged();
 }
@@ -3268,11 +3276,11 @@ void UGameManagerSubSystem::SelectNextStatic()
     if (StaticReferences.Num() > 0)
     {
         CurrentStaticIndex = (CurrentStaticIndex + 1) % StaticReferences.Num();
-        LastSaveMessage = FString::Printf(TEXT("Static 선택: %s"), *GetCurrentStaticName());
+        LastSaveMessage = FString::Printf(TEXT("Static selected: %s"), *GetCurrentStaticName());
     }
     else
     {
-        LastSaveMessage = TEXT("빌드된 Static 모델이 없습니다.");
+        LastSaveMessage = TEXT("No built Static models are available.");
     }
     NotifyStateChanged();
 }
@@ -3282,7 +3290,7 @@ void UGameManagerSubSystem::SelectStaticPlacementTool()
     RefreshBuiltModelLists();
     BuildAvailableItems();
     CurrentMode = EToolMode::PlaceStatic;
-    LastSaveMessage = TEXT("Static 도구: 중앙 십자가 위치에 좌클릭으로 현재 Static을 설치합니다.");
+    LastSaveMessage = TEXT("Static tool: left-click to place the current Static at the center crosshair.");
     NotifyStateChanged();
 }
 
@@ -3291,7 +3299,7 @@ void UGameManagerSubSystem::SelectVehicleTool()
     RefreshBuiltModelLists();
     BuildAvailableItems();
     CurrentMode = EToolMode::PlaceVehicle;
-    LastSaveMessage = TEXT("차량 도구: 중앙 십자가 위치에 좌클릭으로 차량을 설치합니다.");
+    LastSaveMessage = TEXT("Vehicle tool: left-click to place a vehicle at the center crosshair.");
     NotifyStateChanged();
 }
 
@@ -3302,11 +3310,11 @@ void UGameManagerSubSystem::SelectPreviousWeapon()
     if (WeaponReferences.Num() > 0)
     {
         CurrentWeaponIndex = (CurrentWeaponIndex - 1 + WeaponReferences.Num()) % WeaponReferences.Num();
-        LastSaveMessage = FString::Printf(TEXT("무기 선택: %s"), *GetCurrentWeaponName());
+        LastSaveMessage = FString::Printf(TEXT("Weapon selected: %s"), *GetCurrentWeaponName());
     }
     else
     {
-        LastSaveMessage = TEXT("빌드된 Weapon 모델이 없습니다.");
+        LastSaveMessage = TEXT("No built Weapon models are available.");
     }
     NotifyStateChanged();
 }
@@ -3318,11 +3326,11 @@ void UGameManagerSubSystem::SelectNextWeapon()
     if (WeaponReferences.Num() > 0)
     {
         CurrentWeaponIndex = (CurrentWeaponIndex + 1) % WeaponReferences.Num();
-        LastSaveMessage = FString::Printf(TEXT("무기 선택: %s"), *GetCurrentWeaponName());
+        LastSaveMessage = FString::Printf(TEXT("Weapon selected: %s"), *GetCurrentWeaponName());
     }
     else
     {
-        LastSaveMessage = TEXT("빌드된 Weapon 모델이 없습니다.");
+        LastSaveMessage = TEXT("No built Weapon models are available.");
     }
     NotifyStateChanged();
 }
@@ -3335,7 +3343,7 @@ void UGameManagerSubSystem::EquipCurrentWeapon()
     APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
     if (!IsValid(PC))
     {
-        LastSaveMessage = TEXT("PlayerController를 찾을 수 없습니다.");
+        LastSaveMessage = TEXT("PlayerController could not be found.");
         NotifyStateChanged();
         return;
     }
@@ -3358,7 +3366,7 @@ void UGameManagerSubSystem::EquipCurrentWeapon()
 
     if (!IsValid(AttachTarget))
     {
-        LastSaveMessage = TEXT("무기를 부착할 캐릭터 메시 또는 카메라를 찾을 수 없습니다.");
+        LastSaveMessage = TEXT("No character mesh or camera is available for weapon attachment.");
         NotifyStateChanged();
         return;
     }
@@ -3392,13 +3400,13 @@ void UGameManagerSubSystem::EquipCurrentWeapon()
         EquippedWeapon = Weapon;
         CurrentMode = EToolMode::Weapon;
         LastSaveMessage = bHasConfiguredWeaponReference
-            ? FString::Printf(TEXT("무기 장착: %s"), *GetCurrentWeaponName())
-            : TEXT("기본 테스트 무기 장착");
+            ? FString::Printf(TEXT("Weapon equipped: %s"), *GetCurrentWeaponName())
+            : TEXT("Default test weapon equipped");
     }
     else if (IsValid(Weapon))
     {
         Weapon->Destroy();
-        LastSaveMessage = TEXT("무기 로드 실패");
+        LastSaveMessage = TEXT("Weapon load failed");
     }
     NotifyStateChanged();
 }
@@ -3406,14 +3414,14 @@ void UGameManagerSubSystem::EquipCurrentWeapon()
 void UGameManagerSubSystem::ToggleSnap()
 {
     bSnapToGrid = !bSnapToGrid;
-    LastSaveMessage = bSnapToGrid ? TEXT("Grid Snap 켜짐") : TEXT("Grid Snap 꺼짐");
+    LastSaveMessage = bSnapToGrid ? TEXT("Grid Snap enabled") : TEXT("Grid Snap disabled");
     NotifyStateChanged();
 }
 
 void UGameManagerSubSystem::SetSnapEnabled(bool bEnabled)
 {
     bSnapToGrid = bEnabled;
-    LastSaveMessage = bSnapToGrid ? TEXT("Grid Snap 켜짐") : TEXT("Grid Snap 꺼짐");
+    LastSaveMessage = bSnapToGrid ? TEXT("Grid Snap enabled") : TEXT("Grid Snap disabled");
     NotifyStateChanged();
 }
 
@@ -3434,7 +3442,7 @@ void UGameManagerSubSystem::ToggleFirstPerson()
             Character->SetFirstPersonEnabled(bFirstPerson);
         }
     }
-    LastSaveMessage = bFirstPerson ? TEXT("1인칭 모드 켜짐") : TEXT("1인칭 모드 꺼짐");
+    LastSaveMessage = bFirstPerson ? TEXT("First-person mode enabled") : TEXT("First-person mode disabled");
     NotifyStateChanged();
 }
 
@@ -3869,7 +3877,7 @@ void UGameManagerSubSystem::InputPrimaryPressed()
         }
         else
         {
-            LastSaveMessage = TEXT("Static을 설치할 중앙 십자가 위치를 계산할 수 없습니다.");
+            LastSaveMessage = TEXT("Could not resolve the center-crosshair location for Static placement.");
         }
         break;
     case EToolbarItemKind::Vehicle:
@@ -3879,7 +3887,7 @@ void UGameManagerSubSystem::InputPrimaryPressed()
         }
         else
         {
-            LastSaveMessage = TEXT("차량을 설치할 중앙 십자가 위치를 계산할 수 없습니다.");
+            LastSaveMessage = TEXT("Could not resolve the center-crosshair location for vehicle placement.");
         }
         break;
     case EToolbarItemKind::Weapon:
@@ -3996,14 +4004,14 @@ void UGameManagerSubSystem::PlaceCurrentStatic(const FVector& Location)
     UWorld* const World = GetWorld();
     if (!IsValid(World) || !World->IsGameWorld())
     {
-        LastSaveMessage = TEXT("활성 게임 월드가 없어 Static을 설치하지 않았습니다.");
+        LastSaveMessage = TEXT("Static placement was skipped because no active game world is available.");
         return;
     }
 
     RefreshBuiltModelLists();
     if (!StaticReferences.IsValidIndex(CurrentStaticIndex))
     {
-        LastSaveMessage = TEXT("빌드된 Static 모델이 없습니다.");
+        LastSaveMessage = TEXT("No built Static models are available.");
         return;
     }
 
@@ -4016,7 +4024,7 @@ void UGameManagerSubSystem::PlaceCurrentStatic(const FVector& Location)
         || !Database->ResolveLoadable(UUID, Definition, ModelReference)
         || Definition.ModelType != EModelDefinitionType::Static)
     {
-        LastSaveMessage = TEXT("빌드된 Static 모델 참조가 유효하지 않습니다.");
+        LastSaveMessage = TEXT("The built Static model reference is invalid.");
         return;
     }
 
@@ -4052,16 +4060,16 @@ void UGameManagerSubSystem::PlaceCurrentStatic(const FVector& Location)
         if (!Chunks || !Chunks->RegisterPlacedObject(Actor, UUID))
         {
             Actor->Destroy();
-            LastSaveMessage = TEXT("대상 청크 또는 모델 UUID가 아직 준비되지 않아 설치를 보류했습니다.");
+            LastSaveMessage = TEXT("Placement was deferred because the target chunk or model UUID is not ready yet.");
             return;
         }
         SpawnedStatics.Add(TWeakObjectPtr<AStaticActor>(Actor));
-        LastSaveMessage = FString::Printf(TEXT("설치됨: %s"), *ObjectName);
+        LastSaveMessage = FString::Printf(TEXT("Placed: %s"), *ObjectName);
     }
     else if (IsValid(Actor))
     {
         Actor->Destroy();
-        LastSaveMessage = TEXT("Static 로드 실패");
+        LastSaveMessage = TEXT("Static load failed");
     }
 }
 
@@ -4070,7 +4078,7 @@ void UGameManagerSubSystem::PlaceVehicle(const FVector& Location, const FString&
     UWorld* const World = GetWorld();
     if (!IsValid(World) || !World->IsGameWorld())
     {
-        LastSaveMessage = TEXT("활성 게임 월드가 없어 차량을 설치하지 않았습니다.");
+        LastSaveMessage = TEXT("Vehicle placement was skipped because no active game world is available.");
         return;
     }
 
@@ -4084,7 +4092,7 @@ void UGameManagerSubSystem::PlaceVehicle(const FVector& Location, const FString&
         || Definition.ModelType != EModelDefinitionType::Dynamic
         || Definition.EntityType != EModelEntityType::Vehicle)
     {
-        LastSaveMessage = TEXT("빌드된 차량 모델 참조가 유효하지 않습니다.");
+        LastSaveMessage = TEXT("The built vehicle model reference is invalid.");
         return;
     }
 
@@ -4114,7 +4122,7 @@ void UGameManagerSubSystem::PlaceVehicle(const FVector& Location, const FString&
     }
     if (!IsValid(Vehicle))
     {
-        LastSaveMessage = TEXT("차량 액터를 생성하지 못했습니다.");
+        LastSaveMessage = TEXT("Failed to spawn the vehicle actor.");
         return;
     }
 
@@ -4123,7 +4131,7 @@ void UGameManagerSubSystem::PlaceVehicle(const FVector& Location, const FString&
     if (!Vehicle->LoadVehicleModel(RuntimeReference, VehicleObjectName))
     {
         Vehicle->Destroy();
-        LastSaveMessage = TEXT("차량 모델을 로드하지 못해 액터를 제거했습니다.");
+        LastSaveMessage = TEXT("The vehicle actor was removed because its model could not be loaded.");
         return;
     }
 
@@ -4134,10 +4142,10 @@ void UGameManagerSubSystem::PlaceVehicle(const FVector& Location, const FString&
     {
         SpawnedVehicles.Pop(EAllowShrinking::No);
         Vehicle->Destroy();
-        LastSaveMessage = TEXT("대상 청크 또는 모델 UUID가 아직 준비되지 않아 차량 설치를 보류했습니다.");
+        LastSaveMessage = TEXT("Vehicle placement was deferred because the target chunk or model UUID is not ready yet.");
         return;
     }
-    LastSaveMessage = TEXT("glTF 자동차 설치됨. F키로 탑승하세요.");
+    LastSaveMessage = TEXT("glTF vehicle placed. Press F to enter.");
 }
 
 
@@ -4162,7 +4170,7 @@ void UGameManagerSubSystem::TryEnterOrExitVehicle()
         {
             if (CharacterState->IsRagdollActive() || CharacterState->IsGettingUp())
             {
-                LastSaveMessage = TEXT("레그돌 상태에서는 차량에 탑승할 수 없습니다.");
+                LastSaveMessage = TEXT("Vehicles cannot be entered while ragdolled.");
                 NotifyStateChanged();
                 return;
             }
@@ -4191,7 +4199,7 @@ void UGameManagerSubSystem::TryEnterOrExitVehicle()
 
     if (IsValid(BestVehicle) && !BestVehicle->EnterVehicle(PC, CurrentPawn))
     {
-        LastSaveMessage = TEXT("현재 상태에서는 차량에 탑승할 수 없습니다.");
+        LastSaveMessage = TEXT("The vehicle cannot be entered in the current state.");
         NotifyStateChanged();
     }
 }
@@ -4202,7 +4210,7 @@ bool UGameManagerSubSystem::SaveScene()
     UWorldObjectStreamingSubsystem* Chunks = GetWorld() ? GetWorld()->GetSubsystem<UWorldObjectStreamingSubsystem>() : nullptr;
     if (!Chunks || !Chunks->IsRunning())
     {
-        LastSaveMessage = TEXT("청크 스트리밍이 준비되지 않아 저장 요청을 건너뜁니다.");
+        LastSaveMessage = TEXT("Save request skipped because chunk streaming is not ready.");
         return false;
     }
     // Mark tracked actors for the next coalesced .dat checkpoint.
@@ -4210,7 +4218,7 @@ bool UGameManagerSubSystem::SaveScene()
         if (Object.IsValid()) Chunks->MarkObjectChanged(Object.Get());
     for (const TWeakObjectPtr<AVehiclePawn>& Object : SpawnedVehicles)
         if (Object.IsValid()) Chunks->MarkObjectChanged(Object.Get());
-    LastSaveMessage = TEXT("변경된 객체를 다음 .dat 청크 체크포인트에 등록했습니다.");
+    LastSaveMessage = TEXT("The modified object was queued for the next .dat chunk checkpoint.");
     NotifyStateChanged();
     return true;
 }
@@ -4218,6 +4226,118 @@ bool UGameManagerSubSystem::SaveScene()
 FString UGameManagerSubSystem::GetProjectsRootPath()
 {
     return FSafeFileIO::NormalizeFilePath(PATH_PROJECTS);
+}
+
+FString UGameManagerSubSystem::GetExternalResourcesRootPath()
+{
+    const FString ResourcesRoot = FSafeFileIO::NormalizeFilePath(PATH_RESOURCES);
+    if (!ResourcesRoot.IsEmpty())
+    {
+        IFileManager::Get().MakeDirectory(*ResourcesRoot, true);
+    }
+    return ResourcesRoot;
+}
+
+bool UGameManagerSubSystem::GetProjectConfigurationByName(
+    const FString& ProjectName,
+    EGlTFSimulatorProjectType& OutProjectType,
+    bool& bOutAllowExternalAssets,
+    FString& OutDisplayName) const
+{
+    OutProjectType = EGlTFSimulatorProjectType::World;
+    bOutAllowExternalAssets = false;
+    OutDisplayName.Reset();
+    FString SafeName;
+    if (!TryNormalizeWorldFolderName(ProjectName, SafeName, false)) return false;
+    FGlTFSimulatorProjectConfig Config;
+    FString Error;
+    if (!GlTFSimulatorProjectConfig::Load(
+            FPaths::Combine(PATH_PROJECTS, SafeName, LEVEL_FILE_NAME),
+            SafeName, Config, nullptr, Error))
+    {
+        return false;
+    }
+    OutProjectType = Config.ProjectType;
+    bOutAllowExternalAssets = Config.bAllowExternalAssets;
+    OutDisplayName = Config.GetDisplayName(SafeName);
+    return true;
+}
+
+bool UGameManagerSubSystem::SetProjectTypeByName(
+    const FString& ProjectName,
+    const EGlTFSimulatorProjectType ProjectType)
+{
+    check(IsInGameThread());
+    if (IsProjectBuildInProgress()) return false;
+    FString SafeName;
+    if (!TryNormalizeWorldFolderName(ProjectName, SafeName, false)) return false;
+    const FString ConfigPath = FPaths::Combine(PATH_PROJECTS, SafeName, LEVEL_FILE_NAME);
+    const FSafeJsonLoadResult Loaded = FSafeFileIO::LoadJsonBlocking(ConfigPath);
+    TSharedPtr<FJsonObject> Json = Loaded.JsonObject;
+    if (!Loaded.IsSuccess() || !Json.IsValid())
+    {
+        LastSaveMessage = FString::Printf(
+            TEXT("Project configuration could not be updated: %s"),
+            Loaded.Error.IsEmpty() ? TEXT("invalid config.json") : *Loaded.Error);
+        NotifyStateChanged();
+        return false;
+    }
+    Json->SetStringField(PROJECT_TYPE_FIELD, GlTFSimulatorProjectConfig::ToString(ProjectType));
+    if (ProjectType == EGlTFSimulatorProjectType::World)
+    {
+        FString WorldName;
+        if (!Json->TryGetStringField(CONFIG_WORLD_NAME_FIELD, WorldName)
+            || WorldName.TrimStartAndEnd().IsEmpty())
+        {
+            Json->SetStringField(CONFIG_WORLD_NAME_FIELD, SafeName);
+        }
+    }
+    else
+    {
+        Json->SetBoolField(ALLOW_EXTERNAL_ASSETS_FIELD, false);
+        FString ProjectDisplayName;
+        if (!Json->TryGetStringField(PROJECT_NAME_FIELD, ProjectDisplayName)
+            || ProjectDisplayName.TrimStartAndEnd().IsEmpty())
+        {
+            Json->SetStringField(PROJECT_NAME_FIELD, SafeName);
+        }
+    }
+    const FSafeFileWriteResult Saved = FSafeFileIO::SaveJsonBlocking(Json.ToSharedRef(), ConfigPath);
+    LastSaveMessage = Saved.IsSuccess()
+        ? FString::Printf(TEXT("Project type changed to %s."), *GlTFSimulatorProjectConfig::ToString(ProjectType))
+        : FString::Printf(TEXT("Project configuration save failed: %s"), *Saved.Error);
+    NotifyStateChanged();
+    return Saved.IsSuccess();
+}
+
+bool UGameManagerSubSystem::SetWorldExternalAssetsAllowedByName(
+    const FString& ProjectName,
+    const bool bAllowed)
+{
+    check(IsInGameThread());
+    if (IsProjectBuildInProgress()) return false;
+    FString SafeName;
+    if (!TryNormalizeWorldFolderName(ProjectName, SafeName, false)) return false;
+    const FString ConfigPath = FPaths::Combine(PATH_PROJECTS, SafeName, LEVEL_FILE_NAME);
+    FGlTFSimulatorProjectConfig Existing;
+    TSharedPtr<FJsonObject> Json;
+    FString Error;
+    if (!GlTFSimulatorProjectConfig::Load(ConfigPath, SafeName, Existing, &Json, Error)
+        || !Json.IsValid() || Existing.ProjectType != EGlTFSimulatorProjectType::World)
+    {
+        LastSaveMessage = Existing.ProjectType == EGlTFSimulatorProjectType::World
+            ? FString::Printf(TEXT("Project configuration could not be updated: %s"), *Error)
+            : TEXT("Only World projects can allow external asset packs.");
+        NotifyStateChanged();
+        return false;
+    }
+    Json->SetBoolField(ALLOW_EXTERNAL_ASSETS_FIELD, bAllowed);
+    const FSafeFileWriteResult Saved = FSafeFileIO::SaveJsonBlocking(Json.ToSharedRef(), ConfigPath);
+    LastSaveMessage = Saved.IsSuccess()
+        ? FString::Printf(TEXT("External assets are now %s for this world."), bAllowed ? TEXT("enabled") : TEXT("disabled"))
+        : FString::Printf(TEXT("Project configuration save failed: %s"), *Saved.Error);
+    NotifyStateChanged();
+    return Saved.IsSuccess();
 }
 
 bool UGameManagerSubSystem::BuildProjectByName(const FString& ProjectName)
@@ -4228,8 +4348,8 @@ bool UGameManagerSubSystem::BuildProjectByName(const FString& ProjectName)
         || bWorldBakeInProgress || !ActiveBuildProjectRoot.IsEmpty())
     {
         LastSaveMessage = (bWorldBakeInProgress || !ActiveBuildProjectRoot.IsEmpty())
-            ? TEXT("다른 프로젝트 빌드가 이미 진행 중입니다.")
-            : TEXT("유효하지 않은 프로젝트 이름입니다.");
+            ? TEXT("Another project build is already in progress.")
+            : TEXT("The project name is invalid.");
         NotifyStateChanged();
         return false;
     }
@@ -4241,23 +4361,24 @@ bool UGameManagerSubSystem::BuildProjectByName(const FString& ProjectName)
         || !IFileManager::Get().DirectoryExists(*ResourcesRoot)
         || !IFileManager::Get().FileExists(*ConfigPath))
     {
-        LastSaveMessage = TEXT("프로젝트에는 config.json과 resources 폴더가 모두 필요합니다.");
+        LastSaveMessage = TEXT("The project requires both config.json and a resources directory.");
         NotifyStateChanged();
         return false;
     }
 
     if (!GetGameInstance() || !GetGameInstance()->GetSubsystem<UModelDatabaseSubsystem>())
     {
-        LastSaveMessage = TEXT("프로젝트 모델 데이터베이스 서브시스템을 사용할 수 없습니다.");
+        LastSaveMessage = TEXT("The project model database subsystem is unavailable.");
         NotifyStateChanged();
         return false;
     }
 
-    // Reserve the authoring slot before touching disk so repeated UI clicks cannot race two builds.
     ActiveBuildProjectRoot = ProjectRoot;
-    CurrentWorldName = SafeName;
+    ActiveBuildProjectName = SafeName;
+    ActiveBuildProjectType = EGlTFSimulatorProjectType::World;
+    bActiveBuildAllowExternalAssets = false;
     WorldBakeProgressValue = 0.01f;
-    LastSaveMessage = FString::Printf(TEXT("프로젝트 설정 검사 중: %s"), *SafeName);
+    LastSaveMessage = FString::Printf(TEXT("Validating project configuration: %s"), *SafeName);
     OnWorldBakeProgress.Broadcast(WorldBakeProgressValue);
     NotifyStateChanged();
 
@@ -4267,25 +4388,28 @@ bool UGameManagerSubSystem::BuildProjectByName(const FString& ProjectName)
     {
         FString ConfigJson;
         FString ValidationError;
+        FGlTFSimulatorProjectConfig ProjectConfig;
         const FSafeBinaryLoadResult ConfigBytes =
             FSafeFileIO::LoadBinaryBlocking(ConfigPath, 64ll * 1024ll * 1024ll);
         if (!ConfigBytes.IsSuccess())
         {
             ValidationError = FString::Printf(
-                TEXT("프로젝트 config.json 읽기 실패: %s"), *ConfigBytes.Error);
+                TEXT("Failed to read project config.json: %s"), *ConfigBytes.Error);
         }
         else
         {
             const FSafeJsonLoadResult ParsedConfig =
                 FSafeFileIO::ParseJsonUtf8Bytes(ConfigBytes.Data, ConfigPath);
-            FString ConfiguredWorldName;
-            if (!ParsedConfig.IsSuccess()
-                || !ParsedConfig.JsonObject->TryGetStringField(
-                    CONFIG_WORLD_NAME_FIELD, ConfiguredWorldName)
-                || ConfiguredWorldName.TrimStartAndEnd().IsEmpty())
+            if (!ParsedConfig.IsSuccess() || !ParsedConfig.JsonObject.IsValid()
+                || !GlTFSimulatorProjectConfig::Parse(
+                    ParsedConfig.JsonObject, SafeName, ProjectConfig, ValidationError))
             {
-                ValidationError = TEXT(
-                    "프로젝트 config.json에는 비어 있지 않은 WorldName 문자열이 필요합니다.");
+                if (ValidationError.IsEmpty())
+                {
+                    ValidationError = ParsedConfig.Error.IsEmpty()
+                        ? TEXT("Project config.json is invalid.")
+                        : ParsedConfig.Error;
+                }
             }
             else
             {
@@ -4296,13 +4420,13 @@ bool UGameManagerSubSystem::BuildProjectByName(const FString& ProjectName)
             }
         }
 
-        const bool bDispatched = FSafeFileIO::DispatchTrackedGameThread(
-            [WeakThis, ProjectRoot, SafeName,
+        FSafeFileIO::DispatchTrackedGameThread(
+            [WeakThis, ProjectRoot, SafeName, ProjectConfig,
                 ConfigJson = MoveTemp(ConfigJson), ValidationError = MoveTemp(ValidationError)]() mutable
         {
             UGameManagerSubSystem* StrongThis = WeakThis.Get();
             if (!IsValid(StrongThis) || StrongThis->ActiveBuildProjectRoot != ProjectRoot
-                || StrongThis->CurrentWorldName != SafeName)
+                || StrongThis->ActiveBuildProjectName != SafeName)
             {
                 return;
             }
@@ -4310,6 +4434,7 @@ bool UGameManagerSubSystem::BuildProjectByName(const FString& ProjectName)
             {
                 StrongThis->PendingWorldConfigJson.Reset();
                 StrongThis->ActiveBuildProjectRoot.Reset();
+                StrongThis->ActiveBuildProjectName.Reset();
                 StrongThis->LastSaveMessage = ValidationError;
                 StrongThis->OnWorldBakeCompleted.Broadcast(false, StrongThis->LastSaveMessage);
                 StrongThis->NotifyStateChanged();
@@ -4322,21 +4447,22 @@ bool UGameManagerSubSystem::BuildProjectByName(const FString& ProjectName)
             {
                 StrongThis->PendingWorldConfigJson.Reset();
                 StrongThis->ActiveBuildProjectRoot.Reset();
-                StrongThis->LastSaveMessage = TEXT(
-                    "프로젝트 모델 데이터베이스 서브시스템을 사용할 수 없습니다.");
+                StrongThis->ActiveBuildProjectName.Reset();
+                StrongThis->LastSaveMessage = TEXT("The project model database subsystem is unavailable.");
                 StrongThis->OnWorldBakeCompleted.Broadcast(false, StrongThis->LastSaveMessage);
                 StrongThis->NotifyStateChanged();
                 return;
             }
 
+            StrongThis->ActiveBuildProjectType = ProjectConfig.ProjectType;
+            StrongThis->bActiveBuildAllowExternalAssets = ProjectConfig.bAllowExternalAssets;
             StrongThis->PendingWorldConfigJson = MoveTemp(ConfigJson);
             StrongThis->WorldBakeProgressValue = FMath::Max(StrongThis->WorldBakeProgressValue, 0.03f);
             StrongThis->OnWorldBakeProgress.Broadcast(StrongThis->WorldBakeProgressValue);
-            // A Projects-screen build is an explicit user retry. Drop stale process-local source
-            // failure history here so a GLB fixed after an earlier attempt is actually re-opened.
-            // Runtime gwd:// failures will be accumulated again independently during gameplay.
             FglTFRuntimeSafety::ResetRecoverableFailures();
-            StrongThis->LastSaveMessage = FString::Printf(TEXT("프로젝트 모델 검사 중: %s"), *SafeName);
+            StrongThis->LastSaveMessage = FString::Printf(
+                TEXT("Validating %s project models: %s"),
+                *GlTFSimulatorProjectConfig::ToString(ProjectConfig.ProjectType), *SafeName);
             StrongThis->NotifyStateChanged();
             Database->InitializeForAuthoringProject(
                 ProjectRoot, FModelDatabaseReady::CreateLambda(
@@ -4344,7 +4470,7 @@ bool UGameManagerSubSystem::BuildProjectByName(const FString& ProjectName)
             {
                 UGameManagerSubSystem* InnerThis = WeakThis.Get();
                 if (!IsValid(InnerThis) || InnerThis->ActiveBuildProjectRoot != ProjectRoot
-                    || InnerThis->CurrentWorldName != SafeName)
+                    || InnerThis->ActiveBuildProjectName != SafeName)
                 {
                     return;
                 }
@@ -4352,7 +4478,8 @@ bool UGameManagerSubSystem::BuildProjectByName(const FString& ProjectName)
                 {
                     InnerThis->PendingWorldConfigJson.Reset();
                     InnerThis->ActiveBuildProjectRoot.Reset();
-                    InnerThis->LastSaveMessage = FString::Printf(TEXT("프로젝트 검사 실패: %s"), *Error);
+                    InnerThis->ActiveBuildProjectName.Reset();
+                    InnerThis->LastSaveMessage = FString::Printf(TEXT("Project validation failed: %s"), *Error);
                     InnerThis->OnWorldBakeCompleted.Broadcast(false, InnerThis->LastSaveMessage);
                     InnerThis->NotifyStateChanged();
                     return;
@@ -4362,17 +4489,14 @@ bool UGameManagerSubSystem::BuildProjectByName(const FString& ProjectName)
                 InnerThis->BakeWorldData();
             }));
         });
-        if (!bDispatched)
-        {
-            // Shutdown owns the subsystem lifetime from this point; no UObject may be touched here.
-        }
     });
 
     if (!bQueued)
     {
         ActiveBuildProjectRoot.Reset();
+        ActiveBuildProjectName.Reset();
         PendingWorldConfigJson.Reset();
-        LastSaveMessage = TEXT("프로젝트 빌드 worker queue가 종료 중입니다.");
+        LastSaveMessage = TEXT("The project build worker queue is shutting down.");
         NotifyStateChanged();
         return false;
     }
@@ -4384,7 +4508,7 @@ void UGameManagerSubSystem::BakeWorldData()
     UWorld* World = GetWorld();
     if (!World || World->GetNetMode() == NM_Client)
     {
-        const FString Message = TEXT("월드 Bake는 권한이 있는 서버/싱글플레이 월드에서만 실행할 수 있습니다.");
+        const FString Message = TEXT("Project build can run only in an authoritative server or single-player world.");
         LastSaveMessage = Message;
         OnWorldBakeCompleted.Broadcast(false, Message);
         if (bAutoBuildForStartup)
@@ -4395,6 +4519,9 @@ void UGameManagerSubSystem::BakeWorldData()
         {
             PendingWorldConfigJson.Reset();
             ActiveBuildProjectRoot.Reset();
+            ActiveBuildProjectName.Reset();
+            ActiveBuildProjectType = EGlTFSimulatorProjectType::World;
+            bActiveBuildAllowExternalAssets = false;
             NotifyStateChanged();
         }
         return;
@@ -4402,7 +4529,7 @@ void UGameManagerSubSystem::BakeWorldData()
 
     if (bWorldBakeInProgress)
     {
-        const FString Message = TEXT("월드 아카이브 빌드가 이미 진행 중입니다.");
+        const FString Message = TEXT("A project archive build is already in progress.");
         LastSaveMessage = Message;
         if (bAutoBuildForStartup)
         {
@@ -4419,7 +4546,7 @@ void UGameManagerSubSystem::BakeWorldData()
         ? GetGameInstance()->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
     if (!ModelDatabase || !ModelDatabase->IsReady())
     {
-        const FString Message = TEXT("소스 모델 인덱스가 준비되지 않아 .gwd를 빌드할 수 없습니다.");
+        const FString Message = TEXT("The project archive cannot be built because the source model index is not ready.");
         LastSaveMessage = Message;
         OnWorldBakeCompleted.Broadcast(false, Message);
         if (bAutoBuildForStartup)
@@ -4430,13 +4557,16 @@ void UGameManagerSubSystem::BakeWorldData()
         {
             PendingWorldConfigJson.Reset();
             ActiveBuildProjectRoot.Reset();
+            ActiveBuildProjectName.Reset();
+            ActiveBuildProjectType = EGlTFSimulatorProjectType::World;
+            bActiveBuildAllowExternalAssets = false;
             NotifyStateChanged();
         }
         return;
     }
     if (ModelDatabase->IsBuiltWorld())
     {
-        const FString Message = TEXT("검증된 .gwd가 이미 열려 있어 런타임 중 소스 재빌드를 거부했습니다.");
+        const FString Message = TEXT("Source rebuild was refused because a verified runtime archive is already open.");
         LastSaveMessage = Message;
         OnWorldBakeCompleted.Broadcast(false, Message);
         if (bAutoBuildForStartup)
@@ -4447,6 +4577,9 @@ void UGameManagerSubSystem::BakeWorldData()
         {
             PendingWorldConfigJson.Reset();
             ActiveBuildProjectRoot.Reset();
+            ActiveBuildProjectName.Reset();
+            ActiveBuildProjectType = EGlTFSimulatorProjectType::World;
+            bActiveBuildAllowExternalAssets = false;
             NotifyStateChanged();
         }
         return;
@@ -4469,15 +4602,39 @@ void UGameManagerSubSystem::BakeWorldData()
     TArray<FModelDefinition> Definitions;
     ModelDatabase->GetDefinitions(Definitions);
     PendingWorldBakeModels.Reserve(Definitions.Num());
-    // GetDefinitions already returns UUID order. Filtering preserves that deterministic order, so
-    // sorting again would add O(N log N) work (and previously allocated two strings per compare).
+    FString TypeMismatchError;
     for (const FModelDefinition& Definition : Definitions)
     {
         const FString ModelPath = GlbValidation::NormalizePath(Definition.GlbPath);
-        if (!ModelPath.IsEmpty())
+        if (ModelPath.IsEmpty()) continue;
+
+        bool bAllowedForProject = ActiveBuildProjectType == EGlTFSimulatorProjectType::World;
+        if (ActiveBuildProjectType == EGlTFSimulatorProjectType::Character)
         {
-            PendingWorldBakeModels.Add(Definition);
+            bAllowedForProject = Definition.ModelType == EModelDefinitionType::Character;
         }
+        else if (ActiveBuildProjectType == EGlTFSimulatorProjectType::Dynamic)
+        {
+            bAllowedForProject = Definition.ModelType == EModelDefinitionType::Dynamic;
+        }
+
+        if (!bAllowedForProject)
+        {
+            TypeMismatchError = FString::Printf(
+                TEXT("%s projects may contain only %s models, but '%s' is %s."),
+                *GlTFSimulatorProjectConfig::ToString(ActiveBuildProjectType),
+                *GlTFSimulatorProjectConfig::ToString(ActiveBuildProjectType),
+                *Definition.DisplayName,
+                *ModelDefinitionJson::ModelTypeToString(Definition.ModelType));
+            break;
+        }
+        PendingWorldBakeModels.Add(Definition);
+    }
+
+    if (!TypeMismatchError.IsEmpty())
+    {
+        CompleteWorldArchiveBuild(false, FString(), TypeMismatchError);
+        return;
     }
 
     WorldBakeTotalModels = PendingWorldBakeModels.Num();
@@ -4487,7 +4644,8 @@ void UGameManagerSubSystem::BakeWorldData()
     OnWorldBakeProgress.Broadcast(WorldBakeProgressValue);
 
     LastSaveMessage = FString::Printf(
-        TEXT(".gwd 빌드 시작: 모델 %d개"),
+        TEXT("%s project build started: %d model(s)"),
+        *GlTFSimulatorProjectConfig::ToString(ActiveBuildProjectType),
         WorldBakeTotalModels);
     NotifyStateChanged();
 
@@ -4505,7 +4663,7 @@ void UGameManagerSubSystem::BakeWorldData()
         // Never publish an empty archive. A zero count means the resources root was wrong or source
         // discovery failed, and treating that as a build would suppress every later GLB scan.
         CompleteWorldArchiveBuild(false, FString(),
-            TEXT("recursive resources scan produced zero buildable GLB models"));
+            TEXT("recursive resources scan produced zero buildable models for this project type"));
         return;
     }
     StartNextWorldBakeModel();
@@ -4567,7 +4725,7 @@ void UGameManagerSubSystem::StartNextWorldBakeModel()
 
         ActiveWorldBuildTask = BuildTask;
         LastSaveMessage = FString::Printf(
-            TEXT("모델 빌드 중 %d/%d: %s"),
+            TEXT("Building model %d/%d: %s"),
             WorldBakeCompletedModels + 1,
             WorldBakeTotalModels,
             *FPaths::GetCleanFilename(ModelPath));
@@ -4694,37 +4852,65 @@ void UGameManagerSubSystem::FinishWorldBake()
         || CompletedWorldBuildModels.Num() != WorldBakeTotalModels)
     {
         CompleteWorldArchiveBuild(false, FString(),
-            FString::Printf(TEXT("metadata scan failed for %d/%d models"),
+            FString::Printf(TEXT("model build failed for %d/%d models"),
                 WorldBakeFailedModels, WorldBakeTotalModels));
         return;
     }
 
+    const FString BuildProjectName = !ActiveBuildProjectName.IsEmpty()
+        ? ActiveBuildProjectName : CurrentWorldName;
+    if (BuildProjectName.IsEmpty())
+    {
+        CompleteWorldArchiveBuild(false, FString(), TEXT("project build name is empty"));
+        return;
+    }
+
+    const EGlTFSimulatorProjectType BuildProjectType = ActiveBuildProjectType;
+    const bool bWorldProject = BuildProjectType == EGlTFSimulatorProjectType::World;
+    FString OutputRootOrPath;
+    if (bWorldProject)
+    {
+        OutputRootOrPath = FSafeFileIO::NormalizeFilePath(FPaths::Combine(PATH_WORLDS, BuildProjectName));
+    }
+    else
+    {
+        const FString ExternalRoot = GetExternalResourcesRootPath();
+        if (ExternalRoot.IsEmpty())
+        {
+            CompleteWorldArchiveBuild(false, FString(), TEXT("external Resources directory is unavailable"));
+            return;
+        }
+        OutputRootOrPath = FSafeFileIO::NormalizeFilePath(
+            FPaths::Combine(ExternalRoot, BuildProjectName + TEXT(".gasset")));
+    }
+
     bWorldArchiveCommitInFlight = true;
     WorldBakeProgressValue = 0.96f;
-    LastSaveMessage = TEXT(".gwd 아카이브 기록 및 무결성 검증 중...");
+    LastSaveMessage = bWorldProject
+        ? TEXT("Writing and verifying the world .gwd archive...")
+        : TEXT("Writing and verifying the external .gasset archive...");
     OnWorldBakeProgress.Broadcast(WorldBakeProgressValue);
     NotifyStateChanged();
-    const FString WorldRoot = GetWorldRootPath();
-    const FString WorldConfigJson = PendingWorldConfigJson;
-    // Transfer the baked maps to the worker. Copying this array would duplicate every node and mesh
-    // record at the exact point where definition/metadata serialization also needs temporary bytes.
+    const FString ArchiveConfigJson = PendingWorldConfigJson;
     TArray<FGWorldBuildModel> BuildModels = MoveTemp(CompletedWorldBuildModels);
     TWeakObjectPtr<UGameManagerSubSystem> WeakThis(this);
     const uint64 BuildGeneration = WorldBakeGeneration;
     const TSharedPtr<TAtomic<bool>, ESPMode::ThreadSafe> Cancellation = WorldBakeCancellation;
     const bool bQueued = FSafeFileIO::RunTrackedWorker(
-        [WeakThis, WorldRoot, WorldConfigJson, BuildGeneration, Cancellation,
-            BuildModels = MoveTemp(BuildModels)]() mutable
+        [WeakThis, OutputRootOrPath, ArchiveConfigJson, BuildGeneration, Cancellation,
+            bWorldProject, BuildModels = MoveTemp(BuildModels)]() mutable
     {
         FString ArchivePath;
         FString Error;
-        const bool bSuccess = FGWorldArchive::BuildBlocking(
-            WorldRoot, BuildModels, ArchivePath, Error,
-            [Cancellation]()
-            {
-                return Cancellation.IsValid() && Cancellation->Load();
-            },
-            WorldConfigJson);
+        const TFunction<bool()> ShouldCancel = [Cancellation]()
+        {
+            return Cancellation.IsValid() && Cancellation->Load();
+        };
+        const bool bSuccess = bWorldProject
+            ? FGWorldArchive::BuildBlocking(
+                OutputRootOrPath, BuildModels, ArchivePath, Error, ShouldCancel, ArchiveConfigJson)
+            : FGWorldArchive::BuildBlockingToArchivePath(
+                OutputRootOrPath, BuildModels, ArchivePath, Error, ShouldCancel, ArchiveConfigJson);
         FSafeFileIO::DispatchTrackedGameThread(
             [WeakThis, BuildGeneration, bSuccess,
                 ArchivePath = MoveTemp(ArchivePath), Error = MoveTemp(Error)]()
@@ -4742,7 +4928,7 @@ void UGameManagerSubSystem::FinishWorldBake()
     {
         bWorldArchiveCommitInFlight = false;
         CompleteWorldArchiveBuild(false, FString(),
-            TEXT("world archive worker queue is shutting down"));
+            TEXT("project archive worker queue is shutting down"));
     }
 }
 
@@ -4760,12 +4946,16 @@ void UGameManagerSubSystem::CompleteWorldArchiveBuild(
 
     const bool bSuccess = bArchiveSuccess;
     const bool bWasAutomaticStartupBuild = bAutoBuildForStartup;
-    const bool bResumeStartup = bWasAutomaticStartupBuild && bArchiveSuccess;
+    const EGlTFSimulatorProjectType CompletedProjectType = ActiveBuildProjectType;
+    const bool bResumeStartup = bWasAutomaticStartupBuild && bArchiveSuccess
+        && CompletedProjectType == EGlTFSimulatorProjectType::World;
+    const TCHAR* ArchiveKind = CompletedProjectType == EGlTFSimulatorProjectType::World
+        ? TEXT(".gwd") : TEXT(".gasset");
     const FString Message = bSuccess
-        ? FString::Printf(TEXT(".gwd 빌드 완료: 모델 %d개 (%s)"),
-            WorldBakeTotalModels, *ArchivePath)
-        : FString::Printf(TEXT(".gwd 빌드 실패: %s"),
-            Error.IsEmpty() ? TEXT("archive build failed") : *Error);
+        ? FString::Printf(TEXT("%s build completed: %d model(s) (%s)"),
+            ArchiveKind, WorldBakeTotalModels, *ArchivePath)
+        : FString::Printf(TEXT("%s build failed: %s"),
+            ArchiveKind, Error.IsEmpty() ? TEXT("archive build failed") : *Error);
 
     bWorldBakeInProgress = false;
     bWorldArchiveCommitInFlight = false;
@@ -4776,6 +4966,9 @@ void UGameManagerSubSystem::CompleteWorldArchiveBuild(
     ActiveWorldBuildTask = nullptr;
     PendingWorldConfigJson.Reset();
     ActiveBuildProjectRoot.Reset();
+    ActiveBuildProjectName.Reset();
+    ActiveBuildProjectType = EGlTFSimulatorProjectType::World;
+    bActiveBuildAllowExternalAssets = false;
     WorldBakeNextModelIndex = 0;
     WorldBakeProgressValue = 1.0f;
     LastSaveMessage = Message;
@@ -4796,7 +4989,7 @@ void UGameManagerSubSystem::CompleteWorldArchiveBuild(
         if (!Database)
         {
             FailWorldStartup(
-                TEXT("월드 시작 실패: 빌드 후 아카이브를 다시 열 데이터베이스가 없습니다."));
+                TEXT("World startup failed: no model database is available to reopen the archive after the build."));
             return;
         }
         SetLoadingStatus(0.67f);
@@ -4812,7 +5005,7 @@ void UGameManagerSubSystem::CompleteWorldArchiveBuild(
             if (!bOpened || !OpenDatabase || !OpenDatabase->IsBuiltWorld())
             {
                 StrongThis->FailWorldStartup(FString::Printf(
-                    TEXT("빌드 파일 재검증 실패: %s"), *OpenError));
+                    TEXT("Built archive revalidation failed: %s"), *OpenError));
                 return;
             }
             StrongThis->ContinueWorldStartupAfterDatabase();
@@ -4843,6 +5036,9 @@ void UGameManagerSubSystem::CancelWorldBake()
     CompletedWorldBuildModels.Empty();
     PendingWorldConfigJson.Reset();
     ActiveBuildProjectRoot.Reset();
+    ActiveBuildProjectName.Reset();
+    ActiveBuildProjectType = EGlTFSimulatorProjectType::World;
+    bActiveBuildAllowExternalAssets = false;
     bWorldBakeInProgress = false;
     bWorldArchiveCommitInFlight = false;
     WorldBakeCancellation.Reset();
@@ -4871,7 +5067,7 @@ bool UGameManagerSubSystem::LoadSavedScene()
     bSavedSceneLoadFailed = false;
     SavedSceneReadinessAttemptCount = 0;
     SavedSceneDataAttemptCount = 0;
-    LastSaveMessage = TEXT("초기 반경의 월드 객체 청크 로드가 완료되었습니다.");
+    LastSaveMessage = TEXT("Initial-radius world object chunks finished loading.");
     NotifyStateChanged();
     return true;
 }
@@ -4938,7 +5134,7 @@ bool UGameManagerSubSystem::SetCurrentStaticIndex(int32 NewIndex)
     }
 
     CurrentStaticIndex = NewIndex;
-    LastSaveMessage = FString::Printf(TEXT("Static 선택: %s"), *GetCurrentStaticName());
+    LastSaveMessage = FString::Printf(TEXT("Static selected: %s"), *GetCurrentStaticName());
     NotifyStateChanged();
     return true;
 }
@@ -4958,7 +5154,7 @@ bool UGameManagerSubSystem::SetCurrentWeaponIndex(int32 NewIndex)
     }
 
     CurrentWeaponIndex = NewIndex;
-    LastSaveMessage = FString::Printf(TEXT("무기 선택: %s"), *GetCurrentWeaponName());
+    LastSaveMessage = FString::Printf(TEXT("Weapon selected: %s"), *GetCurrentWeaponName());
     NotifyStateChanged();
     return true;
 }
@@ -5001,7 +5197,7 @@ FString UGameManagerSubSystem::BuildStatusText() const
         static_cast<int64>(CurrentMode)).ToString();
     const FToolbarItem SelectedItem = GetSelectedToolbarItem();
     const FString SelectedItemName = SelectedItem.DisplayName.IsEmpty()
-        ? TEXT("비어 있음")
+        ? TEXT("Empty")
         : SelectedItem.DisplayName;
     const FString CrosshairPlacementText = !bLastTraceHasPlacementLocation
         ? TEXT("NONE")

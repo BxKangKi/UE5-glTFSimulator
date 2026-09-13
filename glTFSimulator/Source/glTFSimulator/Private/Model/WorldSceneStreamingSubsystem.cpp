@@ -2,9 +2,9 @@
 
 /**
  * @file WorldSceneStreamingSubsystem.cpp
- * 역할: 거리 기반으로 씬과 플레이어 모델을 스트리밍합니다.
- * 핵심 기능: 씬 액터 클래스 선택·생성, 초기 준비 상태, 플레이어 모델 교체.
- * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
  */
 
 #include "Model/WorldSceneStreamingSubsystem.h"

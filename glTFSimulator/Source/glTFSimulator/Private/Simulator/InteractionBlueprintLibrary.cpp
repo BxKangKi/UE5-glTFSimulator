@@ -1,8 +1,8 @@
 /**
  * @file InteractionBlueprintLibrary.cpp
- * 역할: 상호작용 기능을 Blueprint에 노출합니다.
- * 핵심 기능: 장비 부착, 캐릭터 소켓 및 상호작용 보조.
- * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
  */
 
 #include "Simulator/InteractionBlueprintLibrary.h"

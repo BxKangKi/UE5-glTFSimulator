@@ -3,9 +3,9 @@
 
 /**
  * @file StartWorldWidget.cpp
- * 역할: 메뉴 버튼과 MainGameMode의 월드 실행 기능을 연결합니다.
- * 핵심 기능: 선택 폴더·경로 조회, 메뉴·싱글·호스트·접속 버튼.
- * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
  */
 
 #include "UI/StartWorldWidget.h"

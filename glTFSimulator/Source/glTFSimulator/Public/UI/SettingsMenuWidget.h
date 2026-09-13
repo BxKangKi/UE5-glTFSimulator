@@ -2,9 +2,9 @@
 
 /**
  * @file SettingsMenuWidget.h
- * 역할: 설정 메뉴의 보류값과 적용 동작을 관리합니다.
- * 핵심 기능: 설정 컨트롤 바인딩, 값 변경·확인·적용.
- * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * Declares interface, lifetime, and data-ownership contracts; see the matching implementation for behavior.
  */
 
 #pragma once
@@ -14,51 +14,20 @@
 #include "Components/Button.h"
 #include "Components/ComboBoxString.h"
 #include "Components/Slider.h"
+#include "UI/SettingsFieldTypes.h"
 #include "SettingsMenuWidget.generated.h"
 
 class UGameSettings;
 class USettingsMenuWidget;
 class UTextBlock;
 class USettingsControlBinding;
+class UVerticalBox;
+class USettingControlWidget;
+class UBooleanSettingWidget;
+class UFloatSettingWidget;
+class UEnumSettingWidget;
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FSettingsCloseRequested);
-
-UENUM(BlueprintType)
-enum class ESettingsField : uint8
-{
-    BloomIntensity UMETA(DisplayName="Bloom Intensity"),
-    BloomThreshold UMETA(DisplayName="Bloom Threshold"),
-    AmbientOcclusionIntensity UMETA(DisplayName="Ambient Occlusion"),
-    RayTracing UMETA(DisplayName="Ray Tracing"),
-    HeightFog UMETA(DisplayName="Height Fog"),
-    Cloud UMETA(DisplayName="Cloud"),
-    ShadowQuality UMETA(DisplayName="Shadow Quality"),
-    TextureQuality UMETA(DisplayName="Texture Quality"),
-    MaxTextureResolution UMETA(DisplayName="Max Texture Resolution"),
-    ViewDistanceQuality UMETA(DisplayName="View Distance Quality"),
-    StreamingDistanceMultiplier UMETA(DisplayName="Streaming Distance Multiplier"),
-    StreamingUnloadDistanceMultiplier UMETA(DisplayName="Streaming Unload Multiplier"),
-    ObjectStreamingRadiusMeters UMETA(DisplayName="Object Streaming Radius"),
-    StreamingSceneSpawnBudget UMETA(DisplayName="Scene Spawn Budget"),
-    StreamingNodeBudgetPerFrame UMETA(DisplayName="Node Budget Per Frame"),
-    AntiAliasingQuality UMETA(DisplayName="Anti Aliasing Quality"),
-    PostProcessingQuality UMETA(DisplayName="Post Processing Quality"),
-    EffectsQuality UMETA(DisplayName="Effects Quality"),
-    FoliageQuality UMETA(DisplayName="Foliage Quality"),
-    ShadingQuality UMETA(DisplayName="Shading Quality"),
-    GlobalIlluminationQuality UMETA(DisplayName="GI Quality"),
-    ReflectionQuality UMETA(DisplayName="Reflection Quality"),
-    DynamicGlobalIlluminationMethod UMETA(DisplayName="GI Method"),
-    ReflectionMethod UMETA(DisplayName="Reflection Method")
-};
-
-UENUM(BlueprintType)
-enum class ESettingsControlType : uint8
-{
-    Slider UMETA(DisplayName="Slider"),
-    Dropdown UMETA(DisplayName="Dropdown"),
-    Toggle UMETA(DisplayName="Toggle Button")
-};
 
 /**
  * Per-control delegate adapter. A Blueprint can keep using ordinary Slider/ComboBoxString/Button
@@ -157,9 +126,9 @@ private:
 /**
  * Blueprint-editable settings menu backed by UGameSettings.
  *
- * WBP children should pass buttons and value text blocks explicitly from Construct by calling
- * the Set*Button(), SetTitleText(), RegisterSettingValueText(), and RegisterSettingButton()
- * functions. This class does not use automatic widget-name binding or widget-tree lookup.
+ * A Settings WBP can pass a dedicated VerticalBox through SetSettingsListBox(). Native code then
+ * generates one Blueprint-authored row WBP per settings field using the configured Boolean, Float,
+ * or Enum widget class. Legacy direct-control registration remains available for compatibility.
  */
 UCLASS(Blueprintable, BlueprintType)
 class GLTFSIMULATOR_API USettingsMenuWidget : public UUserWidget
@@ -188,6 +157,30 @@ public:
 
     UFUNCTION(BlueprintCallable, Category="Settings|Widgets")
     void SetCancelButton(UButton* InButton);
+
+    /** Dedicated VerticalBox host. Generated setting WBP rows are created inside this box. */
+    UFUNCTION(BlueprintCallable, Category="Settings|Generated Widgets")
+    void SetSettingsListBox(UVerticalBox* InVerticalBox);
+
+    /** Rebuilds every generated row using the currently assigned WBP classes. */
+    UFUNCTION(BlueprintCallable, Category="Settings|Generated Widgets")
+    void RebuildGeneratedSettingWidgets();
+
+    /** Removes generated setting rows from the assigned VerticalBox. */
+    UFUNCTION(BlueprintCallable, Category="Settings|Generated Widgets")
+    void ClearGeneratedSettingWidgets();
+
+    /** WBP used for bool values such as Ray Tracing, Height Fog, and Cloud. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Settings|Generated Widgets")
+    TSubclassOf<UBooleanSettingWidget> BooleanSettingWidgetClass;
+
+    /** WBP used for ranged numeric values such as Bloom and streaming distance. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Settings|Generated Widgets")
+    TSubclassOf<UFloatSettingWidget> FloatSettingWidgetClass;
+
+    /** WBP used for discrete int/enum values such as quality, methods, and texture resolution. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Settings|Generated Widgets")
+    TSubclassOf<UEnumSettingWidget> EnumSettingWidgetClass;
 
     UFUNCTION(BlueprintCallable, Category="Settings|Widgets")
     void RegisterSettingValueText(ESettingsField Field, UTextBlock* InTextBlock);
@@ -218,6 +211,14 @@ public:
     /** Returns the actual Slider min/max/step for range settings. */
     UFUNCTION(BlueprintPure, Category="Settings|Controls")
     bool GetSettingSliderRange(ESettingsField Field, float& OutMin, float& OutMax, float& OutStep) const;
+
+    /** Returns the current pending bool value for a boolean setting. */
+    UFUNCTION(BlueprintPure, Category="Settings|Controls")
+    bool GetPendingBooleanSettingValue(ESettingsField Field) const;
+
+    /** Returns the current pending numeric value for a slider/range setting. */
+    UFUNCTION(BlueprintPure, Category="Settings|Controls")
+    float GetPendingNumericSettingValue(ESettingsField Field) const;
 
     /** Direct graph target for a Slider OnValueChanged event. */
     UFUNCTION(BlueprintCallable, Category="Settings|Controls")
@@ -367,6 +368,8 @@ private:
     void BindFieldButton(ESettingsField Field, UButton* Button);
     void UnbindFieldButton(ESettingsField Field, UButton* Button);
     void RefreshRegisteredControls();
+    void RefreshGeneratedSettingWidgets();
+    USettingControlWidget* CreateGeneratedSettingWidget(ESettingsField Field);
     void RemoveControlBinding(ESettingsField Field);
     USettingsControlBinding* FindControlBinding(ESettingsField Field) const;
     float GetPendingNumericValue(ESettingsField Field) const;
@@ -402,6 +405,11 @@ private:
 
     UPROPERTY(Transient)
     TArray<TObjectPtr<USettingsControlBinding>> ControlBindings;
+
+    TWeakObjectPtr<UVerticalBox> AssignedSettingsListBox;
+
+    UPROPERTY(Transient)
+    TArray<TObjectPtr<USettingControlWidget>> GeneratedSettingWidgets;
 
     float PendingBloomIntensity = 0.675f;
     float PendingBloomThreshold = -1.0f;

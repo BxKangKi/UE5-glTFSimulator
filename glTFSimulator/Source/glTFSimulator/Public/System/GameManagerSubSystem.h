@@ -2,9 +2,9 @@
 
 /**
  * @file GameManagerSubSystem.h
- * 역할: GameMode가 시작한 월드 빌드·실행 세션의 서비스 상태를 관리합니다.
- * 핵심 기능: 경로 해석, DB→bake→streaming, 배치·저장·세션 종료. 생명주기는 GameMode가 소유합니다.
- * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * Declares interface, lifetime, and data-ownership contracts; see the matching implementation for behavior.
  */
 
 #pragma once
@@ -17,6 +17,7 @@
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "TimerManager.h"
 #include "World/PlacementTypes.h"
+#include "System/ProjectConfig.h"
 #include "System/WorldArchive.h"
 #include "GameManagerSubSystem.generated.h"
 
@@ -285,12 +286,29 @@ public:
     /** Called by the chunk streamer after a UUID-backed Static/Dynamic object is instantiated. */
     void TrackStreamedWorldObject(AActor* Actor);
 
-    /** Explicitly scans Projects/<Project>/resources then atomically publishes Worlds/<Project>.gwd. */
+    /** Scans Projects/<Project>/resources and publishes either a World .gwd or an external .gasset pack. */
     UFUNCTION(BlueprintCallable, Category="Game|Projects")
     bool BuildProjectByName(const FString& ProjectName);
 
     UFUNCTION(BlueprintPure, Category="Game|Projects")
     static FString GetProjectsRootPath();
+
+    /** Runtime folder used for installable Character/Dynamic .gasset packs. */
+    UFUNCTION(BlueprintPure, Category="Game|Projects")
+    static FString GetExternalResourcesRootPath();
+
+    UFUNCTION(BlueprintCallable, Category="Game|Projects")
+    bool GetProjectConfigurationByName(
+        const FString& ProjectName,
+        EGlTFSimulatorProjectType& OutProjectType,
+        bool& bOutAllowExternalAssets,
+        FString& OutDisplayName) const;
+
+    UFUNCTION(BlueprintCallable, Category="Game|Projects")
+    bool SetProjectTypeByName(const FString& ProjectName, EGlTFSimulatorProjectType ProjectType);
+
+    UFUNCTION(BlueprintCallable, Category="Game|Projects")
+    bool SetWorldExternalAssetsAllowedByName(const FString& ProjectName, bool bAllowed);
 
     /** Atomically builds immutable WorldName.gwd from the explicitly prepared authoring database. */
     UFUNCTION(BlueprintCallable, Category="Game|Bake")
@@ -591,6 +609,9 @@ private:
     FString CurrentWorldName;
     FString PendingWorldConfigJson;
     FString ActiveBuildProjectRoot;
+    FString ActiveBuildProjectName;
+    EGlTFSimulatorProjectType ActiveBuildProjectType = EGlTFSimulatorProjectType::World;
+    bool bActiveBuildAllowExternalAssets = false;
     FVector PlayerLocation = FVector::ZeroVector;
     float LoadingStatus = 0.0f;
     int32 TotalSumFPS = 0;

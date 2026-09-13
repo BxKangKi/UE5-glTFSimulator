@@ -3,9 +3,9 @@
 
 /**
  * @file CharacterComponent.h
- * 역할: 캐릭터 이동과 물리 동작을 관리합니다.
- * 핵심 기능: 이동 상태 전환, 접지·수영·비행·래그돌 처리, 물리 결과 반영.
- * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * Declares interface, lifetime, and data-ownership contracts; see the matching implementation for behavior.
  */
 
 #pragma once
@@ -120,12 +120,6 @@ public:
 
     UFUNCTION(BlueprintCallable)
     void ResetMovementState();
-
-    /** Clears smoothed planar input state when the last move axis is released. */
-    void ReleasePlanarMovementInput();
-
-    /** Clears smoothed vertical input state used by flying/swimming ascent/descent. */
-    void ReleaseVerticalMovementInput();
 
     /** Clears only the transient water-surface clamp without stopping all movement. */
     void ClearSwimmingSurfaceConstraintState();

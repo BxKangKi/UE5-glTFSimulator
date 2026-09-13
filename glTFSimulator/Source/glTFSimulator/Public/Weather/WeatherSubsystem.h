@@ -2,9 +2,9 @@
 
 /**
  * @file WeatherSubsystem.h
- * 역할: 월드 날씨 상태와 날씨 효과 액터를 관리합니다.
- * 핵심 기능: 날씨 시계·전환, 비·눈 액터 생성·제거, 카메라 연동.
- * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * Declares interface, lifetime, and data-ownership contracts; see the matching implementation for behavior.
  */
 
 #pragma once

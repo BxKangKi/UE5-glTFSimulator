@@ -2,9 +2,9 @@
 
 /**
  * @file WorldSourceModelBuilder.cpp
- * 역할: 하나의 원본 GLB를 baked 모델로 변환합니다.
- * 핵심 기능: worker 파서 로드, native gate 대기, 프레임별 캡처, 병렬 bounds, 취소.
- * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
  */
 
 #include "System/WorldSourceModelBuilder.h"
@@ -14,6 +14,7 @@
 #include "Dom/JsonObject.h"
 #include "Engine/Texture2D.h"
 #include "HAL/FileManager.h"
+#include "Runtime/Launch/Resources/Version.h"
 #include "Materials/MaterialInterface.h"
 #include "Misc/Paths.h"
 #include "Model/glTFMaterialOverrideUtils.h"
@@ -159,13 +160,12 @@ namespace WorldSourceModelBuilderPrivate
         Config.bLoadMipMaps = true;
         Config.SpecularFactor = 0.0f;
         Config.ImagesConfig.bCompressMips = true;
-        // Build-time textures are short lived, but their platform mip payload must remain CPU
-        // accessible until FGWorldBakedDataCapture has copied it into textures/<id>.dat.
-        // glTFRuntime documents bStreaming as the mode that keeps the mip chain in system memory;
-        // with bStreaming=false UpdateResource() may consume/discard transient BulkData before the
-        // following capture step on UE 5.8. The baked runtime texture itself does not depend on
-        // glTFRuntime streaming: this flag is only used while creating the .gworld payload.
-        Config.ImagesConfig.bStreaming = true;
+        // Build-time textures are captured immediately from FTexturePlatformData on the game thread.
+        // Keep glTFRuntime texture streaming disabled here. On UE 5.8, bStreaming=true attaches
+        // glTFRuntime's custom mip provider before UpdateResource(); the provider can report a
+        // different tiled layout from the transient texture and triggers StreamableTextureResource
+        // validation. CaptureTexture() locks BulkData directly and no longer relies on the provider.
+        Config.ImagesConfig.bStreaming = false;
         const int32 TextureLimit = UGameSettings::ResolveMaxTextureResolution(Builder);
         Config.ImagesConfig.MaxWidth = TextureLimit;
         Config.ImagesConfig.MaxHeight = TextureLimit;
@@ -645,6 +645,8 @@ void UWorldSourceModelBuilder::CaptureNextMeshUnderGate()
     FglTFRuntimeMaterialsConfig MaterialsConfig =
         WorldSourceModelBuilderPrivate::MakeMaterialsConfig(this);
     // The queue owns the native gate and GC references for the entire capture.
+    // Build-only glTFRuntime texture streaming stays disabled; CaptureTexture() copies mip BulkData
+    // immediately after this synchronous decode returns.
     const bool bDecoded = SourceAsset->LoadMeshAsRuntimeLOD(
         MeshIndex, RuntimeLOD, MaterialsConfig);
 

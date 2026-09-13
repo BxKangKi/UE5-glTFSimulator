@@ -2,9 +2,9 @@
 
 /**
  * @file WorldSourceModelBuilder.h
- * 역할: 하나의 원본 GLB를 baked 모델로 변환합니다.
- * 핵심 기능: worker 파서 로드, native gate 대기, 프레임별 캡처, 병렬 bounds, 취소.
- * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * Declares interface, lifetime, and data-ownership contracts; see the matching implementation for behavior.
  */
 
 #pragma once

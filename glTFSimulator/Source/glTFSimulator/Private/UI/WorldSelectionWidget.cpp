@@ -41,8 +41,8 @@ void UWorldSelectionWidget::RebuildWorldButtons()
 
     if (!IsValid(GetSelectionListPanel()))
     {
-        UE_LOG(LogTemp, Warning,
-            TEXT("WorldSelectionWidget cannot build world buttons because the list panel is not assigned. Pass the panel reference from the widget construct event."));
+        // Blueprint commonly assigns the panel from Construct after selection data arrives.
+        // Defer generation silently; SetWorldListPanel() rebuilds the list immediately.
         return;
     }
 

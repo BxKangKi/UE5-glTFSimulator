@@ -2,9 +2,9 @@
 
 /**
  * @file ModelDatabaseSubsystem.cpp
- * 역할: 선택 월드의 모델 인덱스를 관리합니다.
- * 핵심 기능: gwd 디렉터리 읽기, 취소 가능한 소스 검사, 4개 이하 병렬 검사, 정의 LRU.
- * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
  */
 
 #include "Simulator/ModelDatabaseSubsystem.h"
@@ -15,6 +15,8 @@
 #include "Misc/Paths.h"
 #include "System/FileFunctionLibrary.h"
 #include "System/GlbValidation.h"
+#include "System/MacroLibrary.h"
+#include "System/ProjectConfig.h"
 #include "System/SafeFileIO.h"
 
 namespace ModelDatabasePrivate
@@ -34,6 +36,8 @@ namespace ModelDatabasePrivate
         TMap<FGuid, FGWorldModelSummary> Summaries;
         TMap<FGuid, FString> SourceDefinitionJson;
         TSharedPtr<FGWorldArchiveReader, ESPMode::ThreadSafe> ArchiveReader;
+        TMap<FGuid, TSharedPtr<FGWorldArchiveReader, ESPMode::ThreadSafe>> ModelArchiveReaders;
+        TArray<TSharedPtr<FGWorldArchiveReader, ESPMode::ThreadSafe>> ExternalArchiveReaders;
         FString Error;
     };
 
@@ -73,6 +77,162 @@ namespace ModelDatabasePrivate
             const FGuid UUID = Record.Definition.UUID;
             Result.Summaries.Add(UUID, Record.Summary);
             Result.Definitions.Add(UUID, MoveTemp(Record.Definition));
+            Result.ModelArchiveReaders.Add(UUID, Result.ArchiveReader);
+        }
+    }
+
+    bool ParseArchiveProjectConfig(
+        const TSharedPtr<FGWorldArchiveReader, ESPMode::ThreadSafe>& Reader,
+        const FString& FallbackName,
+        FGlTFSimulatorProjectConfig& OutConfig,
+        FString& OutError)
+    {
+        OutConfig = FGlTFSimulatorProjectConfig();
+        OutError.Reset();
+        if (!Reader.IsValid())
+        {
+            OutError = TEXT("Archive reader is invalid.");
+            return false;
+        }
+        FString ConfigText;
+        if (!Reader->ReadWorldConfig(ConfigText, OutError)) return false;
+        FSafeJsonLimits Limits;
+        Limits.MaxFileBytes = 64ll * 1024ll * 1024ll;
+        Limits.MaxDepth = 32;
+        Limits.MaxValues = 131072;
+        Limits.MaxContainerEntries = 65536;
+        Limits.MaxStringCharacters = 32768;
+        Limits.bAllowBackupRecovery = false;
+        const FSafeJsonLoadResult Parsed = FSafeFileIO::ParseJsonText(
+            ConfigText, Reader->GetArchivePath() + TEXT("#config.json"), Limits);
+        if (!Parsed.IsSuccess() || !Parsed.JsonObject.IsValid())
+        {
+            OutError = Parsed.Error.IsEmpty() ? TEXT("Archive config.json is invalid.") : Parsed.Error;
+            return false;
+        }
+        return GlTFSimulatorProjectConfig::Parse(
+            Parsed.JsonObject, FallbackName, OutConfig, OutError);
+    }
+
+    void LoadAllowedExternalAssetArchives(FDatabaseBuildResult& Result)
+    {
+        if (!Result.ArchiveReader.IsValid()) return;
+
+        FGlTFSimulatorProjectConfig WorldConfig;
+        FString ConfigError;
+        if (!ParseArchiveProjectConfig(
+                Result.ArchiveReader,
+                FPaths::GetBaseFilename(Result.ArchiveReader->GetArchivePath()),
+                WorldConfig,
+                ConfigError))
+        {
+            UE_LOG(LogTemp, Warning,
+                TEXT("External asset discovery skipped because the world archive config is invalid: %s"),
+                *ConfigError);
+            return;
+        }
+        if (WorldConfig.ProjectType != EGlTFSimulatorProjectType::World
+            || !WorldConfig.bAllowExternalAssets)
+        {
+            return;
+        }
+
+        const FString ResourcesRoot = FSafeFileIO::NormalizeFilePath(PATH_RESOURCES);
+        if (ResourcesRoot.IsEmpty() || !IFileManager::Get().DirectoryExists(*ResourcesRoot)) return;
+
+        TArray<FString> ArchiveFiles;
+        IFileManager::Get().FindFilesRecursive(
+            ArchiveFiles, *ResourcesRoot, TEXT("*.gasset"), true, false, false);
+        ArchiveFiles.Sort();
+        if (ArchiveFiles.Num() > 512)
+        {
+            UE_LOG(LogTemp, Warning,
+                TEXT("External asset discovery found %d packs; only the first 512 sorted paths are considered."),
+                ArchiveFiles.Num());
+            ArchiveFiles.SetNum(512, EAllowShrinking::No);
+        }
+
+        for (const FString& CandidatePath : ArchiveFiles)
+        {
+            FString OpenError;
+            TSharedPtr<FGWorldArchiveReader, ESPMode::ThreadSafe> Reader =
+                FGWorldArchiveReader::Open(CandidatePath, OpenError);
+            if (!Reader.IsValid())
+            {
+                UE_LOG(LogTemp, Warning,
+                    TEXT("External asset pack ignored. Path=%s Reason=%s"),
+                    *CandidatePath, *OpenError);
+                continue;
+            }
+
+            FGlTFSimulatorProjectConfig PackConfig;
+            FString PackConfigError;
+            if (!ParseArchiveProjectConfig(
+                    Reader, FPaths::GetBaseFilename(CandidatePath), PackConfig, PackConfigError)
+                || !GlTFSimulatorProjectConfig::IsExternalAssetProject(PackConfig.ProjectType))
+            {
+                UE_LOG(LogTemp, Warning,
+                    TEXT("External asset pack ignored because its ProjectType/config is invalid. Path=%s Reason=%s"),
+                    *CandidatePath, *PackConfigError);
+                continue;
+            }
+
+            TArray<FGWorldModelRecord> Records;
+            Reader->GetRecords(Records);
+            if (Records.IsEmpty())
+            {
+                UE_LOG(LogTemp, Warning, TEXT("External asset pack is empty and was ignored: %s"), *CandidatePath);
+                continue;
+            }
+
+            const EModelDefinitionType RequiredModelType =
+                PackConfig.ProjectType == EGlTFSimulatorProjectType::Character
+                    ? EModelDefinitionType::Character
+                    : EModelDefinitionType::Dynamic;
+            bool bPackValid = true;
+            FString RejectReason;
+            for (const FGWorldModelRecord& Record : Records)
+            {
+                if (!Record.Definition.UUID.IsValid()
+                    || Record.Definition.ModelType != RequiredModelType)
+                {
+                    bPackValid = false;
+                    RejectReason = TEXT("the pack contains a model whose type does not match its ProjectType");
+                    break;
+                }
+                if (Result.Definitions.Contains(Record.Definition.UUID))
+                {
+                    bPackValid = false;
+                    RejectReason = FString::Printf(
+                        TEXT("model UUID %s collides with the world or an earlier external pack"),
+                        *Record.Definition.UUID.ToString());
+                    break;
+                }
+            }
+            if (Result.Definitions.Num() + Records.Num() > FGWorldArchive::MaxModels)
+            {
+                bPackValid = false;
+                RejectReason = TEXT("combined model count exceeds the archive safety limit");
+            }
+            if (!bPackValid)
+            {
+                UE_LOG(LogTemp, Warning,
+                    TEXT("External asset pack ignored. Path=%s Reason=%s"),
+                    *CandidatePath, *RejectReason);
+                continue;
+            }
+
+            for (FGWorldModelRecord& Record : Records)
+            {
+                const FGuid UUID = Record.Definition.UUID;
+                Result.Summaries.Add(UUID, Record.Summary);
+                Result.Definitions.Add(UUID, MoveTemp(Record.Definition));
+                Result.ModelArchiveReaders.Add(UUID, Reader);
+            }
+            Result.ExternalArchiveReaders.Add(Reader);
+            UE_LOG(LogTemp, Display,
+                TEXT("Mounted external asset pack: %s (%d model(s), type=%s)"),
+                *CandidatePath, Records.Num(), *GlTFSimulatorProjectConfig::ToString(PackConfig.ProjectType));
         }
     }
 
@@ -192,6 +352,11 @@ void UModelDatabaseSubsystem::InitializeForWorld(
     Stop();
 
     WorldRoot = FSafeFileIO::NormalizeFilePath(InWorldRoot);
+    const FString ExternalResourcesRoot = FSafeFileIO::NormalizeFilePath(PATH_RESOURCES);
+    if (!ExternalResourcesRoot.IsEmpty())
+    {
+        IFileManager::Get().MakeDirectory(*ExternalResourcesRoot, true);
+    }
     if (WorldRoot.IsEmpty())
     {
         Completion.ExecuteIfBound(false, TEXT("explicit world root is empty or invalid"));
@@ -210,6 +375,10 @@ void UModelDatabaseSubsystem::InitializeForWorld(
         using namespace ModelDatabasePrivate;
         FDatabaseBuildResult Result;
         LoadBuiltArchive(RequestedRoot, Result);
+        if (Result.ArchiveReader.IsValid() && Result.Error.IsEmpty())
+        {
+            LoadAllowedExternalAssetArchives(Result);
+        }
         if (Cancellation->Load()) return;
 
         FSafeFileIO::DispatchTrackedGameThread(
@@ -225,6 +394,8 @@ void UModelDatabaseSubsystem::InitializeForWorld(
             StrongThis->Summaries = MoveTemp(Result.Summaries);
             StrongThis->SourceDefinitionJson.Reset();
             StrongThis->ArchiveReader = MoveTemp(Result.ArchiveReader);
+            StrongThis->ModelArchiveReaders = MoveTemp(Result.ModelArchiveReaders);
+            StrongThis->ExternalArchiveReaders = MoveTemp(Result.ExternalArchiveReaders);
             StrongThis->bReady = StrongThis->ArchiveReader.IsValid() && Result.Error.IsEmpty();
             Completion.ExecuteIfBound(StrongThis->bReady, Result.Error);
         });
@@ -276,6 +447,8 @@ void UModelDatabaseSubsystem::InitializeForAuthoringProject(
             StrongThis->Summaries.Reset();
             StrongThis->SourceDefinitionJson = MoveTemp(Result.SourceDefinitionJson);
             StrongThis->ArchiveReader.Reset();
+            StrongThis->ModelArchiveReaders.Reset();
+            StrongThis->ExternalArchiveReaders.Reset();
             StrongThis->bReady = Result.Error.IsEmpty() && !StrongThis->Definitions.IsEmpty();
             Completion.ExecuteIfBound(StrongThis->bReady, Result.Error);
         });
@@ -298,10 +471,23 @@ void UModelDatabaseSubsystem::Stop()
     Summaries.Empty();
     SourceDefinitionJson.Empty();
     ArchiveReader.Reset();
+    ModelArchiveReaders.Reset();
+    ExternalArchiveReaders.Reset();
     DefinitionDetailsCache.Empty();
     CachedDefinitionBytes = 0;
     DefinitionAccessSerial = 0;
     WorldRoot.Reset();
+}
+
+
+TSharedPtr<FGWorldArchiveReader, ESPMode::ThreadSafe>
+UModelDatabaseSubsystem::GetArchiveReaderForModel(const FGuid& UUID) const
+{
+    if (const TSharedPtr<FGWorldArchiveReader, ESPMode::ThreadSafe>* Found = ModelArchiveReaders.Find(UUID))
+    {
+        return *Found;
+    }
+    return nullptr;
 }
 
 bool UModelDatabaseSubsystem::Resolve(
@@ -361,8 +547,9 @@ bool UModelDatabaseSubsystem::GetMetadata(
     OutMetadata = FGWorldModelMetadata();
     if (OutError) OutError->Reset();
     FString Error;
-    const bool bSuccess = ArchiveReader.IsValid()
-        && ArchiveReader->ReadModelMetadata(UUID, OutMetadata, Error);
+    const TSharedPtr<FGWorldArchiveReader, ESPMode::ThreadSafe> Reader = GetArchiveReaderForModel(UUID);
+    const bool bSuccess = Reader.IsValid()
+        && Reader->ReadModelMetadata(UUID, OutMetadata, Error);
     if (!bSuccess && OutError) *OutError = MoveTemp(Error);
     return bSuccess;
 }
@@ -412,15 +599,16 @@ bool UModelDatabaseSubsystem::LoadDefinitionDetails(
     {
         return true;
     }
-    if (!ArchiveReader.IsValid())
+    const TSharedPtr<FGWorldArchiveReader, ESPMode::ThreadSafe> Reader = GetArchiveReaderForModel(UUID);
+    if (!Reader.IsValid())
     {
-        OutError = TEXT("No built .gwd archive is open");
+        OutError = TEXT("No built archive owns this model UUID");
         return false;
     }
 
     TMap<FString, FString> Bones;
     FString Json;
-    if (!ArchiveReader->ReadModelDefinition(UUID, Bones, Json, OutError))
+    if (!Reader->ReadModelDefinition(UUID, Bones, Json, OutError))
     {
         return false;
     }

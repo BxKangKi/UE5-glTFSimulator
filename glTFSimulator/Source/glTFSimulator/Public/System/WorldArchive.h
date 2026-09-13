@@ -2,9 +2,9 @@
 
 /**
  * @file WorldArchive.h
- * 역할: 불변 월드 빌드 결과인 gwd 아카이브를 관리합니다.
- * 핵심 기능: 모델·범위·CRC 검증, transactional build, 범위 리더.
- * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * Declares interface, lifetime, and data-ownership contracts; see the matching implementation for behavior.
  */
 
 #pragma once
@@ -203,4 +203,13 @@ public:
         FString& OutError,
         TFunction<bool()> ShouldCancel = TFunction<bool()>(),
         const FString& WorldConfigJson = FString());
+
+    /** Same immutable archive format, but published to an explicit path such as Resources/Pack.gasset. */
+    static bool BuildBlockingToArchivePath(
+        const FString& ArchivePath,
+        const TArray<FGWorldBuildModel>& Models,
+        FString& OutArchivePath,
+        FString& OutError,
+        TFunction<bool()> ShouldCancel = TFunction<bool()>(),
+        const FString& ArchiveConfigJson = FString());
 };

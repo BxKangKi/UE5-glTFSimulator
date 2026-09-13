@@ -3,9 +3,9 @@
 
 /**
  * File role: SafeFileIO.cpp
- * 역할: 크기가 제한된 파일·JSON 비동기 I/O를 제공합니다.
- * 핵심 기능: tracked worker, GT 전달, 종료 drain, 원자적 쓰기·복구.
- * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
  */
 
 /**
@@ -18,6 +18,8 @@
 #include "Async/Async.h"
 #include "Async/TaskGraphInterfaces.h"
 #include "Containers/StringConv.h"
+#include "Containers/Queue.h"
+#include "Containers/Ticker.h"
 #include "Dom/JsonValue.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformFileManager.h"
@@ -55,6 +57,12 @@ namespace SafeFileIOPrivate
         FThreadSafeCounter ShutdownFlag;
         uint64 NextWriteSequence = 1;
         TMap<FString, uint64> LatestWriteSequenceByPath;
+
+        // Worker completions are queued here and executed by the core ticker on a normal engine
+        // frame. Dispatching UObject/render work directly with AsyncTask(GameThread) from a raw
+        // worker can inherit an empty FAppTime context on UE 5.8.
+        TQueue<FSafeFileIO::FTrackedTask, EQueueMode::Mpsc> GameThreadContinuations;
+        bool bGameThreadPumpScheduled = false;
     };
 
     FState& GetState()
@@ -926,6 +934,89 @@ namespace SafeFileIOPrivate
         return Result;
     }
 
+    /**
+     * Runs queued worker completions from the normal core-ticker frame context. UE 5.8 propagates
+     * FAppTime through TaskGraph ancestry; a GameThread task spawned directly by a raw worker has
+     * no inherited time context even though IsInGameThread() is true. Deferring the real callback
+     * to FTSTicker keeps UObject/RHI work on the engine's regular frame context.
+     */
+    bool TickGameThreadContinuations(float)
+    {
+        check(IsInGameThread());
+        FState& State = GetState();
+
+        FSafeFileIO::FTrackedTask Task;
+        int32 Processed = 0;
+        constexpr int32 MaxCallbacksPerFrame = 256;
+        while (Processed < MaxCallbacksPerFrame && State.GameThreadContinuations.Dequeue(Task))
+        {
+            if (!IsShuttingDown() && Task)
+            {
+                Task();
+            }
+            Task = FSafeFileIO::FTrackedTask();
+            ++Processed;
+        }
+
+        bool bKeepTicker = false;
+        {
+            FScopeLock StateScope(&State.StateLock);
+            bKeepTicker = !State.GameThreadContinuations.IsEmpty();
+            if (!bKeepTicker)
+            {
+                State.bGameThreadPumpScheduled = false;
+            }
+        }
+        return bKeepTicker;
+    }
+
+    void QueueGameThreadContinuation(FSafeFileIO::FTrackedTask Task)
+    {
+        if (!Task)
+        {
+            return;
+        }
+
+        FState& State = GetState();
+        State.GameThreadContinuations.Enqueue(MoveTemp(Task));
+
+        bool bInstallTicker = false;
+        {
+            FScopeLock StateScope(&State.StateLock);
+            if (!State.bGameThreadPumpScheduled)
+            {
+                State.bGameThreadPumpScheduled = true;
+                bInstallTicker = true;
+            }
+        }
+
+        if (!bInstallTicker)
+        {
+            return;
+        }
+
+        // This task only installs the ticker. It deliberately performs no UObject/render work.
+        // The queued continuation itself executes from the next normal core-ticker frame.
+        AsyncTask(ENamedThreads::GameThread, []()
+        {
+            FState& GameState = GetState();
+            if (IsShuttingDown())
+            {
+                FSafeFileIO::FTrackedTask Dropped;
+                while (GameState.GameThreadContinuations.Dequeue(Dropped))
+                {
+                    Dropped = FSafeFileIO::FTrackedTask();
+                }
+                FScopeLock StateScope(&GameState.StateLock);
+                GameState.bGameThreadPumpScheduled = false;
+                return;
+            }
+
+            FTSTicker::GetCoreTicker().AddTicker(
+                FTickerDelegate::CreateStatic(&TickGameThreadContinuations), 0.0f);
+        });
+    }
+
     void DispatchJsonCallback(
         FSafeFileIO::FJsonLoadCallback Callback,
         FSafeJsonLoadResult Result,
@@ -935,12 +1026,12 @@ namespace SafeFileIOPrivate
         {
             return;
         }
-        AsyncTask(ENamedThreads::GameThread,
+        QueueGameThreadContinuation(
             [Callback = MoveTemp(Callback), Result = MoveTemp(Result),
                 OperationLifetime = MoveTemp(OperationLifetime)]() mutable
             {
                 // Holding OperationLifetime keeps module shutdown from unloading callback code while
-                // this game-thread task is still queued. Shutdown pumps the queue and suppresses it.
+                // this continuation is still queued. The ticker suppresses it after shutdown starts.
                 if (!IsShuttingDown())
                 {
                     Callback(MoveTemp(Result));
@@ -957,7 +1048,7 @@ namespace SafeFileIOPrivate
         {
             return;
         }
-        AsyncTask(ENamedThreads::GameThread,
+        QueueGameThreadContinuation(
             [Callback = MoveTemp(Callback), Result = MoveTemp(Result),
                 OperationLifetime = MoveTemp(OperationLifetime)]() mutable
             {
@@ -977,7 +1068,7 @@ namespace SafeFileIOPrivate
         {
             return;
         }
-        AsyncTask(ENamedThreads::GameThread,
+        QueueGameThreadContinuation(
             [Callback = MoveTemp(Callback), Result = MoveTemp(Result),
                 OperationLifetime = MoveTemp(OperationLifetime)]() mutable
             {
@@ -1025,7 +1116,7 @@ bool FSafeFileIO::DispatchTrackedGameThread(FTrackedTask Task)
         return true;
     }
 
-    AsyncTask(ENamedThreads::GameThread,
+    SafeFileIOPrivate::QueueGameThreadContinuation(
         [Task = MoveTemp(Task), TrackedOperation]() mutable
         {
             if (!SafeFileIOPrivate::IsShuttingDown())
@@ -1728,6 +1819,16 @@ bool FSafeFileIO::FlushPendingOperations(const double TimeoutSeconds)
         if (IsInGameThread())
         {
             FTaskGraphInterface::Get().ProcessThreadUntilIdle(ENamedThreads::GameThread);
+            // Shutdown may occur before another engine frame ticks. Drain queued continuations here
+            // so their lifetime trackers can release without executing user callbacks after shutdown.
+            SafeFileIOPrivate::FState& State = SafeFileIOPrivate::GetState();
+            FSafeFileIO::FTrackedTask Dropped;
+            while (State.GameThreadContinuations.Dequeue(Dropped))
+            {
+                Dropped = FSafeFileIO::FTrackedTask();
+            }
+            FScopeLock StateScope(&State.StateLock);
+            State.bGameThreadPumpScheduled = false;
         }
         FPlatformProcess::SleepNoStats(0.005f);
     }

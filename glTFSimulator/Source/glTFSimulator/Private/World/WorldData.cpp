@@ -2,13 +2,14 @@
 
 /**
  * @file WorldData.cpp
- * 역할: 월드 설정과 실행 상태의 데이터 모델입니다.
- * 핵심 기능: config JSON 변환, 시간·날씨·플레이어 선택 설정.
- * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
  */
 
 #include "World/WorldData.h"
 #include "System/MacroLibrary.h"
+#include "System/ProjectConfig.h"
 
 namespace WorldDataJson
 {
@@ -192,6 +193,7 @@ UWorldData::UWorldData()
     WorldTime = OneDayTime * 0.5f;
     TimeSpeed = 60.0f;
     bOcean = false;
+    bAllowExternalAssets = false;
     PlayerLocation = FVector::ZeroVector;
     // An empty value means that no external character has been selected yet. The previous
     // "Player" placeholder was indistinguishable from a real filename and blocked first-run GLBs.
@@ -207,6 +209,7 @@ TSharedRef<FJsonObject> UWorldData::SerializeData(UWorldData *Data)
 
     TSharedRef<FJsonObject> Json = MakeShared<FJsonObject>();
     Json->SetStringField(JSON_VERSION_FIELD, !Data->Version.IsEmpty() ? Data->Version : FString(JSON_SCHEMA_VERSION));
+    Json->SetStringField(PROJECT_TYPE_FIELD, TEXT("World"));
     Json->SetStringField(CONFIG_WORLD_NAME_FIELD, Data->WorldName);
     Json->SetNumberField(LATITUDE, Data->Latitude);
     Json->SetNumberField(LONGITUDE, Data->Longitude);
@@ -215,6 +218,7 @@ TSharedRef<FJsonObject> UWorldData::SerializeData(UWorldData *Data)
     Json->SetNumberField(ONE_DAY_TIME, Data->OneDayTime);
     Json->SetNumberField(TIME_SPEED, Data->TimeSpeed);
     Json->SetBoolField(OCEAN, Data->bOcean);
+    Json->SetBoolField(ALLOW_EXTERNAL_ASSETS_FIELD, Data->bAllowExternalAssets);
 
     // Runtime time, selected player, and player transforms are intentionally omitted. config.json
     // is map-author-owned read-only configuration; mutable state lives in WorldName.dat.
@@ -239,6 +243,7 @@ bool UWorldData::DeserializeData(UWorldData *Data, TSharedPtr<FJsonObject> Json)
         Json->TryGetNumberField(ONE_DAY_TIME, Data->OneDayTime);
         Json->TryGetNumberField(TIME_SPEED, Data->TimeSpeed);
         Json->TryGetBoolField(OCEAN, Data->bOcean);
+        Json->TryGetBoolField(ALLOW_EXTERNAL_ASSETS_FIELD, Data->bAllowExternalAssets);
 
         const TSharedPtr<FJsonObject>* CloudObject = nullptr;
         if (Json->TryGetObjectField(TEXT("Cloud"), CloudObject) && CloudObject && CloudObject->IsValid())

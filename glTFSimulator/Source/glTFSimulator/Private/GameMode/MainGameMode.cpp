@@ -3,9 +3,9 @@
 
 /**
  * @file MainGameMode.cpp
- * 역할: 메뉴 월드의 UI와 목적지 맵 선택을 관리합니다.
- * 핵심 기능: 폴더 목록, 맵·GameMode profile, 선택값 전달, travel watchdog.
- * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
  */
 
 #include "GameMode/MainGameMode.h"

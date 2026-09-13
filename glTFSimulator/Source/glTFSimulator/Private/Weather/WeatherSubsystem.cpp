@@ -2,9 +2,9 @@
 
 /**
  * @file WeatherSubsystem.cpp
- * 역할: 월드 날씨 상태와 날씨 효과 액터를 관리합니다.
- * 핵심 기능: 날씨 시계·전환, 비·눈 액터 생성·제거, 카메라 연동.
- * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
  */
 
 #include "Weather/WeatherSubsystem.h"

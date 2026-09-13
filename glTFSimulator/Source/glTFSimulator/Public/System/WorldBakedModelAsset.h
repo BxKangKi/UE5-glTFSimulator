@@ -2,9 +2,9 @@
 
 /**
  * @file WorldBakedModelAsset.h
- * 역할: baked 모델을 Unreal 런타임 에셋으로 제공합니다.
- * 핵심 기능: dat 범위 로드, 메시·텍스처·머티리얼 재구성, 요청별 GC 보호.
- * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * Declares interface, lifetime, and data-ownership contracts; see the matching implementation for behavior.
  */
 
 #pragma once

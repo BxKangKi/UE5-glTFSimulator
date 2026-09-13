@@ -2,9 +2,9 @@
 
 /**
  * @file MultiplayerWorldStateActor.h
- * 역할: 서버가 선택한 월드 정보를 클라이언트에 복제합니다.
- * 핵심 기능: 월드 폴더 상태 복제, 클라이언트 시작 연계.
- * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * Declares interface, lifetime, and data-ownership contracts; see the matching implementation for behavior.
  */
 
 #pragma once

@@ -3,6 +3,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "System/ProjectConfig.h"
 #include "UI/SelectionWidgetBase.h"
 #include "ProjectSelectionWidget.generated.h"
 
@@ -14,9 +15,9 @@ class UBuildStatusWidget;
 /**
  * Project browser shown directly over the current start menu.
  *
- * Shared generated-entry styling and lifecycle are provided by USelectionWidgetBase. Blueprint
- * owns this top-level widget instance; native code discovers valid Projects/<Project> folders,
- * populates the assigned panel, and starts the normal project -> .gwd build pipeline.
+ * Generated-entry creation and lifecycle are provided by USelectionWidgetBase. Each entry is a
+ * Blueprint-authored UMenuButtonWidget class; native code discovers valid Projects/<Project> folders,
+ * populates the assigned panel, and starts the project-specific .gwd/.gasset build pipeline.
  */
 UCLASS(Blueprintable, BlueprintType)
 class GLTFSIMULATOR_API UProjectSelectionWidget : public USelectionWidgetBase
@@ -53,9 +54,22 @@ public:
     UFUNCTION(BlueprintCallable, Category="Projects")
     void RefreshProjects();
 
-    /** Start building one project into Worlds/<Project>.gwd. */
+    /** Starts the selected project build. World projects emit .gwd; Character/Dynamic projects emit .gasset. */
     UFUNCTION(BlueprintCallable, Category="Projects")
     bool BuildProjectByName(const FString& ProjectName);
+
+    UFUNCTION(BlueprintCallable, Category="Projects|Configuration")
+    bool GetProjectConfiguration(
+        const FString& ProjectName,
+        EGlTFSimulatorProjectType& OutProjectType,
+        bool& bOutAllowExternalAssets,
+        FString& OutDisplayName) const;
+
+    UFUNCTION(BlueprintCallable, Category="Projects|Configuration")
+    bool SetProjectType(const FString& ProjectName, EGlTFSimulatorProjectType ProjectType);
+
+    UFUNCTION(BlueprintCallable, Category="Projects|Configuration")
+    bool SetWorldExternalAssetsAllowed(const FString& ProjectName, bool bAllowed);
 
     /** Hide this registered widget and restore the start widget. */
     UFUNCTION(BlueprintCallable, Category="Projects")
@@ -71,7 +85,7 @@ private:
     void ShowBuildStatus(const FString& ProjectName);
 
     UFUNCTION()
-    void HandleBuildStatusCloseRequested();
+    void HandleBuildStatusConfirmed();
 
     TWeakObjectPtr<UStartWorldWidget> OwnerStartWidget;
     TWeakObjectPtr<UButton> BackButton;

@@ -2,9 +2,9 @@
 
 /**
  * @file RuntimeModelResolver.cpp
- * 역할: 런타임 모델 참조를 활성 아카이브에서 해석합니다.
- * 핵심 기능: UUID 조회, immutable 모델 정의·리더 전달.
- * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
  */
 
 #include "Simulator/RuntimeModelResolver.h"
@@ -55,7 +55,7 @@ bool FRuntimeModelResolver::Resolve(
         OutModel = FResolvedRuntimeModel();
         return false;
     }
-    OutModel.ArchiveReader = Database->GetArchiveReader();
+    OutModel.ArchiveReader = Database->GetArchiveReaderForModel(OutModel.UUID);
     if (!OutModel.IsValid())
     {
         OutError = FString::Printf(TEXT("built model record is incomplete: %s"), *Reference);

@@ -1,11 +1,13 @@
 /**
  * @file ModelDefinitionJson.cpp
- * 역할: 원본 GLB의 모델 정의 JSON을 검증합니다.
- * 핵심 기능: 재귀 발견, 누락 정의 생성, UUID·모델 타입 검증.
- * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
  */
 
 #include "Simulator/ModelDefinitionJson.h"
+
+#include "Character/CharacterBoneSchema.h"
 
 #include "Dom/JsonObject.h"
 #include "HAL/FileManager.h"
@@ -339,21 +341,21 @@ bool ModelDefinitionJson::LoadDefinition(
     if (OutDefinition.ModelType == EModelDefinitionType::Character)
     {
         const TSharedPtr<FJsonObject>* BonesObject = nullptr;
-        if (!Root->TryGetObjectField(TEXT("Bones"), BonesObject) || !BonesObject || !BonesObject->IsValid())
+        if (!Root->TryGetObjectField(TEXT("Bones"), BonesObject)
+            || BonesObject == nullptr
+            || !BonesObject->IsValid())
         {
-            OutError = TEXT("Character requires a Bones object");
+            OutError = TEXT("Character requires a Bones object.");
             return false;
         }
-        for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : (*BonesObject)->Values)
+
+        // The disk schema is canonical-key -> source-bone-name. Canonical keys are fixed and
+        // source values are the only author-controlled part. glTFRuntime expects the inverse
+        // source -> canonical alias map, so conversion happens only after strict validation.
+        if (!CharacterBoneSchema::BuildSourceToCanonicalMap(
+                *BonesObject, OutDefinition.Bones, OutError))
         {
-            FString Bone;
-            if (!Pair.Value.IsValid() || !Pair.Value->TryGetString(Bone)
-                || Pair.Key.TrimStartAndEnd().IsEmpty() || Bone.TrimStartAndEnd().IsEmpty())
-            {
-                OutError = TEXT("Bones must contain only non-empty string-to-string mappings");
-                return false;
-            }
-            OutDefinition.Bones.Add(Bone.TrimStartAndEnd(), Pair.Key.TrimStartAndEnd());
+            return false;
         }
     }
 

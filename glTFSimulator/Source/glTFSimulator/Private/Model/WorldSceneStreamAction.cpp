@@ -3,9 +3,9 @@
 
 /**
  * @file WorldSceneStreamAction.cpp
- * 역할: 월드 씬 메시의 비동기 생성 요청을 처리합니다.
- * 핵심 기능: 메시 생성·충돌 최종화, 월드 참조 보호, 완료·취소 통지.
- * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
  */
 
 #include "Model/WorldSceneStreamAction.h"
@@ -189,7 +189,10 @@ UWorldSceneStreamAction *UWorldSceneStreamAction::StreamAsync(
         Action->MaterialReferenceGuard = GameManager->AcquireMaterialDefaultReferenceGuard();
     }
     Action->bRenderOnly = bInRenderOnly;
-    Action->RegisterWithGameInstance(WorldContextObject);
+    // This action is C++-owned by AStaticActor, not a Blueprint latent action. Root it only while
+    // native I/O/finalizer callbacks may outlive the actor's map entry. This avoids UE's global
+    // UBlueprintAsyncActionBase limit when a large world streams hundreds of mesh groups.
+    Action->AddToRoot();
     return Action;
 }
 
@@ -275,7 +278,10 @@ void UWorldSceneStreamAction::AbortAndRelease(UStaticMesh* OrphanedMesh)
     CurrentLoadingMesh = NAME_None;
     bIsLoading = false;
     bRenderOnly = false;
-    SetReadyToDestroy();
+    if (IsRooted())
+    {
+        RemoveFromRoot();
+    }
 }
 
 void UWorldSceneStreamAction::Activate()
@@ -511,6 +517,10 @@ void UWorldSceneStreamAction::ReleaseActionReferences()
     bStaticMeshLoadInFlight = false;
     bAbortRequested = true;
     bRenderOnly = false;
+    if (IsRooted())
+    {
+        RemoveFromRoot();
+    }
 }
 
 void UWorldSceneStreamAction::ProcessChunk()
@@ -603,7 +613,10 @@ void UWorldSceneStreamAction::ProcessChunk()
         Progress.Broadcast(GroupName, 1.0f);
         Completed.Broadcast(Result);
         ReleaseActionReferences();
-        SetReadyToDestroy();
+        if (IsRooted())
+    {
+        RemoveFromRoot();
+    }
     }
     else
     {

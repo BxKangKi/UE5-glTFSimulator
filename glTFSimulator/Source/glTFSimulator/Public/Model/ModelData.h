@@ -3,9 +3,9 @@
 
 /**
  * @file ModelData.h
- * 역할: 모델·메시·노드의 런타임 데이터 구조를 정의합니다.
- * 핵심 기능: JSON 설정 변환, 메시 속성, 경계·노드·LOD 데이터.
- * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * Declares interface, lifetime, and data-ownership contracts; see the matching implementation for behavior.
  */
 
 #pragma once

@@ -2,9 +2,9 @@
 
 /**
  * @file WorldArchive.cpp
- * 역할: 불변 월드 빌드 결과인 gwd 아카이브를 관리합니다.
- * 핵심 기능: 모델·범위·CRC 검증, transactional build, 범위 리더.
- * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
  */
 
 #include "System/WorldArchive.h"
@@ -1195,7 +1195,7 @@ namespace GWorldArchivePrivate
     }
 
     bool BuildBlockingV4(
-        const FString& WorldRoot,
+        const FString& ArchivePathInput,
         const TArray<FGWorldBuildModel>& Models,
         FString& OutArchivePath,
         FString& OutError,
@@ -1204,12 +1204,12 @@ namespace GWorldArchivePrivate
     {
         OutArchivePath.Reset();
         OutError.Reset();
-        const FString ArchivePath = FGWorldArchive::MakeArchivePath(WorldRoot);
+        const FString ArchivePath = FSafeFileIO::NormalizeFilePath(ArchivePathInput);
         const auto Cancelled = [&ShouldCancel]() { return ShouldCancel && ShouldCancel(); };
         if (ArchivePath.IsEmpty() || Models.IsEmpty()
             || Models.Num() > FGWorldArchive::MaxModels || Cancelled())
         {
-            OutError = TEXT("World root, model count, or cancellation state is invalid");
+            OutError = TEXT("Archive path, model count, or cancellation state is invalid");
             return false;
         }
 
@@ -1286,7 +1286,7 @@ namespace GWorldArchivePrivate
 
         int64 Offset = HeaderBytes;
         const FString ConfigJson = WorldConfigJson.TrimStartAndEnd().IsEmpty()
-            ? FString::Printf(TEXT("{\"WorldName\":\"%s\"}"), *FPaths::GetCleanFilename(WorldRoot))
+            ? FString::Printf(TEXT("{\"WorldName\":\"%s\"}"), *FPaths::GetBaseFilename(ArchivePath))
             : WorldConfigJson;
         FGWorldArchiveRange ConfigRange;
         TArray<uint8> ConfigBytes;
@@ -1881,7 +1881,21 @@ bool FGWorldArchive::BuildBlocking(
     const FString& WorldConfigJson)
 {
     using namespace GWorldArchivePrivate;
-    return BuildBlockingV4(WorldRoot, Models, OutArchivePath, OutError, ShouldCancel, WorldConfigJson);
+    return BuildBlockingV4(
+        MakeArchivePath(WorldRoot), Models, OutArchivePath, OutError, ShouldCancel, WorldConfigJson);
+}
+
+bool FGWorldArchive::BuildBlockingToArchivePath(
+    const FString& ArchivePath,
+    const TArray<FGWorldBuildModel>& Models,
+    FString& OutArchivePath,
+    FString& OutError,
+    TFunction<bool()> ShouldCancel,
+    const FString& ArchiveConfigJson)
+{
+    using namespace GWorldArchivePrivate;
+    return BuildBlockingV4(
+        ArchivePath, Models, OutArchivePath, OutError, ShouldCancel, ArchiveConfigJson);
 }
 
 TSharedPtr<FGWorldArchiveReader, ESPMode::ThreadSafe> FGWorldArchiveReader::Open(
@@ -1895,13 +1909,13 @@ TSharedPtr<FGWorldArchiveReader, ESPMode::ThreadSafe> FGWorldArchiveReader::Open
     TUniquePtr<IFileHandle> Handle(PlatformFile.OpenRead(*NormalizedPath));
     if (!Handle.IsValid())
     {
-        OutError = FString::Printf(TEXT("The .gwd file is missing or unreadable: %s"), *NormalizedPath);
+        OutError = FString::Printf(TEXT("The archive file is missing or unreadable: %s"), *NormalizedPath);
         return nullptr;
     }
     const int64 TotalSize = Handle->Size();
     if (TotalSize < HeaderBytes || TotalSize > MaxArchiveBytes)
     {
-        OutError = TEXT("The .gwd file is outside its bounded archive size");
+        OutError = TEXT("The archive file is outside its bounded size");
         return nullptr;
     }
 

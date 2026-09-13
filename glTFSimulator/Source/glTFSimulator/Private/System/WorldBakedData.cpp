@@ -2,12 +2,14 @@
 
 /**
  * @file WorldBakedData.cpp
- * 역할: glTFRuntime 결과를 저장 가능한 native 데이터로 캡처합니다.
- * 핵심 기능: 메시·스킨·머티리얼·텍스처 복사, 유효성 검사.
- * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
  */
 
 #include "System/WorldBakedData.h"
+
+#include "Character/CharacterBoneSchema.h"
 
 #include "Animation/Skeleton.h"
 #include "Engine/Texture2D.h"
@@ -82,6 +84,45 @@ namespace WorldBakedDataPrivate
             && FMath::IsFinite(Value.GetScale3D().X)
             && FMath::IsFinite(Value.GetScale3D().Y)
             && FMath::IsFinite(Value.GetScale3D().Z);
+    }
+
+    /** Removes invalid and zero-area triangles before they reach Chaos collision cooking. */
+    void SanitizeTriangleIndices(
+        const TArray<FVector>& Positions,
+        const int32 PrimitiveMode,
+        const TArray<uint32>& SourceIndices,
+        TArray<uint32>& OutIndices)
+    {
+        if (PrimitiveMode != 4 || SourceIndices.Num() < 3 || (SourceIndices.Num() % 3) != 0)
+        {
+            OutIndices = SourceIndices;
+            return;
+        }
+
+        OutIndices.Reset(SourceIndices.Num());
+        const uint32 VertexCount = static_cast<uint32>(Positions.Num());
+        for (int32 Index = 0; Index < SourceIndices.Num(); Index += 3)
+        {
+            const uint32 A = SourceIndices[Index];
+            const uint32 B = SourceIndices[Index + 1];
+            const uint32 C = SourceIndices[Index + 2];
+            if (A >= VertexCount || B >= VertexCount || C >= VertexCount
+                || A == B || B == C || C == A)
+            {
+                continue;
+            }
+
+            const FVector EdgeAB = Positions[B] - Positions[A];
+            const FVector EdgeAC = Positions[C] - Positions[A];
+            if (FVector::CrossProduct(EdgeAB, EdgeAC).SizeSquared() <= UE_SMALL_NUMBER)
+            {
+                continue;
+            }
+
+            OutIndices.Add(A);
+            OutIndices.Add(B);
+            OutIndices.Add(C);
+        }
     }
 
     template <typename ValueType>
@@ -217,8 +258,8 @@ namespace WorldBakedDataPrivate
             {
                 OutError = FString::Printf(
                     TEXT("Texture mip %d CPU payload is unavailable after glTFRuntime UpdateResource: %s ")
-                    TEXT("Format=%d Size=%dx%dx%d Resident=%s. Build-time source textures must keep ")
-                    TEXT("ImagesConfig.bStreaming enabled until capture completes."),
+                    TEXT("Format=%d Size=%dx%dx%d Resident=%s. The build path captures transient ")
+                    TEXT("BulkData directly with glTFRuntime texture streaming disabled."),
                     MipIndex, *GetNameSafe(Texture), OutTexture.PixelFormat,
                     SourceMip.SizeX, SourceMip.SizeY, SourceMip.SizeZ,
                     bBulkResident ? TEXT("true") : TEXT("false"));
@@ -710,7 +751,13 @@ bool FGWorldBakedDataCapture::CaptureMesh(
             for (const FVector2D& Value : Source.UVs[Channel])
                 Target.UVs[Channel].Add(FVector2f(Value));
         }
-        Target.Indices = Source.Indices;
+        SanitizeTriangleIndices(Source.Positions, Source.Mode, Source.Indices, Target.Indices);
+        if (Target.Indices.Num() != Source.Indices.Num())
+        {
+            UE_LOG(LogTemp, VeryVerbose,
+                TEXT("Removed %d degenerate/invalid triangle indices while baking mesh %d (%s)."),
+                Source.Indices.Num() - Target.Indices.Num(), MeshIndex, *MeshName);
+        }
         Target.Joints.SetNum(Source.Joints.Num());
         for (int32 SetIndex = 0; SetIndex < Source.Joints.Num(); ++SetIndex)
         {
@@ -798,9 +845,20 @@ bool FGWorldBakedDataCapture::CaptureSkin(
         if (Existing.SkinIndex == SkinIndex) return true;
     }
 
+    if (!BoneAliases.IsEmpty())
+    {
+        FString AliasError;
+        if (!CharacterBoneSchema::ValidateSourceToCanonicalMap(BoneAliases, AliasError))
+        {
+            OutError = FString::Printf(TEXT("Character bone map rejected before skin capture: %s"), *AliasError);
+            return false;
+        }
+    }
+
     FglTFRuntimeSkeletonConfig Config;
     Config.CacheMode = EglTFRuntimeCacheMode::None;
     Config.BonesNameMap = BoneAliases;
+    Config.RootBoneName = TEXT("Root");
     Config.bAddRootNodeIfMissing = true;
     USkeleton* Skeleton = SourceAsset->LoadSkeleton(SkinIndex, Config);
     if (!IsValid(Skeleton))
@@ -813,6 +871,12 @@ bool FGWorldBakedDataCapture::CaptureSkin(
     if (ReferenceSkeleton.GetNum() <= 0 || ReferenceSkeleton.GetNum() > MaxBones)
     {
         OutError = TEXT("Decoded skeleton is empty or exceeds the bone safety limit");
+        return false;
+    }
+    if (!BoneAliases.IsEmpty()
+        && !CharacterBoneSchema::ValidateCanonicalReferenceSkeleton(ReferenceSkeleton, OutError))
+    {
+        OutError = FString::Printf(TEXT("Canonical character skeleton validation failed: %s"), *OutError);
         return false;
     }
 

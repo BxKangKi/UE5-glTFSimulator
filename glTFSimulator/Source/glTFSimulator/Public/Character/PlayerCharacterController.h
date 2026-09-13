@@ -3,9 +3,9 @@
 
 /**
  * @file PlayerCharacterController.h
- * 역할: 플레이어 입력과 UI·게임 매니저를 연결합니다.
- * 핵심 기능: Enhanced Input, 매니저 확보, 메뉴·배치·차량·캐릭터 조작.
- * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * Declares interface, lifetime, and data-ownership contracts; see the matching implementation for behavior.
  */
 
 #pragma once

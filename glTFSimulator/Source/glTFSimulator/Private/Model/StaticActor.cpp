@@ -2,9 +2,9 @@
 
 /**
  * @file StaticActor.cpp
- * 역할: 하나의 baked Static 모델을 월드에 표현합니다.
- * 핵심 기능: gworld 참조 초기화, 메타데이터 범위 읽기, 노드·메시 스트리밍.
- * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
  */
 
 #include "Model/StaticActor.h"
@@ -317,7 +317,7 @@ void AStaticActor::LoadBuiltMetadataAsync(const FGuid& UUID)
         ? GameInstance->GetSubsystem<UModelDatabaseSubsystem>()
         : nullptr;
     const TSharedPtr<FGWorldArchiveReader, ESPMode::ThreadSafe> Reader =
-        Database ? Database->GetArchiveReader() : nullptr;
+        Database ? Database->GetArchiveReaderForModel(UUID) : nullptr;
     const uint64 RequestSerial = ++MetadataRequestSerial;
     const FString ExpectedReference = ModelReference;
     bAsyncLoading = true;

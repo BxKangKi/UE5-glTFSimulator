@@ -2,15 +2,17 @@
 
 /**
  * @file SettingsMenuWidget.cpp
- * 역할: 설정 메뉴의 보류값과 적용 동작을 관리합니다.
- * 핵심 기능: 설정 컨트롤 바인딩, 값 변경·확인·적용.
- * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
  */
 
 #include "UI/SettingsMenuWidget.h"
+#include "UI/SettingControlWidget.h"
 
 #include "Components/ContentWidget.h"
 #include "Components/TextBlock.h"
+#include "Components/VerticalBox.h"
 #include "Setting/GameSettings.h"
 #include "System/GameManagerSubSystem.h"
 
@@ -338,10 +340,13 @@ void USettingsMenuWidget::NativeConstruct()
     CollectAssignedWidgetReferences();
     BindButtonEvents();
     InitializeSettingsFromSavedData();
+    RebuildGeneratedSettingWidgets();
 }
 
 void USettingsMenuWidget::NativeDestruct()
 {
+    ClearGeneratedSettingWidgets();
+    AssignedSettingsListBox.Reset();
     UnbindButtonEvents();
     BoundFieldButtons.Empty();
     AssignedTitleText.Reset();
@@ -424,6 +429,96 @@ void USettingsMenuWidget::SetCancelButton(UButton* InButton)
     {
         InButton->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CloseSettingsFromUI);
         InButton->OnClicked.AddDynamic(this, &USettingsMenuWidget::CloseSettingsFromUI);
+    }
+}
+
+
+void USettingsMenuWidget::SetSettingsListBox(UVerticalBox* InVerticalBox)
+{
+    if (AssignedSettingsListBox.Get() == InVerticalBox)
+    {
+        RebuildGeneratedSettingWidgets();
+        return;
+    }
+
+    ClearGeneratedSettingWidgets();
+    AssignedSettingsListBox = InVerticalBox;
+    RebuildGeneratedSettingWidgets();
+}
+
+void USettingsMenuWidget::ClearGeneratedSettingWidgets()
+{
+    if (UVerticalBox* Host = AssignedSettingsListBox.Get())
+    {
+        // This host is intentionally dedicated to generated setting rows.
+        Host->ClearChildren();
+    }
+    GeneratedSettingWidgets.Empty();
+}
+
+USettingControlWidget* USettingsMenuWidget::CreateGeneratedSettingWidget(ESettingsField Field)
+{
+    TSubclassOf<USettingControlWidget> WidgetClass;
+    switch (GetSettingControlType(Field))
+    {
+    case ESettingsControlType::Toggle:
+        WidgetClass = BooleanSettingWidgetClass;
+        break;
+    case ESettingsControlType::Slider:
+        WidgetClass = FloatSettingWidgetClass;
+        break;
+    case ESettingsControlType::Dropdown:
+        WidgetClass = EnumSettingWidgetClass;
+        break;
+    default:
+        break;
+    }
+
+    if (!WidgetClass)
+    {
+        return nullptr;
+    }
+
+    return Cast<USettingControlWidget>(
+        UUserWidget::CreateWidgetInstance(*this, WidgetClass, NAME_None));
+}
+
+void USettingsMenuWidget::RebuildGeneratedSettingWidgets()
+{
+    UVerticalBox* Host = AssignedSettingsListBox.Get();
+    if (!IsValid(Host))
+    {
+        return;
+    }
+
+    ClearGeneratedSettingWidgets();
+
+    for (ESettingsField Field : GetDefaultSettingsFields())
+    {
+        USettingControlWidget* Row = CreateGeneratedSettingWidget(Field);
+        if (!IsValid(Row))
+        {
+            const ESettingsControlType ControlType = GetSettingControlType(Field);
+            UE_LOG(LogTemp, Verbose,
+                TEXT("Settings row WBP class is not assigned for field %s (control type %d)."),
+                *FieldName(Field).ToString(), static_cast<int32>(ControlType));
+            continue;
+        }
+
+        Host->AddChildToVerticalBox(Row);
+        Row->ConfigureSetting(this, Field);
+        GeneratedSettingWidgets.Add(Row);
+    }
+}
+
+void USettingsMenuWidget::RefreshGeneratedSettingWidgets()
+{
+    for (USettingControlWidget* Widget : GeneratedSettingWidgets)
+    {
+        if (IsValid(Widget))
+        {
+            Widget->RefreshSettingWidget();
+        }
     }
 }
 
@@ -602,6 +697,23 @@ bool USettingsMenuWidget::GetSettingSliderRange(
     default:
         OutMin = 0.0f; OutMax = 1.0f; OutStep = 0.01f; return false;
     }
+}
+
+
+bool USettingsMenuWidget::GetPendingBooleanSettingValue(ESettingsField Field) const
+{
+    switch (Field)
+    {
+    case ESettingsField::RayTracing: return bPendingRayTracing;
+    case ESettingsField::HeightFog: return bPendingHeightFog;
+    case ESettingsField::Cloud: return bPendingCloud;
+    default: return false;
+    }
+}
+
+float USettingsMenuWidget::GetPendingNumericSettingValue(ESettingsField Field) const
+{
+    return GetPendingNumericValue(Field);
 }
 
 void USettingsMenuWidget::SetSettingFromSliderValue(ESettingsField Field, const float Value)
@@ -1130,6 +1242,7 @@ void USettingsMenuWidget::RefreshSettingsValues()
         }
     }
     RefreshRegisteredControls();
+    RefreshGeneratedSettingWidgets();
 }
 
 void USettingsMenuWidget::CycleSettingValueFromUI(ESettingsField Field, int32 Direction)

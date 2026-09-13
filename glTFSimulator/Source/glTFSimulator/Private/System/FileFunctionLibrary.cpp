@@ -3,9 +3,9 @@
 
 /**
  * @file FileFunctionLibrary.cpp
- * 역할: 프로젝트 파일·로그 작업을 위한 공통 함수를 제공합니다.
- * 핵심 기능: 안전한 파일 보조 작업, 비동기 로그 기록.
- * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
  */
 
 #include "System/FileFunctionLibrary.h"

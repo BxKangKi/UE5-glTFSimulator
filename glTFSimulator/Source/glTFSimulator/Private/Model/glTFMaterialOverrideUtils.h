@@ -2,9 +2,9 @@
 
 /**
  * @file glTFMaterialOverrideUtils.h
- * 역할: 공통 머티리얼 설정을 glTFRuntime 로드 설정에 적용합니다.
- * 핵심 기능: 기본 머티리얼 오버라이드 매핑.
- * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * Declares interface, lifetime, and data-ownership contracts; see the matching implementation for behavior.
  */
 
 #pragma once

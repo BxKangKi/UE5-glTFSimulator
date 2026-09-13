@@ -3,9 +3,9 @@
 
 /**
  * File role: SafeFileIO.h
- * 역할: 크기가 제한된 파일·JSON 비동기 I/O를 제공합니다.
- * 핵심 기능: tracked worker, GT 전달, 종료 drain, 원자적 쓰기·복구.
- * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * Declares interface, lifetime, and data-ownership contracts; see the matching implementation for behavior.
  */
 
 /**
@@ -115,7 +115,7 @@ struct GLTFSIMULATOR_API FSafeBinaryLoadResult
  * Non-UObject service for safe file operations.
  *
  * Blocking functions are intended for worker threads. Async functions perform disk/JSON work on
- * the task graph and marshal their completion callback to the game thread.
+ * workers and marshal completions through the normal game-thread ticker frame context.
  */
 class GLTFSIMULATOR_API FSafeFileIO
 {
@@ -135,7 +135,8 @@ public:
     static bool RunTrackedWorker(FTrackedTask Task);
 
     /**
-     * Queues a game-thread continuation whose lifetime is also included in shutdown draining.
+     * Queues a continuation for the normal game-thread ticker frame so UE 5.8 inherited time
+     * context remains valid for UObject/render work. Its lifetime is included in shutdown draining.
      * Returns false when shutdown has already started and the continuation was suppressed.
      */
     static bool DispatchTrackedGameThread(FTrackedTask Task);

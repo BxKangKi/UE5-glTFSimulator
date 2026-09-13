@@ -3,9 +3,9 @@
 
 /**
  * @file WorldObjectStreamingSubsystem.h
- * 역할: entity 청크의 객체 생성·제거·저장을 조정합니다.
- * 핵심 기능: 비동기 범위 읽기, 초기 복구, 변경 객체 추적, 저장 병합.
- * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * Declares interface, lifetime, and data-ownership contracts; see the matching implementation for behavior.
  */
 
 #pragma once

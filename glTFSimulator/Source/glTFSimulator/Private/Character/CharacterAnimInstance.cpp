@@ -3,9 +3,9 @@
 
 /**
  * @file CharacterAnimInstance.cpp
- * 역할: 캐릭터 애니메이션 상태를 AnimGraph에 전달합니다.
- * 핵심 기능: 이동·회전·공중·물 상태와 애니메이션 변수 갱신.
- * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
  */
 
 #include "Character/CharacterAnimInstance.h"

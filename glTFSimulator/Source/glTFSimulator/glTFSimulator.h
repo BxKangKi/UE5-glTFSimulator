@@ -3,9 +3,9 @@
 
 /**
  * @file glTFSimulator.h
- * 역할: 프로젝트 게임 모듈의 수명을 관리합니다.
- * 핵심 기능: 모듈 시작·종료, 로딩 화면, 추적 작업 종료 대기.
- * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * Declares interface, lifetime, and data-ownership contracts; see the matching implementation for behavior.
  */
 
 #pragma once

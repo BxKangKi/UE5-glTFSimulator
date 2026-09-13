@@ -3,9 +3,9 @@
 
 /**
  * @file ComputeFileHashAsyncAction.cpp
- * 역할: 파일 해시 계산을 비동기로 수행합니다.
- * 핵심 기능: 파일 읽기·해시 계산, Blueprint 완료 통지와 취소.
- * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
  */
 
 #include "System/ComputeFileHashAsyncAction.h"

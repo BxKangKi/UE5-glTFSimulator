@@ -2,9 +2,9 @@
 
 /**
  * @file CreatorHUDWidget.cpp
- * 역할: 제작 모드 HUD와 게임 매니저를 연결합니다.
- * 핵심 기능: 명시적 위젯 참조, toolbar·상태·빌드 진행 표시.
- * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
  */
 
 #include "UI/CreatorHUDWidget.h"
@@ -264,7 +264,7 @@ FText UCreatorHUDWidget::GetStatusText() const
     const UGameManagerSubSystem* Manager = GetGameManager();
     if (!IsValid(Manager))
     {
-        return FText::FromString(TEXT("GameManager 없음"));
+        return FText::FromString(TEXT("GameManager unavailable"));
     }
 
     const FToolbarItem SelectedItem = Manager->GetSelectedToolbarItem();

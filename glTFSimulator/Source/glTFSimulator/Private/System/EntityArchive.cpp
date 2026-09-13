@@ -2,9 +2,9 @@
 
 /**
  * @file EntityArchive.cpp
- * 역할: 월드의 변경 가능한 객체·플레이어 상태를 저장합니다.
- * 핵심 기능: 512m 청크, append-only 커밋·복구, 범위 읽기.
- * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
  */
 
 #include "System/EntityArchive.h"

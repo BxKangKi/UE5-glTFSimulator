@@ -3,9 +3,9 @@
 
 /**
  * File role: glTFRuntimeSafety.h
- * 역할: glTFRuntime의 native 작업과 해제를 직렬 조정합니다.
- * 핵심 기능: 작업 티켓·대기 큐, GC 참조 보호, 지연 cache 해제, 종료 drain.
- * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * Declares interface, lifetime, and data-ownership contracts; see the matching implementation for behavior.
  */
 
 /**

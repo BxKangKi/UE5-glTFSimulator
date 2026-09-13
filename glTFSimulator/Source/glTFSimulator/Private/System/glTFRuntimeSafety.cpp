@@ -3,9 +3,9 @@
 
 /**
  * File role: glTFRuntimeSafety.cpp
- * 역할: glTFRuntime의 native 작업과 해제를 직렬 조정합니다.
- * 핵심 기능: 작업 티켓·대기 큐, GC 참조 보호, 지연 cache 해제, 종료 drain.
- * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
  */
 
 /**
@@ -576,10 +576,32 @@ void FglTFRuntimeSafety::CompleteOperation(const uint64 Ticket)
         // Do not route this through FSafeFileIO: its shutdown gate intentionally rejects new
         // dispatches. The active-ticket map itself keeps this module and both UObjects logically
         // alive until this game-thread completion removes the ticket during the shutdown drain.
-        AsyncTask(ENamedThreads::GameThread, [Ticket]()
+        // During normal play, register a one-shot ticker instead of completing the operation inside
+        // a GameThread task spawned by a plugin worker. UE 5.8 propagates FAppTime through task
+        // ancestry; such a task can run on the game thread with no inherited frame-time context and
+        // then start renderer work from an invalid context. The ticker executes on a normal frame.
+        // Shutdown is different: no new native operation will be started, and the shutdown drain
+        // pumps TaskGraph but not FTSTicker, so complete directly through the pumped GameThread task.
+        if (glTFRuntimeSafetyPrivate::IsShuttingDown())
         {
-            FglTFRuntimeSafety::CompleteOperation(Ticket);
-        });
+            AsyncTask(ENamedThreads::GameThread, [Ticket]()
+            {
+                FglTFRuntimeSafety::CompleteOperation(Ticket);
+            });
+        }
+        else
+        {
+            AsyncTask(ENamedThreads::GameThread, [Ticket]()
+            {
+                FTSTicker::GetCoreTicker().AddTicker(
+                    FTickerDelegate::CreateLambda([Ticket](float)
+                    {
+                        FglTFRuntimeSafety::CompleteOperation(Ticket);
+                        return false;
+                    }),
+                    0.0f);
+            });
+        }
         return;
     }
 
@@ -605,13 +627,38 @@ void FglTFRuntimeSafety::CompleteOperationAfterCallback(const uint64 Ticket)
         return;
     }
 
-    // Always enqueue, even when already on the game thread. glTFRuntime executes the project
-    // delegate before its async context calls UnregisterGCObject(); releasing the ticket inline
-    // could therefore run ClearCache against a callback wrapper that has not finished unwinding.
-    AsyncTask(ENamedThreads::GameThread, [Ticket]()
+    // Always defer until the next core-ticker frame. glTFRuntime executes the project delegate
+    // before its async context calls UnregisterGCObject(); releasing the ticket inline could run
+    // ClearCache against a callback wrapper that has not finished unwinding. A ticker also preserves
+    // UE 5.8's normal frame-time context for any queued operation started by CompleteOperation().
+    if (glTFRuntimeSafetyPrivate::IsShuttingDown())
     {
-        FglTFRuntimeSafety::CompleteOperation(Ticket);
-    });
+        AsyncTask(ENamedThreads::GameThread, [Ticket]()
+        {
+            FglTFRuntimeSafety::CompleteOperation(Ticket);
+        });
+        return;
+    }
+
+    auto RegisterCompletionTicker = [Ticket]()
+    {
+        FTSTicker::GetCoreTicker().AddTicker(
+            FTickerDelegate::CreateLambda([Ticket](float)
+            {
+                FglTFRuntimeSafety::CompleteOperation(Ticket);
+                return false;
+            }),
+            0.0f);
+    };
+
+    if (IsInGameThread())
+    {
+        RegisterCompletionTicker();
+    }
+    else
+    {
+        AsyncTask(ENamedThreads::GameThread, MoveTemp(RegisterCompletionTicker));
+    }
 }
 
 void FglTFRuntimeSafety::CancelQueuedOperations(UObject* Owner)
