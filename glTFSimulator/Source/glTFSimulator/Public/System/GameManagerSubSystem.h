@@ -1,22 +1,30 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
+/**
+ * @file GameManagerSubSystem.h
+ * 역할: GameMode가 시작한 월드 빌드·실행 세션의 서비스 상태를 관리합니다.
+ * 핵심 기능: 경로 해석, DB→bake→streaming, 배치·저장·세션 종료. 생명주기는 GameMode가 소유합니다.
+ * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Templates/Atomic.h"
 #include "Engine/HitResult.h"
 #include "GameFramework/Actor.h"
 #include "Model/glTFMaterialAssetReferences.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "TimerManager.h"
 #include "World/PlacementTypes.h"
+#include "System/WorldArchive.h"
 #include "GameManagerSubSystem.generated.h"
 
-class APrefabActor;
+class ADynamicActor;
 class AVehiclePawn;
 class AWeaponActor;
 class UCameraComponent;
 class UMaterialInterface;
-class UMaterialDefaultAsset;
 class UMaterialDefaultRuntimeCache;
 class UProceduralMeshComponent;
 class USceneComponent;
@@ -24,11 +32,12 @@ class UWorldData;
 class UPlayerData;
 class UUserWidget;
 class AWorldEnvManager;
-class AglTFStreamActor;
-class UglTFStreamSubSystem;
+class AStaticActor;
+class UWorldSceneStreamingSubsystem;
+class UWorldSourceModelBuilder;
 class UGameSettings;
 class UPostProcessComponent;
-class AGameManagerActor;
+class AGlTFSimulatorGameplayGameModeBase;
 class UWorld;
 class APlayerController;
 
@@ -36,7 +45,7 @@ UENUM(BlueprintType)
 enum class EToolMode : uint8
 {
     None = 0 UMETA(DisplayName="None"),
-    PlacePrefab = 1 UMETA(DisplayName="Place Prefab"),
+    PlaceStatic = 1 UMETA(DisplayName="Place Static"),
     // Values 2 and 3 are reserved for the removed object/vertex authoring tools.
     PlaceVehicle = 4 UMETA(DisplayName="Place Vehicle"),
     Weapon = 5 UMETA(DisplayName="Weapon")
@@ -53,8 +62,9 @@ UENUM(BlueprintType)
 enum class EToolbarItemKind : uint8
 {
     None = 0 UMETA(DisplayName="None"),
-    // Value 1 is reserved for the removed object-creation item.
-    Prefab = 2 UMETA(DisplayName="Prefab"),
+    // Value 1 belonged to the removed object-authoring item. Keep the remaining wire values stable
+    // so serialized Blueprint defaults and saved toolbar rows are not silently reinterpreted.
+    Static = 2 UMETA(DisplayName="Static"),
     Weapon = 3 UMETA(DisplayName="Weapon"),
     Vehicle = 4 UMETA(DisplayName="Vehicle")
 };
@@ -71,10 +81,10 @@ struct GLTFSIMULATOR_API FToolbarItem
     FString DisplayName;
 
     UPROPERTY(Transient)
-    FString SourcePath;
+    FString ModelReference;
 
     UPROPERTY(Transient)
-    int32 SourceIndex = INDEX_NONE;
+    int32 ModelIndex = INDEX_NONE;
 
     UPROPERTY(Transient)
     bool bAvailable = false;
@@ -94,6 +104,16 @@ class GLTFSIMULATOR_API UGameManagerSubSystem : public UGameInstanceSubsystem
 
 public:
     UGameManagerSubSystem();
+
+    /** GC-visible copy of the active manager's Static actor class; used by the distance streamer. */
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Game|Classes")
+    TSubclassOf<AStaticActor> StaticActorClass;
+
+    /** Validated external folder actually used by startup. Empty means no valid selection. */
+    UFUNCTION(BlueprintPure, Category="Game|World")
+    FString GetSelectedWorldRootPath() const { return GetWorldRootPath(); }
+
+    bool IsActiveGameMode(const AGlTFSimulatorGameplayGameModeBase* GameMode) const;
 
     virtual bool ShouldCreateSubsystem(UObject* Outer) const override;
     virtual void Initialize(FSubsystemCollectionBase& Collection) override;
@@ -122,39 +142,32 @@ public:
     UFUNCTION(BlueprintPure, Category="Game|Assets")
     bool IsMaterialDefaultAssetReady() const { return bMaterialDefaultAssetResolved; }
 
-    // Opens the directly assigned menu world and asks its StartActor to show world selection after travel.
+    // Returns gameplay to the single MainWorld and asks MainGameMode to show world selection after travel.
     UFUNCTION(BlueprintCallable, Category="Game|Lifecycle", meta=(WorldContext="WorldContextObject"))
-    static void OpenWorldSelectionScreen(const UObject* WorldContextObject, TSoftObjectPtr<UWorld> WorldSelectionWorld);
+    static void OpenWorldSelectionScreen(const UObject* WorldContextObject, TSoftObjectPtr<UWorld> MainWorld);
 
     /** Native request path used by pause UI. True means this or an equivalent duplicate request owns travel. */
-    static bool TryOpenWorldSelectionScreen(const UObject* WorldContextObject, TSoftObjectPtr<UWorld> WorldSelectionWorld);
-
-    /** Remembers the currently loaded StartActor menu world without a hard-coded map name or asset path. */
-    void RegisterWorldSelectionWorld(TSoftObjectPtr<UWorld> InWorldSelectionWorld);
-
-    /** Fallback for gameplay controllers whose Blueprint default does not repeat the menu-world assignment. */
-    TSoftObjectPtr<UWorld> GetRegisteredWorldSelectionWorld() const { return RegisteredWorldSelectionWorld; }
+    static bool TryOpenWorldSelectionScreen(const UObject* WorldContextObject, TSoftObjectPtr<UWorld> MainWorld);
 
     /** Rolls back an accepted request when OpenLevel fails and the gameplay world remains active. */
     void CancelWorldSelectionMenuTravel();
-
-    // Opens the directly assigned main-menu world from the world-selection screen.
-    UFUNCTION(BlueprintCallable, Category="Game|Lifecycle", meta=(WorldContext="WorldContextObject"))
-    static void OpenMainMenuFromWorldSelection(const UObject* WorldContextObject, TSoftObjectPtr<UWorld> MainMenuWorld);
 
     // Clears editor-only undo transactions before menu-triggered map travel. No-op outside editor builds.
     UFUNCTION(BlueprintCallable, Category="Game|Lifecycle", meta=(WorldContext="WorldContextObject"))
     static void ResetEditorTransactionBufferForWorldTravel(const UObject* WorldContextObject, const FString& Reason);
 
     UFUNCTION(BlueprintCallable, Category="Game|Lifecycle")
-    void StartGameManager(class AGameManagerActor* InConfigActor);
+    void StartGameplaySession(AGlTFSimulatorGameplayGameModeBase* InGameMode);
+
+    /** Client-side render/session initialization. GameMode exists only on authority, so clients use their PlayerController as lifetime owner. */
+    void StartClientGameplaySession(APlayerController* InOwnerController);
 
     /** Stops the active session. A non-null requester may stop only the session it owns. */
-    void StopGameManager(
+    void StopGameplaySession(
         const EEndPlayReason::Type EndPlayReason,
-        const class AGameManagerActor* RequestingActor = nullptr);
+        const AGlTFSimulatorGameplayGameModeBase* RequestingGameMode = nullptr);
     void UpdateGameManager(float DeltaSeconds);
-    void ApplyEditorConfig(const class AGameManagerActor* InConfigActor);
+    void ApplyGameModeConfig(const AGlTFSimulatorGameplayGameModeBase* InGameMode);
 
     UFUNCTION(BlueprintCallable, Category="Game|Settings")
     void SaveSettings();
@@ -164,13 +177,20 @@ public:
     void TogglePause();
     UFUNCTION(BlueprintCallable, Category="Game|Pause")
     void SetGamePaused(bool bPaused);
+
+    /** Registers or replaces the loading widget. Missing UI is created automatically from the central registry. */
+    UFUNCTION(BlueprintCallable, Category="Game|Loading")
+    void SetLoadingWidget(UUserWidget* InWidget);
+
+    bool HasLoadingWidget() const;
+
     UFUNCTION(BlueprintCallable, Category="Game|Loading")
     void SetWorldLoading(bool bLoading);
     UFUNCTION(BlueprintPure, Category="Game|Loading")
     bool IsWorldLoading() const { return bIsWorldLoading; }
 
     /**
-     * Registers the active character. During world bootstrap this also completes the one-shot
+     * Registers the active character. During initial world-state restoration this also completes the one-shot
      * saved-transform/PlayerStart handshake; later pawn replacements only update the reference.
      */
     void SetPlayerActor(AActor* Actor);
@@ -179,26 +199,38 @@ public:
     void SetCameraComponent(USceneComponent* InCamera);
     void SetGameSettings(UGameSettings* Settings) { GameSettings = Settings; }
     void SetWorldData(UWorldData* Data) { CurrentWorldData = Data; }
+    /**
+     * Stores a direct child key beneath PATH_ROOT. Empty input deliberately clears the hand-off;
+     * malformed input is rejected so URL/replication data can never become an arbitrary path.
+     */
     UFUNCTION(BlueprintCallable, Category="Game|World")
-    void SetCurrentWorldName(FString Name) { CurrentWorldName = Name; }
+    void SetCurrentWorldName(FString Name);
+    /**
+     * Canonical validator shared by menu travel, replicated state, and destination initialization.
+     * Set bRequireExistingDirectory only at the point where a world is about to be opened.
+     */
+    static bool TryNormalizeWorldFolderName(
+        const FString& Candidate,
+        FString& OutNormalized,
+        bool bRequireExistingDirectory = false);
     /** Accepts runtime location updates only from the registered primary player actor. */
     void SetPlayerLocation(const FVector& Location, const AActor* SourceActor);
     void SetPostProcess(UPostProcessComponent* InPostProcess) { PostProcess = InPostProcess; }
-    template <typename T> T* GetPlayerActor() const { return Cast<T>(PlayerActor); }
-    template <typename T> T* GetCameraComponent() const { return Cast<T>(CurrentCamera); }
+    template <typename T> T* GetPlayerActor() const { return Cast<T>(PlayerActor.Get()); }
+    template <typename T> T* GetCameraComponent() const { return Cast<T>(CurrentCamera.Get()); }
     UFUNCTION(BlueprintPure, Category="SettingData")
-    UGameSettings* GetGameSettings() const { return GameSettings; }
+    UGameSettings* GetGameSettings() const { return GameSettings.Get(); }
     FVector GetPlayerLocation() const { return PlayerLocation; }
-    FVector GetCameraLocation() const { return IsValid(CurrentCamera) ? CurrentCamera->GetComponentLocation() : FVector::ZeroVector; }
+    FVector GetCameraLocation() const { return IsValid(CurrentCamera.Get()) ? CurrentCamera->GetComponentLocation() : FVector::ZeroVector; }
     bool GetGamePaused() const { return bIsGamePaused; }
-    UWorldData* GetWorldData() const { return CurrentWorldData; }
+    UWorldData* GetWorldData() const { return CurrentWorldData.Get(); }
 
     /** Authority-side command helpers shared by console and the future chat command path. */
     bool SetWorldTimeSeconds(double Seconds);
     bool AddWorldTimeSeconds(double DeltaSeconds);
     bool SetWorldDay(double DayNumber);
     UFUNCTION(BlueprintPure, Category="Game|Player")
-    UPlayerData* GetPlayerData() const { return ActivePlayerData; }
+    UPlayerData* GetPlayerData() const { return ActivePlayerData.Get(); }
     UFUNCTION(BlueprintPure, Category="Game|Weapon")
     AWeaponActor* GetEquippedWeaponActor() const { return EquippedWeapon.Get(); }
     UFUNCTION(BlueprintPure, Category="Game|Level")
@@ -212,13 +244,13 @@ public:
     FString GetDebugText();
 
     UFUNCTION(BlueprintCallable, Category="Game|UI Actions")
-    void SelectPreviousPrefab();
+    void SelectPreviousStatic();
 
     UFUNCTION(BlueprintCallable, Category="Game|UI Actions")
-    void SelectNextPrefab();
+    void SelectNextStatic();
 
     UFUNCTION(BlueprintCallable, Category="Game|UI Actions")
-    void SelectPrefabPlacementTool();
+    void SelectStaticPlacementTool();
 
     UFUNCTION(BlueprintCallable, Category="Game|UI Actions")
     void SelectVehicleTool();
@@ -250,24 +282,42 @@ public:
     UFUNCTION(BlueprintCallable, Category="Game|UI Actions")
     bool LoadSavedScene();
 
-    /** Called by the chunk streamer after a UUID-backed prefab/entity is instantiated. */
+    /** Called by the chunk streamer after a UUID-backed Static/Dynamic object is instantiated. */
     void TrackStreamedWorldObject(AActor* Actor);
 
-    /**
-     * Flushes dirty prefab/entity chunk files, saves data/level.dat, and builds extensionless /cache files.
-     */
+    /** Explicitly scans Projects/<Project>/resources then atomically publishes Worlds/<Project>.gwd. */
+    UFUNCTION(BlueprintCallable, Category="Game|Projects")
+    bool BuildProjectByName(const FString& ProjectName);
+
+    UFUNCTION(BlueprintPure, Category="Game|Projects")
+    static FString GetProjectsRootPath();
+
+    /** Atomically builds immutable WorldName.gwd from the explicitly prepared authoring database. */
     UFUNCTION(BlueprintCallable, Category="Game|Bake")
     void BakeWorldData();
 
     UFUNCTION(BlueprintPure, Category="Game|Bake")
     bool IsWorldBakeInProgress() const { return bWorldBakeInProgress; }
 
+    /** Includes project validation/indexing before the source-model bake flag becomes true. */
+    UFUNCTION(BlueprintPure, Category="Game|Bake")
+    bool IsProjectBuildInProgress() const
+    {
+        return bWorldBakeInProgress || bWorldArchiveCommitInFlight || !ActiveBuildProjectRoot.IsEmpty();
+    }
+
     UFUNCTION(BlueprintPure, Category="Game|Bake")
     float GetWorldBakeProgress() const { return WorldBakeProgressValue; }
 
-    /** Updates the selected player runtime record and persists it to data/level.dat. */
+    UFUNCTION(BlueprintPure, Category="Game|Bake")
+    int32 GetWorldBakeTotalModels() const { return WorldBakeTotalModels; }
+
+    UFUNCTION(BlueprintPure, Category="Game|Bake")
+    int32 GetWorldBakeCompletedModels() const { return WorldBakeCompletedModels; }
+
+    /** Updates the selected player runtime record and persists it to WorldName.dat. */
     UFUNCTION(BlueprintCallable, Category="Game|World Data")
-    void SetSelectedPlayerForRuntime(const FString& PlayerFileName);
+    void SetSelectedPlayerForRuntime(const FString& PlayerId);
 
     UFUNCTION(BlueprintCallable, Category="Game|UI Actions")
     void RefreshAssetLists();
@@ -276,14 +326,24 @@ public:
     void SetCurrentToolMode(EToolMode NewMode);
 
     UFUNCTION(BlueprintCallable, Category="Game|UI Actions")
-    bool SetCurrentPrefabIndex(int32 NewIndex);
+    bool SetCurrentStaticIndex(int32 NewIndex);
 
     UFUNCTION(BlueprintCallable, Category="Game|UI Actions")
     bool SetCurrentWeaponIndex(int32 NewIndex);
 
+    /** Legacy Blueprint endpoint; placement remains edge-triggered by InputPrimaryPressed. */
+    UFUNCTION(BlueprintCallable, Category="Game|Input",
+        meta=(DeprecatedFunction, DeprecationMessage="Use InputPrimaryPressed"))
+    void InputPrimaryAction();
+
     /** Left mouse pressed. Executes the selected placement/equipment action once. */
     UFUNCTION(BlueprintCallable, Category="Game|Input")
     void InputPrimaryPressed();
+
+    /** Legacy release endpoint retained so existing Blueprint graphs continue to load safely. */
+    UFUNCTION(BlueprintCallable, Category="Game|Input",
+        meta=(DeprecatedFunction, DeprecationMessage="Placement is handled on press"))
+    void InputPrimaryReleased();
 
     /** Secondary action endpoint retained for project input mappings. */
     UFUNCTION(BlueprintCallable, Category="Game|Input")
@@ -376,34 +436,44 @@ public:
     EPlayMode GetPlayMode() const { return PlayMode; }
 
     UFUNCTION(BlueprintPure, Category="Game|Status")
-    FString GetCurrentPrefabName() const;
+    FString GetCurrentStaticName() const;
 
     UFUNCTION(BlueprintPure, Category="Game|Status")
     FString GetCurrentWeaponName() const;
 
     UFUNCTION(BlueprintPure, Category="Game|Assets")
-    int32 GetPrefabCount() const { return PrefabFiles.Num(); }
+    int32 GetStaticCount() const { return StaticReferences.Num(); }
 
     UFUNCTION(BlueprintPure, Category="Game|Assets")
-    int32 GetWeaponCount() const { return WeaponFiles.Num(); }
+    int32 GetWeaponCount() const { return WeaponReferences.Num(); }
 
     UFUNCTION(BlueprintPure, Category="Game|Assets")
-    int32 GetCurrentPrefabIndex() const { return CurrentPrefabIndex; }
+    int32 GetCurrentStaticIndex() const { return CurrentStaticIndex; }
 
     UFUNCTION(BlueprintPure, Category="Game|Assets")
     int32 GetCurrentWeaponIndex() const { return CurrentWeaponIndex; }
 
     UFUNCTION(BlueprintPure, Category="Game|Assets")
-    FString GetPrefabNameAtIndex(int32 Index) const;
+    FString GetStaticNameAtIndex(int32 Index) const;
 
     UFUNCTION(BlueprintPure, Category="Game|Assets")
     FString GetWeaponNameAtIndex(int32 Index) const;
 
-    UFUNCTION(BlueprintPure, Category="Game|Assets")
-    FString GetPrefabPathAtIndex(int32 Index) const;
+    /** Legacy name; the returned value is an immutable gwd:// reference, never a file path. */
+    UFUNCTION(BlueprintPure, Category="Game|Assets",
+        meta=(DeprecatedFunction, DeprecationMessage="Use GetStaticReferenceAtIndex"))
+    FString GetStaticPathAtIndex(int32 Index) const;
+
+    /** Legacy name; the returned value is an immutable gwd:// reference, never a file path. */
+    UFUNCTION(BlueprintPure, Category="Game|Assets",
+        meta=(DeprecatedFunction, DeprecationMessage="Use GetWeaponReferenceAtIndex"))
+    FString GetWeaponPathAtIndex(int32 Index) const;
 
     UFUNCTION(BlueprintPure, Category="Game|Assets")
-    FString GetWeaponPathAtIndex(int32 Index) const;
+    FString GetStaticReferenceAtIndex(int32 Index) const;
+
+    UFUNCTION(BlueprintPure, Category="Game|Assets")
+    FString GetWeaponReferenceAtIndex(int32 Index) const;
 
     UFUNCTION(BlueprintPure, Category="Game|Status")
     bool IsSnapEnabled() const { return bSnapToGrid; }
@@ -444,6 +514,16 @@ public:
     UFUNCTION(BlueprintCallable, Category="Game|Lifecycle")
     void ReleaseMainWorldRuntimeMemory(bool bForceGarbageCollection = true);
 
+    /** Compatibility wrapper for existing menu Blueprint listeners. */
+    UFUNCTION(BlueprintCallable, Category="Game|Lifecycle",
+        meta=(DeprecatedFunction, DeprecationMessage="Use OpenWorldSelectionScreen"))
+    void PrepareForReturnToMenuLevel();
+
+    /** Compatibility alias for older MainWorld navigation graphs. */
+    UFUNCTION(BlueprintCallable, Category="Game|Lifecycle",
+        meta=(DeprecatedFunction, DeprecationMessage="Use OpenWorldSelectionScreen"))
+    void PrepareForReturnToMainWorld();
+
     UFUNCTION(BlueprintPure, Category="Game|Lifecycle")
     bool HasPendingMainWorldRuntimePurge() const { return bPendingMainWorldRuntimePurge; }
 
@@ -465,13 +545,13 @@ public:
 
     /** Returns the gameplay-owned world data object that drives time, sky, player position, and save data. */
     UFUNCTION(BlueprintPure, Category="Game|World")
-    UWorldData* GetActiveWorldData() const { return ActiveWorldData; }
+    UWorldData* GetActiveWorldData() const { return ActiveWorldData.Get(); }
 
-    /** Returns true when initial streamed GLB models and the player replacement are ready. */
+    /** Returns true when initial .gwd model ranges and the player replacement are ready. */
     UFUNCTION(BlueprintPure, Category="Game|World")
     bool AreWorldSystemsReady() const;
 
-    /** Returns the loading percent reported by the GLB stream subsystem. */
+    /** Returns the loading percent reported by the built-world stream subsystem. */
     UFUNCTION(BlueprintPure, Category="Game|World")
     float GetWorldSystemsLoadingStatus() const;
 
@@ -509,6 +589,8 @@ private:
     bool bIsGamePaused = false;
     bool bIsWorldLoading = false;
     FString CurrentWorldName;
+    FString PendingWorldConfigJson;
+    FString ActiveBuildProjectRoot;
     FVector PlayerLocation = FVector::ZeroVector;
     float LoadingStatus = 0.0f;
     int32 TotalSumFPS = 0;
@@ -518,10 +600,13 @@ private:
 
 
     UPROPERTY(Transient)
-    TWeakObjectPtr<AGameManagerActor> ConfigActor;
+    TWeakObjectPtr<AGlTFSimulatorGameplayGameModeBase> ConfigGameMode;
+
+    /** Game-thread session owner: authority GameMode or client PlayerController. */
+    TWeakObjectPtr<AActor> SessionOwner;
 
     FTimerManager& GetWorldTimerManager() const;
-    FVector GetManagerActorLocation() const;
+    FVector GetSessionOwnerLocation() const;
     void EnsureRuntimeComponents();
     bool ResolveMaterialDefaultAsset();
     void ReleaseMaterialDefaultAsset();
@@ -536,16 +621,6 @@ private:
     TObjectPtr<UMaterialInterface> PlacementGridMaterial;
 
 
-    /** Class copied from the configuration actor. No mutable configuration instance exists before play. */
-    UPROPERTY(Transient)
-    TSubclassOf<UMaterialDefaultAsset> MaterialDefaultAssetClass;
-
-    /**
-     * Transient configuration instance created on the game thread when the manager starts. Keeping
-     * it as a UPROPERTY prevents collection during nested synchronous material loads or re-entrant calls.
-     */
-    UPROPERTY(Transient)
-    TObjectPtr<UMaterialDefaultAsset> MaterialDefaultAssetInstance;
 
     /**
      * The one shared strong-reference object for the active world. Async requests retain this guard
@@ -574,7 +649,7 @@ private:
     float PlacementGridFadeRadius = 300.0f;
 
     UPROPERTY(Transient)
-    TSubclassOf<APrefabActor> PrefabActorClass;
+    TSubclassOf<ADynamicActor> DynamicActorClass;
 
     UPROPERTY(Transient)
     TSubclassOf<AVehiclePawn> VehiclePawnClass;
@@ -587,9 +662,6 @@ private:
     TSubclassOf<AWorldEnvManager> WorldEnvManagerClass;
 
     UPROPERTY(Transient)
-    TSubclassOf<AglTFStreamActor> SpawnActorClass;
-
-    UPROPERTY(Transient)
     TSubclassOf<AActor> WaterClass;
 
     UPROPERTY(Transient)
@@ -597,9 +669,6 @@ private:
 
     UPROPERTY(Transient)
     FTransform OceanTransform;
-
-    UPROPERTY(Transient)
-    TSubclassOf<UUserWidget> LoadingWidgetClass;
 
     UPROPERTY()
     TObjectPtr<UWorldData> ActiveWorldData;
@@ -614,21 +683,19 @@ private:
     TObjectPtr<AActor> OceanActor;
 
     UPROPERTY()
-    TObjectPtr<UglTFStreamSubSystem> StreamSubSystem;
+    TObjectPtr<UWorldSceneStreamingSubsystem> StreamSubSystem;
 
     UPROPERTY()
     TObjectPtr<UUserWidget> LoadingWidgetInstance;
 
     bool bManagerStarted = false;
-    bool bWorldBootstrapStarted = false;
+    bool bRuntimeWorldStateInitialized = false;
     bool bWorldLoadCompleted = false;
     bool bSpawnedWorldEnvManager = false;
     bool bPendingMainWorldRuntimePurge = false;
     bool bOpenWorldSelectionMenuOnNextMainWorld = false;
     /** Separate from the destination-menu request so travel state cannot be applied twice. */
     bool bWorldSelectionMenuTravelInProgress = false;
-    /** Menu world captured from the active StartActor; no name/path literal is used. */
-    TSoftObjectPtr<UWorld> RegisteredWorldSelectionWorld;
     /** Distinguishes a real same-world duplicate from a stale GameInstance-level guard. */
     TWeakObjectPtr<UWorld> WorldSelectionTravelSourceWorld;
     /** Restored only when the travel watchdog proves that the old gameplay world never left. */
@@ -643,7 +710,7 @@ private:
     enum class EInitialPlayerLocationSource : uint8
     {
         None,
-        LevelDat
+        EntityArchive
     };
 
     EInitialPlayerLocationSource InitialPlayerLocationSource = EInitialPlayerLocationSource::None;
@@ -682,7 +749,7 @@ private:
     UPROPERTY(Transient)
     float VehicleEnterDistance = 450.0f;
 
-    /** Periodically saves runtime placed prefabs and vehicles. */
+    /** Periodically saves runtime placed Static objects and vehicles. */
     UPROPERTY(Transient)
     bool bAutoSaveScene = true;
 
@@ -701,18 +768,19 @@ private:
 
     /** Non-owning tracking only; the UWorld owns actor lifetime. */
     UPROPERTY(Transient)
-    TArray<TWeakObjectPtr<APrefabActor>> SpawnedPrefabs;
+    TArray<TWeakObjectPtr<AStaticActor>> SpawnedStatics;
 
     UPROPERTY(Transient)
     TArray<TWeakObjectPtr<AVehiclePawn>> SpawnedVehicles;
 
-    TArray<FString> PrefabFiles;
-    TArray<FString> VehicleFiles;
-    TArray<FString> WeaponFiles;
+    /** Opaque gwd:// keys copied from the verified archive directory; never source filenames. */
+    TArray<FString> StaticReferences;
+    TArray<FString> VehicleReferences;
+    TArray<FString> WeaponReferences;
     TArray<FToolbarItem> AvailableItems;
     TArray<FToolbarItem> ToolbarSlots;
     int32 SelectedToolbarSlotIndex = 0;
-    int32 CurrentPrefabIndex = 0;
+    int32 CurrentStaticIndex = 0;
     int32 CurrentWeaponIndex = 0;
     EToolMode CurrentMode = EToolMode::None;
     bool bSnapToGrid = false;
@@ -721,7 +789,7 @@ private:
     bool bToolbarInitialized = false;
     FVector LastPreviewLocation = FVector::ZeroVector;
     FString LastSaveMessage;
-    /** True after the initial-radius prefab/entity chunk pairs have been validated and applied. */
+    /** True after the initial-radius .dat chunks have been validated and applied. */
     bool bSavedSceneLoaded = false;
     bool bSavedSceneLoadInProgress = false;
     /** Records an initial chunk validation failure without modifying its committed generation. */
@@ -740,23 +808,29 @@ private:
     bool bIsSavingScene = false;
 
     bool bWorldBakeInProgress = false;
-    bool bWorldBakeStateFilesSaved = false;
+    bool bWorldArchiveCommitInFlight = false;
+    bool bAutoBuildForStartup = false;
+    bool bWorldStartupContinued = false;
+    uint64 WorldBakeGeneration = 0;
+    /** Worker-visible cancellation flag; a cancelled archive is never published from a stale world. */
+    TSharedPtr<TAtomic<bool>, ESPMode::ThreadSafe> WorldBakeCancellation;
     float WorldBakeProgressValue = 0.0f;
     int32 WorldBakeTotalModels = 0;
     int32 WorldBakeCompletedModels = 0;
     int32 WorldBakeFailedModels = 0;
     int32 WorldBakeNextModelIndex = 0;
-    TArray<FString> PendingWorldBakeModels;
-
+    TArray<FModelDefinition> PendingWorldBakeModels;
+    TArray<FGWorldBuildModel> CompletedWorldBuildModels;
     UPROPERTY(Transient)
-    TObjectPtr<AglTFStreamActor> ActiveWorldBakeActor;
+    TObjectPtr<UWorldSourceModelBuilder> ActiveWorldBuildTask;
 
     FTimerHandle SceneAutoSaveTimerHandle;
     FTimerHandle WorldDataSaveTimerHandle;
     FTimerHandle SavedSceneLoadRetryTimerHandle;
-    /** Polls the active metadata actor so one-model Bake jobs also expose size-scan progress. */
+    /** Polls the active source builder so one-model jobs expose decode progress. */
     FTimerHandle WorldBakeProgressTimerHandle;
 
+    void StartGameplaySessionInternal(AActor* InOwnerActor, const AGlTFSimulatorGameplayGameModeBase* InConfigGameMode);
     void ClearTransientRuntimeReferences();
     void DestroyTrackedRuntimeActors();
     void CompactTrackedEntityReferences();
@@ -767,41 +841,47 @@ private:
     void RequestPostLoadRuntimeMemoryCleanup();
     void HandlePostLoadMapRuntimeCleanup(UWorld* LoadedWorld);
     void RunPostLoadRuntimeMemoryCleanup();
-    void ScanAssetFolders();
-    void EnsureAssetFolders() const;
+    /**
+     * Verifies that a loaded gameplay world is owned by the proper gameplay GameMode.
+     * It never spawns a replacement manager actor; authority startup belongs to GameMode and
+     * clients use their local PlayerController after the replicated world key arrives.
+     */
+    void ValidatePostLoadGameplayLifecycle(UWorld* LoadedWorld);
+    void RefreshBuiltModelLists();
     FString GetWorldRootPath() const;
-    FString GetModelDirectory() const;
-    FString GetDataDirectory() const;
-    FString GetLevelDatPath() const;
     void ScheduleSavedSceneLoadRetry(const FString& Reason, bool bWaitingForWorldReadiness);
     bool TracePlacementLocation(FVector& OutLocation, FHitResult& OutHit);
     FVector ApplyGridSnap(const FVector& Location) const;
     bool ShouldShowPlacementGrid() const;
     void UpdatePlacementGrid();
     void RebuildPlacementGridMesh(const FVector& Center, float Radius);
-    FString GetAssetDisplayName(const FString& AssetPath) const;
+    FString GetAssetDisplayName(const FString& ModelReference) const;
     void AutoSaveScene();
     void ClearPlacementGridMesh();
     FString MakeObjectName(const FString& BaseName, EPlacedObjectKind Kind) const;
     int32 CountExistingBaseName(const FString& BaseName, EPlacedObjectKind Kind) const;
-    void PlaceCurrentPrefab(const FVector& Location);
-    void PlaceVehicle(const FVector& Location, const FString& SourceFile);
+    void PlaceCurrentStatic(const FVector& Location);
+    void PlaceVehicle(const FVector& Location, const FString& ModelReference);
     void TryEnterOrExitVehicle();
     void StartNextWorldBakeModel();
     void RefreshWorldBakeProgress();
-    void HandleWorldBakeModelFinished(AglTFStreamActor* BakeActor, bool bSuccess);
+    void HandleWorldBuildModelFinished(UWorldSourceModelBuilder* BuildTask, bool bSuccess);
     void FinishWorldBake();
+    void CompleteWorldArchiveBuild(bool bSuccess, const FString& ArchivePath, const FString& Error);
     void CancelWorldBake();
+    /** Ends only the runtime-world initialization/loading transaction; the environment actor stays alive for diagnostics. */
+    void FailWorldStartup(const FString& Message);
+    void ContinueWorldStartupAfterDatabase();
     void BuildAvailableItems();
     void InitializeToolbarSlotsIfNeeded();
     void ReconcileToolbarSlotsWithAvailableItems();
     void ApplySelectedToolbarItem(bool bBroadcastChange = true);
-    FToolbarItem MakeToolbarItem(EToolbarItemKind Kind, const FString& DisplayName, const FString& SourcePath = FString(), int32 SourceIndex = INDEX_NONE) const;
+    FToolbarItem MakeToolbarItem(EToolbarItemKind Kind, const FString& DisplayName, const FString& ModelReference = FString(), int32 ModelIndex = INDEX_NONE) const;
     int32 FindAvailableItemIndexMatching(const FToolbarItem& Item) const;
     bool ShouldSpawnOcean() const;
     void SpawnOcean();
-    void MainWorldStreaming(const FString& InWorldRoot, const FString& InInitialPlayerName);
-    void InitializeWorldBootstrap();
+    void StartGameplayWorldStreaming(const FString& InWorldRoot, const FString& InInitialPlayerName);
+    void InitializeRuntimeWorldState();
     void SpawnWorldEnvManager();
     bool CheckWorldSystemsLoaded();
     void LoadWorldData();
@@ -814,7 +894,7 @@ private:
     void SaveWorldDataDelayed();
     void ApplyLevelSettings();
     void ApplyGameplaySettings();
-    /** Logs and validates the actual server GameMode selected before gameplay bootstrap begins. */
+    /** Logs and validates the actual server GameMode selected before gameplay runtime initialization begins. */
     void ValidateResolvedGameMode() const;
     void LoadWorldAsync();
     void UpdateWorldTime(float DeltaSeconds);

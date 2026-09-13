@@ -1,5 +1,12 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
+/**
+ * @file PauseMenuWidget.cpp
+ * 역할: 일시정지 메뉴의 공통 UI 동작을 제공합니다.
+ * 핵심 기능: 버튼 바인딩, 재개·설정·월드 선택 이동.
+ * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ */
+
 #include "UI/PauseMenuWidget.h"
 #include "Character/PlayerCharacterController.h"
 #include "Components/Button.h"

@@ -1,6 +1,13 @@
 // Copyright © 2025 BxKangKi. Licensed under the MIT License.
 // Copyright © 2025 Epic Games, Inc. All rights reserved.
 
+/**
+ * @file WaterActor.h
+ * 역할: 물 영역과 수면 질의를 제공합니다.
+ * 핵심 기능: 수면 높이·영역 검사, overlap과 물 상호작용.
+ * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"
@@ -12,6 +19,7 @@ class UDecalComponent;
 class UBoxComponent;
 class UPostProcessComponent;
 class UStaticMeshComponent;
+class UMaterialInterface;
 
 UCLASS()
 class GLTFSIMULATOR_API AWaterActor : public AActor
@@ -43,10 +51,10 @@ public:
      */
     static bool FindWaterLevelAtLocationStrict(const UObject *WorldContextObject, const FVector &WorldLocation, float &OutLevel);
 
-    UPROPERTY(EditDefaultsOnly, Category = "Materials")
+    UPROPERTY(Transient)
     TObjectPtr<UMaterialInterface> DecalMaterial;
 
-    UPROPERTY(EditDefaultsOnly, Category = "Materials")
+    UPROPERTY(Transient)
     TObjectPtr<UMaterialInterface> UnderWaterMaterial;
 
 protected:
@@ -56,16 +64,16 @@ protected:
     virtual void NotifyActorBeginOverlap(AActor *OtherActor) override;
     virtual void NotifyActorEndOverlap(AActor *OtherActor) override;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite)
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Water|Components")
     TObjectPtr<UDecalComponent> Decal;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite)
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Water|Components")
     TObjectPtr<UBoxComponent> Collision;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite)
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Water|Components")
     TObjectPtr<UPostProcessComponent> PostProcess;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite)
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Water|Components")
     TObjectPtr<UStaticMeshComponent> StaticMesh;
 
 private:

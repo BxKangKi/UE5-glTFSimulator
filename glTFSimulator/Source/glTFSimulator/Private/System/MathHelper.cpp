@@ -1,6 +1,13 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
+/**
+ * @file MathHelper.cpp
+ * 역할: 게임에서 사용하는 공통 수학 연산을 제공합니다.
+ * 핵심 기능: 벡터·수치 관련 보조 연산.
+ * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ */
+
 #include "System/MathHelper.h"
 #include "Math/MathFwd.h"
 

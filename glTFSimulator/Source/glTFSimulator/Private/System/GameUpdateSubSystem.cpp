@@ -1,5 +1,12 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
+/**
+ * @file GameUpdateSubSystem.cpp
+ * 역할: 게임 객체의 업데이트 콜백을 통합 실행합니다.
+ * 핵심 기능: 우선순위 정렬, 등록·해제, 공통 업데이트 배포.
+ * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ */
+
 #include "System/GameUpdateSubSystem.h"
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"

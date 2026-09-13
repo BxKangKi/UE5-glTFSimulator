@@ -1,6 +1,13 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 // Velocity-based streaming barrier; no synthetic collision geometry is created.
 
+/**
+ * @file StreamingMovementGateSubsystem.h
+ * 역할: 아직 로드되지 않은 공간으로의 이동을 제한합니다.
+ * 핵심 기능: 청크·메시 준비 검사, 플레이어·물리 객체 이동 보호.
+ * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"

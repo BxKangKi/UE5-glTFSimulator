@@ -1,10 +1,16 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
+/**
+ * @file CharacterLoadAsyncAction.h
+ * 역할: 캐릭터 모델의 비동기 로드를 조정합니다.
+ * 핵심 기능: 런타임 모델 해석, 로드 완료 통지, 취소·수명 관리.
+ * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"
-#include "HAL/ThreadSafeCounter.h"
 #include "Kismet/BlueprintAsyncActionBase.h"
 #include "TimerManager.h"
 #include "CharacterLoadAsyncAction.generated.h"
@@ -19,7 +25,7 @@ struct FBoneMapWrapper
 };
 
 class ACharacterController;
-class UglTFRuntimeAsset;
+class UWorldBakedModelAsset;
 class USkeleton;
 class USkeletalMesh;
 class UPhysicsAsset;
@@ -52,7 +58,7 @@ private:
     TWeakObjectPtr<ACharacterController> ReleaseObserver;
     FString FilePath;
     UPROPERTY()
-    TObjectPtr<UglTFRuntimeAsset> CurrentLoadedAsset = nullptr;
+    TObjectPtr<UWorldBakedModelAsset> CurrentLoadedAsset = nullptr;
     UPROPERTY(Transient)
     TObjectPtr<USkeleton> CurrentRuntimeSkeleton = nullptr;
 
@@ -71,29 +77,18 @@ private:
 
     TMap<FString, FString> PendingBoneMap;
     FTimerHandle GameThreadStageTimer;
-    TSharedPtr<FThreadSafeCounter, ESPMode::ThreadSafe> AssetLoadCancelToken;
-    int32 AssetLoadRequestSerial = 0;
     bool bCancelled = false;
     bool bFinished = false;
-    /** Background GLB validation/parser construction is active. Written on the game thread only. */
-    bool bAssetLoadInFlight = false;
-    /** Background bone-map file/JSON parsing is active. Written on the game thread only. */
-    bool bBoneMapLoadInFlight = false;
-    /** glTFRuntime worker/finalizer is active. Written on the game thread only. */
+    /** A requested .dat bundle read / mesh finalizer is active. Game-thread owned. */
     bool bMeshLoadInFlight = false;
 
-    /** Ticket held while this request owns or waits for its parser's bounded glTFRuntime slot. */
-    uint64 GlTFRuntimeOperationTicket = 0;
-
-    /** Mesh/skin pair selected from a validated skinned node in the external GLB. */
+    /** Mesh/skin pair selected from the baked node table. */
     int32 DetectedMeshIndex = INDEX_NONE;
     int32 DetectedSkinIndex = INDEX_NONE;
 
     UFUNCTION()
-    void LoadAssetAsync();
-    UFUNCTION()
-    void OnglTFAssetLoaded(UglTFRuntimeAsset *Asset);
-    void LoadBoneMapAsync();
+    void OnBakedAssetLoaded(UWorldBakedModelAsset *Asset);
+    void ContinueWithEmbeddedBoneMap();
 
     /** Game-thread stage: creates only the UObject configuration needed to start glTFRuntime's worker-thread mesh build. */
     void BeginSkeletalMeshLoad_GameThread();
@@ -118,11 +113,10 @@ private:
 
     void ScheduleGameThreadStage(void (UCharacterLoadAsyncAction::*StageFunction)());
     void ClearGameThreadStageTimer();
-    bool CheckRootBoneName(UglTFRuntimeAsset *Asset);
-    bool ResolveCharacterSkin(UglTFRuntimeAsset *Asset);
+    bool CheckRootBoneName(UWorldBakedModelAsset *Asset);
+    bool ResolveCharacterSkin(UWorldBakedModelAsset *Asset);
     void FailLoad(const FString& Reason);
     void ReleaseCurrentAsset();
-    void CancelActiveAssetLoad();
     bool HasAsyncWorkInFlight() const;
     void TryFinishCancelledRequest();
     void FinishAndRelease();

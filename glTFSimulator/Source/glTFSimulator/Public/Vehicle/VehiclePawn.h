@@ -1,5 +1,12 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
+/**
+ * @file VehiclePawn.h
+ * 역할: 런타임 차량 모델과 물리·탑승 동작을 구현합니다.
+ * 핵심 기능: gworld 모델 로드, 차륜·차체 제어, 탑승·입력·물리 상태.
+ * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"
@@ -11,7 +18,7 @@
 class UBoxComponent;
 class UPhysicalMaterial;
 class UStaticMesh;
-class UglTFRuntimeAsset;
+class UWorldBakedModelAsset;
 class UBuoyancyComponent;
 class USpringArmComponent;
 class UCameraComponent;
@@ -36,7 +43,7 @@ public:
     void ExitVehicle();
 
     UFUNCTION(BlueprintPure, Category="Vehicle")
-    bool IsOccupied() const { return IsValid(OccupyingController); }
+    bool IsOccupied() const { return IsValid(OccupyingController.Get()); }
 
     UFUNCTION(BlueprintPure, Category="Vehicle|Model")
     bool IsVehicleModelLoaded() const { return bVehicleModelLoaded; }
@@ -61,19 +68,9 @@ public:
     UFUNCTION(BlueprintPure, Category="Vehicle")
     APawn* GetStoredPawn() const { return StoredPawn.Get(); }
 
+    /** Runtime-only load. InModelReference must resolve to an immutable .gwd member. */
     UFUNCTION(BlueprintCallable, Category="Vehicle|Model")
-    bool LoadVehicleModel(const FString& InFilePath, const FString& InObjectName);
-
-    // Loads per-model driving tune values from a JSON file next to the vehicle model.
-    UFUNCTION(BlueprintCallable, Category="Vehicle|Tuning")
-    bool LoadVehicleTuningJson(const FString& JsonPath);
-
-    // Writes a documented tuning template. Existing files are not overwritten by LoadVehicleModel().
-    UFUNCTION(BlueprintCallable, Category="Vehicle|Tuning")
-    bool SaveVehicleTuningJsonTemplate(const FString& JsonPath) const;
-
-    UFUNCTION(BlueprintPure, Category="Vehicle|Tuning")
-    FString GetVehicleTuningJsonPath() const;
+    bool LoadVehicleModel(const FString& InModelReference, const FString& InObjectName);
 
     UFUNCTION(BlueprintCallable, Category="Vehicle|Physics")
     void ResetVehiclePoseAboveGround();
@@ -701,7 +698,8 @@ private:
     float MaxChassisAntiGroundStickForce = 460000.0f;
 
     UPROPERTY()
-    TObjectPtr<UglTFRuntimeAsset> GltfAsset;
+    /** Range-reading facade for one gwd:// model; it never contains or opens a source GLB. */
+    TObjectPtr<UWorldBakedModelAsset> BakedAsset;
 
     UPROPERTY()
     TMap<int32, TObjectPtr<UStaticMesh>> MeshCache;
@@ -710,17 +708,20 @@ private:
     TArray<int32> LoadedWheelRenderPartIndices;
     bool bVehicleModelLoaded = false;
 
+protected:
+    // Kept non-private for UE 5.8 replication registration (DOREPLIFETIME accessibility check).
     UPROPERTY(ReplicatedUsing=OnRep_VehicleModelReplicationData)
-    FString ReplicatedSourceFilePath;
+    FString ReplicatedModelReference;
 
     UPROPERTY(ReplicatedUsing=OnRep_VehicleModelReplicationData)
     FString ReplicatedObjectName;
 
+private:
     UFUNCTION()
     void OnRep_VehicleModelReplicationData();
 
     UPROPERTY()
-    FString SourceFilePath;
+    FString ModelReference;
 
     UPROPERTY()
     FString ObjectName = TEXT("Vehicle");
@@ -798,7 +799,6 @@ private:
     void ClearLoadedVehicleModel();
     void ReleaseRuntimeResources();
     UStaticMesh* LoadMeshByIndex(int32 MeshIndex);
-    FString ResolveVehicleTuningJsonPath(const FString& ModelPath) const;
     bool IsWheelMeshName(const FString& Name) const;
     void ApplyConfiguredWheelHeightOffsets();
     float GetConfiguredWheelHeightOffset(int32 WheelIndex, float FrontRearSplitX) const;

@@ -1,25 +1,23 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
+/**
+ * @file FileFunctionLibrary.cpp
+ * 역할: 프로젝트 파일·로그 작업을 위한 공통 함수를 제공합니다.
+ * 핵심 기능: 안전한 파일 보조 작업, 비동기 로그 기록.
+ * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ */
+
 #include "System/FileFunctionLibrary.h"
 #include "System/SafeFileIO.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "HAL/FileManager.h"
-#include "Serialization/JsonSerializer.h"
-#include "Serialization/JsonReader.h"
 #include "System/MacroLibrary.h"
 
-#include "Simulator/ModelDefinitionJson.h"
 namespace
 {
     constexpr int64 MAX_SAFE_JSON_FILE_BYTES = 64ll * 1024ll * 1024ll;
-
-    bool IsSafeJsonFileSize(const FString& Path)
-    {
-        const int64 FileSize = IFileManager::Get().FileSize(*Path);
-        return FileSize >= 0 && FileSize <= MAX_SAFE_JSON_FILE_BYTES;
-    }
 }
 
 #pragma region File IO
@@ -52,84 +50,6 @@ FString UFileFunctionLibrary::GetPathWithoutExtension(const FString &Path)
     FString Directory = FPaths::GetPath(Path);
     FString BaseName = FPaths::GetBaseFilename(Path);
     return FPaths::Combine(Directory, BaseName);
-}
-
-TArray<FString> UFileFunctionLibrary::GetFileNamesWithExtension(const FString &Directory, const FString &Extension)
-{
-    TArray<FString> FoundFiles;
-    const FString AbsoluteDirectory = FPaths::ConvertRelativePathToFull(Directory);
-    if (!IFileManager::Get().DirectoryExists(*AbsoluteDirectory))
-    {
-        return FoundFiles;
-    }
-
-    // Enumerate once and compare extensions without case sensitivity. Literal "*.glb" patterns
-    // can miss valid ".GLB" files on case-sensitive packaged platforms.
-    // Generate safe, non-loadable definitions before JSON enumeration.
-    // This is file-system work only; no UObject is accessed on the worker thread.
-    ModelDefinitionJson::EnsureMissingDefinitions(AbsoluteDirectory);
-
-    IFileManager::Get().FindFilesRecursive(
-        FoundFiles,
-        *AbsoluteDirectory,
-        TEXT("*"),
-        true,
-        false,
-        false);
-
-    FString NormalizedExtension = Extension;
-    NormalizedExtension.RemoveFromStart(TEXT("."));
-    FoundFiles.RemoveAllSwap(
-        [&NormalizedExtension](const FString& FilePath)
-        {
-            return !FPaths::GetExtension(FilePath).Equals(
-                NormalizedExtension,
-                ESearchCase::IgnoreCase);
-        },
-        EAllowShrinking::No);
-    FoundFiles.Sort([](const FString& A, const FString& B)
-    {
-        return A.Compare(B, ESearchCase::IgnoreCase) < 0;
-    });
-    return FoundFiles;
-}
-
-bool UFileFunctionLibrary::ToBinary(FBufferArchive Ar, const FString &FilePath)
-{
-    return FFileHelper::SaveArrayToFile(Ar, *FilePath);
-}
-
-void UFileFunctionLibrary::ToBinaryAsync(FBufferArchive Ar, const FString &FilePath)
-{
-    // SafeFileIO copies the archive into a tracked worker and commits through temp + backup files.
-    FSafeFileIO::SaveBinaryAsync(
-        Ar,
-        FilePath,
-        static_cast<int64>(Ar.Num()),
-        [FilePath](FSafeFileWriteResult Result)
-        {
-            if (Result.IsSuccess())
-            {
-#if WITH_EDITOR
-                UE_LOG(LogTemp, Verbose, TEXT("Successfully saved binary to %s"), *FilePath);
-#endif
-            }
-            else if (Result.Status != ESafeFileIOStatus::ShuttingDown &&
-                Result.Status != ESafeFileIOStatus::Superseded)
-            {
-                UE_LOG(LogTemp, Error, TEXT("Failed to save binary to %s: %s"), *FilePath, *Result.Error);
-            }
-        });
-}
-
-bool UFileFunctionLibrary::FromBinary(TArray<uint8> &FileData, const FString &FilePath)
-{
-    if (!FFileHelper::LoadFileToArray(FileData, *FilePath))
-    {
-        UE_LOG(LogTemp, Error, TEXT("Failed to load binary file : %s"), *FilePath);
-        return false;
-    }
-    return true;
 }
 
 bool UFileFunctionLibrary::AppendLineToFile(const FString &Line, const FString &FilePath)
@@ -208,7 +128,13 @@ bool UFileFunctionLibrary::GetSubFolders(const FString& ParentFolderPath, TArray
     IFileManager& FileManager = IFileManager::Get();
 
     TArray<FString> AllItems;
-    FileManager.FindFiles(AllItems, *FPaths::Combine(ParentFolderPath, TEXT("*")), true, true);
+    // Ask the platform layer for directories only; enumerating every .gwd/.dat/config file
+    // merely to discard it made world-selection refresh scale with all deployment artifacts.
+    FileManager.FindFiles(
+        AllItems,
+        *FPaths::Combine(ParentFolderPath, TEXT("*")),
+        false,
+        true);
 
     // Keep only directories.
     for (const FString& Item : AllItems)
@@ -298,29 +224,16 @@ bool UFileFunctionLibrary::LoadJsonStringValue(
 {
     OutValue.Reset();
 
-    if (!IsSafeJsonFileSize(JsonFilePath))
-    {
-        return false;
-    }
-
-    // Check whether the file exists and read its contents.
-    FString JsonRaw;
-    if (!FFileHelper::LoadFileToString(JsonRaw, *JsonFilePath))
-    {
-        return false;
-    }
-
-    // Parse JSON.
-    TSharedPtr<FJsonObject> JsonObject;
-    TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonRaw);
-
-    if (!FJsonSerializer::Deserialize(Reader, JsonObject) || !JsonObject.IsValid())
-    {
-        return false;
-    }
-
-    // Extract the key value.
-    return JsonObject->TryGetStringField(*KeyName, OutValue);
+    // Route menu discovery through the same bounded parser as every other external JSON read.
+    // This closes the size-check/read race and applies depth, value-count and string-length limits
+    // before a malformed config can allocate an unbounded DOM on the game thread.
+    FSafeJsonLimits Limits;
+    Limits.MaxFileBytes = MAX_SAFE_JSON_FILE_BYTES;
+    Limits.bAllowBackupRecovery = false;
+    const FSafeJsonLoadResult Result =
+        FSafeFileIO::LoadJsonBlocking(JsonFilePath, Limits);
+    return Result.IsSuccess()
+        && Result.JsonObject->TryGetStringField(*KeyName, OutValue);
 }
 
 

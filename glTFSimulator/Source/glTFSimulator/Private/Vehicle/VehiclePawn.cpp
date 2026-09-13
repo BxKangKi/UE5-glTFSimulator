@@ -1,5 +1,12 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
+/**
+ * @file VehiclePawn.cpp
+ * 역할: 런타임 차량 모델과 물리·탑승 동작을 구현합니다.
+ * 핵심 기능: gworld 모델 로드, 차륜·차체 제어, 탑승·입력·물리 상태.
+ * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ */
+
 #include "Vehicle/VehiclePawn.h"
 #include "Simulator/NodeTokenLibrary.h"
 #include "Camera/CameraComponent.h"
@@ -21,26 +28,21 @@
 #include "Interface/WaterInteract.h"
 #include "PhysicalMaterials/PhysicalMaterial.h"
 #include "glTFRuntimeAsset.h"
-#include "glTFRuntimeFunctionLibrary.h"
 #include "glTFRuntimeParser.h"
 #include "Materials/MaterialInterface.h"
-#include "HAL/FileManager.h"
 #include "HAL/PlatformTime.h"
-#include "Misc/Paths.h"
-#include "Misc/FileHelper.h"
 #include "Model/InstancedEntitySubsystem.h"
 #include "Model/glTFMaterialOverrideUtils.h"
+#include "Simulator/RuntimeModelResolver.h"
 #include "Setting/GameSettings.h"
 #include "System/ActorHelper.h"
-#include "System/FileFunctionLibrary.h"
 #include "System/GameManagerSubSystem.h"
-#include "System/GlbValidation.h"
 #include "System/MathHelper.h"
-#include "System/MacroLibrary.h"
 #include "System/PhysicsHelper.h"
 #include "System/SafeFileIO.h"
 #include "System/MultiplayerWorldSubSystem.h"
 #include "System/glTFRuntimeSafety.h"
+#include "System/WorldBakedModelAsset.h"
 #include "Net/UnrealNetwork.h"
 #include "Vehicle/VehicleSubSystem.h"
 #include "World/BuoyancyComponent.h"
@@ -187,38 +189,6 @@ static bool IsVehicleExitLocationInWater(const UObject* WorldContextObject, cons
 }
 
 
-static FString ResolveReplicatedVehicleGltfPathForCurrentWorld(const UObject* WorldContextObject, const FString& InPath)
-{
-    const FString NormalizedPath = GlbValidation::NormalizePath(InPath);
-    if (FPaths::FileExists(NormalizedPath))
-    {
-        return NormalizedPath;
-    }
-
-    FString RelativeModelPath = FPaths::GetCleanFilename(NormalizedPath);
-    const int32 ModelSegmentIndex = NormalizedPath.Find(TEXT("/model/"), ESearchCase::IgnoreCase, ESearchDir::FromStart);
-    if (ModelSegmentIndex != INDEX_NONE)
-    {
-        RelativeModelPath = NormalizedPath.Mid(ModelSegmentIndex + 7);
-    }
-
-    if (const UMultiplayerWorldSubSystem* Multiplayer = UMultiplayerWorldSubSystem::Get(WorldContextObject))
-    {
-        const FString WorldFolderName = Multiplayer->GetSelectedWorldFolderName();
-        if (!WorldFolderName.IsEmpty())
-        {
-            const FString Candidate = GlbValidation::NormalizePath(
-                FPaths::Combine(PATH_ROOT, WorldFolderName, TEXT("model"), RelativeModelPath));
-            if (FPaths::FileExists(Candidate))
-            {
-                return Candidate;
-            }
-        }
-    }
-
-    return FString();
-}
-
 static void ApplyVehicleWaterExitState(APawn* RestoredPawn, float WaterLevel)
 {
     if (!IsValid(RestoredPawn))
@@ -322,27 +292,19 @@ AVehiclePawn::AVehiclePawn()
 void AVehiclePawn::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
 {
     Super::GetLifetimeReplicatedProps(OutLifetimeProps);
-    DOREPLIFETIME(AVehiclePawn, ReplicatedSourceFilePath);
+    DOREPLIFETIME(AVehiclePawn, ReplicatedModelReference);
     DOREPLIFETIME(AVehiclePawn, ReplicatedObjectName);
 }
 
 void AVehiclePawn::OnRep_VehicleModelReplicationData()
 {
-    if (ReplicatedSourceFilePath.IsEmpty())
+    if (ReplicatedModelReference.IsEmpty())
     {
         ClearLoadedVehicleModel();
         return;
     }
 
-    const FString ResolvedPath = ResolveReplicatedVehicleGltfPathForCurrentWorld(this, ReplicatedSourceFilePath);
-    if (ResolvedPath.IsEmpty())
-    {
-        UE_LOG(LogTemp, Warning, TEXT("VehiclePawn: replicated source file is missing; load skipped. Source=%s"), *ReplicatedSourceFilePath);
-        ClearLoadedVehicleModel();
-        return;
-    }
-
-    LoadVehicleModel(ResolvedPath, ReplicatedObjectName);
+    LoadVehicleModel(ReplicatedModelReference, ReplicatedObjectName);
 }
 
 void AVehiclePawn::BeginPlay()
@@ -393,8 +355,10 @@ void AVehiclePawn::BeginPlay()
         WheelSpringLengths[WheelIndex] = TargetSpringLength;
         WheelVisualSpringLengths[WheelIndex] = TargetSpringLength;
     }
-    const float InitialSupportForce = (WheelOffsets.Num() > 0 && GetWorld())
-        ? FMath::Max(1.0f, VehicleMassKg) * FMath::Max(1.0f, FMath::Abs(GetWorld()->GetGravityZ())) / static_cast<float>(WheelOffsets.Num())
+    // Resolve the UWorld once so gravity initialization uses one validated context and one lookup.
+    const UWorld* const World = GetWorld();
+    const float InitialSupportForce = (WheelOffsets.Num() > 0 && World)
+        ? FMath::Max(1.0f, VehicleMassKg) * FMath::Max(1.0f, FMath::Abs(World->GetGravityZ())) / static_cast<float>(WheelOffsets.Num())
         : 0.0f;
     WheelSuspensionForces.Init(InitialSupportForce, WheelOffsets.Num());
     WheelLateralForces.Init(0.0f, WheelOffsets.Num());
@@ -928,13 +892,9 @@ void AVehiclePawn::ClearLoadedVehicleModel()
     }
 
     // Generated meshes are retained by the shared ISM actor while at least one entity uses the
-    // source prefab. This actor owns only a temporary load cache and can release it immediately.
+    // built model member. This actor owns only a temporary load cache and can release it immediately.
     MeshCache.Empty();
-    if (IsValid(GltfAsset))
-    {
-        FglTFRuntimeSafety::RequestAssetRelease(GltfAsset);
-        GltfAsset = nullptr;
-    }
+    BakedAsset = nullptr;
 
     LoadedWheelRenderPartIndices.Empty();
     LoadedWheelBaseRotations.Empty();
@@ -973,42 +933,18 @@ void AVehiclePawn::ClearLoadedVehicleModel()
     StablePhysicsAngularVelocity = FVector::ZeroVector;
     bStablePhysicsStateInitialized = false;
 
-    SourceFilePath.Reset();
+    ModelReference.Reset();
     BaseName.Reset();
     ObjectName.Reset();
     bVehicleModelLoaded = false;
     if (HasAuthority())
     {
-        ReplicatedSourceFilePath.Reset();
+        ReplicatedModelReference.Reset();
         ReplicatedObjectName.Reset();
     }
     DeactivateVehicleUntilModelLoaded();
 }
 
-
-FString AVehiclePawn::ResolveVehicleTuningJsonPath(const FString& ModelPath) const
-{
-    if (ModelPath.IsEmpty())
-    {
-        return FString();
-    }
-
-    const FString FullModelPath = FPaths::ConvertRelativePathToFull(ModelPath);
-    const FString ModelDirectory = FPaths::GetPath(FullModelPath);
-    const FString ModelBaseName = FPaths::GetBaseFilename(FullModelPath);
-    if (ModelDirectory.IsEmpty() || ModelBaseName.IsEmpty())
-    {
-        return FString();
-    }
-
-    // Per-model driving data lives beside the prefab/model file as "ModelName.json".
-    return FPaths::Combine(ModelDirectory, ModelBaseName + TEXT(".json"));
-}
-
-FString AVehiclePawn::GetVehicleTuningJsonPath() const
-{
-    return ResolveVehicleTuningJsonPath(SourceFilePath);
-}
 
 bool AVehiclePawn::IsWheelMeshName(const FString& Name) const
 {
@@ -1294,148 +1230,6 @@ bool AVehiclePawn::ApplyVehicleTuningJsonObject(const TSharedPtr<FJsonObject>& J
     return bAppliedAnyField;
 }
 
-bool AVehiclePawn::LoadVehicleTuningJson(const FString& JsonPath)
-{
-    if (JsonPath.IsEmpty())
-    {
-        return false;
-    }
-
-    const FString FullJsonPath = FPaths::ConvertRelativePathToFull(JsonPath);
-    if (!IFileManager::Get().FileExists(*FullJsonPath))
-    {
-        UE_LOG(LogTemp, Warning, TEXT("VehiclePawn: tuning JSON does not exist: %s"), *FullJsonPath);
-        return false;
-    }
-
-    const TSharedPtr<FJsonObject> JsonObject = UFileFunctionLibrary::FromJson(FullJsonPath);
-    if (!JsonObject.IsValid())
-    {
-        return false;
-    }
-
-    ResetVehicleTuningToClassDefaults();
-    const bool bApplied = ApplyVehicleTuningJsonObject(JsonObject);
-    if (bApplied)
-    {
-        UE_LOG(LogTemp, Log, TEXT("VehiclePawn: loaded tuning JSON %s"), *FullJsonPath);
-    }
-    else
-    {
-        UE_LOG(LogTemp, Warning, TEXT("VehiclePawn: tuning JSON contained no supported fields: %s"), *FullJsonPath);
-    }
-    return bApplied;
-}
-
-bool AVehiclePawn::SaveVehicleTuningJsonTemplate(const FString& JsonPath) const
-{
-    if (JsonPath.IsEmpty())
-    {
-        return false;
-    }
-
-    const FString FullJsonPath = FPaths::ConvertRelativePathToFull(JsonPath);
-    TSharedRef<FJsonObject> RootObject = MakeShared<FJsonObject>();
-    RootObject->SetStringField(JSON_VERSION_FIELD, JSON_SCHEMA_VERSION);
-    RootObject->SetStringField(TEXT("Schema"), TEXT("glTFSimulator.VehicleTuning.v3"));
-    RootObject->SetStringField(TEXT("UUID"), FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower));
-    RootObject->SetStringField(TEXT("Name"), BaseName.IsEmpty() ? TEXT("Vehicle") : BaseName);
-    RootObject->SetStringField(TEXT("ModelType"), TEXT("Entity"));
-    RootObject->SetStringField(TEXT("EntityType"), TEXT("Vehicle"));
-    RootObject->SetStringField(TEXT("DisplayName"), ObjectName.IsEmpty() ? BaseName : ObjectName);
-    RootObject->SetStringField(TEXT("Notes"), TEXT("Runtime JSON and mesh bounds are cached as /cache/<JSON filename without extension>. Positive RideHeightOffset raises the chassis; negative lowers it."));
-
-    RootObject->SetNumberField(TEXT("MaxSpeedForward"), MaxSpeedForward);
-    RootObject->SetNumberField(TEXT("EngineForce"), EngineForce);
-    RootObject->SetNumberField(TEXT("ReverseForce"), ReverseForce);
-    RootObject->SetNumberField(TEXT("BrakeForce"), BrakeForce);
-    RootObject->SetNumberField(TEXT("EngineBrakingForce"), EngineBrakingForce);
-    RootObject->SetNumberField(TEXT("RollingResistance"), RollingResistance);
-
-    RootObject->SetNumberField(TEXT("RideHeightOffset"), RideHeightOffset);
-    RootObject->SetNumberField(TEXT("WheelHeightOffset"), WheelHeightOffset);
-    RootObject->SetNumberField(TEXT("FrontWheelHeightOffset"), FrontWheelHeightOffset);
-    RootObject->SetNumberField(TEXT("RearWheelHeightOffset"), RearWheelHeightOffset);
-    RootObject->SetNumberField(TEXT("WheelSpinDirection"), WheelSpinDirection);
-    TArray<TSharedPtr<FJsonValue>> WheelHeightArray;
-    const int32 TemplateWheelCount = FMath::Max(WheelOffsets.Num(), WheelHeightOffsets.Num());
-    WheelHeightArray.Reserve(TemplateWheelCount);
-    for (int32 WheelIndex = 0; WheelIndex < TemplateWheelCount; ++WheelIndex)
-    {
-        const float PerWheelOffset = WheelHeightOffsets.IsValidIndex(WheelIndex) ? WheelHeightOffsets[WheelIndex] : 0.0f;
-        WheelHeightArray.Add(MakeShared<FJsonValueNumber>(PerWheelOffset));
-    }
-    RootObject->SetArrayField(TEXT("WheelHeightOffsets"), WheelHeightArray);
-
-    TArray<TSharedPtr<FJsonValue>> WheelNameValues;
-    WheelNameValues.Reserve(WheelMeshNames.Num());
-    for (const FString& WheelMeshName : WheelMeshNames)
-    {
-        if (!WheelMeshName.IsEmpty())
-        {
-            WheelNameValues.Add(MakeShared<FJsonValueString>(WheelMeshName));
-        }
-    }
-    RootObject->SetArrayField(TEXT("WheelMeshNames"), WheelNameValues);
-    RootObject->SetNumberField(TEXT("StableRideHeightGroundBuffer"), StableRideHeightGroundBuffer);
-    RootObject->SetNumberField(TEXT("WheelVisualGroundContactBuffer"), WheelVisualGroundContactBuffer);
-
-    RootObject->SetNumberField(TEXT("MaxSteeringAngleDegrees"), MaxSteeringAngleDegrees);
-    RootObject->SetNumberField(TEXT("HighSpeedSteeringAngleDegrees"), HighSpeedSteeringAngleDegrees);
-    RootObject->SetNumberField(TEXT("SteeringYawRateAssist"), SteeringYawRateAssist);
-    RootObject->SetNumberField(TEXT("HighSpeedYawAssistStrength"), HighSpeedYawAssistStrength);
-    RootObject->SetNumberField(TEXT("HighSpeedYawAssistStartSpeed"), HighSpeedYawAssistStartSpeed);
-    RootObject->SetNumberField(TEXT("SteeringYawDamping"), SteeringYawDamping);
-    RootObject->SetNumberField(TEXT("MaxSteeringAssistTorque"), MaxSteeringAssistTorque);
-    RootObject->SetNumberField(TEXT("LowSpeedSteeringYawAssistSpeed"), LowSpeedSteeringYawAssistSpeed);
-    RootObject->SetNumberField(TEXT("SteeringSpeedForFullAssist"), SteeringSpeedForFullAssist);
-    RootObject->SetNumberField(TEXT("AckermannStrength"), AckermannStrength);
-    RootObject->SetNumberField(TEXT("FrontSteeringGripMultiplier"), FrontSteeringGripMultiplier);
-    RootObject->SetNumberField(TEXT("RearSteeringGripMultiplier"), RearSteeringGripMultiplier);
-    RootObject->SetNumberField(TEXT("HighSpeedFrontGripBoost"), HighSpeedFrontGripBoost);
-    RootObject->SetNumberField(TEXT("HighSpeedSteeringAuthorityScale"), HighSpeedSteeringAuthorityScale);
-
-    RootObject->SetNumberField(TEXT("LateralGrip"), LateralGrip);
-    RootObject->SetNumberField(TEXT("TireLateralForceScale"), TireLateralForceScale);
-    RootObject->SetNumberField(TEXT("MaxLateralGripForce"), MaxLateralGripForce);
-    RootObject->SetNumberField(TEXT("TireLongitudinalFriction"), TireLongitudinalFriction);
-    RootObject->SetNumberField(TEXT("TireLateralFriction"), TireLateralFriction);
-    RootObject->SetNumberField(TEXT("TireCorneringStiffness"), TireCorneringStiffness);
-    RootObject->SetNumberField(TEXT("TireSlipReferenceSpeed"), TireSlipReferenceSpeed);
-    RootObject->SetNumberField(TEXT("HighSpeedLateralGripScale"), HighSpeedLateralGripScale);
-    RootObject->SetNumberField(TEXT("HighSpeedLateralGripSpeed"), HighSpeedLateralGripSpeed);
-    RootObject->SetNumberField(TEXT("SteeringLateralGripReserve"), SteeringLateralGripReserve);
-    RootObject->SetNumberField(TEXT("DrivenFrontTorqueShare"), DrivenFrontTorqueShare);
-
-    RootObject->SetNumberField(TEXT("AerodynamicDragCoefficient"), AerodynamicDragCoefficient);
-    RootObject->SetNumberField(TEXT("MaxAerodynamicDrag"), MaxAerodynamicDrag);
-    RootObject->SetNumberField(TEXT("GroundedDownforceCoefficient"), GroundedDownforceCoefficient);
-    RootObject->SetNumberField(TEXT("MaxGroundedDownforce"), MaxGroundedDownforce);
-    RootObject->SetNumberField(TEXT("MinimumDownforceSpeed"), MinimumDownforceSpeed);
-    RootObject->SetNumberField(TEXT("FrontDownforceCoefficient"), FrontDownforceCoefficient);
-    RootObject->SetNumberField(TEXT("MaxFrontDownforce"), MaxFrontDownforce);
-    RootObject->SetNumberField(TEXT("ThrottleFrontDownforce"), ThrottleFrontDownforce);
-
-    RootObject->SetNumberField(TEXT("ThrottleInputInterpSpeed"), ThrottleInputInterpSpeed);
-    RootObject->SetNumberField(TEXT("SteeringInputInterpSpeed"), SteeringInputInterpSpeed);
-    RootObject->SetNumberField(TEXT("SteeringInputRiseRate"), SteeringInputRiseRate);
-    RootObject->SetNumberField(TEXT("SteeringInputReturnRate"), SteeringInputReturnRate);
-    RootObject->SetNumberField(TEXT("SteeringInputSpeedDamping"), SteeringInputSpeedDamping);
-    RootObject->SetNumberField(TEXT("SteeringInputCurveExponent"), SteeringInputCurveExponent);
-
-    const FSafeFileWriteResult Result = FSafeFileIO::CreateJsonIfMissingBlocking(
-        RootObject,
-        FullJsonPath,
-        64ll * 1024ll * 1024ll);
-    if (!Result.IsSuccess())
-    {
-        UE_LOG(LogTemp, Warning, TEXT("VehiclePawn: could not create missing read-only tuning template. Path=%s Reason=%s"),
-            *FullJsonPath,
-            *Result.Error);
-    }
-    return Result.IsSuccess();
-}
-
 UStaticMesh* AVehiclePawn::LoadMeshByIndex(int32 MeshIndex)
 {
     if (MeshIndex < 0)
@@ -1451,14 +1245,14 @@ UStaticMesh* AVehiclePawn::LoadMeshByIndex(int32 MeshIndex)
     UInstancedEntitySubsystem* InstancedEntities = UInstancedEntitySubsystem::Get(this);
     if (InstancedEntities)
     {
-        if (UStaticMesh* SharedMesh = InstancedEntities->FindSharedMesh(SourceFilePath, MeshIndex))
+        if (UStaticMesh* SharedMesh = InstancedEntities->FindSharedMesh(ModelReference, MeshIndex))
         {
             MeshCache.Add(MeshIndex, SharedMesh);
             return SharedMesh;
         }
     }
 
-    if (!IsValid(GltfAsset) || MeshIndex >= GltfAsset->GetNumMeshes())
+    if (!IsValid(BakedAsset) || MeshIndex >= BakedAsset->GetNumMeshes())
     {
         return nullptr;
     }
@@ -1487,17 +1281,7 @@ UStaticMesh* AVehiclePawn::LoadMeshByIndex(int32 MeshIndex)
     MeshConfig.bBuildNavCollision = false;
     MeshConfig.CollisionComplexity = ECollisionTraceFlag::CTF_UseDefault;
 
-    UStaticMesh* Mesh = nullptr;
-    const bool bExecuted = FglTFRuntimeSafety::ExecuteSynchronousOperation(
-        FString::Printf(TEXT("Vehicle LoadStaticMesh %d"), MeshIndex),
-        [this, MeshIndex, &MeshConfig, &Mesh]()
-        {
-            Mesh = GltfAsset->LoadStaticMesh(MeshIndex, MeshConfig);
-        });
-    if (!bExecuted)
-    {
-        return nullptr;
-    }
+    UStaticMesh* Mesh = BakedAsset->LoadStaticMesh(MeshIndex, MeshConfig);
     if (IsValid(Mesh))
     {
         MeshCache.Add(MeshIndex, Mesh);
@@ -1506,38 +1290,39 @@ UStaticMesh* AVehiclePawn::LoadMeshByIndex(int32 MeshIndex)
 }
 
 
-bool AVehiclePawn::LoadVehicleModel(const FString& InFilePath, const FString& InObjectName)
+bool AVehiclePawn::LoadVehicleModel(const FString& InModelReference, const FString& InObjectName)
 {
     if (!ensureMsgf(IsInGameThread(), TEXT("AVehiclePawn::LoadVehicleModel must run on the game thread")))
     {
         return false;
     }
 
-    const FString NormalizedPath = GlbValidation::NormalizePath(InFilePath);
-    if (NormalizedPath.IsEmpty() || !IFileManager::Get().FileExists(*NormalizedPath))
+    FResolvedRuntimeModel Model;
+    FString ResolveError;
+    if (!FRuntimeModelResolver::Resolve(this, InModelReference, Model, ResolveError)
+        || Model.Definition.ModelType != EModelDefinitionType::Dynamic
+        || Model.Definition.EntityType != EModelEntityType::Vehicle)
     {
-        UE_LOG(LogTemp, Warning, TEXT("VehiclePawn: source file is missing; load skipped. Path=%s"), *NormalizedPath);
-        return false;
-    }
-
-    FString ValidationReason;
-    if (!GlbValidation::ValidateRuntimeModelFile(NormalizedPath, ValidationReason))
-    {
-        UE_LOG(LogTemp, Warning, TEXT("VehiclePawn: invalid glTF model skipped. Path=%s Reason=%s"), *NormalizedPath, *ValidationReason);
+        UE_LOG(LogTemp, Warning,
+            TEXT("VehiclePawn: built vehicle model rejected. Reference=%s Reason=%s"),
+            *InModelReference, *ResolveError);
         return false;
     }
 
     ClearLoadedVehicleModel();
-    SourceFilePath = NormalizedPath;
-    BaseName = FPaths::GetBaseFilename(SourceFilePath);
+    ModelReference = Model.Reference;
+    BaseName = Model.Definition.Name;
     ObjectName = InObjectName.IsEmpty() ? BaseName : InObjectName;
     ResetVehicleTuningToClassDefaults();
 
-    const FString TuningJsonPath = GetVehicleTuningJsonPath();
-    const bool bHasTuningJson = !TuningJsonPath.IsEmpty() && IFileManager::Get().FileExists(*TuningJsonPath);
-    if (bHasTuningJson)
+    FSafeJsonLimits TuningLimits;
+    TuningLimits.MaxFileBytes = 16ll * 1024ll * 1024ll;
+    TuningLimits.bAllowBackupRecovery = false;
+    const FSafeJsonLoadResult TuningJson = FSafeFileIO::ParseJsonText(
+        Model.DefinitionJson, TEXT(".gwd vehicle definition"), TuningLimits);
+    if (TuningJson.IsSuccess())
     {
-        LoadVehicleTuningJson(TuningJsonPath);
+        ApplyVehicleTuningJsonObject(TuningJson.JsonObject);
     }
 
     UInstancedEntitySubsystem* InstancedEntities = UInstancedEntitySubsystem::Get(this);
@@ -1625,28 +1410,22 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InFilePath, const FString& In
         }
     };
 
-    auto FinishSuccessfulModelLoad = [this, bHasTuningJson, TuningJsonPath]()
+    auto FinishSuccessfulModelLoad = [this]()
     {
         UpdateWheelVisuals(0.0f);
 
-        if (!bHasTuningJson && !TuningJsonPath.IsEmpty())
-        {
-            // Generate a documented v3 template only after the authored wheel count is known.
-            SaveVehicleTuningJsonTemplate(TuningJsonPath);
-        }
-
         if (HasAuthority())
         {
-            ReplicatedSourceFilePath = SourceFilePath;
+            ReplicatedModelReference = ModelReference;
             ReplicatedObjectName = ObjectName;
             ForceNetUpdate();
         }
     };
 
-    // Reuse the shared vehicle prefab while at least one instance still owns the resource. This
+    // Reuse the shared vehicle model while at least one instance still owns the resource. This
     // avoids reopening and reparsing the glTF file for every vehicle while keeping JSON tuning per entity.
     FInstancedVehicleTemplateData CachedVehicleTemplate;
-    if (InstancedEntities->GetVehicleTemplateData(SourceFilePath, CachedVehicleTemplate))
+    if (InstancedEntities->GetVehicleTemplateData(ModelReference, CachedVehicleTemplate))
     {
         LoadedWheelRenderPartIndices = CachedVehicleTemplate.WheelPartIndices;
         LoadedWheelBaseRotations = CachedVehicleTemplate.WheelBaseRotations;
@@ -1664,15 +1443,15 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InFilePath, const FString& In
 
         const FInstancedEntityRegistrationOptions RegistrationOptions = BuildRegistrationOptions(false);
         InstancedRenderRegistrationId = InstancedEntities->RegisterVehicleEntityFromTemplate(
-            SourceFilePath,
+            ModelReference,
             this,
             Body,
             RegistrationOptions);
         if (InstancedRenderRegistrationId == INDEX_NONE)
         {
             UE_LOG(LogTemp, Warning,
-                TEXT("VehiclePawn: failed to register cached vehicle prefab for %s"),
-                *SourceFilePath);
+                TEXT("VehiclePawn: failed to register cached vehicle model for %s"),
+                *ModelReference);
             ClearLoadedVehicleModel();
             return false;
         }
@@ -1681,37 +1460,28 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InFilePath, const FString& In
         return true;
     }
 
-    FglTFRuntimeConfig LoaderConfig;
-    LoaderConfig.bAllowExternalFiles = true;
-    const bool bAssetLoadExecuted = FglTFRuntimeSafety::ExecuteSynchronousOperation(
-        TEXT("Vehicle parser creation"),
-        [this, &LoaderConfig]()
-        {
-            GltfAsset = UglTFRuntimeFunctionLibrary::glTFLoadAssetFromFilename(
-                SourceFilePath, false, LoaderConfig);
-        });
-    if (!bAssetLoadExecuted)
+    FString LoadError;
+    BakedAsset = FRuntimeModelResolver::LoadAssetSynchronously(Model, LoadError);
+    if (!IsValid(BakedAsset))
     {
-        ClearLoadedVehicleModel();
-        return false;
-    }
-    if (!IsValid(GltfAsset))
-    {
-        UE_LOG(LogTemp, Warning, TEXT("VehiclePawn: failed to load vehicle model %s"), *SourceFilePath);
+        UE_LOG(LogTemp, Warning, TEXT("VehiclePawn: failed to load vehicle model %s: %s"),
+            *ModelReference, *LoadError);
         ClearLoadedVehicleModel();
         return false;
     }
 
-    const TArray<FglTFRuntimeNode> Nodes = GltfAsset->GetNodes();
+    // Node metadata already belongs to the baked facade; keep a view instead of allocating a
+    // second hierarchy while this vehicle builds its component layout.
+    const TArray<FglTFRuntimeNode>& Nodes = BakedAsset->GetNodes();
     if (Nodes.Num() > MaxRuntimeVehicleNodeCount)
     {
         UE_LOG(LogTemp, Warning, TEXT("VehiclePawn: glTF node count exceeds the runtime safety limit. Path=%s Nodes=%d"),
-            *SourceFilePath, Nodes.Num());
+            *ModelReference, Nodes.Num());
         ClearLoadedVehicleModel();
         return false;
     }
 
-    const int32 MeshCount = GltfAsset->GetNumMeshes();
+    const int32 MeshCount = BakedAsset->GetNumMeshes();
     TMap<int32, FglTFRuntimeNode> NodeMap;
     for (const FglTFRuntimeNode& Node : Nodes)
     {
@@ -1722,17 +1492,10 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InFilePath, const FString& In
     }
 
     TMap<int32, FString> MeshNamesByIndex;
-    if (GltfAsset->GetParser().IsValid())
+    for (int32 MeshIndex = 0; MeshIndex < MeshCount; ++MeshIndex)
     {
-        const TArray<TSharedRef<FJsonObject>> MeshObjects = GltfAsset->GetParser()->GetMeshes();
-        for (int32 MeshIndex = 0; MeshIndex < MeshObjects.Num(); ++MeshIndex)
-        {
-            FString MeshName;
-            if (MeshObjects[MeshIndex]->TryGetStringField(TEXT("name"), MeshName))
-            {
-                MeshNamesByIndex.Add(MeshIndex, MeshName);
-            }
-        }
+        const FString MeshName = BakedAsset->GetMeshName(MeshIndex);
+        if (!MeshName.IsEmpty()) MeshNamesByIndex.Add(MeshIndex, MeshName);
     }
 
     TArray<FInstancedEntityMeshPart> RenderParts;
@@ -1863,7 +1626,7 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InFilePath, const FString& In
     {
         UE_LOG(LogTemp, Warning,
             TEXT("VehiclePawn: vehicle requires at least one body mesh and one wheel mesh (name tag or JSON WheelMeshNames). Load skipped: %s"),
-            *SourceFilePath);
+            *ModelReference);
         ClearLoadedVehicleModel();
         return false;
     }
@@ -1881,7 +1644,7 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InFilePath, const FString& In
 
     const FInstancedEntityRegistrationOptions RegistrationOptions = BuildRegistrationOptions(true);
     InstancedRenderRegistrationId = InstancedEntities->RegisterEntity(
-        SourceFilePath,
+        ModelReference,
         this,
         Body,
         RenderParts,
@@ -1889,7 +1652,7 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InFilePath, const FString& In
         CombinedLocalBounds);
     if (InstancedRenderRegistrationId == INDEX_NONE)
     {
-        UE_LOG(LogTemp, Warning, TEXT("VehiclePawn: failed to register instanced renderer for %s"), *SourceFilePath);
+        UE_LOG(LogTemp, Warning, TEXT("VehiclePawn: failed to register instanced renderer for %s"), *ModelReference);
         ClearLoadedVehicleModel();
         return false;
     }
@@ -1906,20 +1669,17 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InFilePath, const FString& In
     VehicleTemplateData.WheelVisualRestBounds = LoadedWheelVisualRestBounds;
     VehicleTemplateData.CombinedLocalBounds = CombinedLocalBounds;
     VehicleTemplateData.RuntimeWheelRadius = RuntimeWheelRadius;
-    if (!InstancedEntities->StoreVehicleTemplateData(SourceFilePath, VehicleTemplateData))
+    if (!InstancedEntities->StoreVehicleTemplateData(ModelReference, VehicleTemplateData))
     {
         UE_LOG(LogTemp, Warning,
             TEXT("VehiclePawn: shared vehicle metadata could not be cached; this instance remains usable. Path=%s"),
-            *SourceFilePath);
+            *ModelReference);
     }
 
-    // The shared ISM actor now retains the meshes. This vehicle no longer needs a parser/cache.
+    // The shared ISM actor now retains the meshes. This vehicle no longer needs its baked facade or
+    // per-vehicle mesh cache; releasing both lets metadata and unused streamed dependencies be GC'd.
     MeshCache.Empty();
-    if (IsValid(GltfAsset))
-    {
-        FglTFRuntimeSafety::RequestAssetRelease(GltfAsset);
-        GltfAsset = nullptr;
-    }
+    BakedAsset = nullptr;
 
     FinishSuccessfulModelLoad();
     return true;

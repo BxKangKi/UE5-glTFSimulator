@@ -1,12 +1,19 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
+/**
+ * @file PlayerData.h
+ * 역할: 플레이어별 저장 상태를 표현합니다.
+ * 핵심 기능: 플레이어 기록 변환, entity 저장 상태 연계.
+ * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"
 #include "Dom/JsonObject.h"
 #include "PlayerData.generated.h"
 
-/** Persistent per-player runtime record stored with game time in data/level.dat. */
+/** Persistent per-player runtime record stored with game time in WorldName.dat. */
 USTRUCT(BlueprintType)
 struct GLTFSIMULATOR_API FWorldPlayerRecord
 {

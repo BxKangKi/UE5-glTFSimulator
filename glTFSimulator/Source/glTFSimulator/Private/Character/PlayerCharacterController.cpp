@@ -1,6 +1,13 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
+/**
+ * @file PlayerCharacterController.cpp
+ * 역할: 플레이어 입력과 UI·게임 매니저를 연결합니다.
+ * 핵심 기능: Enhanced Input, 매니저 확보, 메뉴·배치·차량·캐릭터 조작.
+ * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ */
+
 #include "Character/PlayerCharacterController.h"
 #include "Character/CharacterController.h"
 #include "EnhancedInputComponent.h"
@@ -11,13 +18,14 @@
 #include "InputActionValue.h"
 #include "InputMappingContext.h"
 #include "InputCoreTypes.h"
-#include "Model/glTFStreamSubSystem.h"
-#include "System/GameManagerActor.h"
+#include "Model/WorldSceneStreamingSubsystem.h"
 #include "UI/CreatorHUDWidget.h"
 #include "UI/PauseMenuWidget.h"
 #include "UI/SettingsMenuWidget.h"
 #include "Vehicle/VehiclePawn.h"
 #include "System/GameManagerSubSystem.h"
+#include "System/GlTFSimulatorGameInstance.h"
+#include "System/GlTFSimulatorAssetRegistry.h"
 #include "System/SimulatorCommandSubsystem.h"
 #include "System/GameUpdateSubSystem.h"
 #include "TimerManager.h"
@@ -77,19 +85,141 @@ void APlayerCharacterController::ServerExecuteSimulatorCommand_Implementation(co
     }
 }
 
-APlayerCharacterController::APlayerCharacterController()
+APlayerCharacterController::APlayerCharacterController() = default;
+
+void APlayerCharacterController::ResolveCentralAssets()
 {
-    GameManagerActorClass = nullptr;
+    UGlTFSimulatorAssetRegistry* Registry = UGlTFSimulatorGameInstance::GetAssetRegistryFromContext(this);
+    if (!IsValid(Registry))
+    {
+        return;
+    }
 
-    // InputAction assets are assigned directly in the owning Blueprint/class defaults.
+    InputMappingContext = Registry->PrimaryInputMappingContext.IsNull()
+        ? nullptr : Registry->PrimaryInputMappingContext.LoadSynchronous();
+    InputMappingPriority = Registry->PrimaryInputMappingPriority;
 
-    // Do not hard-load an optional debug widget from a project asset path in the native CDO.
-    // Assign DebugWidgetClass in a Blueprint/defaults asset when the widget exists.
-    DebugWidgetClass = nullptr;
+    AdditionalInputMappingContexts.Reset();
+    AdditionalInputMappingContexts.Reserve(Registry->AdditionalInputMappingContexts.Num());
+    for (const FGlTFSimulatorInputMappingContextConfig& SoftConfig : Registry->AdditionalInputMappingContexts)
+    {
+        UInputMappingContext* Context = SoftConfig.MappingContext.IsNull()
+            ? nullptr : SoftConfig.MappingContext.LoadSynchronous();
+        if (!IsValid(Context))
+        {
+            continue;
+        }
 
-    bAutoCreateCreatorHUD = false;
-    PauseMenuWidgetClass = nullptr;
-    SettingsMenuWidgetClass = nullptr;
+        FPlayerInputMappingContextConfig RuntimeConfig;
+        RuntimeConfig.MappingContext = Context;
+        RuntimeConfig.Priority = SoftConfig.Priority;
+        AdditionalInputMappingContexts.Add(MoveTemp(RuntimeConfig));
+    }
+
+    const auto ResolveAction = [](const TSoftObjectPtr<UInputAction>& SoftAction) -> UInputAction*
+    {
+        return SoftAction.IsNull() ? nullptr : SoftAction.LoadSynchronous();
+    };
+
+    MoveAction = ResolveAction(Registry->MoveAction);
+    LookAction = ResolveAction(Registry->LookAction);
+    JumpAction = ResolveAction(Registry->JumpAction);
+    SprintAction = ResolveAction(Registry->SprintAction);
+    CrouchAction = ResolveAction(Registry->CrouchAction);
+    FlyAction = ResolveAction(Registry->FlyAction);
+    RagdollAction = ResolveAction(Registry->RagdollAction);
+    InteractAction = ResolveAction(Registry->InteractAction);
+    ToggleFirstPersonAction = ResolveAction(Registry->ToggleFirstPersonAction);
+    ChangeCharacterAction = ResolveAction(Registry->ChangeCharacterAction);
+    ToolbarScrollAction = ResolveAction(Registry->ToolbarScrollAction);
+    ToggleItemListAction = ResolveAction(Registry->ToggleItemListAction);
+    SnapAction = ResolveAction(Registry->SnapAction);
+    VehicleMoveAction = ResolveAction(Registry->VehicleMoveAction);
+    VehicleThrottleAction = ResolveAction(Registry->VehicleThrottleAction);
+    VehicleSteeringAction = ResolveAction(Registry->VehicleSteeringAction);
+    VehicleStopAction = ResolveAction(Registry->VehicleStopAction);
+    PauseAction = ResolveAction(Registry->PauseAction);
+    DebugAction = ResolveAction(Registry->DebugAction);
+
+
+}
+
+
+void APlayerCharacterController::InitializeRegistryDrivenUI()
+{
+    if (!IsLocalController())
+    {
+        return;
+    }
+
+    UGlTFSimulatorAssetRegistry* Registry = UGlTFSimulatorGameInstance::GetAssetRegistryFromContext(this);
+    if (!IsValid(Registry))
+    {
+        UE_LOG(LogTemp, Error, TEXT("PlayerCharacterController cannot initialize registry-driven UI because the central AssetRegistry is unavailable."));
+        return;
+    }
+
+    const auto AddTopLevelWidget = [](UUserWidget* Widget, const int32 ZOrder)
+    {
+        if (IsValid(Widget) && !Widget->IsInViewport())
+        {
+            Widget->AddToPlayerScreen(ZOrder);
+        }
+    };
+
+    if (!IsValid(CreatorHUDWidget) && !Registry->CreatorHUDWidgetClass.IsNull())
+    {
+        if (UClass* WidgetClass = Registry->CreatorHUDWidgetClass.LoadSynchronous())
+        {
+            UCreatorHUDWidget* Widget = CreateWidget<UCreatorHUDWidget>(this, WidgetClass);
+            SetCreatorHUDWidget(Widget);
+            AddTopLevelWidget(Widget, 0);
+        }
+    }
+
+    if (!IsValid(DebugWidget) && !Registry->DebugWidgetClass.IsNull())
+    {
+        if (UClass* WidgetClass = Registry->DebugWidgetClass.LoadSynchronous())
+        {
+            UUserWidget* Widget = CreateWidget<UUserWidget>(this, WidgetClass);
+            SetDebugWidget(Widget);
+            AddTopLevelWidget(Widget, 40);
+        }
+    }
+
+    if (!IsValid(PauseMenuWidget) && !Registry->PauseMenuWidgetClass.IsNull())
+    {
+        if (UClass* WidgetClass = Registry->PauseMenuWidgetClass.LoadSynchronous())
+        {
+            UPauseMenuWidget* Widget = CreateWidget<UPauseMenuWidget>(this, WidgetClass);
+            SetPauseMenuWidget(Widget);
+            AddTopLevelWidget(Widget, 50);
+        }
+    }
+
+    if (!IsValid(SettingsMenuWidget) && !Registry->SettingsMenuWidgetClass.IsNull())
+    {
+        if (UClass* WidgetClass = Registry->SettingsMenuWidgetClass.LoadSynchronous())
+        {
+            USettingsMenuWidget* Widget = CreateWidget<USettingsMenuWidget>(this, WidgetClass);
+            SetSettingsMenuWidget(Widget);
+            AddTopLevelWidget(Widget, 60);
+        }
+    }
+
+    if (IsValid(SubSystem) && !SubSystem->HasLoadingWidget() && !Registry->LoadingWidgetClass.IsNull())
+    {
+        if (UClass* WidgetClass = Registry->LoadingWidgetClass.LoadSynchronous())
+        {
+            UUserWidget* Widget = CreateWidget<UUserWidget>(this, WidgetClass);
+            if (IsValid(Widget))
+            {
+                Widget->SetVisibility(ESlateVisibility::Collapsed);
+                AddTopLevelWidget(Widget, 100);
+                SubSystem->SetLoadingWidget(Widget);
+            }
+        }
+    }
 }
 
 void APlayerCharacterController::BeginPlay()
@@ -104,10 +234,12 @@ void APlayerCharacterController::BeginPlay()
     // loading/UI flow starts so repeated mode callbacks cannot leave keyboard and mouse look locked.
     ResetIgnoreMoveInput();
     ResetIgnoreLookInput();
+    ResolveCentralAssets();
     if (!IsValid(SubSystem))
     {
         SubSystem = UGameManagerSubSystem::GetSubSystem(this);
     }
+    InitializeRegistryDrivenUI();
 
     // Snapshot the initial state so the update hook can detect the first completed loading/pause
     // transition instead of repeatedly forcing input mode every frame.
@@ -119,11 +251,14 @@ void APlayerCharacterController::BeginPlay()
         ApplyConfiguredInputMappingContexts();
     }
 
-    if (bAutoSpawnGameManager)
+    // Authority/standalone runtime initialization is owned exclusively by SingleplayGameMode /
+    // MultiplayGameMode. A network client has no GameMode instance, so only the client schedules a
+    // next-tick render-session reconciliation after GameState/replicated world state can begin arriving.
+    if (GetNetMode() == NM_Client)
     {
         GetWorldTimerManager().SetTimerForNextTick(FTimerDelegate::CreateWeakLambda(this, [this]()
         {
-            if (!IsValid(SubSystem) || !SubSystem->IsWorldLoading())
+            if (IsValid(this) && !IsActorBeingDestroyed())
             {
                 GetGameManager();
             }
@@ -175,67 +310,61 @@ void APlayerCharacterController::BeginPlay()
 }
 
 
-UUserWidget* APlayerCharacterController::CreateCreatorHUD()
+void APlayerCharacterController::SetCreatorHUDWidget(UCreatorHUDWidget* InWidget)
 {
-    if (IsValid(SubSystem) && SubSystem->IsWorldLoading())
+    CreatorHUDWidget = InWidget;
+}
+
+void APlayerCharacterController::SetDebugWidget(UUserWidget* InWidget)
+{
+    DebugWidget = InWidget;
+    if (IsValid(DebugWidget))
     {
-        return nullptr;
+        DebugWidget->SetVisibility(ESlateVisibility::Collapsed);
+    }
+    bIsDebug = false;
+}
+
+void APlayerCharacterController::SetPauseMenuWidget(UPauseMenuWidget* InWidget)
+{
+    PauseMenuWidget = InWidget;
+    if (IsValid(PauseMenuWidget))
+    {
+        PauseMenuWidget->SetVisibility(ESlateVisibility::Collapsed);
+    }
+}
+
+void APlayerCharacterController::SetSettingsMenuWidget(USettingsMenuWidget* InWidget)
+{
+    if (IsValid(SettingsMenuWidget))
+    {
+        SettingsMenuWidget->OnCloseRequested.RemoveDynamic(
+            this, &APlayerCharacterController::ReturnToPauseMenuFromSettings);
     }
 
-    // No native/WBP fallback class is loaded here anymore. Assign a WBP class explicitly or create the widget in Blueprint.
-    if (!CreatorHUDWidgetClass)
+    SettingsMenuWidget = InWidget;
+    if (IsValid(SettingsMenuWidget))
     {
-        UE_LOG(LogTemp, Verbose, TEXT("PlayerCharacterController: CreatorHUDWidgetClass is not assigned; skipping Creator HUD creation."));
-        return nullptr;
+        SettingsMenuWidget->OnCloseRequested.RemoveDynamic(
+            this, &APlayerCharacterController::ReturnToPauseMenuFromSettings);
+        SettingsMenuWidget->OnCloseRequested.AddDynamic(
+            this, &APlayerCharacterController::ReturnToPauseMenuFromSettings);
+        SettingsMenuWidget->SetVisibility(ESlateVisibility::Collapsed);
     }
-
-    // Reuse the existing HUD instance when it is still alive.
-    if (IsValid(CreatorHUDWidget))
-    {
-        if (!CreatorHUDWidget->IsInViewport())
-        {
-            CreatorHUDWidget->AddToViewport(CreatorHUDZOrder);
-        }
-        return CreatorHUDWidget.Get();
-    }
-
-    // Only instantiate an explicitly assigned WBP class.
-    CreatorHUDWidget = CreateWidget<UUserWidget>(this, CreatorHUDWidgetClass);
-
-    // Return nullptr if widget creation fails.
-    if (!IsValid(CreatorHUDWidget))
-    {
-        return nullptr;
-    }
-
-    // Add the HUD to the viewport.
-    CreatorHUDWidget->AddToViewport(CreatorHUDZOrder);
-
-    // Keep GameOnly input so this HUD does not interrupt crosshair-centered gameplay.
-    if (!bUIInputMode)
-    {
-        ApplyGameInputMode();
-    }
-
-    // Return the created HUD instance.
-    return CreatorHUDWidget.Get();
 }
 
 void APlayerCharacterController::RemoveCreatorHUD()
 {
-    // Remove the HUD from the viewport if it is valid.
     if (IsValid(CreatorHUDWidget))
     {
-        CreatorHUDWidget->RemoveFromParent();
+        CreatorHUDWidget->SetVisibility(ESlateVisibility::Collapsed);
     }
-
-    // Clear the reference so the next request can create a fresh instance.
-    CreatorHUDWidget = nullptr;
 }
 
 void APlayerCharacterController::SetupInputComponent()
 {
     Super::SetupInputComponent();
+    ResolveCentralAssets();
     if (bApplyInputMappingContextsOnBeginPlay)
     {
         ApplyConfiguredInputMappingContexts();
@@ -342,7 +471,9 @@ void APlayerCharacterController::RegisterPrimaryCharacterPawn(APawn* InPawn)
                 SubSystem->SetPlayerActor(PlayerCharacter);
                 USceneComponent* FollowCamera = PlayerCharacter->GetFollowCameraComponent();
                 SubSystem->SetCameraComponent(FollowCamera);
-                if (UWeatherSubsystem* Weather = GetGameInstance()->GetSubsystem<UWeatherSubsystem>())
+                UGameInstance* const GameInstance = GetGameInstance();
+                if (UWeatherSubsystem* Weather = GameInstance
+                    ? GameInstance->GetSubsystem<UWeatherSubsystem>() : nullptr)
                 {
                     Weather->SetWeatherCamera(FollowCamera);
                 }
@@ -364,6 +495,16 @@ void APlayerCharacterController::EndPlay(const EEndPlayReason::Type EndPlayReaso
         GameUpdate->UnregisterUpdate(GameUpdateTickHandle);
     }
     GameUpdateTickHandle = INDEX_NONE;
+
+    if (IsValid(SettingsMenuWidget))
+    {
+        SettingsMenuWidget->OnCloseRequested.RemoveDynamic(
+            this, &APlayerCharacterController::ReturnToPauseMenuFromSettings);
+    }
+    CreatorHUDWidget = nullptr;
+    DebugWidget = nullptr;
+    PauseMenuWidget = nullptr;
+    SettingsMenuWidget = nullptr;
 
     Super::EndPlay(EndPlayReason);
 }
@@ -462,9 +603,12 @@ void APlayerCharacterController::ApplyUIInputMode(UUserWidget* WidgetToFocus)
     }
 
     bUIInputMode = true;
+    UUserWidget* SafeFocusWidget = IsValid(WidgetToFocus) && WidgetToFocus->IsFocusable()
+        ? WidgetToFocus
+        : nullptr;
     UWidgetBlueprintLibrary::SetInputMode_GameAndUIEx(
         this,
-        WidgetToFocus,
+        SafeFocusWidget,
         EMouseLockMode::DoNotLock,
         true,
         false);
@@ -479,9 +623,14 @@ void APlayerCharacterController::ApplyLoadingInputMode(UUserWidget* WidgetToFocu
 {
     bUIInputMode = true;
     StopFallbackMovement();
+    // Loading-screen roots are commonly non-focusable. Passing one to SetInputMode causes Slate
+    // to emit "Attempting to focus Non-Focusable widget SObjectWidget" on every build/load.
+    UUserWidget* SafeFocusWidget = IsValid(WidgetToFocus) && WidgetToFocus->IsFocusable()
+        ? WidgetToFocus
+        : nullptr;
     UWidgetBlueprintLibrary::SetInputMode_GameAndUIEx(
         this,
-        WidgetToFocus,
+        SafeFocusWidget,
         EMouseLockMode::DoNotLock,
         false,
         false);
@@ -580,24 +729,18 @@ void APlayerCharacterController::LockInputForMenuWorldTravel()
     bShowMouseCursor = false;
 }
 
-TSoftObjectPtr<UWorld> APlayerCharacterController::ResolveWorldSelectionWorld() const
+TSoftObjectPtr<UWorld> APlayerCharacterController::ResolveMainWorld() const
 {
-    if (!WorldSelectionWorld.IsNull())
+    if (UGlTFSimulatorAssetRegistry* Registry = UGlTFSimulatorGameInstance::GetAssetRegistryFromContext(this))
     {
-        return WorldSelectionWorld;
+        return Registry->MainWorld;
     }
-
-    if (UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(this))
-    {
-        return Manager->GetRegisteredWorldSelectionWorld();
-    }
-
     return TSoftObjectPtr<UWorld>();
 }
 
 bool APlayerCharacterController::CanExitToWorldSelectionFromPauseMenu() const
 {
-    return !bMenuWorldTravelPending && !ResolveWorldSelectionWorld().IsNull();
+    return !bMenuWorldTravelPending && !ResolveMainWorld().IsNull();
 }
 
 void APlayerCharacterController::RestorePauseMenuAfterRejectedTravel()
@@ -620,26 +763,20 @@ void APlayerCharacterController::RestorePauseMenuAfterRejectedTravel()
 
     if (IsValid(SettingsMenuWidget))
     {
-        SettingsMenuWidget->RemoveFromParent();
+        SettingsMenuWidget->SetVisibility(ESlateVisibility::Collapsed);
     }
 
-    UUserWidget* Menu = PauseMenuWidget.Get();
+    UPauseMenuWidget* Menu = PauseMenuWidget.Get();
     if (IsValid(Menu))
     {
         Menu->SetIsEnabled(true);
-        if (!Menu->IsInViewport())
-        {
-            Menu->AddToViewport(PauseMenuZOrder);
-        }
+        Menu->SetVisibility(ESlateVisibility::Visible);
+        Menu->ResetExitRequestState();
     }
     else
     {
-        Menu = CreatePauseMenu();
-    }
-
-    if (UPauseMenuWidget* NativePauseMenu = Cast<UPauseMenuWidget>(Menu))
-    {
-        NativePauseMenu->ResetExitRequestState();
+        UE_LOG(LogTemp, Warning,
+            TEXT("Pause travel was rejected but no PauseMenuWidget is available from the central AssetRegistry or an explicit override."));
     }
 
     ApplyUIInputMode(Menu);
@@ -754,7 +891,7 @@ FString APlayerCharacterController::GetInputFixVersion() const
 FString APlayerCharacterController::GetInputSetupStatus() const
 {
     return FString::Printf(
-        TEXT("%s | Controller=%s | Class=%s | PrimaryIMC=%s | IMCCount=%d | IAAssigned=%d | EnhancedInputComponent=%s | MappingApplied=%s | GameplayMouse=%s | ManagerClass=%s"),
+        TEXT("%s | Controller=%s | Class=%s | PrimaryIMC=%s | IMCCount=%d | IAAssigned=%d | EnhancedInputComponent=%s | MappingApplied=%s | GameplayMouse=%s"),
         TEXT("GameplayInputRecovery-v4"),
         *GetNameSafe(this),
         *GetNameSafe(GetClass()),
@@ -763,8 +900,7 @@ FString APlayerCharacterController::GetInputSetupStatus() const
         CountAssignedEnhancedInputActions(),
         bEnhancedInputComponentWasAvailable ? TEXT("OK") : TEXT("NO"),
         bAnyInputMappingContextApplied ? TEXT("YES") : TEXT("NO"),
-        (bEnableFallbackKeyBindings && bBindMouseButtons) ? TEXT("LMB/RMB") : TEXT("OFF"),
-        *GetNameSafe(GameManagerActorClass ? GameManagerActorClass.Get() : AGameManagerActor::StaticClass()));
+        (bEnableFallbackKeyBindings && bBindMouseButtons) ? TEXT("LMB/RMB") : TEXT("OFF"));
 }
 
 void APlayerCharacterController::PrintInputSetupStatus() const
@@ -1364,6 +1500,21 @@ void APlayerCharacterController::Input_PrimaryPressed()
     }
 }
 
+void APlayerCharacterController::Input_PrimaryReleased()
+{
+    // Do not restore the redundant native release binding. This reflected bridge exists only for
+    // older Blueprint graphs and forwards to the intentionally side-effect-free manager endpoint.
+    if (bUIInputMode)
+    {
+        return;
+    }
+
+    if (UGameManagerSubSystem* Manager = GetGameManager())
+    {
+        Manager->InputPrimaryReleased();
+    }
+}
+
 void APlayerCharacterController::Input_SecondaryPressed()
 {
     if (bUIInputMode || !ConsumeInputDebounce(LastSecondaryInputTime))
@@ -1420,7 +1571,7 @@ void APlayerCharacterController::Input_ChangeCharacterPressed()
         return;
     }
 
-    if (UglTFStreamSubSystem* StreamSubSystem = UglTFStreamSubSystem::Get(this))
+    if (UWorldSceneStreamingSubsystem* StreamSubSystem = UWorldSceneStreamingSubsystem::Get(this))
     {
         StreamSubSystem->CycleNextPlayerCharacter();
     }
@@ -1574,39 +1725,15 @@ void APlayerCharacterController::Input_DebugPressed()
         return;
     }
 
-    if (bIsDebug)
+    if (!IsValid(DebugWidget))
     {
-        // When bIsDebug is true, remove the widget from the screen.
-        if (IsValid(DebugWidget))
-        {
-            DebugWidget->RemoveFromParent();
-        }
-        bIsDebug = false;
+        UE_LOG(LogTemp, Verbose,
+            TEXT("Debug toggle ignored because no DebugWidget is available from the central AssetRegistry or an explicit override."));
+        return;
     }
-    else
-    {
-        // When bIsDebug is false, create the widget and add it to the screen.
-        if (DebugWidgetClass)
-        {
-            // Create the widget if it does not exist yet, matching Blueprint CreateWidget.
-            // Cache the widget instead of recreating it every toggle.
-            if (!IsValid(DebugWidget))
-            {
-                DebugWidget = CreateWidget<UUserWidget>(this, DebugWidgetClass);
-            }
 
-            // Add the widget to the viewport, matching Blueprint AddToViewport.
-            if (IsValid(DebugWidget))
-            {
-                DebugWidget->AddToViewport(0); // ZOrder 0
-                bIsDebug = true;
-            }
-        }
-        else
-        {
-            UE_LOG(LogTemp, Warning, TEXT("DebugWidgetClass is not assigned in PlayerCharacterController!"));
-        }
-    }
+    bIsDebug = !bIsDebug;
+    DebugWidget->SetVisibility(bIsDebug ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
 }
 
 void APlayerCharacterController::Input_PausePressed()
@@ -1626,13 +1753,20 @@ void APlayerCharacterController::Input_PausePressed()
         return;
     }
 
-    if (IsValid(SettingsMenuWidget) && SettingsMenuWidget->IsInViewport())
+    const auto IsMenuWidgetVisible = [](const UWidget* Widget)
+    {
+        return IsValid(Widget)
+            && Widget->GetVisibility() != ESlateVisibility::Collapsed
+            && Widget->GetVisibility() != ESlateVisibility::Hidden;
+    };
+
+    if (IsMenuWidgetVisible(SettingsMenuWidget.Get()))
     {
         ReturnToPauseMenuFromSettings();
         return;
     }
 
-    if (SubSystem->GetGamePaused() || (IsValid(PauseMenuWidget) && PauseMenuWidget->IsInViewport()))
+    if (SubSystem->GetGamePaused() || IsMenuWidgetVisible(PauseMenuWidget.Get()))
     {
         ClosePauseMenu(true);
     }
@@ -1642,93 +1776,6 @@ void APlayerCharacterController::Input_PausePressed()
     }
 }
 
-
-UUserWidget* APlayerCharacterController::CreatePauseMenu()
-{
-    if (bMenuWorldTravelPending)
-    {
-        return nullptr;
-    }
-
-    if (!IsValid(SubSystem))
-    {
-        SubSystem = UGameManagerSubSystem::GetSubSystem(this);
-    }
-    if (IsValid(SubSystem) && SubSystem->IsWorldLoading())
-    {
-        return nullptr;
-    }
-
-    if (!PauseMenuWidgetClass)
-    {
-        UE_LOG(LogTemp, Verbose, TEXT("PlayerCharacterController: PauseMenuWidgetClass is not assigned; skipping pause menu creation."));
-        return nullptr;
-    }
-
-    if (IsValid(PauseMenuWidget))
-    {
-        if (!PauseMenuWidget->IsInViewport())
-        {
-            PauseMenuWidget->AddToViewport(PauseMenuZOrder);
-        }
-        return PauseMenuWidget.Get();
-    }
-
-    PauseMenuWidget = CreateWidget<UUserWidget>(this, PauseMenuWidgetClass.Get());
-    if (IsValid(PauseMenuWidget))
-    {
-        PauseMenuWidget->AddToViewport(PauseMenuZOrder);
-    }
-    return PauseMenuWidget.Get();
-}
-
-UUserWidget* APlayerCharacterController::CreateSettingsMenu()
-{
-    if (bMenuWorldTravelPending)
-    {
-        return nullptr;
-    }
-
-    if (!IsValid(SubSystem))
-    {
-        SubSystem = UGameManagerSubSystem::GetSubSystem(this);
-    }
-    if (IsValid(SubSystem) && SubSystem->IsWorldLoading())
-    {
-        return nullptr;
-    }
-
-    if (!SettingsMenuWidgetClass)
-    {
-        UE_LOG(LogTemp, Verbose, TEXT("PlayerCharacterController: SettingsMenuWidgetClass is not assigned; skipping settings menu creation."));
-        return nullptr;
-    }
-
-    if (!IsValid(SettingsMenuWidget))
-    {
-        SettingsMenuWidget = CreateWidget<UUserWidget>(this, SettingsMenuWidgetClass.Get());
-    }
-
-    if (IsValid(SettingsMenuWidget))
-    {
-        if (USettingsMenuWidget* SettingsWidget = Cast<USettingsMenuWidget>(SettingsMenuWidget.Get()))
-        {
-            // Re-opened settings menus must show the latest saved/runtime values, not stale pending edits.
-            SettingsWidget->InitializeSettingsFromSavedData();
-        }
-
-        SettingsMenuWidget->SetVisibility(ESlateVisibility::Visible);
-        if (!SettingsMenuWidget->IsInViewport())
-        {
-            SettingsMenuWidget->AddToViewport(SettingsMenuZOrder);
-        }
-
-        return SettingsMenuWidget.Get();
-    }
-
-    UE_LOG(LogTemp, Warning, TEXT("PlayerCharacterController: failed to create settings menu widget."));
-    return nullptr;
-}
 
 void APlayerCharacterController::OpenPauseMenu()
 {
@@ -1748,12 +1795,21 @@ void APlayerCharacterController::OpenPauseMenu()
 
     if (IsValid(SettingsMenuWidget))
     {
-        SettingsMenuWidget->RemoveFromParent();
+        SettingsMenuWidget->SetVisibility(ESlateVisibility::Collapsed);
     }
 
-    UUserWidget* Menu = CreatePauseMenu();
+    if (!IsValid(PauseMenuWidget))
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("Pause requested but no PauseMenuWidget is available from the central AssetRegistry or an explicit override."));
+        return;
+    }
+
+    PauseMenuWidget->SetIsEnabled(true);
+    PauseMenuWidget->SetVisibility(ESlateVisibility::Visible);
+    PauseMenuWidget->ResetExitRequestState();
     SubSystem->SetGamePaused(true);
-    ApplyUIInputMode(Menu);
+    ApplyUIInputMode(PauseMenuWidget.Get());
     bPrevGamePaused = true;
 }
 
@@ -1771,11 +1827,11 @@ void APlayerCharacterController::ClosePauseMenu(bool bResumeGame)
 
     if (IsValid(SettingsMenuWidget))
     {
-        SettingsMenuWidget->RemoveFromParent();
+        SettingsMenuWidget->SetVisibility(ESlateVisibility::Collapsed);
     }
     if (IsValid(PauseMenuWidget))
     {
-        PauseMenuWidget->RemoveFromParent();
+        PauseMenuWidget->SetVisibility(ESlateVisibility::Collapsed);
     }
 
     if (bResumeGame && IsValid(SubSystem))
@@ -1803,22 +1859,22 @@ void APlayerCharacterController::ShowSettingsMenuFromPause()
         return;
     }
 
-    if (IsValid(PauseMenuWidget))
+    if (!IsValid(SettingsMenuWidget))
     {
-        PauseMenuWidget->RemoveFromParent();
-    }
-
-    UUserWidget* Settings = CreateSettingsMenu();
-    if (!IsValid(Settings))
-    {
-        // Keep the pause menu visible if the settings widget could not be built.
-        CreatePauseMenu();
-        ApplyUIInputMode(PauseMenuWidget.Get());
+        UE_LOG(LogTemp, Warning,
+            TEXT("Settings requested from pause but no SettingsMenuWidget is available from the central AssetRegistry or an explicit override."));
         return;
     }
 
+    if (IsValid(PauseMenuWidget))
+    {
+        PauseMenuWidget->SetVisibility(ESlateVisibility::Collapsed);
+    }
+
+    SettingsMenuWidget->InitializeSettingsFromSavedData();
+    SettingsMenuWidget->SetVisibility(ESlateVisibility::Visible);
     SubSystem->SetGamePaused(true);
-    ApplyUIInputMode(Settings);
+    ApplyUIInputMode(SettingsMenuWidget.Get());
     bPrevGamePaused = true;
 }
 
@@ -1831,7 +1887,7 @@ void APlayerCharacterController::ReturnToPauseMenuFromSettings()
 
     if (IsValid(SettingsMenuWidget))
     {
-        SettingsMenuWidget->RemoveFromParent();
+        SettingsMenuWidget->SetVisibility(ESlateVisibility::Collapsed);
     }
 
     if (!IsValid(SubSystem))
@@ -1843,8 +1899,13 @@ void APlayerCharacterController::ReturnToPauseMenuFromSettings()
         SubSystem->SetGamePaused(true);
     }
 
-    UUserWidget* Menu = CreatePauseMenu();
-    ApplyUIInputMode(Menu);
+    if (IsValid(PauseMenuWidget))
+    {
+        PauseMenuWidget->SetIsEnabled(true);
+        PauseMenuWidget->SetVisibility(ESlateVisibility::Visible);
+        PauseMenuWidget->ResetExitRequestState();
+    }
+    ApplyUIInputMode(PauseMenuWidget.Get());
     bPrevGamePaused = true;
 }
 
@@ -1870,19 +1931,12 @@ bool APlayerCharacterController::TryExitToWorldSelectionFromPauseMenu()
         return true;
     }
 
-    const TSoftObjectPtr<UWorld> DestinationWorld = ResolveWorldSelectionWorld();
+    const TSoftObjectPtr<UWorld> DestinationWorld = ResolveMainWorld();
     if (DestinationWorld.IsNull())
     {
         UE_LOG(LogTemp, Error,
-            TEXT("[MenuTravel] Cannot leave gameplay: no WorldSelectionWorld is assigned on the PlayerController "
-                 "and no menu world was registered by StartActor."));
+            TEXT("[MenuTravel] Cannot leave gameplay: AssetRegistry.MainWorld is empty."));
         return false;
-    }
-
-    if (WorldSelectionWorld.IsNull())
-    {
-        UE_LOG(LogTemp, Display,
-            TEXT("[MenuTravel] PlayerController WorldSelectionWorld is empty; using the menu world registered by StartActor."));
     }
 
     bMenuWorldTravelPending = true;
@@ -1890,16 +1944,16 @@ bool APlayerCharacterController::TryExitToWorldSelectionFromPauseMenu()
     if (IsValid(SettingsMenuWidget))
     {
         SettingsMenuWidget->SetIsEnabled(false);
-        SettingsMenuWidget->RemoveFromParent();
+        SettingsMenuWidget->SetVisibility(ESlateVisibility::Collapsed);
     }
     if (IsValid(PauseMenuWidget))
     {
         PauseMenuWidget->SetIsEnabled(false);
-        PauseMenuWidget->RemoveFromParent();
+        PauseMenuWidget->SetVisibility(ESlateVisibility::Collapsed);
     }
 
     LockInputForMenuWorldTravel();
-    UE_LOG(LogTemp, Display, TEXT("[MenuTravel] Pause Exit accepted; requesting the world-selection world."));
+    UE_LOG(LogTemp, Display, TEXT("[MenuTravel] Pause Exit accepted; requesting MainWorld with WorldSelection UI."));
 
     if (!UGameManagerSubSystem::TryOpenWorldSelectionScreen(this, DestinationWorld))
     {
@@ -1912,35 +1966,7 @@ bool APlayerCharacterController::TryExitToWorldSelectionFromPauseMenu()
     return true;
 }
 
-void APlayerCharacterController::ReturnToMainMenuFromWorldSelection()
-{
-    if (bMenuWorldTravelPending)
-    {
-        return;
-    }
 
-    if (MainMenuWorld.IsNull())
-    {
-        UE_LOG(LogTemp, Error,
-            TEXT("PlayerCharacterController cannot open the main menu because MainMenuWorld is not assigned."));
-        return;
-    }
-
-    bMenuWorldTravelPending = true;
-    if (IsValid(SettingsMenuWidget))
-    {
-        SettingsMenuWidget->SetIsEnabled(false);
-        SettingsMenuWidget->RemoveFromParent();
-    }
-    if (IsValid(PauseMenuWidget))
-    {
-        PauseMenuWidget->SetIsEnabled(false);
-        PauseMenuWidget->RemoveFromParent();
-    }
-
-    LockInputForMenuWorldTravel();
-    UGameManagerSubSystem::OpenMainMenuFromWorldSelection(this, MainMenuWorld);
-}
 
 UGameManagerSubSystem* APlayerCharacterController::GetGameManager()
 {
@@ -1951,64 +1977,9 @@ UGameManagerSubSystem* APlayerCharacterController::GetGameManager()
     }
 
     SubSystem = Manager;
-
-    const UClass* DesiredActorClass = GameManagerActorClass ? GameManagerActorClass.Get() : AGameManagerActor::StaticClass();
-
-    if (IsValid(CachedGameManagerActor) && CachedGameManagerActor->IsA(DesiredActorClass))
+    if (GetNetMode() == NM_Client)
     {
-        Manager->StartGameManager(CachedGameManagerActor.Get());
-        return Manager;
-    }
-    CachedGameManagerActor = nullptr;
-
-    UWorld* World = GetWorld();
-    if (!World)
-    {
-        return Manager;
-    }
-
-    AGameManagerActor* FirstCompatibleActor = nullptr;
-    for (TActorIterator<AGameManagerActor> It(World); It; ++It)
-    {
-        AGameManagerActor* ExistingActor = *It;
-        if (!IsValid(ExistingActor))
-        {
-            continue;
-        }
-
-        if (ExistingActor->IsA(DesiredActorClass))
-        {
-            CachedGameManagerActor = ExistingActor;
-            Manager->StartGameManager(ExistingActor);
-            return Manager;
-        }
-
-        if (!FirstCompatibleActor && DesiredActorClass == AGameManagerActor::StaticClass())
-        {
-            FirstCompatibleActor = ExistingActor;
-        }
-    }
-
-    if (FirstCompatibleActor)
-    {
-        CachedGameManagerActor = FirstCompatibleActor;
-        Manager->StartGameManager(FirstCompatibleActor);
-        return Manager;
-    }
-
-    if (Manager->IsWorldLoading())
-    {
-        return Manager;
-    }
-
-    FActorSpawnParameters Params;
-    Params.Owner = this;
-    Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-    UClass* ManagerSpawnClass = GameManagerActorClass ? GameManagerActorClass.Get() : AGameManagerActor::StaticClass();
-    CachedGameManagerActor = World->SpawnActor<AGameManagerActor>(ManagerSpawnClass, FTransform::Identity, Params);
-    if (IsValid(CachedGameManagerActor))
-    {
-        Manager->StartGameManager(CachedGameManagerActor.Get());
+        Manager->StartClientGameplaySession(this);
     }
     return Manager;
 }

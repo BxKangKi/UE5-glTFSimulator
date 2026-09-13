@@ -1,5 +1,12 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
+/**
+ * @file MultiplayerWorldSubSystem.h
+ * 역할: 월드 선택값과 싱글·멀티플레이 이동을 관리합니다.
+ * 핵심 기능: GameInstance 수명 선택값, World URL 옵션, 호스트·클라이언트 travel.
+ * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"
@@ -33,8 +40,9 @@ public:
     UFUNCTION(BlueprintPure, Category="Multiplayer", meta=(WorldContext="WorldContextObject"))
     static UMultiplayerWorldSubSystem* Find(const UObject* WorldContextObject) { return Get(WorldContextObject); }
 
+    /** Stores only a normalized direct-child world key; empty input clears the current selection. */
     UFUNCTION(BlueprintCallable, Category="Multiplayer")
-    void SetSelectedWorldFolderName(const FString& InWorldFolderName) { SelectedWorldFolderName = InWorldFolderName; }
+    void SetSelectedWorldFolderName(const FString& InWorldFolderName);
 
     UFUNCTION(BlueprintPure, Category="Multiplayer")
     FString GetSelectedWorldFolderName() const { return SelectedWorldFolderName; }
@@ -48,7 +56,7 @@ public:
     UFUNCTION(BlueprintCallable, Category="Multiplayer", meta=(WorldContext="WorldContextObject"))
     bool StartSinglePlayerWorld(const UObject* WorldContextObject, const FString& WorldFolderName, TSoftObjectPtr<UWorld> SinglePlayerWorld);
 
-    /** Direct world/GameMode travel path used by StartActor and optional Blueprint callers. */
+    /** Direct world/GameMode travel path used by MainGameMode and optional Blueprint callers. */
     UFUNCTION(BlueprintCallable, Category="Multiplayer", meta=(WorldContext="WorldContextObject"))
     bool StartSinglePlayerWorldWithGameMode(
         const UObject* WorldContextObject,
@@ -59,7 +67,7 @@ public:
     UFUNCTION(BlueprintCallable, Category="Multiplayer", meta=(WorldContext="WorldContextObject"))
     bool HostMultiplayerWorld(const UObject* WorldContextObject, const FString& WorldFolderName, TSoftObjectPtr<UWorld> HostWorld, int32 Port = 7777);
 
-    /** Direct host-world/GameMode travel path used by StartActor and optional Blueprint callers. */
+    /** Direct host-world/GameMode travel path used by MainGameMode and optional Blueprint callers. */
     UFUNCTION(BlueprintCallable, Category="Multiplayer", meta=(WorldContext="WorldContextObject"))
     bool HostMultiplayerWorldWithGameMode(
         const UObject* WorldContextObject,

@@ -1,5 +1,12 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
+/**
+ * @file GameUpdateSubSystem.h
+ * 역할: 게임 객체의 업데이트 콜백을 통합 실행합니다.
+ * 핵심 기능: 우선순위 정렬, 등록·해제, 공통 업데이트 배포.
+ * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"

@@ -1,5 +1,12 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
+/**
+ * @file CreatorHUDWidget.h
+ * 역할: 제작 모드 HUD와 게임 매니저를 연결합니다.
+ * 핵심 기능: 명시적 위젯 참조, toolbar·상태·빌드 진행 표시.
+ * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"

@@ -1,6 +1,13 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
+/**
+ * @file CharacterAnimInstance.cpp
+ * 역할: 캐릭터 애니메이션 상태를 AnimGraph에 전달합니다.
+ * 핵심 기능: 이동·회전·공중·물 상태와 애니메이션 변수 갱신.
+ * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ */
+
 #include "Character/CharacterAnimInstance.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "System/PhysicsHelper.h"

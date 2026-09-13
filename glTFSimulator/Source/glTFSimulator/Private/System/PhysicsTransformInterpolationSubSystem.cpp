@@ -1,5 +1,12 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
+/**
+ * @file PhysicsTransformInterpolationSubSystem.cpp
+ * 역할: 비동기 물리 결과를 게임 스레드 Transform에 반영합니다.
+ * 핵심 기능: 물리 샘플 보간, 컴포넌트·액터 갱신.
+ * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ */
+
 #include "System/PhysicsTransformInterpolationSubSystem.h"
 #include "System/GameUpdateSubSystem.h"
 #include "Async/ParallelFor.h"

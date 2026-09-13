@@ -1,6 +1,13 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
+/**
+ * @file ModelData.h
+ * 역할: 모델·메시·노드의 런타임 데이터 구조를 정의합니다.
+ * 핵심 기능: JSON 설정 변환, 메시 속성, 경계·노드·LOD 데이터.
+ * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"
@@ -8,8 +15,6 @@
 #include "Engine/Scene.h"
 #include "ModelData.generated.h"
 
-class UInstancedStaticMeshComponent;
-class UBoxComponent;
 class UShapeComponent;
 class ULightComponent;
 class AWaterActor;
@@ -93,21 +98,17 @@ struct FModelData
 {
     GENERATED_BODY()
 
-    /** Runtime/cache-derived model center. This value is never read from or written to JSON. */
+    /** Build-derived model center stored in the .gwd directory, never in author JSON. */
     UPROPERTY()
     FVector Center = FVector::ZeroVector;
 
-    /** Runtime/cache-derived full model size. This value is never read from or written to JSON. */
+    /** Build-derived full model size stored in the .gwd directory, never in author JSON. */
     UPROPERTY()
     FVector Size = FVector::ZeroVector;
 
     /** User-authored read-only JSON settings, keyed by base mesh name. */
     UPROPERTY()
     TMap<FName, FMeshData> MeshData;
-
-    /** Optional prefab name whose strict sibling JSON declares ModelType=Prefab. */
-    UPROPERTY()
-    FString Prefab;
 
     TSharedRef<FJsonObject> Serialization() const;
     bool Deserialization(const TSharedPtr<FJsonObject> &Json);
@@ -133,7 +134,7 @@ struct FModelMeshData
     UPROPERTY()
     FMeshData Data;
 
-    /** Unscaled local-space mesh half size; the cache stores the corresponding full Size. */
+    /** Unscaled local-space mesh half size; the .gwd metadata member also stores full Size. */
     UPROPERTY()
     FVector Extent = FVector::ZeroVector;
 
@@ -154,7 +155,19 @@ struct FModelNodeData
     FName MeshName = NAME_None;
 
     UPROPERTY()
-    FTransform Transform;
+    FTransform Transform = FTransform::Identity;
+
+    /** 8192 m model-space coarse chunk. */
+    UPROPERTY()
+    FIntVector CoarseChunk = FIntVector::ZeroValue;
+
+    /** 512 m child chunk, stored as 0..15 coordinates relative to CoarseChunk. */
+    UPROPERTY()
+    FIntVector FineChunk = FIntVector::ZeroValue;
+
+    /** A single transformed mesh larger than 8192 m is retained for the scene lifetime. */
+    UPROPERTY()
+    bool bAlwaysLoaded = false;
 };
 
 
@@ -170,10 +183,15 @@ struct FWaterStreamNodeData
     float StreamRadius = 65536.0f;
 };
 
+/** Render-oriented scene tables decoded from one model's metadata.dat member. */
 USTRUCT(BlueprintType)
-struct FLoadAsyncWrapper
+struct FGWorldSceneRenderData
 {
     GENERATED_BODY()
+
+    /** True only when definition parsing and the complete bounded node scan finished. */
+    UPROPERTY()
+    bool bSuccess = false;
 
     UPROPERTY()
     TMap<FName, FModelNodeData> NodeMap;
@@ -188,7 +206,7 @@ struct FLoadAsyncWrapper
     FModelData ModelData;
 };
 
-// Component group now also owns box components.
+/** Runtime collider/light components owned by one streamed scene node. */
 USTRUCT()
 struct FComponentGroup
 {
@@ -200,23 +218,26 @@ struct FComponentGroup
     TArray<TObjectPtr<ULightComponent>> Lights;
 };
 
+/** Terminal result from one mesh-group or water-group .gwd streaming pass. */
 USTRUCT(BlueprintType)
-struct FStreamAsyncWrapper
+struct FWorldSceneStreamResult
 {
     GENERATED_BODY()
 
+    /** Mesh name processed by this action. NAME_None identifies the water-only group. */
     UPROPERTY()
-    TSet<FName> LoadedNodes;
+    FName GroupName;
+
+    UPROPERTY()
+    bool bWaterGroup = false;
+
+    UPROPERTY()
+    bool bGroupFailed = false;
+
     UPROPERTY()
     TSet<FName> LoadedWaterNodes;
     UPROPERTY()
-    TMap<FName, FModelNodeData> NodeMap;
-    UPROPERTY()
     TMap<FName, FWaterStreamNodeData> WaterNodeMap;
-    UPROPERTY()
-    TMap<FName, TObjectPtr<UInstancedStaticMeshComponent>> InstanceMap;
-    UPROPERTY()
-    TMap<FName, FComponentGroup> DynamicComponentMap;
     UPROPERTY()
     TMap<FName, TObjectPtr<AWaterActor>> WaterActorMap;
 };

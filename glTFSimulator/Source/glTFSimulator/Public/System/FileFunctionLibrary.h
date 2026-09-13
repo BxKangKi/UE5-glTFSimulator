@@ -1,12 +1,18 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
+/**
+ * @file FileFunctionLibrary.h
+ * 역할: 프로젝트 파일·로그 작업을 위한 공통 함수를 제공합니다.
+ * 핵심 기능: 안전한 파일 보조 작업, 비동기 로그 기록.
+ * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"
 #include "Dom/JsonObject.h"
 #include "Kismet/BlueprintFunctionLibrary.h"
-#include "Serialization/BufferArchive.h"
 #include "Templates/SharedPointer.h"
 #include "FileFunctionLibrary.generated.h"
 
@@ -24,15 +30,7 @@ public:
     static bool GenerateDirectory(const FString &FilePath);
 
     UFUNCTION(BlueprintCallable)
-    static TArray<FString> GetFileNamesWithExtension(const FString &Directory,
-                                                    const FString &Extension);
-
-    UFUNCTION(BlueprintCallable)
     static FString GetPathWithoutExtension(const FString &Path);
-
-    static bool ToBinary(FBufferArchive Ar, const FString &FilePath);
-    static void ToBinaryAsync(FBufferArchive Ar, const FString &FilePath);
-    static bool FromBinary(TArray<uint8> &FileData, const FString &FilePath);
 
     // add line function
     UFUNCTION(BlueprintCallable)

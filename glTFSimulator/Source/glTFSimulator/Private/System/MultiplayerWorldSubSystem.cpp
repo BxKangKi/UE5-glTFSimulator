@@ -1,5 +1,12 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
+/**
+ * @file MultiplayerWorldSubSystem.cpp
+ * 역할: 월드 선택값과 싱글·멀티플레이 이동을 관리합니다.
+ * 핵심 기능: GameInstance 수명 선택값, World URL 옵션, 호스트·클라이언트 travel.
+ * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ */
+
 #include "System/MultiplayerWorldSubSystem.h"
 
 #include "Engine/GameInstance.h"
@@ -61,6 +68,32 @@ namespace
         AppendTravelOption(InOutOptions, TEXT("game"), GameModeClassPath);
         return true;
     }
+
+    /**
+     * Normalizes an optional world key before persistent state or a travel URL can observe it.
+     * Empty remains meaningful for client connections where the server supplies the world option.
+     */
+    bool NormalizeOptionalWorldFolder(
+        const FString& Candidate,
+        FString& OutNormalized)
+    {
+        if (Candidate.TrimStartAndEnd().IsEmpty())
+        {
+            OutNormalized.Reset();
+            return true;
+        }
+
+        if (UGameManagerSubSystem::TryNormalizeWorldFolderName(
+                Candidate, OutNormalized, false))
+        {
+            return true;
+        }
+
+        UE_LOG(LogTemp, Error,
+            TEXT("Rejected invalid multiplayer world folder key: %s"),
+            *Candidate.Left(256));
+        return false;
+    }
 }
 
 UMultiplayerWorldSubSystem* UMultiplayerWorldSubSystem::Get(const UObject* WorldContextObject)
@@ -91,6 +124,21 @@ UMultiplayerWorldSubSystem* UMultiplayerWorldSubSystem::Get(const UObject* World
 
     UGameInstance* GameInstance = World->GetGameInstance();
     return GameInstance ? GameInstance->GetSubsystem<UMultiplayerWorldSubSystem>() : nullptr;
+}
+
+void UMultiplayerWorldSubSystem::SetSelectedWorldFolderName(
+    const FString& InWorldFolderName)
+{
+    check(IsInGameThread());
+    FString Normalized;
+    if (!NormalizeOptionalWorldFolder(InWorldFolderName, Normalized))
+    {
+        // Clear instead of retaining a previous world: stale selection is more dangerous than an
+        // explicit startup failure when this method receives untrusted replicated/Blueprint data.
+        SelectedWorldFolderName.Reset();
+        return;
+    }
+    SelectedWorldFolderName = MoveTemp(Normalized);
 }
 
 void UMultiplayerWorldSubSystem::ClearRequestedGameModeOverride()
@@ -161,22 +209,28 @@ bool UMultiplayerWorldSubSystem::StartSinglePlayerWorldWithGameMode(
         return false;
     }
 
+    FString NormalizedWorldFolderName;
+    if (!NormalizeOptionalWorldFolder(WorldFolderName, NormalizedWorldFolderName))
+    {
+        return false;
+    }
+
     WorldMode = EMultiplayerWorldMode::SinglePlayer;
-    SelectedWorldFolderName = WorldFolderName;
+    SelectedWorldFolderName = NormalizedWorldFolderName;
     RequestedGameModeOverride = GameModeOverride;
-    RequestedGameModeWorldFolder = WorldFolderName;
+    RequestedGameModeWorldFolder = NormalizedWorldFolderName;
 
     if (UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(WorldContextObject))
     {
-        Manager->SetCurrentWorldName(WorldFolderName);
+        Manager->SetCurrentWorldName(NormalizedWorldFolderName);
     }
 
     FString Options;
-    if (!WorldFolderName.IsEmpty())
+    if (!NormalizedWorldFolderName.IsEmpty())
     {
         // GameManagerSubSystem reads this option in the destination map. This is required because
         // the old world's shutdown can clear transient references during OpenLevel.
-        AppendTravelOption(Options, TEXT("World"), WorldFolderName);
+        AppendTravelOption(Options, TEXT("World"), NormalizedWorldFolderName);
     }
 
     const bool bOpened = OpenWorldByReference(
@@ -217,20 +271,26 @@ bool UMultiplayerWorldSubSystem::HostMultiplayerWorldWithGameMode(
         return false;
     }
 
+    FString NormalizedWorldFolderName;
+    if (!NormalizeOptionalWorldFolder(WorldFolderName, NormalizedWorldFolderName))
+    {
+        return false;
+    }
+
     WorldMode = EMultiplayerWorldMode::Host;
-    SelectedWorldFolderName = WorldFolderName;
+    SelectedWorldFolderName = NormalizedWorldFolderName;
     RequestedGameModeOverride = GameModeOverride;
-    RequestedGameModeWorldFolder = WorldFolderName;
+    RequestedGameModeWorldFolder = NormalizedWorldFolderName;
 
     if (UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(WorldContextObject))
     {
-        Manager->SetCurrentWorldName(WorldFolderName);
+        Manager->SetCurrentWorldName(NormalizedWorldFolderName);
     }
 
     FString Options(TEXT("listen"));
-    if (!WorldFolderName.IsEmpty())
+    if (!NormalizedWorldFolderName.IsEmpty())
     {
-        AppendTravelOption(Options, TEXT("World"), WorldFolderName);
+        AppendTravelOption(Options, TEXT("World"), NormalizedWorldFolderName);
     }
     if (Port > 0)
     {
@@ -260,6 +320,13 @@ bool UMultiplayerWorldSubSystem::OpenClientConnectionWorld(
 
     WorldMode = EMultiplayerWorldMode::Client;
     ClearRequestedGameModeOverride();
+    // The connection map is UI, not an external data world. Clear any prior selection so the
+    // automatic destination bootstrap cannot mistake this intermediate map for gameplay.
+    SelectedWorldFolderName.Reset();
+    if (UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(WorldContextObject))
+    {
+        Manager->SetCurrentWorldName(FString());
+    }
     return OpenWorldByReference(
         WorldContextObject,
         ClientWorld,
@@ -277,16 +344,19 @@ bool UMultiplayerWorldSubSystem::JoinMultiplayerWorld(
         return false;
     }
 
+    FString NormalizedWorldFolderName;
+    if (!NormalizeOptionalWorldFolder(WorldFolderName, NormalizedWorldFolderName))
+    {
+        return false;
+    }
+
     // A client does not select the authoritative GameMode. The server's active map/travel URL does.
     WorldMode = EMultiplayerWorldMode::Client;
     ClearRequestedGameModeOverride();
-    if (!WorldFolderName.IsEmpty())
+    SelectedWorldFolderName = NormalizedWorldFolderName;
+    if (UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(WorldContextObject))
     {
-        SelectedWorldFolderName = WorldFolderName;
-        if (UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(WorldContextObject))
-        {
-            Manager->SetCurrentWorldName(WorldFolderName);
-        }
+        Manager->SetCurrentWorldName(NormalizedWorldFolderName);
     }
 
     ServerAddress = InServerAddress.IsEmpty() ? ServerAddress : InServerAddress;
@@ -305,6 +375,8 @@ bool UMultiplayerWorldSubSystem::JoinMultiplayerWorld(
     FString TravelAddress = ServerAddress;
     if (!SelectedWorldFolderName.IsEmpty() && !TravelAddress.Contains(TEXT("?World=")))
     {
+        // The optional hint is attached to direct ClientTravel for servers that route several
+        // external data worlds through the same gameplay map.
         TravelAddress += FString::Printf(TEXT("?World=%s"), *SelectedWorldFolderName);
     }
 

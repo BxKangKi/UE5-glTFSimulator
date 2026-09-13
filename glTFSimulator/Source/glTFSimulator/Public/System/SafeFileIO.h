@@ -2,6 +2,13 @@
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
 /**
+ * File role: SafeFileIO.h
+ * 역할: 크기가 제한된 파일·JSON 비동기 I/O를 제공합니다.
+ * 핵심 기능: tracked worker, GT 전달, 종료 drain, 원자적 쓰기·복구.
+ * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ */
+
+/**
  * @file SafeFileIO.h
  * @brief Bounded, asynchronous, crash-resilient file and JSON I/O used by runtime data systems.
  *

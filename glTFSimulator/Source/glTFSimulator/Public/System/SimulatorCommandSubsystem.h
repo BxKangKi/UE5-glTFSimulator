@@ -1,5 +1,12 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
+/**
+ * @file SimulatorCommandSubsystem.h
+ * 역할: 시뮬레이터 명령을 공통 해석·실행합니다.
+ * 핵심 기능: 콘솔 입력 파싱, 명령 분기, 게임 기능 호출.
+ * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"

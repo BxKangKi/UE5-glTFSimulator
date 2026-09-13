@@ -1,6 +1,13 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
+/**
+ * @file CharacterComponent.cpp
+ * 역할: 캐릭터 이동과 물리 동작을 관리합니다.
+ * 핵심 기능: 이동 상태 전환, 접지·수영·비행·래그돌 처리, 물리 결과 반영.
+ * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ */
+
 #include "Character/CharacterComponent.h"
 #include "Character/CharacterController.h"
 #include "Character/CharacterFunctionLibrary.h"
@@ -71,6 +78,7 @@ namespace CharacterMovementTuning
     constexpr float FlyingRagdollResistance = 1000000.0f;
     constexpr float GroundWaterRagdollResistance = 1200.0f;
     constexpr float FlyingMaxAcceleration = 15000.0f;
+    constexpr float FlyingBrakingDeceleration = 12000.0f;
     constexpr float FlyingMaxSpeed = 3000.0f;
     constexpr float FlyingSprintMaxSpeed = 15000.0f;
     constexpr float SwimmingLinearResistance = 4.75f;
@@ -1398,7 +1406,11 @@ void UCharacterComponent::UpdateComponent(float DeltaTime, const FVector &MoveIn
     const bool bIsCrouch = UCharacterFunctionLibrary::IsStateActive(CharacterState, STATE_CROUCH);
     const FVector GroundNormal = bIsContactGround ? HitResult.ImpactNormal : FVector::UpVector;
 
-    Movement->bOrientRotationToMovement = (MoveInput.X != 0.0f || MoveInput.Y != 0.0f) && !bIsFalling;
+    constexpr float RotationInputDeadZone = 0.01f;
+    Movement->bOrientRotationToMovement =
+        (!FMath::IsNearlyZero(MoveInput.X, RotationInputDeadZone)
+            || !FMath::IsNearlyZero(MoveInput.Y, RotationInputDeadZone))
+        && !bIsFalling;
 
     const float BaseTime = DeltaTime * CharacterMovementTuning::BaseAccelerationTimeScale;
 
@@ -1413,6 +1425,7 @@ void UCharacterComponent::UpdateComponent(float DeltaTime, const FVector &MoveIn
         CurrentSpeed.Z = CalculateAcceleration(CurrentSpeed.Z, MoveInput.Z, BaseTime);
 
         Movement->MaxAcceleration = CharacterMovementTuning::FlyingMaxAcceleration;
+        Movement->BrakingDecelerationFlying = CharacterMovementTuning::FlyingBrakingDeceleration;
         Movement->MaxFlySpeed = UCharacterFunctionLibrary::IsStateActive(CharacterState, STATE_SPRINT)
             ? CharacterMovementTuning::FlyingSprintMaxSpeed
             : CharacterMovementTuning::FlyingMaxSpeed;
@@ -1586,6 +1599,17 @@ void UCharacterComponent::UpdateComponent(float DeltaTime, const FVector &MoveIn
     }
 
     UpdateRagdoll(DeltaTime, OwnerCharacter, MeshComp);
+}
+
+void UCharacterComponent::ReleasePlanarMovementInput()
+{
+    CurrentSpeed.X = 0.0f;
+    CurrentSpeed.Y = 0.0f;
+}
+
+void UCharacterComponent::ReleaseVerticalMovementInput()
+{
+    CurrentSpeed.Z = 0.0f;
 }
 
 void UCharacterComponent::ResetMovementState()
@@ -3200,6 +3224,12 @@ void UCharacterComponent::ActiveRagdoll(ACharacterController *InOwner, USkeletal
     }
 
     FActorHelper::DetachParent(SkeletalMesh, FDetachmentTransformRules::KeepWorldTransform);
+    // The mesh participates in world physics only while ragdoll is active. Normal character
+    // collision belongs to the capsule; using the Ragdoll profile outside this window lets the
+    // skeletal bodies fight the capsule and nearby overlap volumes.
+    SkeletalMesh->SetCollisionProfileName(RAGDOLL);
+    SkeletalMesh->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+    SkeletalMesh->SetGenerateOverlapEvents(true);
     SkeletalMesh->SetAllBodiesSimulatePhysics(true);
     UCharacterFunctionLibrary::BlendRagdoll(*SkeletalMesh, CharacterRagdollTuning::MaxBlendWeight);
     ApplyInitialRagdollVelocity(SkeletalMesh, InitialRagdollVelocity);
@@ -3272,6 +3302,8 @@ void UCharacterComponent::DeactiveRagdoll(ACharacterController *InOwner, USkelet
         // underwater deactivation feel like it popped before interpolation even began.
 
         UCharacterFunctionLibrary::DisableRagdollPhysicsButKeepSecondary(*SkeletalMesh);
+        SkeletalMesh->SetCollisionProfileName(TEXT("CharacterMesh"));
+        SkeletalMesh->SetGenerateOverlapEvents(false);
         RestoreRagdollCapsuleCollision();
         if (SkeletalMesh->GetAttachParent() != InOwner->GetCapsuleComponent())
         {
@@ -3303,6 +3335,8 @@ void UCharacterComponent::DeactiveRagdoll(ACharacterController *InOwner, USkelet
             ETeleportType::TeleportPhysics);
 
         UCharacterFunctionLibrary::DisableRagdollPhysicsButKeepSecondary(*SkeletalMesh);
+        SkeletalMesh->SetCollisionProfileName(TEXT("CharacterMesh"));
+        SkeletalMesh->SetGenerateOverlapEvents(false);
         RestoreRagdollCapsuleCollision();
         FActorHelper::AttachParent(SkeletalMesh, InOwner->GetCapsuleComponent(), FAttachmentTransformRules::KeepWorldTransform);
         SetSkeletalMeshLocationAndRotation(SkeletalMesh, CharacterRagdollTuning::MeshRecoveryRelativeLocation, CharacterRagdollTuning::MeshRecoveryRelativeRotation);
@@ -3355,6 +3389,8 @@ void UCharacterComponent::FinalizeRagdollRecovery(ACharacterController *InOwner,
     }
 
     UCharacterFunctionLibrary::DisableRagdollPhysicsButKeepSecondary(*SkeletalMesh);
+    SkeletalMesh->SetCollisionProfileName(TEXT("CharacterMesh"));
+    SkeletalMesh->SetGenerateOverlapEvents(false);
     FActorHelper::AttachParent(SkeletalMesh, InOwner->GetCapsuleComponent(), FAttachmentTransformRules::KeepWorldTransform);
     SetSkeletalMeshLocationAndRotation(SkeletalMesh, CharacterRagdollTuning::MeshRecoveryRelativeLocation, CharacterRagdollTuning::MeshRecoveryRelativeRotation);
     SkeletalMesh->SetVisibility(true, true);

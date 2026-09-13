@@ -1,10 +1,24 @@
 // Copyright © 2025 BxKangKi. Licensed under the MIT License.
 // Copyright © 2025 Epic Games, Inc. All rights reserved.
 
+/**
+ * @file StartWorldWidget.cpp
+ * 역할: 메뉴 버튼과 MainGameMode의 월드 실행 기능을 연결합니다.
+ * 핵심 기능: 선택 폴더·경로 조회, 메뉴·싱글·호스트·접속 버튼.
+ * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ */
+
 #include "UI/StartWorldWidget.h"
 
 #include "Components/Button.h"
-#include "World/StartActor.h"
+#include "GameFramework/PlayerController.h"
+#include "Engine/World.h"
+#include "GameMode/MainGameMode.h"
+#include "UI/ProjectSelectionWidget.h"
+#include "System/GameManagerSubSystem.h"
+#include "System/MacroLibrary.h"
+#include "Misc/Paths.h"
+#include "HAL/PlatformProcess.h"
 
 namespace
 {
@@ -25,87 +39,205 @@ void UStartWorldWidget::NativeConstruct()
 void UStartWorldWidget::NativeDestruct()
 {
     UnbindDefaultButtons();
+    if (IsValid(ProjectSelectionWidget))
+    {
+        ProjectSelectionWidget->SetOwnerStartWidget(nullptr);
+        ProjectSelectionWidget = nullptr;
+    }
     StartButton.Reset();
     WorldSelectionButton.Reset();
     BackButton.Reset();
     RefreshButton.Reset();
     MultiplayerButton.Reset();
+    SettingsButton.Reset();
+    ProjectsButton.Reset();
     HostButton.Reset();
     ClientButton.Reset();
     JoinButton.Reset();
-    StartActor.Reset();
+    MainGameMode.Reset();
     Super::NativeDestruct();
 }
 
-void UStartWorldWidget::SetStartActor(AStartActor* InStartActor)
+void UStartWorldWidget::SetMainGameMode(AMainGameMode* InMainGameMode)
 {
-    StartActor = InStartActor;
+    MainGameMode = InMainGameMode;
 }
 
 void UStartWorldWidget::ExecuteStartGame()
 {
-    if (AStartActor* Owner = StartActor.Get())
+    if (AMainGameMode* Owner = MainGameMode.Get())
     {
         Owner->StartGame();
         return;
     }
 
-    UE_LOG(LogTemp, Warning, TEXT("StartWorldWidget cannot start the game because StartActor is not assigned."));
+    UE_LOG(LogTemp, Warning, TEXT("StartWorldWidget cannot start the game because MainGameMode is not assigned."));
 }
 
 void UStartWorldWidget::ExecuteReturnToMainMenuFromWorldSelection()
 {
-    if (AStartActor* Owner = StartActor.Get())
+    if (AMainGameMode* Owner = MainGameMode.Get())
     {
         Owner->ReturnToMainMenuFromWorldSelection();
         return;
     }
 
-    UE_LOG(LogTemp, Warning, TEXT("StartWorldWidget cannot return to the main menu because StartActor is not assigned."));
+    UE_LOG(LogTemp, Warning, TEXT("StartWorldWidget cannot return to the main menu because MainGameMode is not assigned."));
 }
 
 void UStartWorldWidget::ExecuteShowStartMenu()
 {
-    if (AStartActor* Owner = StartActor.Get())
+    if (AMainGameMode* Owner = MainGameMode.Get())
     {
         Owner->ShowStartMenu();
         return;
     }
 
-    UE_LOG(LogTemp, Warning, TEXT("StartWorldWidget cannot show the start menu because StartActor is not assigned."));
+    UE_LOG(LogTemp, Warning, TEXT("StartWorldWidget cannot show the start menu because MainGameMode is not assigned."));
 }
 
 void UStartWorldWidget::ExecuteShowWorldSelectionMenu()
 {
-    if (AStartActor* Owner = StartActor.Get())
+    if (AMainGameMode* Owner = MainGameMode.Get())
     {
         Owner->ShowWorldSelectionMenu();
         return;
     }
 
-    UE_LOG(LogTemp, Warning, TEXT("StartWorldWidget cannot show the world-selection menu because StartActor is not assigned."));
+    UE_LOG(LogTemp, Warning, TEXT("StartWorldWidget cannot show the world-selection menu because MainGameMode is not assigned."));
 }
 
 void UStartWorldWidget::ExecuteShowMultiplayerMenu()
 {
-    if (AStartActor* Owner = StartActor.Get())
+    if (AMainGameMode* Owner = MainGameMode.Get())
     {
         Owner->ShowMultiplayerMenu();
         return;
     }
 
-    UE_LOG(LogTemp, Warning, TEXT("StartWorldWidget cannot show the multiplayer menu because StartActor is not assigned."));
+    UE_LOG(LogTemp, Warning, TEXT("StartWorldWidget cannot show the multiplayer menu because MainGameMode is not assigned."));
+}
+
+void UStartWorldWidget::ExecuteShowSettingsMenu()
+{
+    if (AMainGameMode* Owner = MainGameMode.Get())
+    {
+        Owner->ShowSettingsMenu();
+        return;
+    }
+
+    UE_LOG(LogTemp, Warning, TEXT("StartWorldWidget cannot show settings because MainGameMode is not assigned."));
+}
+
+void UStartWorldWidget::ExecuteShowProjectSelectionWidget()
+{
+    if (!IsValid(ProjectSelectionWidget))
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("Projects button requires ProjectSelectionWidgetClass in the central AssetRegistry or an explicit SetProjectSelectionWidget() override."));
+        return;
+    }
+
+    VisibilityBeforeProjectSelection = GetVisibility();
+    SetVisibility(ESlateVisibility::Collapsed);
+    ProjectSelectionWidget->SetOwnerStartWidget(this);
+    ProjectSelectionWidget->SetVisibility(ESlateVisibility::Visible);
+    ProjectSelectionWidget->RefreshProjects();
+    ApplyProjectSelectionInputMode(ProjectSelectionWidget.Get());
+}
+
+void UStartWorldWidget::CloseProjectSelectionWidget()
+{
+    if (IsValid(ProjectSelectionWidget))
+    {
+        ProjectSelectionWidget->SetVisibility(ESlateVisibility::Collapsed);
+    }
+
+    if (IsInViewport())
+    {
+        SetVisibility(VisibilityBeforeProjectSelection);
+        ApplyProjectSelectionInputMode(this);
+    }
+}
+
+void UStartWorldWidget::ToggleProjectSelectionWidget()
+{
+    if (IsValid(ProjectSelectionWidget)
+        && ProjectSelectionWidget->GetVisibility() != ESlateVisibility::Collapsed
+        && ProjectSelectionWidget->GetVisibility() != ESlateVisibility::Hidden)
+    {
+        CloseProjectSelectionWidget();
+    }
+    else
+    {
+        ExecuteShowProjectSelectionWidget();
+    }
+}
+
+void UStartWorldWidget::SetProjectSelectionWidget(UProjectSelectionWidget* InWidget)
+{
+    if (ProjectSelectionWidget == InWidget)
+    {
+        return;
+    }
+
+    if (IsValid(ProjectSelectionWidget))
+    {
+        ProjectSelectionWidget->SetOwnerStartWidget(nullptr);
+    }
+
+    ProjectSelectionWidget = InWidget;
+    if (IsValid(ProjectSelectionWidget))
+    {
+        ProjectSelectionWidget->SetOwnerStartWidget(this);
+        ProjectSelectionWidget->SetVisibility(ESlateVisibility::Collapsed);
+    }
+}
+
+void UStartWorldWidget::HandleProjectSelectionWidgetRemoved(UProjectSelectionWidget* RemovedWidget)
+{
+    if (ProjectSelectionWidget.Get() != RemovedWidget)
+    {
+        return;
+    }
+
+    ProjectSelectionWidget = nullptr;
+    if (IsInViewport())
+    {
+        SetVisibility(VisibilityBeforeProjectSelection);
+        ApplyProjectSelectionInputMode(this);
+    }
+}
+
+void UStartWorldWidget::ApplyProjectSelectionInputMode(UUserWidget* FocusWidget) const
+{
+    APlayerController* PlayerController = GetOwningPlayer();
+    if (!IsValid(PlayerController))
+    {
+        return;
+    }
+
+    FInputModeUIOnly InputMode;
+    // UIOnly logs an engine error if the requested Slate widget cannot accept keyboard focus.
+    // Mouse-only menu/loading roots do not need explicit focus.
+    if (IsValid(FocusWidget) && FocusWidget->IsFocusable())
+    {
+        InputMode.SetWidgetToFocus(FocusWidget->TakeWidget());
+    }
+    InputMode.SetLockMouseToViewportBehavior(EMouseLockMode::DoNotLock);
+    PlayerController->SetInputMode(InputMode);
+    PlayerController->bShowMouseCursor = true;
 }
 
 void UStartWorldWidget::ExecuteRefreshWorldSelectionData()
 {
-    if (AStartActor* Owner = StartActor.Get())
+    if (AMainGameMode* Owner = MainGameMode.Get())
     {
         Owner->RefreshWorldFolderNameMap();
         return;
     }
 
-    UE_LOG(LogTemp, Warning, TEXT("StartWorldWidget cannot refresh world-selection data because StartActor is not assigned."));
+    UE_LOG(LogTemp, Warning, TEXT("StartWorldWidget cannot refresh world-selection data because MainGameMode is not assigned."));
 }
 
 void UStartWorldWidget::BindDefaultButtons()
@@ -141,6 +273,18 @@ void UStartWorldWidget::BindDefaultButtons()
     {
         Button->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteShowMultiplayerMenu);
         Button->OnClicked.AddDynamic(this, &UStartWorldWidget::ExecuteShowMultiplayerMenu);
+    }
+
+    if (UButton* Button = SettingsButton.Get())
+    {
+        Button->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteShowSettingsMenu);
+        Button->OnClicked.AddDynamic(this, &UStartWorldWidget::ExecuteShowSettingsMenu);
+    }
+
+    if (UButton* Button = ProjectsButton.Get())
+    {
+        Button->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteShowProjectSelectionWidget);
+        Button->OnClicked.AddDynamic(this, &UStartWorldWidget::ExecuteShowProjectSelectionWidget);
     }
 
     if (UButton* Button = HostButton.Get())
@@ -187,6 +331,16 @@ void UStartWorldWidget::UnbindDefaultButtons()
     if (UButton* Button = MultiplayerButton.Get())
     {
         Button->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteShowMultiplayerMenu);
+    }
+
+    if (UButton* Button = SettingsButton.Get())
+    {
+        Button->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteShowSettingsMenu);
+    }
+
+    if (UButton* Button = ProjectsButton.Get())
+    {
+        Button->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteShowProjectSelectionWidget);
     }
 
     if (UButton* Button = HostButton.Get())
@@ -286,6 +440,34 @@ void UStartWorldWidget::SetMultiplayerButton(UButton* InButton)
     }
 }
 
+void UStartWorldWidget::SetSettingsButton(UButton* InButton)
+{
+    if (UButton* Button = SettingsButton.Get())
+    {
+        Button->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteShowSettingsMenu);
+    }
+    SettingsButton = InButton;
+    if (IsValid(InButton))
+    {
+        InButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteShowSettingsMenu);
+        InButton->OnClicked.AddDynamic(this, &UStartWorldWidget::ExecuteShowSettingsMenu);
+    }
+}
+
+void UStartWorldWidget::SetProjectsButton(UButton* InButton)
+{
+    if (UButton* Button = ProjectsButton.Get())
+    {
+        Button->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteShowProjectSelectionWidget);
+    }
+    ProjectsButton = InButton;
+    if (IsValid(InButton))
+    {
+        InButton->OnClicked.RemoveDynamic(this, &UStartWorldWidget::ExecuteShowProjectSelectionWidget);
+        InButton->OnClicked.AddDynamic(this, &UStartWorldWidget::ExecuteShowProjectSelectionWidget);
+    }
+}
+
 void UStartWorldWidget::SetHostButton(UButton* InButton)
 {
     if (UButton* Button = HostButton.Get())
@@ -376,6 +558,14 @@ bool UStartWorldWidget::ResolveWorldFolderName(const FString& FolderOrDisplayNam
     return false;
 }
 
+FString UStartWorldWidget::GetSelectedWorldRootPath() const
+{
+    FString Folder;
+    if (!UGameManagerSubSystem::TryNormalizeWorldFolderName(SelectedWorldFolderName, Folder, true))
+        return FString();
+    return FPaths::ConvertRelativePathToFull(FPaths::Combine(PATH_ROOT, Folder));
+}
+
 bool UStartWorldWidget::OpenSelectedWorld()
 {
     return OpenWorldByFolderName(SelectedWorldFolderName);
@@ -391,13 +581,13 @@ bool UStartWorldWidget::OpenWorldByFolderName(const FString& WorldFolderName)
     }
 
     SelectedWorldFolderName = ResolvedFolderName;
-    if (AStartActor* Owner = StartActor.Get())
+    if (AMainGameMode* Owner = MainGameMode.Get())
     {
         Owner->OpenSinglePlayerWorldByFolderName(ResolvedFolderName);
         return true;
     }
 
-    UE_LOG(LogTemp, Warning, TEXT("StartWorldWidget cannot open world %s because StartActor is not assigned."), *ResolvedFolderName);
+    UE_LOG(LogTemp, Warning, TEXT("StartWorldWidget cannot open world %s because MainGameMode is not assigned."), *ResolvedFolderName);
     return false;
 }
 
@@ -421,13 +611,13 @@ bool UStartWorldWidget::HostWorldByFolderName(const FString& WorldFolderName)
     }
 
     SelectedWorldFolderName = ResolvedFolderName;
-    if (AStartActor* Owner = StartActor.Get())
+    if (AMainGameMode* Owner = MainGameMode.Get())
     {
         Owner->HostMultiplayerWorldByFolderName(ResolvedFolderName);
         return true;
     }
 
-    UE_LOG(LogTemp, Warning, TEXT("StartWorldWidget cannot host world because StartActor is not assigned."));
+    UE_LOG(LogTemp, Warning, TEXT("StartWorldWidget cannot host world because MainGameMode is not assigned."));
     return false;
 }
 
@@ -438,26 +628,26 @@ void UStartWorldWidget::ExecuteJoinSelectedWorld()
 
 bool UStartWorldWidget::JoinSelectedWorld()
 {
-    if (AStartActor* Owner = StartActor.Get())
+    if (AMainGameMode* Owner = MainGameMode.Get())
     {
         Owner->JoinMultiplayerServer(ServerAddress, SelectedWorldFolderName);
         return true;
     }
 
-    UE_LOG(LogTemp, Warning, TEXT("StartWorldWidget cannot join multiplayer because StartActor is not assigned."));
+    UE_LOG(LogTemp, Warning, TEXT("StartWorldWidget cannot join multiplayer because MainGameMode is not assigned."));
     return false;
 }
 
 bool UStartWorldWidget::JoinServer(const FString& InServerAddress)
 {
     SetServerAddress(InServerAddress);
-    if (AStartActor* Owner = StartActor.Get())
+    if (AMainGameMode* Owner = MainGameMode.Get())
     {
         Owner->JoinMultiplayerServer(ServerAddress, SelectedWorldFolderName);
         return true;
     }
 
-    UE_LOG(LogTemp, Warning, TEXT("StartWorldWidget cannot join server because StartActor is not assigned."));
+    UE_LOG(LogTemp, Warning, TEXT("StartWorldWidget cannot join server because MainGameMode is not assigned."));
     return false;
 }
 
@@ -468,13 +658,13 @@ void UStartWorldWidget::ExecuteOpenClientConnectionWorld()
 
 bool UStartWorldWidget::OpenClientConnectionWorld()
 {
-    if (AStartActor* Owner = StartActor.Get())
+    if (AMainGameMode* Owner = MainGameMode.Get())
     {
         Owner->OpenClientConnectionWorld(ServerAddress);
         return true;
     }
 
-    UE_LOG(LogTemp, Warning, TEXT("StartWorldWidget cannot open ClientWorld because StartActor is not assigned."));
+    UE_LOG(LogTemp, Warning, TEXT("StartWorldWidget cannot open ClientWorld because MainGameMode is not assigned."));
     return false;
 }
 
@@ -486,7 +676,7 @@ void UStartWorldWidget::SetServerAddress(const FString& InServerAddress)
         ServerAddress = TEXT("127.0.0.1:7777");
     }
 
-    if (AStartActor* Owner = StartActor.Get())
+    if (AMainGameMode* Owner = MainGameMode.Get())
     {
         Owner->SetPendingServerAddress(ServerAddress);
     }
@@ -494,7 +684,7 @@ void UStartWorldWidget::SetServerAddress(const FString& InServerAddress)
 
 TMap<FString, FString> UStartWorldWidget::GetFolderNameMap() const
 {
-    if (const AStartActor* Owner = StartActor.Get())
+    if (const AMainGameMode* Owner = MainGameMode.Get())
     {
         return Owner->GetFolderNameMap();
     }

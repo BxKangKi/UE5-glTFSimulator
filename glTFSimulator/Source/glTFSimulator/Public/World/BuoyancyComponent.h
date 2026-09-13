@@ -1,5 +1,12 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
+/**
+ * @file BuoyancyComponent.h
+ * 역할: 물에 잠긴 물체의 부력과 저항을 계산합니다.
+ * 핵심 기능: 샘플 기반 잠김 계산, 부력·항력, 물리 힘 적용.
+ * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"

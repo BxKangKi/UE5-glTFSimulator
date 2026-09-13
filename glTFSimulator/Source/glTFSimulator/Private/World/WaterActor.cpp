@@ -1,7 +1,16 @@
 // Copyright © 2025 BxKangKi. Licensed under the MIT License.
 // Copyright © 2025 Epic Games, Inc. All rights reserved.
 
+/**
+ * @file WaterActor.cpp
+ * 역할: 물 영역과 수면 질의를 제공합니다.
+ * 핵심 기능: 수면 높이·영역 검사, overlap과 물 상호작용.
+ * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ */
+
 #include "World/WaterActor.h"
+#include "System/GlTFSimulatorGameInstance.h"
+#include "System/GlTFSimulatorAssetRegistry.h"
 #include "Character/CharacterController.h"
 #include "Interface/WaterInteract.h"
 #include "Components/BoxComponent.h"
@@ -57,14 +66,20 @@ AWaterActor::AWaterActor()
     RootComponent = CreateDefaultSubobject<USceneComponent>(TEXT("Root"));
     Decal = CreateDefaultSubobject<UDecalComponent>(TEXT("StaticMesh"));
     Decal->SetupAttachment(RootComponent);
-    Decal->SetWorldLocation(FVector(0.0f, 0.0f, -1.0f));
+    Decal->SetRelativeLocation(FVector(0.0f, 0.0f, -1.0f));
     Decal->DecalSize = FVector(1.0f, 1.0f, 1.0f);
     Collision = CreateDefaultSubobject<UBoxComponent>(TEXT("Collision"));
     Collision->SetupAttachment(RootComponent);
-    Collision->SetWorldLocation(FVector(0.0f, 0.0f, -1.0f));
+    Collision->SetRelativeLocation(FVector(0.0f, 0.0f, -1.0f));
     Collision->SetBoxExtent(FVector(1.0f, 1.0f, 1.0f));
     Collision->SetEnableGravity(false);
     Collision->SetVisibility(false);
+    // Water is a trigger/query volume, never a solid physics wall. The old default primitive
+    // response could block capsules and ragdoll bodies depending on the project collision preset.
+    Collision->SetCollisionEnabled(ECollisionEnabled::QueryOnly);
+    Collision->SetCollisionResponseToAllChannels(ECR_Overlap);
+    Collision->SetGenerateOverlapEvents(true);
+    Collision->SetCanEverAffectNavigation(false);
     PostProcess = CreateDefaultSubobject<UPostProcessComponent>(TEXT("PostProces"));
     PostProcess->SetupAttachment(Collision);
     PostProcess->bUnbound = false;
@@ -74,12 +89,51 @@ AWaterActor::AWaterActor()
     StaticMesh->SetupAttachment(RootComponent);
     StaticMesh->SetEnableGravity(false);
     StaticMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+    StaticMesh->SetGenerateOverlapEvents(false);
     StaticMesh->SetCastShadow(false);
+    StaticMesh->SetVisibility(true, true);
+    StaticMesh->SetHiddenInGame(false, true);
 }
 
 void AWaterActor::BeginPlay()
 {
     Super::BeginPlay();
+
+    // Re-assert native water collision at runtime as Blueprint subclasses may carry older serialized
+    // component presets that override constructor defaults. Water must overlap, never block.
+    if (IsValid(Collision.Get()))
+    {
+        Collision->SetCollisionEnabled(ECollisionEnabled::QueryOnly);
+        Collision->SetCollisionResponseToAllChannels(ECR_Overlap);
+        Collision->SetGenerateOverlapEvents(true);
+        Collision->SetCanEverAffectNavigation(false);
+    }
+    if (IsValid(StaticMesh.Get()))
+    {
+        StaticMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+        StaticMesh->SetGenerateOverlapEvents(false);
+        StaticMesh->SetVisibility(true, true);
+        StaticMesh->SetHiddenInGame(false, true);
+    }
+
+    if (UGlTFSimulatorAssetRegistry* Registry = UGlTFSimulatorGameInstance::GetAssetRegistryFromContext(this))
+    {
+        DecalMaterial = Registry->WaterDecalMaterial.IsNull()
+            ? nullptr : Registry->WaterDecalMaterial.LoadSynchronous();
+        UnderWaterMaterial = Registry->UnderWaterMaterial.IsNull()
+            ? nullptr : Registry->UnderWaterMaterial.LoadSynchronous();
+        if (IsValid(StaticMesh) && !Registry->WaterMesh.IsNull())
+        {
+            StaticMesh->SetStaticMesh(Registry->WaterMesh.LoadSynchronous());
+        }
+    }
+    if (!IsValid(StaticMesh.Get()) || !IsValid(StaticMesh->GetStaticMesh()))
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("Water actor has no render mesh. Actor=%s Class=%s; configure AssetRegistry.WaterMesh or a derived WaterActor visual."),
+            *GetName(), *GetNameSafe(GetClass()));
+    }
+
     RegisterWaterActor(this);
     SetCurrentLevel();
     APhysicsVolume *Volume = Collision->GetPhysicsVolume();
@@ -87,13 +141,13 @@ void AWaterActor::BeginPlay()
     {
         Volume->bWaterVolume = true;
     }
-    UMaterialInstanceDynamic *DecalMID = UMaterialInstanceDynamic::Create(DecalMaterial, this);
+    UMaterialInstanceDynamic *DecalMID = IsValid(DecalMaterial) ? UMaterialInstanceDynamic::Create(DecalMaterial, this) : nullptr;
     if (DecalMID)
     {
         DecalMID->SetScalarParameterValue(TEXT("WaterLevel"), Level);
         Decal->SetDecalMaterial(DecalMID);
     }
-    UMaterialInstanceDynamic *PostProcessMID = UMaterialInstanceDynamic::Create(UnderWaterMaterial, this);
+    UMaterialInstanceDynamic *PostProcessMID = IsValid(UnderWaterMaterial) ? UMaterialInstanceDynamic::Create(UnderWaterMaterial, this) : nullptr;
     if (PostProcessMID)
     {
         // 2. Add this to the post-process component Blendables array with weight 1.0.

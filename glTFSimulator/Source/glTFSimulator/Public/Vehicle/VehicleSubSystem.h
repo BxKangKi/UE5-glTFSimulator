@@ -1,5 +1,12 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
+/**
+ * @file VehicleSubSystem.h
+ * 역할: 월드 차량의 업데이트와 제어 계산을 통합합니다.
+ * 핵심 기능: 차량 등록, GT 스냅샷, 병렬 제어 계산·결과 적용.
+ * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"

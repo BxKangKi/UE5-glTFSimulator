@@ -1,5 +1,12 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
+/**
+ * @file GlbValidation.h
+ * 역할: 외부 GLB 파일의 구조와 읽기 범위를 검사합니다.
+ * 핵심 기능: 헤더·청크·크기 검증, 경로 정규화, 잘못된 입력 거부.
+ * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"
@@ -10,24 +17,13 @@ namespace GlbValidation
     /** Converts a supplied file path to a normalized absolute path. */
     GLTFSIMULATOR_API FString NormalizePath(const FString& FilePath);
 
-    /** Validates the outer .glb or placement-only .inst.glb container without parsing mesh data. */
+    /** Validates a binary glTF container without parsing mesh data. */
     GLTFSIMULATOR_API bool ValidateFile(const FString& FilePath, FString& OutReason);
 
     /**
-     * Performs the expensive runtime-mesh preflight on a worker thread before glTFRuntime is called.
-     * The check validates JSON types, buffers, buffer views, accessors, primitive counts, LOD build
-     * totals and estimated allocation limits so malformed input cannot request impossible TArray sizes.
+     * Performs the expensive authoring preflight on a worker before the build-only glTFRuntime
+     * parser is called. JSON types, buffer ranges, accessors, primitives and allocation estimates
+     * are bounded so malformed source data cannot request impossible native allocations.
      */
-    GLTFSIMULATOR_API bool ValidateRuntimeMeshFile(const FString& FilePath, FString& OutReason);
-
-    /**
-     * Validates a runtime entity model while preserving both supported container types.
-     * Binary .glb files receive the full allocation/range preflight above. JSON .gltf files are
-     * parsed with bounded JSON limits and every local external buffer/image URI is checked before
-     * glTFRuntime is allowed to open the model.
-     */
-    GLTFSIMULATOR_API bool ValidateRuntimeModelFile(const FString& FilePath, FString& OutReason);
-
-    /** Validates a runtime mesh file and the additional node/skin requirements for a character GLB. */
-    GLTFSIMULATOR_API bool ValidateCharacterFile(const FString& FilePath, FString& OutReason);
+    GLTFSIMULATOR_API bool ValidateBuildSourceFile(const FString& FilePath, FString& OutReason);
 }

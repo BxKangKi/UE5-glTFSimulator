@@ -1,5 +1,12 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
+/**
+ * @file WorldData.cpp
+ * 역할: 월드 설정과 실행 상태의 데이터 모델입니다.
+ * 핵심 기능: config JSON 변환, 시간·날씨·플레이어 선택 설정.
+ * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ */
+
 #include "World/WorldData.h"
 #include "System/MacroLibrary.h"
 
@@ -175,12 +182,14 @@ UWorldData::UWorldData()
 {
     Version = JSON_SCHEMA_VERSION;
     WorldName = TEXT("New World");
-    WorldTime = 0.0f;
     Latitude = 38.0f;
     Longitude = 127.0f;
     AxialTilt = 23.5f;
     OneYearDays = 365.0f;
     OneDayTime = 24.0f * 60.0f * 60.0f;
+    // A new .dat starts at local noon. With no star-dome dependency, midnight is correctly
+    // almost black and was easily mistaken for a missing WorldEnvManager during the first Play.
+    WorldTime = OneDayTime * 0.5f;
     TimeSpeed = 60.0f;
     bOcean = false;
     PlayerLocation = FVector::ZeroVector;
@@ -208,7 +217,7 @@ TSharedRef<FJsonObject> UWorldData::SerializeData(UWorldData *Data)
     Json->SetBoolField(OCEAN, Data->bOcean);
 
     // Runtime time, selected player, and player transforms are intentionally omitted. config.json
-    // is map-author-owned read-only configuration; mutable state lives under data/*.dat.
+    // is map-author-owned read-only configuration; mutable state lives in WorldName.dat.
 
     Json->SetObjectField(TEXT("Cloud"), Data->Cloud.ToJson());
     Json->SetObjectField(TEXT("Weather"), Data->Weather.ToJson());

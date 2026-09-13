@@ -1,5 +1,12 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
+/**
+ * @file CreatorHUDWidget.cpp
+ * 역할: 제작 모드 HUD와 게임 매니저를 연결합니다.
+ * 핵심 기능: 명시적 위젯 참조, toolbar·상태·빌드 진행 표시.
+ * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ */
+
 #include "UI/CreatorHUDWidget.h"
 
 #include "Components/Border.h"
@@ -12,8 +19,8 @@ static FString MakeKindLabel(EToolbarItemKind Kind)
 {
     switch (Kind)
     {
-    case EToolbarItemKind::Prefab:
-        return TEXT("Prefab");
+    case EToolbarItemKind::Static:
+        return TEXT("Static");
     case EToolbarItemKind::Weapon:
         return TEXT("Weapon");
     case EToolbarItemKind::Vehicle:
@@ -138,16 +145,17 @@ void UCreatorHUDWidget::RefreshItemList()
     // No native fallback item buttons are generated here anymore.
     // User-authored WBP graphs should build their own list and call SelectAvailableItemFromUI().
 
-    if (IsValid(AssignedItemListPanel.Get()))
+    if (UWidget* const ItemListPanel = AssignedItemListPanel.Get(); IsValid(ItemListPanel))
     {
         const UGameManagerSubSystem* Manager = GetGameManager();
         const ESlateVisibility NewVisibility =
             IsValid(Manager) && Manager->IsItemListWindowOpen()
                 ? ESlateVisibility::Visible
                 : ESlateVisibility::Collapsed;
-        if (AssignedItemListPanel.Get()->GetVisibility() != NewVisibility)
+        // Resolve the weak widget once so every access in this game-thread call observes one object.
+        if (ItemListPanel->GetVisibility() != NewVisibility)
         {
-            AssignedItemListPanel.Get()->SetVisibility(NewVisibility);
+            ItemListPanel->SetVisibility(NewVisibility);
         }
     }
 }
@@ -166,16 +174,17 @@ void UCreatorHUDWidget::RefreshStatus()
     {
         SetTextIfChanged(AssignedMessageText.Get(), GetMessageText());
     }
-    if (IsValid(AssignedItemListPanel.Get()))
+    if (UWidget* const ItemListPanel = AssignedItemListPanel.Get(); IsValid(ItemListPanel))
     {
         const UGameManagerSubSystem* Manager = GetGameManager();
         const ESlateVisibility NewVisibility =
             IsValid(Manager) && Manager->IsItemListWindowOpen()
                 ? ESlateVisibility::Visible
                 : ESlateVisibility::Collapsed;
-        if (AssignedItemListPanel.Get()->GetVisibility() != NewVisibility)
+        // Resolve the weak widget once so every access in this game-thread call observes one object.
+        if (ItemListPanel->GetVisibility() != NewVisibility)
         {
-            AssignedItemListPanel.Get()->SetVisibility(NewVisibility);
+            ItemListPanel->SetVisibility(NewVisibility);
         }
     }
 }

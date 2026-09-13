@@ -1,5 +1,12 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
+/**
+ * @file InstancedEntitySubsystem.cpp
+ * 역할: 동적 객체의 인스턴스 렌더 데이터를 조정합니다.
+ * 핵심 기능: 모델별 렌더 그룹과 인스턴스 매핑 관리.
+ * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ */
+
 #include "Model/InstancedEntitySubsystem.h"
 
 #include "Async/ParallelFor.h"
@@ -9,10 +16,9 @@
 #include "GameFramework/Actor.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
-#include "HAL/FileManager.h"
 #include "Model/InstancedEntityRenderActor.h"
-#include "System/GlbValidation.h"
 #include "System/GameUpdateSubSystem.h"
+#include "System/WorldArchive.h"
 
 namespace
 {
@@ -160,20 +166,12 @@ void UInstancedEntitySubsystem::Deinitialize()
     Super::Deinitialize();
 }
 
-FString UInstancedEntitySubsystem::MakeResourceKey(const FString& SourceFilePath) const
+FString UInstancedEntitySubsystem::MakeResourceKey(const FString& ModelReference) const
 {
-    if (SourceFilePath.IsEmpty())
-    {
-        return FString();
-    }
-
-    FString ResourceKey = GlbValidation::NormalizePath(SourceFilePath);
-#if PLATFORM_WINDOWS
-    // Windows paths are case-insensitive. Canonicalizing the key avoids creating duplicate
-    // render resources when the same file arrives through differently-cased replicated paths.
-    ResourceKey.ToLowerInline();
-#endif
-    return ResourceKey;
+    FGuid ModelUUID;
+    return FGWorldArchive::ParseModelReference(ModelReference, ModelUUID)
+        ? FGWorldArchive::MakeModelReference(ModelUUID)
+        : FString();
 }
 
 AInstancedEntityRenderActor* UInstancedEntitySubsystem::GetOrCreateRenderActor(const FString& ResourceKey)
@@ -217,7 +215,7 @@ AInstancedEntityRenderActor* UInstancedEntitySubsystem::GetOrCreateRenderActor(c
 }
 
 int32 UInstancedEntitySubsystem::RegisterEntity(
-    const FString& SourceFilePath,
+    const FString& ModelReference,
     AActor* Owner,
     UPrimitiveComponent* PhysicsRoot,
     const TArray<FInstancedEntityMeshPart>& MeshParts,
@@ -231,12 +229,12 @@ int32 UInstancedEntitySubsystem::RegisterEntity(
         return INDEX_NONE;
     }
 
-    const FString NormalizedSourcePath = GlbValidation::NormalizePath(SourceFilePath);
-    if (NormalizedSourcePath.IsEmpty() || !IFileManager::Get().FileExists(*NormalizedSourcePath))
+    const FString ResourceKey = MakeResourceKey(ModelReference);
+    if (ResourceKey.IsEmpty())
     {
         UE_LOG(LogTemp, Warning,
-            TEXT("InstancedEntitySubsystem: source file is missing; registration skipped. Path=%s"),
-            *NormalizedSourcePath);
+            TEXT("InstancedEntitySubsystem: non-.gwd model reference rejected. Reference=%s"),
+            *ModelReference);
         return INDEX_NONE;
     }
 
@@ -250,7 +248,6 @@ int32 UInstancedEntitySubsystem::RegisterEntity(
         }
     }
 
-    const FString ResourceKey = MakeResourceKey(NormalizedSourcePath);
     AInstancedEntityRenderActor* RenderActor = GetOrCreateRenderActor(ResourceKey);
     if (!IsValid(RenderActor))
     {
@@ -313,19 +310,19 @@ int32 UInstancedEntitySubsystem::RegisterEntity(
     }
     RenderActor->FlushDirtyTransforms();
 
-    if (Options.bStoreAsPrefabTemplate)
+    if (Options.bStoreAsEntityTemplate)
     {
         FResourceState& ResourceState = ResourceStates.FindOrAdd(ResourceKey);
-        if (ResourceState.PrefabTemplateParts.Num() == 0)
+        if (ResourceState.EntityTemplateParts.Num() == 0)
         {
-            ResourceState.PrefabTemplateParts.Reserve(Registration.Parts.Num());
+            ResourceState.EntityTemplateParts.Reserve(Registration.Parts.Num());
             for (const FEntityPartBinding& Binding : Registration.Parts)
             {
-                FPrefabTemplatePart& TemplatePart = ResourceState.PrefabTemplateParts.AddDefaulted_GetRef();
+                FEntityTemplatePart& TemplatePart = ResourceState.EntityTemplateParts.AddDefaulted_GetRef();
                 TemplatePart.MeshKey = Binding.MeshKey;
                 TemplatePart.LocalTransform = Binding.LocalTransform;
             }
-            ResourceState.PrefabTemplateBounds = LocalBounds;
+            ResourceState.EntityTemplateBounds = LocalBounds;
         }
     }
 
@@ -337,7 +334,7 @@ int32 UInstancedEntitySubsystem::RegisterEntity(
             ResourceState.VehicleTemplateParts.Reserve(Registration.Parts.Num());
             for (const FEntityPartBinding& Binding : Registration.Parts)
             {
-                FPrefabTemplatePart& TemplatePart = ResourceState.VehicleTemplateParts.AddDefaulted_GetRef();
+                FEntityTemplatePart& TemplatePart = ResourceState.VehicleTemplateParts.AddDefaulted_GetRef();
                 TemplatePart.MeshKey = Binding.MeshKey;
                 TemplatePart.LocalTransform = Binding.LocalTransform;
             }
@@ -351,8 +348,8 @@ int32 UInstancedEntitySubsystem::RegisterEntity(
 }
 
 
-int32 UInstancedEntitySubsystem::RegisterEntityFromPrefabTemplate(
-    const FString& SourceFilePath,
+int32 UInstancedEntitySubsystem::RegisterEntityFromEntityTemplate(
+    const FString& ModelReference,
     AActor* Owner,
     UPrimitiveComponent* PhysicsRoot,
     const FInstancedEntityRegistrationOptions& Options,
@@ -361,18 +358,18 @@ int32 UInstancedEntitySubsystem::RegisterEntityFromPrefabTemplate(
     check(IsInGameThread());
     OutLocalBounds.Init();
 
-    const FString ResourceKey = MakeResourceKey(SourceFilePath);
+    const FString ResourceKey = MakeResourceKey(ModelReference);
     const FResourceState* ResourceState = ResourceStates.Find(ResourceKey);
     const TObjectPtr<AInstancedEntityRenderActor>* RenderActorPtr = RenderActors.Find(ResourceKey);
     AInstancedEntityRenderActor* RenderActor = RenderActorPtr ? RenderActorPtr->Get() : nullptr;
-    if (!ResourceState || ResourceState->PrefabTemplateParts.Num() == 0 || !IsValid(RenderActor))
+    if (!ResourceState || ResourceState->EntityTemplateParts.Num() == 0 || !IsValid(RenderActor))
     {
         return INDEX_NONE;
     }
 
     TArray<FInstancedEntityMeshPart> MeshParts;
-    MeshParts.Reserve(ResourceState->PrefabTemplateParts.Num());
-    for (const FPrefabTemplatePart& TemplatePart : ResourceState->PrefabTemplateParts)
+    MeshParts.Reserve(ResourceState->EntityTemplateParts.Num());
+    for (const FEntityTemplatePart& TemplatePart : ResourceState->EntityTemplateParts)
     {
         UStaticMesh* Mesh = RenderActor->FindMesh(TemplatePart.MeshKey);
         if (!IsValid(Mesh))
@@ -386,21 +383,21 @@ int32 UInstancedEntitySubsystem::RegisterEntityFromPrefabTemplate(
         Part.LocalTransform = TemplatePart.LocalTransform;
     }
 
-    OutLocalBounds = ResourceState->PrefabTemplateBounds;
+    OutLocalBounds = ResourceState->EntityTemplateBounds;
     FInstancedEntityRegistrationOptions TemplateOptions = Options;
-    TemplateOptions.bStoreAsPrefabTemplate = false;
-    return RegisterEntity(SourceFilePath, Owner, PhysicsRoot, MeshParts, TemplateOptions, OutLocalBounds);
+    TemplateOptions.bStoreAsEntityTemplate = false;
+    return RegisterEntity(ModelReference, Owner, PhysicsRoot, MeshParts, TemplateOptions, OutLocalBounds);
 }
 
 int32 UInstancedEntitySubsystem::RegisterVehicleEntityFromTemplate(
-    const FString& SourceFilePath,
+    const FString& ModelReference,
     AActor* Owner,
     UPrimitiveComponent* PhysicsRoot,
     const FInstancedEntityRegistrationOptions& Options)
 {
     check(IsInGameThread());
 
-    const FString ResourceKey = MakeResourceKey(SourceFilePath);
+    const FString ResourceKey = MakeResourceKey(ModelReference);
     const FResourceState* ResourceState = ResourceStates.Find(ResourceKey);
     const TObjectPtr<AInstancedEntityRenderActor>* RenderActorPtr = RenderActors.Find(ResourceKey);
     AInstancedEntityRenderActor* RenderActor = RenderActorPtr ? RenderActorPtr->Get() : nullptr;
@@ -415,7 +412,7 @@ int32 UInstancedEntitySubsystem::RegisterVehicleEntityFromTemplate(
 
     TArray<FInstancedEntityMeshPart> MeshParts;
     MeshParts.Reserve(ResourceState->VehicleTemplateParts.Num());
-    for (const FPrefabTemplatePart& TemplatePart : ResourceState->VehicleTemplateParts)
+    for (const FEntityTemplatePart& TemplatePart : ResourceState->VehicleTemplateParts)
     {
         UStaticMesh* Mesh = RenderActor->FindMesh(TemplatePart.MeshKey);
         if (!IsValid(Mesh))
@@ -430,11 +427,11 @@ int32 UInstancedEntitySubsystem::RegisterVehicleEntityFromTemplate(
     }
 
     FInstancedEntityRegistrationOptions TemplateOptions = Options;
-    TemplateOptions.bStoreAsPrefabTemplate = false;
+    TemplateOptions.bStoreAsEntityTemplate = false;
     TemplateOptions.bStoreAsVehicleTemplate = false;
     const FBox CombinedLocalBounds = ResourceState->VehicleTemplateData.CombinedLocalBounds;
     return RegisterEntity(
-        SourceFilePath,
+        ModelReference,
         Owner,
         PhysicsRoot,
         MeshParts,
@@ -443,11 +440,11 @@ int32 UInstancedEntitySubsystem::RegisterVehicleEntityFromTemplate(
 }
 
 bool UInstancedEntitySubsystem::GetVehicleTemplateData(
-    const FString& SourceFilePath,
+    const FString& ModelReference,
     FInstancedVehicleTemplateData& OutTemplateData) const
 {
     OutTemplateData = FInstancedVehicleTemplateData();
-    const FString ResourceKey = MakeResourceKey(SourceFilePath);
+    const FString ResourceKey = MakeResourceKey(ModelReference);
     const FResourceState* ResourceState = ResourceStates.Find(ResourceKey);
     const TObjectPtr<AInstancedEntityRenderActor>* RenderActorPtr = RenderActors.Find(ResourceKey);
     if (!ResourceState
@@ -473,7 +470,7 @@ bool UInstancedEntitySubsystem::GetVehicleTemplateData(
 }
 
 bool UInstancedEntitySubsystem::StoreVehicleTemplateData(
-    const FString& SourceFilePath,
+    const FString& ModelReference,
     const FInstancedVehicleTemplateData& TemplateData)
 {
     check(IsInGameThread());
@@ -483,7 +480,7 @@ bool UInstancedEntitySubsystem::StoreVehicleTemplateData(
         return false;
     }
 
-    const FString ResourceKey = MakeResourceKey(SourceFilePath);
+    const FString ResourceKey = MakeResourceKey(ModelReference);
     FResourceState* ResourceState = ResourceStates.Find(ResourceKey);
     if (!ResourceState || ResourceState->VehicleTemplateParts.Num() == 0)
     {
@@ -641,9 +638,9 @@ bool UInstancedEntitySubsystem::IsEntityPhysicsActive(int32 RegistrationId) cons
     return Registration && !Registration->bPhysicsSuspended;
 }
 
-UStaticMesh* UInstancedEntitySubsystem::FindSharedMesh(const FString& SourceFilePath, int32 MeshKey) const
+UStaticMesh* UInstancedEntitySubsystem::FindSharedMesh(const FString& ModelReference, int32 MeshKey) const
 {
-    const FString ResourceKey = MakeResourceKey(SourceFilePath);
+    const FString ResourceKey = MakeResourceKey(ModelReference);
     const TObjectPtr<AInstancedEntityRenderActor>* ActorPtr = RenderActors.Find(ResourceKey);
     return ActorPtr && IsValid(ActorPtr->Get()) ? ActorPtr->Get()->FindMesh(MeshKey) : nullptr;
 }

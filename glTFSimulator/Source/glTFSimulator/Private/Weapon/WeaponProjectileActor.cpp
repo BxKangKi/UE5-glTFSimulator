@@ -1,5 +1,12 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
+/**
+ * @file WeaponProjectileActor.cpp
+ * 역할: 서버 권한의 경량 투사체 액터입니다.
+ * 핵심 기능: 통합 업데이트 이동, 충돌·수명 종료.
+ * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ */
+
 #include "Weapon/WeaponProjectileActor.h"
 
 #include "Components/SphereComponent.h"

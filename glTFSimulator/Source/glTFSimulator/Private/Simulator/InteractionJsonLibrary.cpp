@@ -1,3 +1,10 @@
+/**
+ * @file InteractionJsonLibrary.cpp
+ * 역할: 상호작용 설정과 JSON을 변환합니다.
+ * 핵심 기능: 상호작용 데이터 직렬화·역직렬화.
+ * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ */
+
 #include "Simulator/InteractionJsonLibrary.h"
 
 #include "JsonObjectConverter.h"

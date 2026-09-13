@@ -1,3 +1,10 @@
+/**
+ * @file NodeTokenTests.cpp
+ * 역할: 노드 이름 토큰 해석을 검증합니다.
+ * 핵심 기능: 토큰 정규화·유효성 회귀 테스트.
+ * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ */
+
 #include "Simulator/NodeTokenLibrary.h"
 #include "Misc/AutomationTest.h"
 
@@ -8,14 +15,11 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FSimulatorNodeTokenContractTest,
 
 bool FSimulatorNodeTokenContractTest::RunTest(const FString& Parameters)
 {
-    const FSimulatorParsedNodeName Bare = USimulatorNodeTokenLibrary::ParseNodeName(TEXT("BodyINST"));
-    TestFalse(TEXT("A bare suffix is not a directive"), Bare.HasEffectiveToken(TEXT("INST")));
-
     const FSimulatorParsedNodeName Alias = USimulatorNodeTokenLibrary::ParseNodeName(TEXT("wheel_front"));
     TestFalse(TEXT("Legacy wheel underscore aliases are not directives"), Alias.HasEffectiveToken(TEXT("WHEEL")));
 
-    const FSimulatorParsedNodeName FirstWins = USimulatorNodeTokenLibrary::ParseNodeName(TEXT("Body;INST;LOD0"));
-    TestTrue(TEXT("First render token wins"), FirstWins.HasEffectiveToken(TEXT("INST")));
+    const FSimulatorParsedNodeName FirstWins = USimulatorNodeTokenLibrary::ParseNodeName(TEXT("Body;LOD1;LOD0"));
+    TestTrue(TEXT("First render token wins"), FirstWins.HasEffectiveToken(TEXT("LOD1")));
     TestFalse(TEXT("Later conflicting render token is ignored"), FirstWins.HasEffectiveToken(TEXT("LOD0")));
 
     const FSimulatorParsedNodeName DifferentFamilies = USimulatorNodeTokenLibrary::ParseNodeName(TEXT("WheelFL;WHEEL;LOD0;NCOL"));
@@ -24,13 +28,27 @@ bool FSimulatorNodeTokenContractTest::RunTest(const FString& Parameters)
     TestTrue(TEXT("Collision mode can coexist"), DifferentFamilies.HasEffectiveToken(TEXT("NCOL")));
     TestEqual(TEXT("Base name is preserved"), DifferentFamilies.BaseName, FString(TEXT("WheelFL")));
 
+    const FSimulatorParsedNodeName InstancedLod0 = USimulatorNodeTokenLibrary::ParseNodeName(TEXT("Tree;LOD0;INST"));
+    TestTrue(TEXT("INST is recognized as an independent token family"),
+        InstancedLod0.HasEffectiveToken(TEXT("INST")));
+    TestTrue(TEXT("INST can coexist with LOD0"),
+        InstancedLod0.HasEffectiveToken(TEXT("LOD0")));
+    TestEqual(TEXT("INST keeps the canonical base name"),
+        InstancedLod0.BaseName, FString(TEXT("Tree")));
+    TestFalse(TEXT("INST substring/underscore aliases are not directives"),
+        USimulatorNodeTokenLibrary::ParseNodeName(TEXT("Tree_INST")).HasEffectiveToken(TEXT("INST")));
+    const FSimulatorParsedNodeName UnsupportedLod = USimulatorNodeTokenLibrary::ParseNodeName(TEXT("Tree;LOD4"));
+    TestFalse(TEXT("Only LOD0 through LOD3 are supported"), UnsupportedLod.HasEffectiveToken(TEXT("LOD4")));
+    TestTrue(TEXT("Unsupported numeric LOD is retained as an invalid segment"),
+        UnsupportedLod.InvalidSegments.Contains(TEXT("LOD4")));
+
     const FSimulatorParsedNodeName Water = USimulatorNodeTokenLibrary::ParseNodeName(TEXT("River;WATER"));
     TestTrue(TEXT("WATER is recognized only as a semicolon token"), Water.HasEffectiveToken(TEXT("WATER")));
     TestFalse(TEXT("WATER substring is not a directive"),
         USimulatorNodeTokenLibrary::ParseNodeName(TEXT("WATERFALL")).HasEffectiveToken(TEXT("WATER")));
 
-    TestTrue(TEXT("Full-name helper preserves the first token after the delimiter"),
-        USimulatorNodeTokenLibrary::HasEffectiveToken(TEXT("Body;INST;LOD0"), FName(TEXT("INST"))));
+    TestTrue(TEXT("Full-name helper preserves the first render token"),
+        USimulatorNodeTokenLibrary::HasEffectiveToken(TEXT("Body;LOD1;LOD0"), FName(TEXT("LOD1"))));
     return true;
 }
 #endif

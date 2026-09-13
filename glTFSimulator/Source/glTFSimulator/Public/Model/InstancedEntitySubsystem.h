@@ -1,5 +1,12 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
+/**
+ * @file InstancedEntitySubsystem.h
+ * 역할: 동적 객체의 인스턴스 렌더 데이터를 조정합니다.
+ * 핵심 기능: 모델별 렌더 그룹과 인스턴스 매핑 관리.
+ * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"
@@ -12,7 +19,7 @@ class AInstancedEntityRenderActor;
 class UPrimitiveComponent;
 class UStaticMesh;
 
-/** One renderable mesh node belonging to an entity prefab. */
+/** One renderable mesh node belonging to an entity model. */
 struct GLTFSIMULATOR_API FInstancedEntityMeshPart
 {
     int32 MeshKey = INDEX_NONE;
@@ -26,7 +33,7 @@ struct GLTFSIMULATOR_API FInstancedEntityRegistrationOptions
     bool bDynamic = false;
     bool bAllowPhysicsDistanceDeactivation = false;
     bool bAlwaysRelevant = false;
-    bool bStoreAsPrefabTemplate = false;
+    bool bStoreAsEntityTemplate = false;
     bool bStoreAsVehicleTemplate = false;
 
     float InterpolationSpeed = 18.0f;
@@ -70,7 +77,7 @@ struct GLTFSIMULATOR_API FInstancedVehicleTemplateData
 /**
  * Separates physics/entity actors from rendering.
  *
- * - One AInstancedEntityRenderActor is created per normalized source prefab path.
+ * - One AInstancedEntityRenderActor is created per canonical gwd:// model UUID.
  * - Every entity keeps only its physics/collision proxy and contributes transforms to shared ISMs.
  * - Interpolation math is performed from immutable snapshots in ParallelFor and applied in one batch
  *   per ISM component on the game thread.
@@ -90,7 +97,7 @@ public:
     virtual void Deinitialize() override;
 
     int32 RegisterEntity(
-        const FString& SourceFilePath,
+        const FString& ModelReference,
         AActor* Owner,
         UPrimitiveComponent* PhysicsRoot,
         const TArray<FInstancedEntityMeshPart>& MeshParts,
@@ -98,8 +105,8 @@ public:
         const FBox& LocalBounds = FBox(ForceInit));
 
     /** Reuses the first entity's mesh-node template without loading the glTF meshes again. */
-    int32 RegisterEntityFromPrefabTemplate(
-        const FString& SourceFilePath,
+    int32 RegisterEntityFromEntityTemplate(
+        const FString& ModelReference,
         AActor* Owner,
         UPrimitiveComponent* PhysicsRoot,
         const FInstancedEntityRegistrationOptions& Options,
@@ -107,17 +114,17 @@ public:
 
     /** Registers a vehicle from the retained authored part list without reopening the glTF parser. */
     int32 RegisterVehicleEntityFromTemplate(
-        const FString& SourceFilePath,
+        const FString& ModelReference,
         AActor* Owner,
         UPrimitiveComponent* PhysicsRoot,
         const FInstancedEntityRegistrationOptions& Options);
 
     bool GetVehicleTemplateData(
-        const FString& SourceFilePath,
+        const FString& ModelReference,
         FInstancedVehicleTemplateData& OutTemplateData) const;
 
     bool StoreVehicleTemplateData(
-        const FString& SourceFilePath,
+        const FString& ModelReference,
         const FInstancedVehicleTemplateData& TemplateData);
 
     void UnregisterEntity(int32 RegistrationId);
@@ -127,8 +134,8 @@ public:
     void SetEntityAlwaysRelevant(int32 RegistrationId, bool bAlwaysRelevant);
     bool IsEntityPhysicsActive(int32 RegistrationId) const;
 
-    /** Returns a mesh already owned by the shared renderer for this source path, if available. */
-    UStaticMesh* FindSharedMesh(const FString& SourceFilePath, int32 MeshKey) const;
+    /** Returns a mesh already owned by the shared renderer for this built model, if available. */
+    UStaticMesh* FindSharedMesh(const FString& ModelReference, int32 MeshKey) const;
 
     /** Safe Outer for generated runtime meshes; meshes are kept alive by the shared ISM components. */
     UObject* GetRuntimeMeshOuter() { return this; }
@@ -172,7 +179,7 @@ private:
         FVector SuspendedAngularVelocity = FVector::ZeroVector;
     };
 
-    struct FPrefabTemplatePart
+    struct FEntityTemplatePart
     {
         int32 MeshKey = INDEX_NONE;
         FTransform LocalTransform = FTransform::Identity;
@@ -180,9 +187,9 @@ private:
 
     struct FResourceState
     {
-        TArray<FPrefabTemplatePart> PrefabTemplateParts;
-        FBox PrefabTemplateBounds = FBox(ForceInit);
-        TArray<FPrefabTemplatePart> VehicleTemplateParts;
+        TArray<FEntityTemplatePart> EntityTemplateParts;
+        FBox EntityTemplateBounds = FBox(ForceInit);
+        TArray<FEntityTemplatePart> VehicleTemplateParts;
         FInstancedVehicleTemplateData VehicleTemplateData;
         bool bHasVehicleTemplateData = false;
     };
@@ -195,7 +202,7 @@ private:
     int32 NextRegistrationId = 1;
     int32 GameUpdateHandle = INDEX_NONE;
 
-    FString MakeResourceKey(const FString& SourceFilePath) const;
+    FString MakeResourceKey(const FString& ModelReference) const;
     void RegisterGameUpdate();
     void UnregisterGameUpdate();
     AInstancedEntityRenderActor* GetOrCreateRenderActor(const FString& ResourceKey);

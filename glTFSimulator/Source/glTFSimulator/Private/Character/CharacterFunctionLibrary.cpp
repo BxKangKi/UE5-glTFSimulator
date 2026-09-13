@@ -1,6 +1,13 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
+/**
+ * @file CharacterFunctionLibrary.cpp
+ * 역할: 캐릭터·스켈레톤 관련 공통 작업을 제공합니다.
+ * 핵심 기능: 본·메시·캐릭터 데이터 변환 및 보조 연산.
+ * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ */
+
 #include "Character/CharacterFunctionLibrary.h"
 #include "System/MacroLibrary.h"
 #include "PhysicsEngine/SkeletalBodySetup.h"

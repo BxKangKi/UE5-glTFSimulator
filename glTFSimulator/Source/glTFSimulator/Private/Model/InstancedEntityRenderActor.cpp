@@ -1,5 +1,12 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
+/**
+ * @file InstancedEntityRenderActor.cpp
+ * 역할: 동일 모델의 동적 객체를 ISM으로 모아 렌더링합니다.
+ * 핵심 기능: 모델별 인스턴스 추가·갱신·제거, 렌더 컴포넌트 관리.
+ * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ */
+
 #include "Model/InstancedEntityRenderActor.h"
 
 #include "Components/InstancedStaticMeshComponent.h"

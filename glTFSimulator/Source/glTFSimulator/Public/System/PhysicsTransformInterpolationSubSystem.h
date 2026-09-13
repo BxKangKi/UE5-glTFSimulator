@@ -1,5 +1,12 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
+/**
+ * @file PhysicsTransformInterpolationSubSystem.h
+ * 역할: 비동기 물리 결과를 게임 스레드 Transform에 반영합니다.
+ * 핵심 기능: 물리 샘플 보간, 컴포넌트·액터 갱신.
+ * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"

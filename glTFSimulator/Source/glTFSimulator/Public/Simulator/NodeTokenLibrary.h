@@ -1,3 +1,10 @@
+/**
+ * @file NodeTokenLibrary.h
+ * 역할: glTF 노드 이름의 동작 토큰을 해석합니다.
+ * 핵심 기능: 토큰 정규화, 유효 토큰 조회, 충돌·LOD·물 태그 해석.
+ * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"
@@ -54,8 +61,7 @@ struct GLTFSIMULATOR_API FSimulatorParsedNodeName
  *
  * Grammar: <ordinary base name>[;<reserved token>[;<reserved token>...]]
  * A bare word, substring, prefix, suffix or underscore alias is never a directive.
- * Tokens from different families may coexist. Within one family the left-most token
- * wins, so "Body;INST;LOD0" executes INST and ignores LOD0.
+ * Tokens from different families may coexist. Within one family the left-most token wins.
  */
 UCLASS()
 class GLTFSIMULATOR_API USimulatorNodeTokenLibrary final : public UBlueprintFunctionLibrary

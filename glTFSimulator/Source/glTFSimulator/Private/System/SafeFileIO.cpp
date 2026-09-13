@@ -2,6 +2,13 @@
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
 /**
+ * File role: SafeFileIO.cpp
+ * 역할: 크기가 제한된 파일·JSON 비동기 I/O를 제공합니다.
+ * 핵심 기능: tracked worker, GT 전달, 종료 drain, 원자적 쓰기·복구.
+ * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ */
+
+/**
  * @file SafeFileIO.cpp
  * @brief Implements bounded JSON parsing, asynchronous file jobs, and recoverable atomic commits.
  */
@@ -1392,8 +1399,8 @@ FSafeBinaryLoadResult FSafeFileIO::LoadBinaryBlocking(const FString& Path, const
         return Primary;
     }
 
-    // DAT/model-cache callers perform schema, length, and CRC validation after this bounded
-    // primary-file read. Binary state has no alternate-generation recovery path.
+    // Format-specific callers perform schema, range, and checksum validation after this bounded
+    // primary-file read. Transactional generation recovery belongs to the owning format layer.
     return Primary;
 }
 

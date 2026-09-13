@@ -1,5 +1,12 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
+/**
+ * @file WorldData.h
+ * 역할: 월드 설정과 실행 상태의 데이터 모델입니다.
+ * 핵심 기능: config JSON 변환, 시간·날씨·플레이어 선택 설정.
+ * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"
@@ -17,7 +24,7 @@
 #define PLAYER_X TEXT("X")
 #define PLAYER_Y TEXT("Y")
 #define PLAYER_Z TEXT("Z")
-#define LEVEL_FILE_NAME TEXT("/config.json")
+#define LEVEL_FILE_NAME TEXT("config.json")
 
 USTRUCT(BlueprintType)
 struct GLTFSIMULATOR_API FLevelCloudSettings
@@ -95,7 +102,7 @@ struct GLTFSIMULATOR_API FLevelGameplaySettings
 
     /**
      * Runtime rule-mode key consumed by GameManagerSubSystem. Accepted explicit values are Creator
-     * and RealLife; empty, Default, or legacy SinglePlayer uses the current map's GameManagerActor
+     * and RealLife; empty, Default, or legacy SinglePlayer uses the current map's gameplay GameMode
      * default. This field does not choose Unreal's AGameModeBase.
      */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level|Gameplay", meta=(DisplayName="Runtime Play Mode Key"))
@@ -104,7 +111,7 @@ struct GLTFSIMULATOR_API FLevelGameplaySettings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level|Gameplay")
     bool bCheatsEnabled = false;
 
-    /** Map-author setting. Current player health is mutable state stored in data/level.dat. */
+    /** Map-author setting. Current player health is mutable state stored in WorldName.dat. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level|Gameplay", meta=(ClampMin="1.0"))
     float PlayerMaxHealth = 100.0f;
 
@@ -140,7 +147,7 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level")
     FString WorldName;
 
-    /** Mutable runtime time. Persisted only in data/level.dat, never in config.json. */
+    /** Mutable runtime time. Persisted only in WorldName.dat, never in config.json. */
     UPROPERTY(Transient, BlueprintReadWrite, Category="Level|Runtime")
     float WorldTime;
 
@@ -165,11 +172,11 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level")
     bool bOcean;
 
-    /** Runtime player location mirror. All player transforms persist in data/level.dat. */
+    /** Runtime player location mirror. All player transforms persist in WorldName.dat. */
     UPROPERTY(Transient, BlueprintReadWrite, Category="Level|Runtime")
     FVector PlayerLocation;
 
-    /** Selected external player asset. Persisted only in data/level.dat. */
+    /** Selected built character UUID. Persisted only in WorldName.dat. */
     UPROPERTY(Transient, BlueprintReadWrite, Category="Level|Runtime")
     FString Player;
 

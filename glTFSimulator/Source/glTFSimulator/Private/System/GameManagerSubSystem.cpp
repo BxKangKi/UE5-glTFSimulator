@@ -1,22 +1,31 @@
 // Copyright © 2025 BxKangKi. Licensed under the MIT License.
 // Copyright © 2025 Epic Games, Inc. All rights reserved.
 
+/**
+ * @file GameManagerSubSystem.cpp
+ * 역할: GameMode가 시작한 월드 빌드·실행 세션의 서비스 상태를 관리합니다.
+ * 핵심 기능: 경로 해석, DB→bake→streaming, 배치·저장·세션 종료. 생명주기는 GameMode가 소유합니다.
+ * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ */
+
 #include "System/GameManagerSubSystem.h"
 
 #if WITH_EDITOR
 #include "Editor.h"
 #include "Editor/TransBuffer.h"
 #endif
-#include "System/GameManagerActor.h"
-#include "System/BinaryDataStore.h"
+#include "GameMode/GameplayGameModeBase.h"
+#include "System/GlTFSimulatorGameInstance.h"
+#include "System/GlTFSimulatorAssetRegistry.h"
 #include "System/ActorHelper.h"
+#include "System/EntityArchive.h"
 #include "System/SafeFileIO.h"
-#include "World/PrefabActor.h"
+#include "Model/DynamicActor.h"
 #include "Vehicle/VehiclePawn.h"
 #include "Weapon/WeaponActor.h"
-#include "Model/glTFStreamActor.h"
 #include "Model/MaterialDefaultAsset.h"
 #include "World/WorldEnvManager.h"
+#include "World/WaterActor.h"
 #include "World/PlayerData.h"
 #include "ProceduralMeshComponent.h"
 #include "System/MacroLibrary.h"
@@ -27,19 +36,23 @@
 #include "World/WorldData.h"
 #include "Kismet/GameplayStatics.h"
 #include "GameFramework/GameModeBase.h"
+#include "GameFramework/GameStateBase.h"
 #include "GameFramework/GameUserSettings.h"
 #include "GameFramework/WorldSettings.h"
 #include "System/SystemInfoFunctionLibrary.h"
 #include "Components/PostProcessComponent.h"
-#include "Model/glTFStreamSubSystem.h"
+#include "Model/WorldSceneStreamingSubsystem.h"
+#include "Model/StaticActor.h"
 #include "Model/InstancedEntitySubsystem.h"
 #include "Character/CharacterController.h"
 #include "Character/CharacterComponent.h"
 #include "Character/PlayerCharacterController.h"
 #include "System/FileFunctionLibrary.h"
 #include "System/GlbValidation.h"
+#include "System/glTFRuntimeSafety.h"
 #include "Simulator/ModelDatabaseSubsystem.h"
 #include "System/WorldObjectStreamingSubsystem.h"
+#include "System/WorldSourceModelBuilder.h"
 #include "Camera/CameraComponent.h"
 #include "Weather/WeatherSubsystem.h"
 #include "Blueprint/UserWidget.h"
@@ -54,11 +67,7 @@
 #include "GameFramework/Pawn.h"
 #include "GameFramework/Character.h"
 #include "HAL/FileManager.h"
-#include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
-#include "Serialization/JsonReader.h"
-#include "Serialization/JsonSerializer.h"
-#include "RenderingThread.h"
 #include "Templates/UnrealTemplate.h"
 #include "UObject/UObjectGlobals.h"
 #include "UObject/GarbageCollection.h"
@@ -72,10 +81,23 @@ namespace
     constexpr int32 MaxSavedSceneDataAttempts = 20; // Allow transient model-registration failures to settle for up to five seconds.
     constexpr float SavedSceneLoadRetryDelaySeconds = 0.25f;
 
+    // Global ocean is intentionally independent from Blueprint/GameMode transforms. Keeping one
+    // native transform prevents an unset BP default (Identity) from spawning a 1 cm water volume.
+    // 100000x on XY covers a very large world when the water mesh is authored at UE unit scale;
+    // the smaller Z scale keeps the overlap/post-process volume bounded around sea level.
+    const FTransform& GetHardcodedOceanTransform()
+    {
+        static const FTransform Transform(
+            FRotator::ZeroRotator,
+            FVector(0.0, 0.0, 0.0),
+            FVector(100000.0, 100000.0, 10000.0));
+        return Transform;
+    }
+
     /**
      * Resolves the external world JSON play-mode key without letting a previous world's value leak
      * through the GameInstance subsystem. Empty/Default/SinglePlayer means use the map's directly
-     * assigned GameManagerActor default.
+     * assigned GameplayGameMode default.
      */
     EPlayMode ResolveRuntimePlayModeKey(
         FString RuntimeModeKey,
@@ -142,11 +164,11 @@ UGameManagerSubSystem::UGameManagerSubSystem()
     LoadingStatus = 0.0f;
     TotalSumFPS = 0;
     TotalCountFPS = 0;
-    PrefabActorClass = APrefabActor::StaticClass();
+    StaticActorClass = AStaticActor::StaticClass();
+    DynamicActorClass = ADynamicActor::StaticClass();
     VehiclePawnClass = AVehiclePawn::StaticClass();
     WeaponActorClass = AWeaponActor::StaticClass();
     WorldEnvManagerClass = AWorldEnvManager::StaticClass();
-    SpawnActorClass = AglTFStreamActor::StaticClass();
 }
 
 
@@ -174,7 +196,7 @@ void UGameManagerSubSystem::Initialize(FSubsystemCollectionBase &Collection)
 void UGameManagerSubSystem::Deinitialize()
 {
     // Runs when the game instance shuts down; clean up runtime actors owned by the subsystem.
-    StopGameManager(EEndPlayReason::Destroyed);
+    StopGameplaySession(EEndPlayReason::Destroyed);
 
     if (PostLoadMapCleanupHandle.IsValid())
     {
@@ -183,7 +205,6 @@ void UGameManagerSubSystem::Deinitialize()
     }
 
     ReleaseMaterialDefaultAsset();
-    RegisteredWorldSelectionWorld.Reset();
     WorldSelectionTravelSourceWorld.Reset();
     WorldNameBeforeMenuTravel.Reset();
     bMenuTravelStatePrepared = false;
@@ -222,7 +243,7 @@ UMaterialDefaultRuntimeCache* UGameManagerSubSystem::AcquireMaterialDefaultRefer
 
 bool UGameManagerSubSystem::ResolveMaterialDefaultAsset()
 {
-    if (!ensureMsgf(IsInGameThread(), TEXT("MaterialDefaultAsset must be resolved on the game thread")))
+    if (!ensureMsgf(IsInGameThread(), TEXT("glTF material defaults must be resolved on the game thread")))
     {
         return false;
     }
@@ -232,101 +253,53 @@ bool UGameManagerSubSystem::ResolveMaterialDefaultAsset()
         return IsValid(MaterialDefaultRuntimeCache);
     }
     TGuardValue<bool> ResolvingGuard(bMaterialDefaultAssetResolving, true);
-
     bMaterialDefaultAssetResolved = false;
 
     // Never mutate an old guard: a cancelled native glTFRuntime callback may still hold it.
-    // Installing fresh objects makes world replacement atomic from the request's perspective.
     MaterialDefaultRuntimeCache = nullptr;
-    MaterialDefaultAssetInstance = nullptr;
-
-    UMaterialDefaultAsset* ConfigInstance = nullptr;
-    FString ConfigSource;
-
-    if (UClass* ConfigClass = MaterialDefaultAssetClass.Get())
-    {
-        const bool bUsableClass =
-            ConfigClass->IsChildOf(UMaterialDefaultAsset::StaticClass()) &&
-            !ConfigClass->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists);
-        if (!bUsableClass)
-        {
-            bMaterialDefaultAssetResolved = true;
-            UE_LOG(LogTemp, Error,
-                TEXT("MaterialDefaultAssetClass is not instantiable. Runtime glTF actors will use plugin defaults. Class=%s"),
-                *GetPathNameSafe(ConfigClass));
-            return false;
-        }
-
-        // StartGameManager is entered from AGameManagerActor::BeginPlay. Creating the object here
-        // keeps UObject allocation and all subsequent soft-material loads on the game thread.
-        ConfigInstance = NewObject<UMaterialDefaultAsset>(
-            this,
-            ConfigClass,
-            NAME_None,
-            RF_Transient);
-        if (!IsValid(ConfigInstance))
-        {
-            bMaterialDefaultAssetResolved = true;
-            UE_LOG(LogTemp, Error,
-                TEXT("MaterialDefaultAssetClass instance could not be created. Runtime glTF actors will use plugin defaults. Class=%s"),
-                *GetPathNameSafe(ConfigClass));
-            return false;
-        }
-
-        // Root the instance before resolving. ResolveMaterials may synchronously load packages, and
-        // a nested game-thread call must never observe an unreferenced configuration object.
-        MaterialDefaultAssetInstance = ConfigInstance;
-        ConfigSource = ConfigClass->GetPathName();
-    }
-    else
-    {
-        bMaterialDefaultAssetResolved = true;
-        UE_LOG(LogTemp, Display,
-            TEXT("No MaterialDefaultAssetClass is configured; glTFRuntime material defaults will be used."));
-        return true;
-    }
 
     UMaterialDefaultRuntimeCache* NewCache = NewObject<UMaterialDefaultRuntimeCache>(this);
     if (!IsValid(NewCache))
     {
-        MaterialDefaultAssetInstance = nullptr;
         bMaterialDefaultAssetResolved = true;
-        UE_LOG(LogTemp, Error, TEXT("MaterialDefaultAsset runtime reference guard could not be allocated."));
+        UE_LOG(LogTemp, Error, TEXT("glTF material runtime reference guard could not be allocated."));
         return false;
     }
-
-    // Assign before resolving so any re-entrant game-thread lookup sees a GC-rooted object.
     MaterialDefaultRuntimeCache = NewCache;
 
+    UGlTFSimulatorAssetRegistry* Registry =
+        UGlTFSimulatorGameInstance::GetAssetRegistryFromContext(this);
+    if (!IsValid(Registry))
+    {
+        bMaterialDefaultAssetResolved = true;
+        UE_LOG(LogTemp, Warning,
+            TEXT("No central AssetRegistry is available; glTFRuntime plugin material defaults will be used."));
+        return true;
+    }
+
     TArray<FString> Failures;
-    const bool bResolveCallSucceeded = ConfigInstance->ResolveMaterials(
+    const bool bResolveCallSucceeded = Registry->GlTFMaterials.Resolve(
         NewCache->References,
         Failures);
     bMaterialDefaultAssetResolved = true;
 
     for (const FString& Failure : Failures)
     {
-        UE_LOG(LogTemp, Warning, TEXT("MaterialDefaultAsset reference skipped: %s"), *Failure);
+        UE_LOG(LogTemp, Warning, TEXT("Central glTF material reference skipped: %s"), *Failure);
     }
 
     UE_LOG(LogTemp, Display,
-        TEXT("MaterialDefaultAsset runtime instance resolved for the active world. Configured=%d Named=%d Failures=%d Source=%s Instance=%s"),
-        ConfigInstance->Materials.NumConfiguredReferences(),
+        TEXT("Central glTF materials resolved. Configured=%d Named=%d Failures=%d"),
+        Registry->GlTFMaterials.NumConfiguredReferences(),
         NewCache->References.ByMaterialName.Num(),
-        Failures.Num(),
-        *ConfigSource,
-        *GetNameSafe(ConfigInstance));
-
+        Failures.Num());
     return bResolveCallSucceeded;
 }
 
 void UGameManagerSubSystem::ReleaseMaterialDefaultAsset()
 {
-    // Drop only the subsystem's pointer. Never Reset() the cache object itself: an async action may
-    // still be holding the same guard until a native glTFRuntime callback reaches its terminal path.
+    // Async requests can still retain the old cache object until their native callbacks finish.
     MaterialDefaultRuntimeCache = nullptr;
-    MaterialDefaultAssetInstance = nullptr;
-    MaterialDefaultAssetClass = nullptr;
     bMaterialDefaultAssetResolved = false;
     bMaterialDefaultAssetResolving = false;
 }
@@ -399,6 +372,59 @@ void UGameManagerSubSystem::SetCameraComponent(USceneComponent* InCamera)
     }
 }
 
+bool UGameManagerSubSystem::TryNormalizeWorldFolderName(
+    const FString& Candidate,
+    FString& OutNormalized,
+    const bool bRequireExistingDirectory)
+{
+    // A world name is an opaque direct-child key, not a path. Run the same normalization at every
+    // trust boundary so menu selections, URL options, PIE overrides, and replication cannot drift.
+    OutNormalized = Candidate.TrimStartAndEnd();
+    if (OutNormalized.IsEmpty()
+        || OutNormalized == TEXT(".")
+        || OutNormalized == TEXT("..")
+        || FPaths::GetCleanFilename(OutNormalized) != OutNormalized
+        || FPaths::MakeValidFileName(OutNormalized) != OutNormalized)
+    {
+        OutNormalized.Reset();
+        return false;
+    }
+
+    if (bRequireExistingDirectory)
+    {
+        const FString VirtualRoot = FPaths::Combine(PATH_WORLDS, OutNormalized);
+        if (!IFileManager::Get().FileExists(*FGWorldArchive::MakeArchivePath(VirtualRoot)))
+        {
+            OutNormalized.Reset();
+            return false;
+        }
+    }
+    return true;
+}
+
+void UGameManagerSubSystem::SetCurrentWorldName(FString Name)
+{
+    check(IsInGameThread());
+
+    // Empty is the explicit menu/teardown reset. Invalid non-empty values also clear the old key:
+    // retaining it could make a malformed network value reopen the previous world's data instead.
+    if (Name.TrimStartAndEnd().IsEmpty())
+    {
+        CurrentWorldName.Reset();
+        return;
+    }
+
+    FString Normalized;
+    if (!TryNormalizeWorldFolderName(Name, Normalized, false))
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("Rejected invalid external world folder key: %s"), *Name.Left(256));
+        CurrentWorldName.Reset();
+        return;
+    }
+    CurrentWorldName = MoveTemp(Normalized);
+}
+
 void UGameManagerSubSystem::SetPlayerActor(AActor* Actor)
 {
     UWorld* World = GetWorld();
@@ -440,7 +466,7 @@ void UGameManagerSubSystem::SetPlayerActor(AActor* Actor)
     if (!bInitialPlayerDataLoadCompleted)
     {
         // BeginPlay ordering is not guaranteed. Preserve the PlayerStart transform provisionally
-        // while the manager checks level.dat; a valid saved transform may still supersede it.
+        // while the manager checks .dat; a valid saved transform may still supersede it.
         const FVector SpawnLocation = Actor->GetActorLocation();
         if (InitialPlayerLocationSource == EInitialPlayerLocationSource::None
             && IsFiniteWorldLocation(SpawnLocation))
@@ -493,9 +519,36 @@ void UGameManagerSubSystem::ApplyPendingInitialPlayerControlRotation(
 
 void UGameManagerSubSystem::UpdateSettings()
 {
-    if (IsValid(GameSettings) && IsValid(PostProcess))
+    if (!IsValid(GameSettings))
+    {
+        return;
+    }
+
+    if (IsValid(PostProcess))
     {
         GameSettings->UpdateSettings(PostProcess);
+    }
+    else
+    {
+        // Streaming settings are still valid in menu/headless contexts even when no post process
+        // component has been registered yet.
+        GameSettings->UpdateSettings(nullptr);
+    }
+
+    if (UWorldObjectStreamingSubsystem* Chunks = GetWorld()
+        ? GetWorld()->GetSubsystem<UWorldObjectStreamingSubsystem>() : nullptr)
+    {
+        if (Chunks->IsRunning())
+        {
+            Chunks->SetLoadRadiusMeters(GameSettings->GetEffectiveObjectStreamingRadiusMeters());
+        }
+    }
+
+    // Height fog/cloud are ordinary settings.json toggles as well. Re-apply them to the active
+    // environment immediately instead of requiring a world reload.
+    if (IsValid(WorldEnvManagerActor))
+    {
+        WorldEnvManagerActor->RefreshRuntimeSettings();
     }
 }
 
@@ -527,19 +580,6 @@ UGameManagerSubSystem *UGameManagerSubSystem::GetSubSystem(UWorld *InWorld)
     }
 }
 
-
-void UGameManagerSubSystem::RegisterWorldSelectionWorld(TSoftObjectPtr<UWorld> InWorldSelectionWorld)
-{
-    if (InWorldSelectionWorld.IsNull())
-    {
-        return;
-    }
-
-    RegisteredWorldSelectionWorld = InWorldSelectionWorld;
-    UE_LOG(LogTemp, Display,
-        TEXT("[MenuTravel] StartActor registered the current menu world as the pause-Exit fallback: %s"),
-        *GetNameSafe(InWorldSelectionWorld.Get()));
-}
 
 void UGameManagerSubSystem::FinalizeWorldSelectionTravelState()
 {
@@ -626,62 +666,74 @@ FString UGameManagerSubSystem::GetFramerateInfoText(FString InString)
     return InString;
 }
 
-void UGameManagerSubSystem::ApplyEditorConfig(const AGameManagerActor* InConfigActor)
+void UGameManagerSubSystem::ApplyGameModeConfig(const AGlTFSimulatorGameplayGameModeBase* InConfigGameMode)
 {
-    if (!IsValid(InConfigActor))
+    if (!IsValid(InConfigGameMode))
     {
         return;
     }
 
-    // Copy only editor-authored values from the actor. Runtime state remains owned by this subsystem.
-    PlacementGridMaterial = InConfigActor->PlacementGridMaterial;
-    PlacementGridSpacing = InConfigActor->PlacementGridSpacing;
-    PlacementGridLineThickness = InConfigActor->PlacementGridLineThickness;
-    PlacementGridMaxRadius = InConfigActor->PlacementGridMaxRadius;
-    PlacementGridStrongRadius = InConfigActor->PlacementGridStrongRadius;
-    PlacementGridFadeRadius = InConfigActor->PlacementGridFadeRadius;
-    PrefabActorClass = InConfigActor->PrefabActorClass;
-    VehiclePawnClass = InConfigActor->VehiclePawnClass;
-    WeaponActorClass = InConfigActor->WeaponActorClass;
+    // Level actors own only numeric/session tuning. Asset/class references live in the GameInstance registry.
+    PlacementGridSpacing = InConfigGameMode->PlacementGridSpacing;
+    PlacementGridLineThickness = InConfigGameMode->PlacementGridLineThickness;
+    PlacementGridMaxRadius = InConfigGameMode->PlacementGridMaxRadius;
+    PlacementGridStrongRadius = InConfigGameMode->PlacementGridStrongRadius;
+    PlacementGridFadeRadius = InConfigGameMode->PlacementGridFadeRadius;
+    OceanTransform = GetHardcodedOceanTransform();
+    PlacementTraceDistance = InConfigGameMode->PlacementTraceDistance;
+    CrosshairCollisionTraceDistance = InConfigGameMode->CrosshairCollisionTraceDistance;
+    FreeSpacePlacementDistance = InConfigGameMode->FreeSpacePlacementDistance;
+    bAllowFreeSpacePlacement = InConfigGameMode->bAllowFreeSpacePlacement;
+    GridSize = InConfigGameMode->GridSize;
+    SurfacePlacementOffset = InConfigGameMode->SurfacePlacementOffset;
+    VehicleEnterDistance = InConfigGameMode->VehicleEnterDistance;
+    bAutoSaveScene = InConfigGameMode->bAutoSaveScene;
+    SceneAutoSaveIntervalSeconds = InConfigGameMode->SceneAutoSaveIntervalSeconds;
+    bSaveSceneOnEndPlay = InConfigGameMode->bSaveSceneOnEndPlay;
+    PlayMode = InConfigGameMode->PlayMode;
 
-    // Use the editor-authored world environment class, with the native class as a safe fallback.
-    if (InConfigActor->WorldEnvManagerClass)
-    {
-        WorldEnvManagerClass = InConfigActor->WorldEnvManagerClass;
-    }
-    else
-    {
-        WorldEnvManagerClass = AWorldEnvManager::StaticClass();
-    }
+    UGlTFSimulatorAssetRegistry* Registry =
+        UGlTFSimulatorGameInstance::GetAssetRegistryFromContext(this);
 
-    // Player/input code may call StartGameManager repeatedly. Rebuild this immutable runtime
-    // configuration only when its effective editor-authored source changes.
-    const UClass* RequestedMaterialClass = InConfigActor->MaterialDefaultAssetClass.Get();
-    const bool bMaterialConfigurationChanged =
-        MaterialDefaultAssetClass.Get() != RequestedMaterialClass;
-    if (!bMaterialDefaultAssetResolved || bMaterialConfigurationChanged)
+    auto IsUsableClass = [](UClass* Class, UClass* RequiredBase)
     {
-        ReleaseMaterialDefaultAsset();
-        MaterialDefaultAssetClass = InConfigActor->MaterialDefaultAssetClass;
+        return IsValid(Class) && Class->IsChildOf(RequiredBase)
+            && !Class->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists);
+    };
+
+    UClass* ResolvedStatic = Registry ? Registry->StaticActorClass.LoadSynchronous() : nullptr;
+    StaticActorClass = IsUsableClass(ResolvedStatic, AStaticActor::StaticClass())
+        ? ResolvedStatic : AStaticActor::StaticClass();
+
+    UClass* ResolvedDynamic = Registry ? Registry->DynamicActorClass.LoadSynchronous() : nullptr;
+    DynamicActorClass = IsUsableClass(ResolvedDynamic, ADynamicActor::StaticClass())
+        ? ResolvedDynamic : ADynamicActor::StaticClass();
+
+    UClass* ResolvedVehicle = Registry ? Registry->VehiclePawnClass.LoadSynchronous() : nullptr;
+    VehiclePawnClass = IsUsableClass(ResolvedVehicle, AVehiclePawn::StaticClass())
+        ? ResolvedVehicle : AVehiclePawn::StaticClass();
+
+    UClass* ResolvedWeapon = Registry ? Registry->WeaponActorClass.LoadSynchronous() : nullptr;
+    WeaponActorClass = IsUsableClass(ResolvedWeapon, AWeaponActor::StaticClass())
+        ? ResolvedWeapon : AWeaponActor::StaticClass();
+
+    UClass* ResolvedEnv = Registry ? Registry->WorldEnvManagerClass.LoadSynchronous() : nullptr;
+    WorldEnvManagerClass = IsUsableClass(ResolvedEnv, AWorldEnvManager::StaticClass())
+        ? ResolvedEnv : AWorldEnvManager::StaticClass();
+
+    UClass* ResolvedWater = Registry ? Registry->WaterActorClass.LoadSynchronous() : nullptr;
+    WaterClass = IsUsableClass(ResolvedWater, AWaterActor::StaticClass())
+        ? ResolvedWater : AWaterActor::StaticClass();
+
+    UClass* ResolvedRain = Registry ? Registry->RainWeatherActorClass.LoadSynchronous() : nullptr;
+    RainWeatherActorClass = IsUsableClass(ResolvedRain, AActor::StaticClass()) ? ResolvedRain : nullptr;
+
+    PlacementGridMaterial = Registry ? Registry->PlacementGridMaterial.LoadSynchronous() : nullptr;
+
+    if (!bMaterialDefaultAssetResolved)
+    {
         ResolveMaterialDefaultAsset();
     }
-
-    SpawnActorClass = InConfigActor->SpawnActorClass;
-    WaterClass = InConfigActor->WaterClass;
-    RainWeatherActorClass = InConfigActor->RainWeatherActorClass;
-    OceanTransform = InConfigActor->OceanTransform;
-    LoadingWidgetClass = InConfigActor->LoadingWidgetClass;
-    PlacementTraceDistance = InConfigActor->PlacementTraceDistance;
-    CrosshairCollisionTraceDistance = InConfigActor->CrosshairCollisionTraceDistance;
-    FreeSpacePlacementDistance = InConfigActor->FreeSpacePlacementDistance;
-    bAllowFreeSpacePlacement = InConfigActor->bAllowFreeSpacePlacement;
-    GridSize = InConfigActor->GridSize;
-    SurfacePlacementOffset = InConfigActor->SurfacePlacementOffset;
-    VehicleEnterDistance = InConfigActor->VehicleEnterDistance;
-    bAutoSaveScene = InConfigActor->bAutoSaveScene;
-    SceneAutoSaveIntervalSeconds = InConfigActor->SceneAutoSaveIntervalSeconds;
-    bSaveSceneOnEndPlay = InConfigActor->bSaveSceneOnEndPlay;
-    PlayMode = InConfigActor->PlayMode;
 }
 
 FTimerManager& UGameManagerSubSystem::GetWorldTimerManager() const
@@ -690,14 +742,14 @@ FTimerManager& UGameManagerSubSystem::GetWorldTimerManager() const
     return GetWorld()->GetTimerManager();
 }
 
-FVector UGameManagerSubSystem::GetManagerActorLocation() const
+FVector UGameManagerSubSystem::GetSessionOwnerLocation() const
 {
-    return ConfigActor.IsValid() ? ConfigActor->GetActorLocation() : FVector::ZeroVector;
+    return SessionOwner.IsValid() ? SessionOwner->GetActorLocation() : FVector::ZeroVector;
 }
 
 void UGameManagerSubSystem::EnsureRuntimeComponents()
 {
-    AGameManagerActor* OwnerActor = ConfigActor.Get();
+    AActor* OwnerActor = SessionOwner.Get();
     if (!IsValid(OwnerActor))
     {
         return;
@@ -714,7 +766,10 @@ void UGameManagerSubSystem::EnsureRuntimeComponents()
     if (IsValid(PlacementGridComponent))
     {
         OwnerActor->AddInstanceComponent(PlacementGridComponent);
-        PlacementGridComponent->SetupAttachment(Root);
+        if (IsValid(Root))
+        {
+            PlacementGridComponent->SetupAttachment(Root);
+        }
         PlacementGridComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
         PlacementGridComponent->SetGenerateOverlapEvents(false);
         PlacementGridComponent->SetCastShadow(false);
@@ -724,133 +779,275 @@ void UGameManagerSubSystem::EnsureRuntimeComponents()
 }
 
 
-void UGameManagerSubSystem::StartGameManager(AGameManagerActor* InConfigActor)
+bool UGameManagerSubSystem::IsActiveGameMode(const AGlTFSimulatorGameplayGameModeBase* GameMode) const
 {
-    if (!IsValid(InConfigActor))
+    return ConfigGameMode.Get() == GameMode && SessionOwner.Get() == GameMode;
+}
+
+void UGameManagerSubSystem::StartGameplaySession(AGlTFSimulatorGameplayGameModeBase* InGameMode)
+{
+    if (!IsValid(InGameMode) || InGameMode->IsActorBeingDestroyed())
+    {
+        return;
+    }
+    StartGameplaySessionInternal(InGameMode, InGameMode);
+}
+
+void UGameManagerSubSystem::StartClientGameplaySession(APlayerController* InOwnerController)
+{
+    if (!IsValid(InOwnerController) || InOwnerController->IsActorBeingDestroyed())
     {
         return;
     }
 
-    // GameInstance subsystems survive level travel. If the previous actor weak pointer expired
-    // before its EndPlay callback reset the flags, bManagerStarted can still describe the old world.
-    // Force-release that stale session before accepting the destination world's manager actor.
-    if (bManagerStarted && ConfigActor.Get() != InConfigActor)
+    // GameMode exists only on authority, but AGameStateBase replicates the active GameModeClass.
+    // Prefer that class's CDO so Blueprint defaults configured on MultiplayGameMode also reach
+    // clients. Fall back to the native common CDO while GameState is not ready yet.
+    const AGlTFSimulatorGameplayGameModeBase* Defaults =
+        GetDefault<AGlTFSimulatorGameplayGameModeBase>();
+
+    if (const UWorld* World = InOwnerController->GetWorld())
     {
-        StopGameManager(EEndPlayReason::Destroyed);
+        if (const AGameStateBase* GameState = World->GetGameState())
+        {
+            UClass* ReplicatedGameModeClass = GameState->GameModeClass.Get();
+            if (IsValid(ReplicatedGameModeClass)
+                && ReplicatedGameModeClass->IsChildOf(AGlTFSimulatorGameplayGameModeBase::StaticClass()))
+            {
+                if (const AGlTFSimulatorGameplayGameModeBase* ReplicatedDefaults =
+                    Cast<AGlTFSimulatorGameplayGameModeBase>(ReplicatedGameModeClass->GetDefaultObject()))
+                {
+                    Defaults = ReplicatedDefaults;
+                }
+            }
+        }
     }
 
-    ConfigActor = InConfigActor;
-    ApplyEditorConfig(InConfigActor);
+    // Replication can call this again after the local render session was already started. Refresh
+    // tunables from the now-known Blueprint GameMode CDO instead of rebuilding the whole session.
+    if (bManagerStarted && SessionOwner.Get() == InOwnerController)
+    {
+        ApplyGameModeConfig(Defaults);
+        return;
+    }
 
-    // A newly started gameplay manager belongs to a completed menu -> gameplay transition.
+    StartGameplaySessionInternal(InOwnerController, Defaults);
+}
+
+void UGameManagerSubSystem::StartGameplaySessionInternal(
+    AActor* InOwnerActor,
+    const AGlTFSimulatorGameplayGameModeBase* InConfigGameMode)
+{
+    if (!IsValid(InOwnerActor) || !IsValid(InConfigGameMode))
+    {
+        return;
+    }
+
+    check(IsInGameThread());
+    UWorld* World = InOwnerActor->GetWorld();
+    if (!IsValid(World) || World != GetWorld())
+    {
+        return;
+    }
+
+    if (bManagerStarted && SessionOwner.IsValid()
+        && !SessionOwner->IsActorBeingDestroyed()
+        && SessionOwner->GetWorld() == World)
+    {
+        SpawnWorldEnvManager();
+        return;
+    }
+
+    if (bManagerStarted && SessionOwner.Get() != InOwnerActor)
+    {
+        StopGameplaySession(EEndPlayReason::Destroyed);
+    }
+
+    SessionOwner = InOwnerActor;
+    ConfigGameMode = Cast<AGlTFSimulatorGameplayGameModeBase>(InOwnerActor);
+    ApplyGameModeConfig(InConfigGameMode);
+
+    // World environment is a rendering prerequisite and intentionally starts before .gwd I/O.
+    SpawnWorldEnvManager();
+
     bMenuTravelStatePrepared = false;
     bMenuTravelSaveCompleted = false;
     WorldNameBeforeMenuTravel.Reset();
 
-    if (UWorld* World = GetWorld())
-    {
-        UMultiplayerWorldSubSystem* Multiplayer = UMultiplayerWorldSubSystem::Get(this);
-        const TCHAR* WorldOption = World->URL.GetOption(TEXT("World="), nullptr);
-        if (WorldOption && FCString::Strlen(WorldOption) > 0)
+    UMultiplayerWorldSubSystem* Multiplayer = UMultiplayerWorldSubSystem::Get(this);
+    FString ResolvedWorldName;
+    FString ResolutionSource;
+    const auto TryWorldCandidate =
+        [&ResolvedWorldName, &ResolutionSource](const FString& Candidate, const TCHAR* Source)
         {
-            CurrentWorldName = FString(WorldOption);
-        }
-        else if (IsValid(Multiplayer))
-        {
-            // Single-player OpenLevel historically omitted the World URL option. Always prefer the
-            // current world-selection value over a name retained by this persistent subsystem from
-            // an earlier map; otherwise chunk files can be read from the previous world's folder.
-            FString SelectedWorldName = Multiplayer->GetSelectedWorldFolderName();
-            SelectedWorldName.TrimStartAndEndInline();
-            if (!SelectedWorldName.IsEmpty())
+            if (!ResolvedWorldName.IsEmpty())
             {
-                CurrentWorldName = MoveTemp(SelectedWorldName);
+                return true;
             }
-        }
+            const FString TrimmedCandidate = Candidate.TrimStartAndEnd();
+            if (TrimmedCandidate.IsEmpty())
+            {
+                return false;
+            }
+            FString Normalized;
+            if (!UGameManagerSubSystem::TryNormalizeWorldFolderName(TrimmedCandidate, Normalized, true))
+            {
+                UE_LOG(LogTemp, Warning,
+                    TEXT("Ignored unavailable or invalid world hand-off. Source=%s Value=%s"),
+                    Source, *TrimmedCandidate.Left(256));
+                return false;
+            }
+            ResolvedWorldName = MoveTemp(Normalized);
+            ResolutionSource = Source;
+            return true;
+        };
 
-        CurrentWorldName.TrimStartAndEndInline();
-        if (!CurrentWorldName.IsEmpty() && IsValid(Multiplayer))
-        {
-            Multiplayer->SetSelectedWorldFolderName(CurrentWorldName);
-        }
-        UE_LOG(LogTemp, Display,
-            TEXT("Resolved runtime world data root. SelectedWorld=%s Root=%s Data=%s"),
-            CurrentWorldName.IsEmpty() ? TEXT("<empty>") : *CurrentWorldName,
-            *GetWorldRootPath(),
-            *GetDataDirectory());
+    const TCHAR* WorldOption = World->URL.GetOption(TEXT("World="), nullptr);
+    if (WorldOption && FCString::Strlen(WorldOption) > 0)
+    {
+        TryWorldCandidate(FString(WorldOption), TEXT("URL option"));
+    }
+    if (IsValid(Multiplayer))
+    {
+        TryWorldCandidate(Multiplayer->GetSelectedWorldFolderName(), TEXT("world selection"));
+    }
+    TryWorldCandidate(CurrentWorldName, TEXT("pending selection"));
+    TryWorldCandidate(InConfigGameMode->WorldFolderName, TEXT("game mode default"));
 
-        if (GetWorldRootPath().IsEmpty())
-        {
-            UE_LOG(LogTemp, Error,
-                TEXT("GameManager startup aborted: no explicit world root was resolved; no relative data paths will be used."));
-            return;
-        }
-
-        if (World->GetNetMode() != NM_Standalone && World->GetNetMode() != NM_Client)
-        {
-            AMultiplayerWorldStateActor::SpawnOrUpdateForWorld(this, CurrentWorldName);
-        }
+    if (ResolvedWorldName.IsEmpty())
+    {
+        const FString MapFolderName = UWorld::RemovePIEPrefix(
+            FPaths::GetBaseFilename(World->GetMapName()), nullptr);
+        TryWorldCandidate(MapFolderName, TEXT("PIE map folder"));
     }
 
-    // GameMode is chosen while the destination UWorld is initialized. Validate it before any custom
-    // gameplay systems spawn actors, so a wrong map/profile assignment is immediately visible.
+    CurrentWorldName = MoveTemp(ResolvedWorldName);
+    if (!CurrentWorldName.IsEmpty() && IsValid(Multiplayer))
+    {
+        Multiplayer->SetSelectedWorldFolderName(CurrentWorldName);
+    }
+
+    const FString ResolvedWorldRoot = GetWorldRootPath();
+    UE_LOG(LogTemp, Display,
+        TEXT("Resolved runtime world root. SelectedWorld=%s Root=%s Source=%s"),
+        CurrentWorldName.IsEmpty() ? TEXT("<empty>") : *CurrentWorldName,
+        *ResolvedWorldRoot,
+        ResolutionSource.IsEmpty() ? TEXT("<none>") : *ResolutionSource);
+
+    if (ResolvedWorldRoot.IsEmpty())
+    {
+        FailWorldStartup(TEXT("월드 시작 실패: 명시적인 월드 폴더를 찾지 못했습니다."));
+        return;
+    }
+
+    if (World->GetNetMode() != NM_Standalone && World->GetNetMode() != NM_Client)
+    {
+        AMultiplayerWorldStateActor::SpawnOrUpdateForWorld(this, CurrentWorldName);
+    }
+
     ValidateResolvedGameMode();
     EnsureRuntimeComponents();
 
-    // Input and UI code may request the manager repeatedly; only run the boot sequence once per config actor.
     if (bManagerStarted)
     {
         return;
     }
     bManagerStarted = true;
-    EnsureAssetFolders();
+    bWorldStartupContinued = false;
+    bAutoBuildForStartup = false;
+
+    SetWorldLoading(true);
+    SetLoadingStatus(0.01f);
+    ShowLoadingWidget();
+
     UModelDatabaseSubsystem* ModelDatabase = GetGameInstance()
         ? GetGameInstance()->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
     if (ModelDatabase)
     {
         TWeakObjectPtr<UGameManagerSubSystem> WeakThis(this);
+        const TWeakObjectPtr<AActor> StartupOwner = SessionOwner;
         ModelDatabase->InitializeForWorld(GetWorldRootPath(), FModelDatabaseReady::CreateLambda(
-            [WeakThis](const bool bSuccess, const FString& Error)
+            [WeakThis, StartupOwner](const bool bSuccess, const FString& Error)
             {
                 UGameManagerSubSystem* StrongThis = WeakThis.Get();
-                if (!IsValid(StrongThis) || !StrongThis->bManagerStarted) return;
+                if (!IsValid(StrongThis) || !StrongThis->bManagerStarted
+                    || !StartupOwner.IsValid() || StrongThis->SessionOwner != StartupOwner)
+                {
+                    return;
+                }
                 if (!bSuccess)
                 {
-                    UE_LOG(LogTemp, Error, TEXT("Model database initialization completed with errors: %s"), *Error);
+                    StrongThis->FailWorldStartup(FString::Printf(
+                        TEXT("월드 모델 인덱스를 열지 못했습니다: %s"), *Error));
+                    return;
                 }
-                StrongThis->ScanAssetFolders();
-                StrongThis->BuildAvailableItems();
-                StrongThis->InitializeToolbarSlotsIfNeeded();
-                StrongThis->ApplySelectedToolbarItem(false);
-                if (UWorldObjectStreamingSubsystem* Chunks = StrongThis->GetWorld()
-                    ? StrongThis->GetWorld()->GetSubsystem<UWorldObjectStreamingSubsystem>() : nullptr)
+                UModelDatabaseSubsystem* ReadyDatabase = StrongThis->GetGameInstance()
+                    ? StrongThis->GetGameInstance()->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
+                if (!ReadyDatabase || !ReadyDatabase->IsBuiltWorld())
                 {
-                    Chunks->Start(StrongThis->GetWorldRootPath());
+                    StrongThis->FailWorldStartup(
+                        TEXT("월드 시작 실패: 런타임은 Worlds/*.gwd만 사용합니다. MainWorld의 Projects UI에서 먼저 빌드하십시오."));
+                    return;
                 }
-                StrongThis->InitializeWorldBootstrap();
-                StrongThis->NotifyToolbarChanged();
+                StrongThis->ContinueWorldStartupAfterDatabase();
             }));
     }
     else
     {
-        UE_LOG(LogTemp, Error, TEXT("Model database subsystem is unavailable; world bootstrap aborted."));
+        FailWorldStartup(TEXT("월드 시작 실패: 모델 데이터베이스 서브시스템을 사용할 수 없습니다."));
     }
-    UE_LOG(LogTemp, Display, TEXT("[Gameplay] GameManager active: %s Class=%s"),
-        *GetNameSafe(this),
-        *GetNameSafe(GetClass()));
+
+    UE_LOG(LogTemp, Display, TEXT("[Gameplay] Session active. Owner=%s GameMode=%s"),
+        *GetNameSafe(SessionOwner.Get()),
+        ConfigGameMode.IsValid() ? *GetNameSafe(ConfigGameMode.Get()) : TEXT("<client>"));
     NotifyStateChanged();
+}
+
+void UGameManagerSubSystem::ContinueWorldStartupAfterDatabase()
+{
+    check(IsInGameThread());
+    if (!bManagerStarted || bWorldStartupContinued) return;
+
+    UModelDatabaseSubsystem* Database = GetGameInstance()
+        ? GetGameInstance()->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
+    if (!Database || !Database->IsBuiltWorld())
+    {
+        FailWorldStartup(
+            TEXT("월드 시작 실패: 검증된 .gwd 아카이브가 열려 있지 않습니다."));
+        return;
+    }
+
+    bWorldStartupContinued = true;
+    bAutoBuildForStartup = false;
+    // The archive directory is now verified. Reserve 70..96% for initial range streaming and the
+    // final 4% for restoring the first .dat area.
+    SetLoadingStatus(FMath::Max(LoadingStatus, 0.70f));
+    RefreshBuiltModelLists();
+    BuildAvailableItems();
+    InitializeToolbarSlotsIfNeeded();
+    ApplySelectedToolbarItem(false);
+    if (UWorldObjectStreamingSubsystem* Chunks = GetWorld()
+        ? GetWorld()->GetSubsystem<UWorldObjectStreamingSubsystem>() : nullptr)
+    {
+        const float ObjectRadiusMeters = IsValid(GameSettings)
+            ? GameSettings->GetEffectiveObjectStreamingRadiusMeters()
+            : 2048.0f;
+        Chunks->Start(GetWorldRootPath(), ObjectRadiusMeters);
+    }
+    InitializeRuntimeWorldState();
+    NotifyToolbarChanged();
+
     if (UWorld* World = GetWorld())
     {
         TWeakObjectPtr<UGameManagerSubSystem> WeakThis(this);
-        World->GetTimerManager().SetTimerForNextTick(FTimerDelegate::CreateLambda([WeakThis]()
+        const TWeakObjectPtr<UWorld> StartupWorld(World);
+        World->GetTimerManager().SetTimerForNextTick(FTimerDelegate::CreateLambda([WeakThis, StartupWorld]()
         {
-            if (WeakThis.IsValid())
-            {
+            if (WeakThis.IsValid() && StartupWorld.IsValid()
+                && WeakThis->GetWorld() == StartupWorld.Get() && WeakThis->bManagerStarted)
                 WeakThis->LoadSavedScene();
-            }
         }));
     }
-
     if (bAutoSaveScene && SceneAutoSaveIntervalSeconds >= 5.0f)
     {
         GetWorldTimerManager().SetTimer(
@@ -862,31 +1059,46 @@ void UGameManagerSubSystem::StartGameManager(AGameManagerActor* InConfigActor)
     }
 }
 
-void UGameManagerSubSystem::StopGameManager(
+void UGameManagerSubSystem::FailWorldStartup(const FString& Message)
+{
+    check(IsInGameThread());
+
+    bAutoBuildForStartup = false;
+    LastSaveMessage = Message;
+    UE_LOG(LogTemp, Error, TEXT("%s"), *Message);
+
+    // Never destroy WorldEnvManager here. Its dependency-free atmosphere is intentionally kept
+    // visible so a source/config error produces a usable diagnostic scene rather than a black map.
+    HideLoadingWidget();
+    SetWorldLoading(false);
+    NotifyStateChanged();
+}
+
+void UGameManagerSubSystem::StopGameplaySession(
     const EEndPlayReason::Type EndPlayReason,
-    const AGameManagerActor* RequestingActor)
+    const AGlTFSimulatorGameplayGameModeBase* RequestingGameMode)
 {
     // An old map actor can finish EndPlay after the destination map has already started its own
     // manager. Never let that stale callback tear down the destination world's streaming session.
-    if (RequestingActor && ConfigActor.IsValid() && ConfigActor.Get() != RequestingActor)
+    if (RequestingGameMode && ConfigGameMode.IsValid() && ConfigGameMode.Get() != RequestingGameMode)
     {
         UE_LOG(LogTemp, Display,
-            TEXT("[Gameplay] Ignored stale GameManagerActor EndPlay. Requester=%s Active=%s"),
-            *GetNameSafe(RequestingActor),
-            *GetNameSafe(ConfigActor.Get()));
+            TEXT("[Gameplay] Ignored stale GameplayGameMode EndPlay. Requester=%s Active=%s"),
+            *GetNameSafe(RequestingGameMode),
+            *GetNameSafe(ConfigGameMode.Get()));
         return;
     }
 
     CancelWorldBake();
     CompactTrackedEntityReferences();
 
-    const bool bHadActiveMainWorld = bManagerStarted
-        || bWorldBootstrapStarted
+    const bool bHadActiveRuntimeWorld = bManagerStarted
+        || bRuntimeWorldStateInitialized
         || IsValid(StreamSubSystem)
         || IsValid(WorldEnvManagerActor)
         || IsValid(OceanActor)
-        || IsValid(LoadingWidgetInstance)
-        || SpawnedPrefabs.Num() > 0
+        || IsValid(LoadingWidgetInstance.Get())
+        || SpawnedStatics.Num() > 0
         || SpawnedVehicles.Num() > 0
         || IsValid(EquippedWeapon);
 
@@ -897,7 +1109,7 @@ void UGameManagerSubSystem::StopGameManager(
         World->GetTimerManager().ClearAllTimersForObject(this);
     }
 
-    if (bHadActiveMainWorld && bSaveSceneOnEndPlay && !bMenuTravelSaveCompleted
+    if (bHadActiveRuntimeWorld && bSaveSceneOnEndPlay && !bMenuTravelSaveCompleted
         && EndPlayReason != EEndPlayReason::Destroyed)
     {
         // Fallback for editor shutdown or travel paths that did not run the pre-travel commit.
@@ -929,7 +1141,7 @@ void UGameManagerSubSystem::PrepareForMenuLevelTravelRequest()
     }
 
     // Commit while every tracked actor is still alive. EndPlay ordering is not deterministic: a
-    // prefab or vehicle can be destroyed before the manager receives its own EndPlay callback,
+    // Static object or vehicle can be destroyed before the manager receives its own EndPlay callback,
     // so every live object is snapshotted before its owning chunk is released.
     WorldNameBeforeMenuTravel = CurrentWorldName;
     const bool bEntitySaveCompleted = SaveScene();
@@ -937,7 +1149,7 @@ void UGameManagerSubSystem::PrepareForMenuLevelTravelRequest()
     SavePlayerData();
 
     bMenuTravelStatePrepared = true;
-    // A failed/blocked save intentionally leaves the last committed DAT untouched. Do not retry
+    // A failed/blocked save intentionally leaves the last committed .dat generation untouched. Do not retry
     // from actor teardown, where the snapshot is less trustworthy than it is at this point.
     bMenuTravelSaveCompleted = true;
     UE_LOG(LogTemp, Display,
@@ -946,6 +1158,20 @@ void UGameManagerSubSystem::PrepareForMenuLevelTravelRequest()
         bEntitySaveCompleted ? TEXT("success") : TEXT("preserved-previous-generation"));
     RequestPostLoadRuntimeMemoryCleanup();
     SetGamePaused(false);
+}
+
+void UGameManagerSubSystem::PrepareForReturnToMenuLevel()
+{
+    // Keep the old Blueprint ABI non-destructive: it prepares the atomic save/cleanup state, while
+    // the caller still owns the actual OpenLevel request and can recover if travel is rejected.
+    PrepareForMenuLevelTravelRequest();
+}
+
+void UGameManagerSubSystem::PrepareForReturnToMainWorld()
+{
+    // The two legacy names historically had identical behavior; funnel both through one audited
+    // implementation so save ordering and reference release cannot diverge again.
+    PrepareForReturnToMenuLevel();
 }
 
 void UGameManagerSubSystem::RequestWorldSelectionMenuOnNextMainWorld()
@@ -968,7 +1194,7 @@ void UGameManagerSubSystem::ClearWorldSelectionMenuRequest()
 void UGameManagerSubSystem::ReleaseMainWorldRuntimeMemory(bool bForceGarbageCollection)
 {
     // GameInstance subsystems survive level travel, so every UPROPERTY reference held here can keep
-    // gameplay-world actors, streamed glTF assets, and async-load state reachable.
+    // gameplay-world actors, streamed built assets, and async-load state reachable.
     SetWorldLoading(false);
     SetGamePaused(false);
     HideLoadingWidget();
@@ -998,12 +1224,13 @@ void UGameManagerSubSystem::ReleaseMainWorldRuntimeMemory(bool bForceGarbageColl
     }
 
     Root = nullptr;
-    ConfigActor = nullptr;
+    ConfigGameMode = nullptr;
+    SessionOwner = nullptr;
     ClearTransientRuntimeReferences();
     ResetWorldRuntimeReferences();
 
     bManagerStarted = false;
-    bWorldBootstrapStarted = false;
+    bRuntimeWorldStateInitialized = false;
     bWorldLoadCompleted = false;
     bSpawnedWorldEnvManager = false;
     bIsWorldLoading = false;
@@ -1031,9 +1258,9 @@ void UGameManagerSubSystem::DestroyTrackedRuntimeActors()
 
     DestroyActorIfValid(EquippedWeapon.Get());
 
-    for (const TWeakObjectPtr<APrefabActor>& PrefabReference : SpawnedPrefabs)
+    for (const TWeakObjectPtr<AStaticActor>& StaticReference : SpawnedStatics)
     {
-        DestroyActorIfValid(PrefabReference.Get());
+        DestroyActorIfValid(StaticReference.Get());
     }
     for (const TWeakObjectPtr<AVehiclePawn>& VehicleReference : SpawnedVehicles)
     {
@@ -1054,16 +1281,16 @@ void UGameManagerSubSystem::DestroyTrackedRuntimeActors()
     }
 
     EquippedWeapon = nullptr;
-    SpawnedPrefabs.Empty();
+    SpawnedStatics.Empty();
     SpawnedVehicles.Empty();
 }
 
 void UGameManagerSubSystem::CompactTrackedEntityReferences()
 {
-    const int32 RemovedPrefabs = SpawnedPrefabs.RemoveAllSwap(
-        [](const TWeakObjectPtr<APrefabActor>& Reference)
+    const int32 RemovedStatics = SpawnedStatics.RemoveAllSwap(
+        [](const TWeakObjectPtr<AStaticActor>& Reference)
         {
-            const APrefabActor* Actor = Reference.Get();
+            const AStaticActor* Actor = Reference.Get();
             return !IsValid(Actor) || Actor->IsActorBeingDestroyed();
         },
         EAllowShrinking::No);
@@ -1077,9 +1304,9 @@ void UGameManagerSubSystem::CompactTrackedEntityReferences()
         EAllowShrinking::No);
 
     // Avoid reallocating during normal placement churn, but release clearly excessive slack.
-    if (RemovedPrefabs > 0 && SpawnedPrefabs.Max() > FMath::Max(32, SpawnedPrefabs.Num() * 2))
+    if (RemovedStatics > 0 && SpawnedStatics.Max() > FMath::Max(32, SpawnedStatics.Num() * 2))
     {
-        SpawnedPrefabs.Shrink();
+        SpawnedStatics.Shrink();
     }
     if (RemovedVehicles > 0 && SpawnedVehicles.Max() > FMath::Max(16, SpawnedVehicles.Num() * 2))
     {
@@ -1089,7 +1316,9 @@ void UGameManagerSubSystem::CompactTrackedEntityReferences()
 
 void UGameManagerSubSystem::ResetWorldRuntimeReferences()
 {
-    ConfigActor.Reset();
+    StaticActorClass = nullptr;
+    ConfigGameMode.Reset();
+    SessionOwner.Reset();
     PlayerActor = nullptr;
     CurrentCamera = nullptr;
     PostProcess = nullptr;
@@ -1129,19 +1358,96 @@ void UGameManagerSubSystem::RequestPostLoadRuntimeMemoryCleanup()
 
 void UGameManagerSubSystem::HandlePostLoadMapRuntimeCleanup(UWorld* LoadedWorld)
 {
-    if (!bPendingMainWorldRuntimePurge)
-    {
-        return;
-    }
-
     if (LoadedWorld)
     {
+        // Give placed actors and the configured PlayerController their normal BeginPlay/next-tick
+        // opportunity first. The second tick performs cleanup/configuration validation and the
+        // client-only render-session initialization. Authority startup is owned only by GameMode::BeginPlay.
+        const TWeakObjectPtr<UWorld> WeakLoadedWorld(LoadedWorld);
         LoadedWorld->GetTimerManager().SetTimerForNextTick(
-            FTimerDelegate::CreateUObject(this, &UGameManagerSubSystem::RunPostLoadRuntimeMemoryCleanup));
+            FTimerDelegate::CreateWeakLambda(this, [this, WeakLoadedWorld]()
+            {
+                UWorld* StrongLoadedWorld = WeakLoadedWorld.Get();
+                if (!IsValid(StrongLoadedWorld) || StrongLoadedWorld != GetWorld())
+                {
+                    return;
+                }
+
+                RunPostLoadRuntimeMemoryCleanup();
+                StrongLoadedWorld->GetTimerManager().SetTimerForNextTick(
+                    FTimerDelegate::CreateWeakLambda(this, [this, WeakLoadedWorld]()
+                    {
+                        if (UWorld* CurrentLoadedWorld = WeakLoadedWorld.Get();
+                            IsValid(CurrentLoadedWorld) && CurrentLoadedWorld == GetWorld())
+                        {
+                            ValidatePostLoadGameplayLifecycle(CurrentLoadedWorld);
+                        }
+                    }));
+            }));
         return;
     }
 
     RunPostLoadRuntimeMemoryCleanup();
+}
+
+void UGameManagerSubSystem::ValidatePostLoadGameplayLifecycle(UWorld* LoadedWorld)
+{
+    check(IsInGameThread());
+    if (!IsValid(LoadedWorld) || LoadedWorld != GetWorld() || !LoadedWorld->IsGameWorld())
+    {
+        return;
+    }
+
+    // MainWorld is UI-only. A pending return-to-menu request must never be mistaken for gameplay.
+    if (bMenuTravelStatePrepared || bWorldSelectionMenuTravelInProgress
+        || bOpenWorldSelectionMenuOnNextMainWorld)
+    {
+        return;
+    }
+
+    if (bManagerStarted && SessionOwner.IsValid() && SessionOwner->GetWorld() == LoadedWorld)
+    {
+        SpawnWorldEnvManager();
+        return;
+    }
+
+    // Authority/standalone initialization belongs exclusively to the configured gameplay
+    // GameMode's BeginPlay. PostLoadMap must never become a second lifecycle owner.
+    if (Cast<AGlTFSimulatorGameplayGameModeBase>(LoadedWorld->GetAuthGameMode()))
+    {
+        return;
+    }
+
+    // Clients never own GameMode. They start their render/session side from the local controller;
+    // the authoritative world key is subsequently reinforced by AMultiplayerWorldStateActor.
+    if (LoadedWorld->GetNetMode() == NM_Client)
+    {
+        if (APlayerController* PC = LoadedWorld->GetFirstPlayerController())
+        {
+            StartClientGameplaySession(PC);
+        }
+        return;
+    }
+
+    // A world that resolves to a real .gwd but does not use the gameplay GameMode classes is a
+    // configuration error. Do not spawn a substitute manager actor; GameMode is now the lifecycle owner.
+    FString Candidate;
+    const TCHAR* WorldOption = LoadedWorld->URL.GetOption(TEXT("World="), nullptr);
+    if (WorldOption && FCString::Strlen(WorldOption) > 0)
+    {
+        Candidate = FString(WorldOption);
+    }
+    if (Candidate.IsEmpty())
+    {
+        Candidate = CurrentWorldName;
+    }
+    FString Normalized;
+    if (TryNormalizeWorldFolderName(Candidate, Normalized, true))
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("Gameplay world '%s' resolved .gwd '%s' but its active GameMode is not derived from AGlTFSimulatorGameplayGameModeBase. Assign SingleplayGameMode or MultiplayGameMode in World Settings / travel override."),
+            *GetNameSafe(LoadedWorld), *Normalized);
+    }
 }
 
 void UGameManagerSubSystem::RunPostLoadRuntimeMemoryCleanup()
@@ -1152,8 +1458,8 @@ void UGameManagerSubSystem::RunPostLoadRuntimeMemoryCleanup()
     }
 
     UWorld* CurrentWorld = GetWorld();
-    const bool bNewWorldEnvManagerIsActive = bManagerStarted && ConfigActor.IsValid() &&
-        ConfigActor->GetWorld() == CurrentWorld;
+    const bool bNewWorldEnvManagerIsActive = bManagerStarted && SessionOwner.IsValid() &&
+        SessionOwner->GetWorld() == CurrentWorld;
     if (bNewWorldEnvManagerIsActive)
     {
         // PostLoadMap runs before/around BeginPlay depending on the travel path. A deferred cleanup
@@ -1170,14 +1476,14 @@ void UGameManagerSubSystem::RunPostLoadRuntimeMemoryCleanup()
     // GameInstance subsystems survive OpenLevel. Clear only stale streaming state. If another startup
     // path already attached the subsystem to the destination world, preserving it is safer than
     // treating a persistent subsystem as old-world state.
-    UglTFStreamSubSystem* GlobalStreamSubSystem = nullptr;
+    UWorldSceneStreamingSubsystem* GlobalStreamSubSystem = nullptr;
     if (UGameInstance* GameInstance = GetGameInstance())
     {
-        GlobalStreamSubSystem = GameInstance->GetSubsystem<UglTFStreamSubSystem>();
+        GlobalStreamSubSystem = GameInstance->GetSubsystem<UWorldSceneStreamingSubsystem>();
     }
     if (GlobalStreamSubSystem && !GlobalStreamSubSystem->IsActiveForWorld(CurrentWorld))
     {
-        GlobalStreamSubSystem->StopMainWorldStreaming();
+        GlobalStreamSubSystem->StopWorldStreaming();
     }
 
     HideLoadingWidget();
@@ -1195,9 +1501,9 @@ void UGameManagerSubSystem::InitializeWorldSystems(UWorldData* InWorldData, cons
     ActiveWorldData = InWorldData;
     ApplyLevelSettings();
 
-    // Keep gameplay-owned world actors centralized here: water and streamed GLB actors are not rendering concerns.
+    // Keep gameplay-owned world actors centralized here: water and streamed world actors are not rendering concerns.
     SpawnOcean();
-    MainWorldStreaming(InWorldRoot, InInitialPlayerName);
+    StartGameplayWorldStreaming(InWorldRoot, InInitialPlayerName);
 }
 
 void UGameManagerSubSystem::StopWorldSystems()
@@ -1212,14 +1518,14 @@ void UGameManagerSubSystem::StopWorldSystems()
     // Stop the streaming subsystem before destroying this manager so spawned stream actors release their assets cleanly.
     if (IsValid(StreamSubSystem))
     {
-        StreamSubSystem->StopMainWorldStreaming();
+        StreamSubSystem->StopWorldStreaming();
         StreamSubSystem = nullptr;
     }
-    else if (UglTFStreamSubSystem* GlobalStreamSubSystem = UglTFStreamSubSystem::Get(this))
+    else if (UWorldSceneStreamingSubsystem* GlobalStreamSubSystem = UWorldSceneStreamingSubsystem::Get(this))
     {
         // GameInstance subsystems persist after map travel. If our cached pointer was already cleared,
-        // still force-stop the global streaming subsystem so glTF assets cannot stay resident.
-        GlobalStreamSubSystem->StopMainWorldStreaming();
+        // still force-stop the global streaming subsystem so built assets cannot stay resident.
+        GlobalStreamSubSystem->StopWorldStreaming();
     }
 
     if (IsValid(OceanActor))
@@ -1260,22 +1566,22 @@ float UGameManagerSubSystem::GetWorldSystemsLoadingStatus() const
     return bWorldLoadCompleted ? 1.0f : FMath::Clamp(LoadingStatus, 0.0f, 0.99f);
 }
 
-void UGameManagerSubSystem::InitializeWorldBootstrap()
+void UGameManagerSubSystem::InitializeRuntimeWorldState()
 {
-    if (bWorldBootstrapStarted)
+    if (bRuntimeWorldStateInitialized)
     {
         return;
     }
     // The subsystem survives OpenLevel, while the initial player transform is scoped to one world.
-    // Reset its source/applied markers before reading the current level.dat player data.
+    // Reset its source/applied markers before reading the current .dat player data.
     ResetInitialPlayerTransformState();
-    bWorldBootstrapStarted = true;
+    bRuntimeWorldStateInitialized = true;
     bWorldLoadCompleted = false;
 
     SetWorldLoading(true);
-    SetLoadingStatus(0.0f);
+    SetLoadingStatus(FMath::Max(LoadingStatus, 0.70f));
 
-    // Loading UI, world data, world rendering, water, and GLB streaming now start from one owner.
+    // Loading UI, world data, world rendering, water, and .gwd streaming now start from one owner.
     ShowLoadingWidget();
     LoadWorldData();
 }
@@ -1283,36 +1589,110 @@ void UGameManagerSubSystem::InitializeWorldBootstrap()
 void UGameManagerSubSystem::SpawnWorldEnvManager()
 {
     UWorld* World = GetWorld();
-    if (IsValid(WorldEnvManagerActor) || !World)
+    if (!World)
     {
         return;
     }
+    if (IsValid(WorldEnvManagerActor))
+    {
+        if (WorldEnvManagerActor->GetWorld() == World)
+        {
+            WorldEnvManagerActor->PrepareForWorldLoading();
+            return;
+        }
 
-    UClass* EffectiveWorldEnvManagerClass = WorldEnvManagerClass ? WorldEnvManagerClass.Get() : AWorldEnvManager::StaticClass();
+        // GameInstance subsystems survive map travel. Never mistake an actor that is still
+        // finishing EndPlay in the source map for the destination world's environment manager.
+        WorldEnvManagerActor = nullptr;
+        bSpawnedWorldEnvManager = false;
+    }
 
+    UClass* EffectiveWorldEnvManagerClass = WorldEnvManagerClass.Get();
+    if (!IsValid(EffectiveWorldEnvManagerClass)
+        || !EffectiveWorldEnvManagerClass->IsChildOf(AWorldEnvManager::StaticClass())
+        || EffectiveWorldEnvManagerClass->HasAnyClassFlags(
+            CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists))
+    {
+        EffectiveWorldEnvManagerClass = AWorldEnvManager::StaticClass();
+    }
+
+    AWorldEnvManager* AnyExistingManager = nullptr;
     for (TActorIterator<AWorldEnvManager> It(World); It; ++It)
     {
         AWorldEnvManager* ExistingWorldEnvManager = *It;
-        if (IsValid(ExistingWorldEnvManager) && ExistingWorldEnvManager->IsA(EffectiveWorldEnvManagerClass))
+        if (!IsValid(ExistingWorldEnvManager))
+        {
+            continue;
+        }
+        if (ExistingWorldEnvManager->IsA(EffectiveWorldEnvManagerClass))
         {
             WorldEnvManagerActor = ExistingWorldEnvManager;
             bSpawnedWorldEnvManager = false;
+            ExistingWorldEnvManager->PrepareForWorldLoading();
+            UE_LOG(LogTemp, Display,
+                TEXT("Using placed WorldEnvManager before world-data I/O. Actor=%s Class=%s"),
+                *GetNameSafe(ExistingWorldEnvManager),
+                *GetNameSafe(ExistingWorldEnvManager->GetClass()));
             return;
+        }
+        if (!IsValid(AnyExistingManager))
+        {
+            AnyExistingManager = ExistingWorldEnvManager;
         }
     }
 
+    // A placed native/Blueprint environment is preferable to creating a duplicate merely because
+    // the manager's configured subclass changed. Its component contract is defined by the native
+    // base class and remains sufficient for the procedural fallback sky.
+    if (IsValid(AnyExistingManager))
+    {
+        WorldEnvManagerActor = AnyExistingManager;
+        bSpawnedWorldEnvManager = false;
+        AnyExistingManager->PrepareForWorldLoading();
+        UE_LOG(LogTemp, Warning,
+            TEXT("Using placed WorldEnvManager '%s' because no placed actor matched configured class '%s'."),
+            *GetNameSafe(AnyExistingManager),
+            *GetNameSafe(EffectiveWorldEnvManagerClass));
+        return;
+    }
+
     FActorSpawnParameters Params;
-    Params.Owner = ConfigActor.Get();
+    Params.Owner = SessionOwner.Get();
     Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
     WorldEnvManagerActor = World->SpawnActor<AWorldEnvManager>(EffectiveWorldEnvManagerClass, FTransform::Identity, Params);
+
+    // A stale/missing Blueprint generated class must not remove the entire sky. Retry with the
+    // native class, which owns all required components and needs no content asset to render.
+    if (!IsValid(WorldEnvManagerActor)
+        && EffectiveWorldEnvManagerClass != AWorldEnvManager::StaticClass())
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("Configured WorldEnvManager class failed to spawn; retrying native fallback. Class=%s"),
+            *GetNameSafe(EffectiveWorldEnvManagerClass));
+        WorldEnvManagerActor = World->SpawnActor<AWorldEnvManager>(
+            AWorldEnvManager::StaticClass(), FTransform::Identity, Params);
+    }
     bSpawnedWorldEnvManager = IsValid(WorldEnvManagerActor);
+    if (bSpawnedWorldEnvManager)
+    {
+        WorldEnvManagerActor->PrepareForWorldLoading();
+        UE_LOG(LogTemp, Display,
+            TEXT("WorldEnvManager spawned before world-data I/O. Actor=%s Class=%s"),
+            *GetNameSafe(WorldEnvManagerActor),
+            *GetNameSafe(WorldEnvManagerActor->GetClass()));
+    }
+    else
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("WorldEnvManager could not be spawned; procedural sky is unavailable for this world."));
+    }
 }
 
 bool UGameManagerSubSystem::CheckWorldSystemsLoaded()
 {
     // Reserve the final progress node for initial chunk validation and actor restoration. Without
     // this reservation the streaming subsystem could publish 100% and hide the loading screen
-    // before saved prefabs/vehicles had actually been recreated in the destination world.
+    // before saved Static objects/vehicles had actually been recreated in the destination world.
     constexpr float EntityRestoreProgressStart = 0.96f;
 
     if (!IsValid(StreamSubSystem))
@@ -1327,66 +1707,145 @@ bool UGameManagerSubSystem::CheckWorldSystemsLoaded()
     const bool bSystemsReady = StreamSubSystem->IsInitialWorldReady();
     const float Percent = StreamSubSystem->GetLoadingStatus();
     const bool bVisibleProgressComplete = Percent >= 1.0f - KINDA_SMALL_NUMBER;
-    SetLoadingStatus(FMath::Clamp(Percent, 0.0f, 1.0f) * EntityRestoreProgressStart);
+    constexpr float RuntimeProgressStart = 0.70f;
+    SetLoadingStatus(FMath::Lerp(
+        RuntimeProgressStart,
+        EntityRestoreProgressStart,
+        FMath::Clamp(Percent, 0.0f, 1.0f)));
     return bSystemsReady && bVisibleProgressComplete;
 }
 
 void UGameManagerSubSystem::LoadWorldData()
 {
     check(IsInGameThread());
-    const FString ConfigPath = GetWorldFilePath(LEVEL_FILE_NAME);
-    const FString LevelPath = GetLevelDatPath();
     const FString RequestedRoot = GetWorldRootPath();
+    const TWeakObjectPtr<AActor> StartupOwner = SessionOwner;
+    UModelDatabaseSubsystem* Database = GetGameInstance()
+        ? GetGameInstance()->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
+    const TSharedPtr<FGWorldArchiveReader, ESPMode::ThreadSafe> ArchiveReader =
+        Database ? Database->GetArchiveReader() : nullptr;
+    if (!ArchiveReader.IsValid())
+    {
+        FailWorldStartup(TEXT("월드 시작 실패: config.json을 읽을 .gwd reader가 없습니다."));
+        return;
+    }
     TWeakObjectPtr<UGameManagerSubSystem> WeakThis(this);
-    const bool bQueued = FSafeFileIO::RunTrackedWorker([WeakThis, ConfigPath, LevelPath, RequestedRoot]()
+    const bool bQueued = FSafeFileIO::RunTrackedWorker([WeakThis, ArchiveReader, RequestedRoot, StartupOwner]()
     {
         FSafeJsonLimits Limits;
         Limits.MaxFileBytes = 64ll * 1024ll * 1024ll;
         Limits.bAllowBackupRecovery = false;
-        FSafeJsonLoadResult Config = FSafeFileIO::LoadJsonBlocking(ConfigPath, Limits);
-        FLevelRuntimeData Level;
-        FString LevelError;
-        const bool bLevelLoaded = FBinaryDataStore::LoadLevel(LevelPath, Level, LevelError);
+        FString ConfigText;
+        FString ConfigError;
+        FSafeJsonLoadResult Config;
+        if (ArchiveReader->ReadWorldConfig(ConfigText, ConfigError))
+        {
+            Config = FSafeFileIO::ParseJsonText(ConfigText, TEXT(".gwd/config.json"), Limits);
+        }
+        else
+        {
+            Config.Status = ESafeFileIOStatus::ReadFailed;
+            Config.Path = ArchiveReader->GetArchivePath() + TEXT("#config.json");
+            Config.Error = MoveTemp(ConfigError);
+        }
         FSafeFileIO::DispatchTrackedGameThread(
-            [WeakThis, RequestedRoot, Config = MoveTemp(Config), Level = MoveTemp(Level),
-                LevelError = MoveTemp(LevelError), bLevelLoaded]() mutable
+            [WeakThis, RequestedRoot, StartupOwner, Config = MoveTemp(Config)]() mutable
             {
                 UGameManagerSubSystem* StrongThis = WeakThis.Get();
                 if (!IsValid(StrongThis) || !StrongThis->bManagerStarted
+                    || !StartupOwner.IsValid() || StrongThis->SessionOwner != StartupOwner
                     || StrongThis->GetWorldRootPath() != RequestedRoot) return;
-                StrongThis->ActiveWorldData = NewObject<UWorldData>(StrongThis);
-                StrongThis->ActivePlayerData = NewObject<UPlayerData>(StrongThis);
-                if (!IsValid(StrongThis->ActiveWorldData) || !IsValid(StrongThis->ActivePlayerData)) return;
-                if (!Config.IsSuccess() || !UWorldData::DeserializeData(StrongThis->ActiveWorldData, Config.JsonObject))
-                    UE_LOG(LogTemp, Warning, TEXT("config.json invalid or missing; defaults used. Path=%s Reason=%s"), *Config.Path, *Config.Error);
-                if (bLevelLoaded)
+
+                // config.json is immutable author/world configuration. Mutable time/player state is
+                // range-read from the state record in the single .dat commit log.
+                TFunction<void(bool, bool, FWorldRuntimeState, FString)> ApplyLoadedState =
+                    [WeakThis, RequestedRoot, StartupOwner, Config = MoveTemp(Config)](
+                        const bool bStateLoaded,
+                        const bool bStateMissing,
+                        FWorldRuntimeState State,
+                        FString StateError) mutable
                 {
-                    StrongThis->ActiveWorldData->WorldTime = Level.WorldTime;
-                    StrongThis->ActiveWorldData->Player = Level.SelectedPlayer;
-                    StrongThis->ActivePlayerData->Players = MoveTemp(Level.Players);
+                    UGameManagerSubSystem* Manager = WeakThis.Get();
+                    if (!IsValid(Manager) || !Manager->bManagerStarted
+                        || !StartupOwner.IsValid() || Manager->SessionOwner != StartupOwner
+                        || Manager->GetWorldRootPath() != RequestedRoot) return;
+
+                    Manager->ActiveWorldData = NewObject<UWorldData>(Manager);
+                    Manager->ActivePlayerData = NewObject<UPlayerData>(Manager);
+                    if (!IsValid(Manager->ActiveWorldData)
+                        || !IsValid(Manager->ActivePlayerData))
+                    {
+                        Manager->FailWorldStartup(
+                            TEXT("월드 시작 실패: 런타임 월드 상태를 할당하지 못했습니다."));
+                        return;
+                    }
+
+                    if (!Config.IsSuccess()
+                        || !UWorldData::DeserializeData(
+                            Manager->ActiveWorldData, Config.JsonObject))
+                    {
+                        UE_LOG(LogTemp, Warning,
+                            TEXT("config.json invalid or missing; defaults used. Path=%s Reason=%s"),
+                            *Config.Path, *Config.Error);
+                    }
+                    if (bStateLoaded && !bStateMissing)
+                    {
+                        Manager->ActiveWorldData->WorldTime = State.WorldTime;
+                        Manager->ActiveWorldData->Player = State.SelectedPlayer;
+                        Manager->ActivePlayerData->Players = MoveTemp(State.Players);
+                    }
+                    else
+                    {
+                        Manager->bPendingInitialWorldDataSave = true;
+                        Manager->bPendingInitialPlayerDataSave = true;
+                        if (!StateError.IsEmpty())
+                        {
+                            UE_LOG(LogTemp, Warning,
+                                TEXT(".dat runtime state unavailable; defaults will be saved. Reason=%s"),
+                                *StateError);
+                        }
+                    }
+
+                    Manager->SetWorldData(Manager->ActiveWorldData);
+                    Manager->LoadPlayerData();
+                    Manager->ApplyLevelSettings();
+                    Manager->SpawnWorldEnvManager();
+                    if (IsValid(Manager->WorldEnvManagerActor))
+                    {
+                        Manager->WorldEnvManagerActor->InitializeRendering(
+                            Manager->ActiveWorldData);
+                    }
+                    Manager->InitializeWorldSystems(
+                        Manager->ActiveWorldData,
+                        Manager->GetWorldRootPath(),
+                        Manager->ActivePlayerId);
+
+                    // StartGameplayWorldStreaming reports terminal startup rejection through
+                    // FailWorldStartup. Do not start the next-tick poll after that failure or the
+                    // loading transaction would live forever even though its overlay is hidden.
+                    if (Manager->bIsWorldLoading)
+                    {
+                        Manager->LoadWorldAsync();
+                    }
+                };
+
+                UWorldObjectStreamingSubsystem* Chunks = StrongThis->GetWorld()
+                    ? StrongThis->GetWorld()->GetSubsystem<UWorldObjectStreamingSubsystem>() : nullptr;
+                if (Chunks && Chunks->IsRunning())
+                {
+                    Chunks->LoadRuntimeStateAsync(MoveTemp(ApplyLoadedState));
                 }
                 else
                 {
-                    StrongThis->bPendingInitialWorldDataSave = true;
-                    StrongThis->bPendingInitialPlayerDataSave = true;
-                    if (!LevelError.IsEmpty()) UE_LOG(LogTemp, Warning, TEXT("level.dat unavailable; defaults will be saved. Reason=%s"), *LevelError);
+                    ApplyLoadedState(false, true, FWorldRuntimeState(),
+                        TEXT("the .dat streamer is unavailable"));
                 }
-                StrongThis->SetWorldData(StrongThis->ActiveWorldData);
-                StrongThis->LoadPlayerData();
-                StrongThis->ApplyLevelSettings();
-                StrongThis->SpawnWorldEnvManager();
-                if (IsValid(StrongThis->WorldEnvManagerActor))
-                    StrongThis->WorldEnvManagerActor->InitializeRendering(StrongThis->ActiveWorldData);
-                StrongThis->InitializeWorldSystems(
-                    StrongThis->ActiveWorldData,
-                    StrongThis->GetWorldRootPath(),
-                    StrongThis->ActivePlayerId);
-                StrongThis->LoadWorldAsync();
             });
     });
     if (!bQueued)
     {
-        UE_LOG(LogTemp, Error, TEXT("World data load was rejected because async I/O is shutting down."));
+        FailWorldStartup(
+            TEXT("월드 시작 실패: 비동기 파일 I/O가 종료 중이라 config.json을 읽을 수 없습니다."));
     }
 }
 
@@ -1406,7 +1865,7 @@ void UGameManagerSubSystem::LoadPlayerData()
     if (Existing && IsFiniteWorldLocation(Existing->Location))
     {
         PlayerLocation = Existing->Location;
-        InitialPlayerLocationSource = EInitialPlayerLocationSource::LevelDat;
+        InitialPlayerLocationSource = EInitialPlayerLocationSource::EntityArchive;
         LoadedInitialPlayerRotation = Existing->Rotation.GetNormalized();
         bHasLoadedInitialPlayerRotation = IsFiniteRotation(LoadedInitialPlayerRotation);
     }
@@ -1592,15 +2051,18 @@ void UGameManagerSubSystem::SaveWorldData()
     check(IsInGameThread());
     if (const UWorld* World = GetWorld(); World && World->GetNetMode() == NM_Client) return;
     if (!IsValid(ActiveWorldData) || !IsValid(ActivePlayerData) || !FMath::IsFinite(ActiveWorldData->WorldTime)) return;
-    FLevelRuntimeData Snapshot;
+    FWorldRuntimeState Snapshot;
     Snapshot.WorldTime = ActiveWorldData->WorldTime;
     Snapshot.SelectedPlayer = FPaths::GetCleanFilename(ActiveWorldData->Player);
     Snapshot.Players = ActivePlayerData->Players;
-    FBinaryDataStore::SaveLevelAsync(GetLevelDatPath(), Snapshot, [](FSafeFileWriteResult Result)
+    UWorldObjectStreamingSubsystem* Chunks = GetWorld()
+        ? GetWorld()->GetSubsystem<UWorldObjectStreamingSubsystem>() : nullptr;
+    if (!Chunks || !Chunks->IsRunning()) return;
+    Chunks->SaveRuntimeStateAsync(Snapshot, [](FSafeFileWriteResult Result)
     {
         if (!Result.IsSuccess() && Result.Status != ESafeFileIOStatus::ShuttingDown
             && Result.Status != ESafeFileIOStatus::Superseded)
-            UE_LOG(LogTemp, Error, TEXT("level.dat transactional save failed. Path=%s Reason=%s"), *Result.Path, *Result.Error);
+            UE_LOG(LogTemp, Error, TEXT(".dat transactional save failed. Path=%s Reason=%s"), *Result.Path, *Result.Error);
     });
     bPendingInitialWorldDataSave = false;
 }
@@ -1618,20 +2080,20 @@ void UGameManagerSubSystem::SavePlayerData()
     bPendingInitialPlayerDataSave = false;
 }
 
-void UGameManagerSubSystem::SetSelectedPlayerForRuntime(const FString& PlayerFileName)
+void UGameManagerSubSystem::SetSelectedPlayerForRuntime(const FString& PlayerId)
 {
     if (!IsValid(ActiveWorldData))
     {
         return;
     }
 
-    FString SafeName = FPaths::GetCleanFilename(PlayerFileName);
+    FString SafeName = FPaths::GetCleanFilename(PlayerId);
     SafeName.TrimStartAndEndInline();
     if (SafeName.Contains(TEXT("..")) || SafeName.Contains(TEXT("/")) || SafeName.Contains(TEXT("\\")))
     {
         UE_LOG(LogTemp, Warning,
             TEXT("Rejected unsafe selected-player name: %s"),
-            *PlayerFileName);
+            *PlayerId);
         return;
     }
 
@@ -1770,9 +2232,7 @@ void UGameManagerSubSystem::ApplyGameplaySettings()
 
     // UGameManagerSubSystem survives OpenLevel. Resolve the mode from a clean per-map baseline on
     // every world load; otherwise an unrecognized key can leave the previous world's mode active.
-    const EPlayMode ConfiguredDefault = ConfigActor.IsValid()
-        ? ConfigActor->PlayMode
-        : EPlayMode::Creator;
+    const EPlayMode ConfiguredDefault = PlayMode;
     const FString RuntimeModeKey = IsValid(ActiveWorldData)
         ? ActiveWorldData->Gameplay.WorldGameMode
         : FString();
@@ -1782,7 +2242,7 @@ void UGameManagerSubSystem::ApplyGameplaySettings()
     if (!bRecognizedModeKey)
     {
         UE_LOG(LogTemp, Warning,
-            TEXT("[RuntimePlayMode] Unknown Runtime Play Mode Key '%s' in config.json. Using GameManagerActor default '%s'."),
+            TEXT("[RuntimePlayMode] Unknown Runtime Play Mode Key '%s' in config.json. Using GameplayGameMode default '%s'."),
             *RuntimeModeKey,
             ConfiguredDefault == EPlayMode::Creator ? TEXT("Creator") : TEXT("RealLife"));
     }
@@ -1836,7 +2296,7 @@ void UGameManagerSubSystem::LoadWorldAsync()
 
     if (CheckWorldSystemsLoaded())
     {
-        // Re-run the idempotent DAT restore at the exact point where world streaming is ready.
+        // Re-run the idempotent .dat restore when world streaming is ready.
         // The earlier next-tick attempt can legitimately occur before the persistent GameInstance
         // streaming subsystem has attached itself to this destination UWorld.
         if (!bSavedSceneLoaded && !bSavedSceneLoadInProgress && !bSavedSceneLoadFailed)
@@ -1948,7 +2408,7 @@ void UGameManagerSubSystem::UpdateWorldTime(float DeltaSeconds)
         static_cast<double>(DeltaSeconds) * static_cast<double>(ActiveWorldData->TimeSpeed);
     ActiveWorldData->WorldTime = static_cast<float>(FMath::Clamp(AdvancedTime, 0.0, MaxSafeWorldTimeSeconds));
 
-    // Player transforms live only in data/level.dat. Keep the in-memory mirrors current so the
+    // Player transforms live only in WorldName.dat. Keep the in-memory mirrors current so the
     // next periodic binary save has an immutable validated snapshot.
     const FVector CurrentLocation = GetPlayerLocation();
     ActiveWorldData->PlayerLocation = CurrentLocation;
@@ -1966,33 +2426,77 @@ void UGameManagerSubSystem::UpdateWorldTime(float DeltaSeconds)
 FString UGameManagerSubSystem::GetWorldFilePath(const FString& FileName) const
 {
     const FString WorldRootPath = GetWorldRootPath();
-    return WorldRootPath.IsEmpty() ? FString() : WorldRootPath + FileName;
+    return WorldRootPath.IsEmpty()
+        ? FString()
+        : FPaths::Combine(WorldRootPath, FPaths::GetCleanFilename(FileName));
+}
+
+bool UGameManagerSubSystem::HasLoadingWidget() const
+{
+    return IsValid(LoadingWidgetInstance.Get());
+}
+
+void UGameManagerSubSystem::SetLoadingWidget(UUserWidget* InWidget)
+{
+    if (LoadingWidgetInstance == InWidget)
+    {
+        return;
+    }
+    if (IsValid(LoadingWidgetInstance.Get()))
+    {
+        LoadingWidgetInstance->SetVisibility(ESlateVisibility::Collapsed);
+    }
+    LoadingWidgetInstance = InWidget;
+    if (IsValid(LoadingWidgetInstance.Get()))
+    {
+        LoadingWidgetInstance->SetVisibility(bIsWorldLoading
+            ? ESlateVisibility::Visible
+            : ESlateVisibility::Collapsed);
+    }
 }
 
 void UGameManagerSubSystem::ShowLoadingWidget()
 {
-    if (IsValid(LoadingWidgetInstance) || !LoadingWidgetClass)
+    if (!IsValid(LoadingWidgetInstance.Get()))
     {
-        return;
+        UGlTFSimulatorAssetRegistry* Registry = UGlTFSimulatorGameInstance::GetAssetRegistryFromContext(this);
+        APlayerController* PlayerController = UGameplayStatics::GetPlayerController(this, 0);
+        if (IsValid(Registry) && IsValid(PlayerController) && PlayerController->IsLocalController()
+            && !Registry->LoadingWidgetClass.IsNull())
+        {
+            if (UClass* WidgetClass = Registry->LoadingWidgetClass.LoadSynchronous())
+            {
+                UUserWidget* Widget = CreateWidget<UUserWidget>(PlayerController, WidgetClass);
+                if (IsValid(Widget))
+                {
+                    Widget->AddToPlayerScreen(100);
+                    SetLoadingWidget(Widget);
+                }
+            }
+        }
     }
 
-    LoadingWidgetInstance = CreateWidget<UUserWidget>(GetWorld(), LoadingWidgetClass);
-    if (IsValid(LoadingWidgetInstance))
+    if (IsValid(LoadingWidgetInstance.Get()))
     {
-        LoadingWidgetInstance->AddToViewport(0);
-        if (APlayerCharacterController* PlayerController = Cast<APlayerCharacterController>(UGameplayStatics::GetPlayerController(this, 0)))
+        LoadingWidgetInstance->SetVisibility(ESlateVisibility::Visible);
+        if (!LoadingWidgetInstance->IsInViewport())
         {
-            PlayerController->ApplyLoadingInputMode(LoadingWidgetInstance.Get());
+            LoadingWidgetInstance->AddToPlayerScreen(100);
         }
+    }
+
+    if (APlayerCharacterController* PlayerController =
+            Cast<APlayerCharacterController>(UGameplayStatics::GetPlayerController(this, 0)))
+    {
+        PlayerController->ApplyLoadingInputMode(LoadingWidgetInstance.Get());
     }
 }
 
 void UGameManagerSubSystem::HideLoadingWidget()
 {
-    if (IsValid(LoadingWidgetInstance))
+    if (IsValid(LoadingWidgetInstance.Get()))
     {
-        LoadingWidgetInstance->RemoveFromParent();
-        LoadingWidgetInstance = nullptr;
+        LoadingWidgetInstance->SetVisibility(ESlateVisibility::Collapsed);
     }
 }
 
@@ -2003,8 +2507,14 @@ bool UGameManagerSubSystem::ShouldSpawnOcean() const
 
 void UGameManagerSubSystem::SpawnOcean()
 {
-    if (IsValid(OceanActor) || !ShouldSpawnOcean() || !WaterClass)
+    if (IsValid(OceanActor))
     {
+        return;
+    }
+    if (!ShouldSpawnOcean())
+    {
+        UE_LOG(LogTemp, Display,
+            TEXT("Global ocean disabled by world config (bOcean=false)."));
         return;
     }
 
@@ -2015,39 +2525,72 @@ void UGameManagerSubSystem::SpawnOcean()
     }
 
     FActorSpawnParameters SpawnParams;
-    SpawnParams.Owner = ConfigActor.Get();
-    SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::Undefined;
-    OceanActor = World->SpawnActor<AActor>(WaterClass, OceanTransform, SpawnParams);
+    SpawnParams.Owner = SessionOwner.Get();
+    // Water is an overlap volume. Never let existing world collision suppress the global ocean.
+    SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+    UClass* OceanClass = WaterClass ? WaterClass.Get() : AWaterActor::StaticClass();
+    if (!IsValid(OceanClass) || !OceanClass->IsChildOf(AWaterActor::StaticClass()))
+    {
+        OceanClass = AWaterActor::StaticClass();
+    }
+    const FTransform& HardcodedOceanTransform = GetHardcodedOceanTransform();
+    OceanTransform = HardcodedOceanTransform;
+    OceanActor = World->SpawnActor<AActor>(OceanClass, HardcodedOceanTransform, SpawnParams);
+    if (!IsValid(OceanActor) && OceanClass != AWaterActor::StaticClass())
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("Configured water actor class failed to spawn ocean; retrying native AWaterActor. Class=%s"),
+            *GetNameSafe(OceanClass));
+        OceanActor = World->SpawnActor<AActor>(AWaterActor::StaticClass(), HardcodedOceanTransform, SpawnParams);
+    }
+
+    if (IsValid(OceanActor))
+    {
+        OceanActor->SetActorTransform(HardcodedOceanTransform, false, nullptr, ETeleportType::TeleportPhysics);
+        UE_LOG(LogTemp, Display,
+            TEXT("Global ocean spawned with native hardcoded transform. Class=%s Location=%s Scale=%s"),
+            *GetNameSafe(OceanActor->GetClass()),
+            *HardcodedOceanTransform.GetLocation().ToCompactString(),
+            *HardcodedOceanTransform.GetScale3D().ToCompactString());
+    }
+    else
+    {
+        UE_LOG(LogTemp, Error, TEXT("Global ocean spawn failed even after native AWaterActor fallback."));
+    }
 }
 
-void UGameManagerSubSystem::MainWorldStreaming(const FString& InWorldRoot, const FString& InInitialPlayerName)
+void UGameManagerSubSystem::StartGameplayWorldStreaming(const FString& InWorldRoot, const FString& InInitialPlayerName)
 {
     UWorld* World = GetWorld();
     if (!World)
     {
+        FailWorldStartup(TEXT("월드 시작 실패: 스트리밍에 사용할 UWorld가 없습니다."));
         return;
     }
 
-    StreamSubSystem = UglTFStreamSubSystem::Get(this);
+    StreamSubSystem = UWorldSceneStreamingSubsystem::Get(this);
     if (!IsValid(StreamSubSystem))
     {
+        FailWorldStartup(TEXT("월드 시작 실패: 월드 스트리밍 서브시스템을 만들 수 없습니다."));
         return;
-    }
-
-    // Fall back to the native stream actor if a Blueprint subclass was not assigned in the manager instance.
-    TSubclassOf<AglTFStreamActor> EffectiveSpawnClass = SpawnActorClass;
-    if (!EffectiveSpawnClass)
-    {
-        EffectiveSpawnClass = AglTFStreamActor::StaticClass();
     }
 
     const bool bRenderOnlyStreaming = UMultiplayerWorldSubSystem::ShouldUseClientRenderOnlyStreaming(this);
-    StreamSubSystem->StartMainWorldStreaming(
-        ConfigActor.Get(),
-        EffectiveSpawnClass,
+    StreamSubSystem->StartWorldStreaming(
+        SessionOwner.Get(),
         InWorldRoot,
         InInitialPlayerName,
         bRenderOnlyStreaming);
+
+    // StartWorldStreaming deliberately refuses every non-.gwd source. Convert that
+    // refusal into a terminal runtime-start failure here so LoadWorldAsync cannot spin forever.
+    if (StreamSubSystem->HasStartupFailed()
+        || !StreamSubSystem->IsActiveForWorld(World))
+    {
+        StreamSubSystem = nullptr;
+        FailWorldStartup(
+            TEXT("월드 시작 실패: 검증된 .gwd 스트리밍 세션을 시작하지 못했습니다."));
+    }
 }
 
 void UGameManagerSubSystem::UpdateGameManager(float DeltaSeconds)
@@ -2101,34 +2644,33 @@ void UGameManagerSubSystem::ClearTransientRuntimeReferences()
 
     // These class references may point at Blueprint packages with large dependency graphs. Revert to
     // lightweight native defaults (or null for optional systems) once the world session is gone.
-    PrefabActorClass = APrefabActor::StaticClass();
+    StaticActorClass = AStaticActor::StaticClass();
+    DynamicActorClass = ADynamicActor::StaticClass();
     VehiclePawnClass = AVehiclePawn::StaticClass();
     WeaponActorClass = AWeaponActor::StaticClass();
     WorldEnvManagerClass = AWorldEnvManager::StaticClass();
-    SpawnActorClass = AglTFStreamActor::StaticClass();
     WaterClass = nullptr;
     RainWeatherActorClass = nullptr;
-    LoadingWidgetClass = nullptr;
     OceanTransform = FTransform::Identity;
 
     EquippedWeapon = nullptr;
-    SpawnedPrefabs.Empty();
+    SpawnedStatics.Empty();
     SpawnedVehicles.Empty();
 
     // This method is used only at world/session teardown. Empty releases the allocator capacity
     // retained by large worlds instead of carrying it into menus and subsequent level loads.
-    PrefabFiles.Empty();
-    VehicleFiles.Empty();
-    WeaponFiles.Empty();
+    StaticReferences.Empty();
+    VehicleReferences.Empty();
+    WeaponReferences.Empty();
     AvailableItems.Empty();
     ToolbarSlots.Empty();
     bToolbarInitialized = false;
 
     // Keep CurrentWorldName across ordinary level travel. A confirmed menu return clears it only
-    // after StopGameManager has finished saving the source gameplay world.
+    // after StopGameplaySession has finished saving the source gameplay world.
     ResetInitialPlayerTransformState();
     SelectedToolbarSlotIndex = 0;
-    CurrentPrefabIndex = 0;
+    CurrentStaticIndex = 0;
     CurrentWeaponIndex = 0;
     CurrentMode = EToolMode::None;
     bSnapToGrid = false;
@@ -2150,9 +2692,12 @@ void UGameManagerSubSystem::ClearTransientRuntimeReferences()
     SavedSceneDataAttemptCount = 0;
     bIsSavingScene = false;
     PendingWorldBakeModels.Empty();
-    ActiveWorldBakeActor = nullptr;
+    CompletedWorldBuildModels.Empty();
+    ActiveWorldBuildTask = nullptr;
     bWorldBakeInProgress = false;
-    bWorldBakeStateFilesSaved = false;
+    bWorldArchiveCommitInFlight = false;
+    bAutoBuildForStartup = false;
+    bWorldStartupContinued = false;
     WorldBakeTotalModels = 0;
     WorldBakeCompletedModels = 0;
     WorldBakeFailedModels = 0;
@@ -2163,41 +2708,16 @@ void UGameManagerSubSystem::ClearTransientRuntimeReferences()
     bPlacementGridBuilt = false;
 }
 
-void UGameManagerSubSystem::EnsureAssetFolders() const
-{
-    if (GetWorldRootPath().IsEmpty())
-    {
-        UE_LOG(LogTemp, Error, TEXT("Asset-folder creation skipped because the explicit world root is empty."));
-        return;
-    }
-    IFileManager::Get().MakeDirectory(*GetModelDirectory(), true);
-    IFileManager::Get().MakeDirectory(*GetDataDirectory(), true);
-    IFileManager::Get().MakeDirectory(*FPaths::Combine(GetWorldRootPath(), TEXT("cache")), true);
-}
-
 FString UGameManagerSubSystem::GetWorldRootPath() const
 {
-    FString WorldName = CurrentWorldName;
-    WorldName.TrimStartAndEndInline();
-    return WorldName.IsEmpty() ? FString() : FPaths::Combine(PATH_ROOT, WorldName);
-}
-
-FString UGameManagerSubSystem::GetModelDirectory() const
-{
-    const FString WorldRootPath = GetWorldRootPath();
-    return WorldRootPath.IsEmpty() ? FString() : FPaths::Combine(WorldRootPath, TEXT("model"));
-}
-
-FString UGameManagerSubSystem::GetDataDirectory() const
-{
-    const FString WorldRootPath = GetWorldRootPath();
-    return WorldRootPath.IsEmpty() ? FString() : FPaths::Combine(WorldRootPath, TEXT("data"));
-}
-
-FString UGameManagerSubSystem::GetLevelDatPath() const
-{
-    const FString DataDirectory = GetDataDirectory();
-    return DataDirectory.IsEmpty() ? FString() : FPaths::Combine(DataDirectory, TEXT("level.dat"));
+    // Revalidate on use as a final defense against stale serialized state or future native callers
+    // that bypass SetCurrentWorldName. Directory existence is checked during startup resolution.
+    FString WorldName;
+    if (!TryNormalizeWorldFolderName(CurrentWorldName, WorldName, false))
+    {
+        return FString();
+    }
+    return FPaths::Combine(PATH_WORLDS, WorldName);
 }
 void UGameManagerSubSystem::ScheduleSavedSceneLoadRetry(
     const FString& Reason,
@@ -2222,10 +2742,10 @@ void UGameManagerSubSystem::ScheduleSavedSceneLoadRetry(
         // replacing an unreadable/non-applied chunk with an empty generation during shutdown.
         bSavedSceneLoadFailed = true;
         UE_LOG(LogTemp, Error,
-            TEXT("World-object DAT restore failed after %d attempts. World=%s Phase=%s Reason=%s"),
+            TEXT("World-object .dat restore failed after %d attempts. World=%s Phase=%s Reason=%s"),
             AttemptCount,
             *GetWorldRootPath(),
-            bWaitingForWorldReadiness ? TEXT("world-readiness") : TEXT("DAT-validation/apply"),
+            bWaitingForWorldReadiness ? TEXT("world-readiness") : TEXT("entity-validation/apply"),
             *Reason);
         return;
     }
@@ -2235,7 +2755,7 @@ void UGameManagerSubSystem::ScheduleSavedSceneLoadRetry(
     {
         bSavedSceneLoadFailed = true;
         UE_LOG(LogTemp, Error,
-            TEXT("World-object DAT load could not be retried because the world is unavailable: %s"),
+            TEXT("World-object .dat load could not be retried because the world is unavailable: %s"),
             *Reason);
         return;
     }
@@ -2254,24 +2774,25 @@ void UGameManagerSubSystem::ScheduleSavedSceneLoadRetry(
         SavedSceneLoadRetryDelaySeconds,
         false);
     UE_LOG(LogTemp, Warning,
-        TEXT("World-object DAT load will retry. Phase=%s Attempt=%d/%d Reason=%s"),
-        bWaitingForWorldReadiness ? TEXT("world-readiness") : TEXT("DAT-validation/apply"),
+        TEXT("World-object .dat load will retry. Phase=%s Attempt=%d/%d Reason=%s"),
+        bWaitingForWorldReadiness ? TEXT("world-readiness") : TEXT("entity-validation/apply"),
         AttemptCount,
         MaximumAttempts,
         *Reason);
 }
 
-void UGameManagerSubSystem::ScanAssetFolders()
+void UGameManagerSubSystem::RefreshBuiltModelLists()
 {
-    PrefabFiles.Empty();
-    VehicleFiles.Empty();
-    WeaponFiles.Empty();
+    StaticReferences.Empty();
+    VehicleReferences.Empty();
+    WeaponReferences.Empty();
 
     const UModelDatabaseSubsystem* Database = GetGameInstance()
         ? GetGameInstance()->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
     if (!Database || !Database->IsReady())
     {
-        UE_LOG(LogTemp, Error, TEXT("Asset scan skipped because db.dat has not been validated."));
+        UE_LOG(LogTemp, Error,
+            TEXT("Built model list refresh skipped because the world model index is unavailable."));
         return;
     }
 
@@ -2279,59 +2800,59 @@ void UGameManagerSubSystem::ScanAssetFolders()
     Database->GetDefinitions(Definitions);
     for (const FModelDefinition& Definition : Definitions)
     {
-        if (Definition.ModelType == EModelDefinitionType::Prefab
-            || (Definition.ModelType == EModelDefinitionType::Entity
-                && (Definition.EntityType == EModelEntityType::Prop
-                    || Definition.EntityType == EModelEntityType::Animal)))
-            PrefabFiles.Add(Definition.GlbPath);
-        else if (Definition.ModelType == EModelDefinitionType::Entity
-            && Definition.EntityType == EModelEntityType::Vehicle)
-            VehicleFiles.Add(Definition.GlbPath);
-        else if (Definition.ModelType == EModelDefinitionType::Item
-            && Definition.ItemType == EModelItemType::Weapon)
-            WeaponFiles.Add(Definition.GlbPath);
-    }
-
-    PrefabFiles.Sort();
-    VehicleFiles.Sort();
-    WeaponFiles.Sort();
-
-    CurrentPrefabIndex = PrefabFiles.Num() > 0 ? FMath::Clamp(CurrentPrefabIndex, 0, PrefabFiles.Num() - 1) : 0;
-    CurrentWeaponIndex = WeaponFiles.Num() > 0 ? FMath::Clamp(CurrentWeaponIndex, 0, WeaponFiles.Num() - 1) : 0;
-}
-
-FString UGameManagerSubSystem::GetAssetDisplayName(const FString& AssetPath) const
-{
-    const FString JsonPath = FPaths::ChangeExtension(AssetPath, TEXT("json"));
-    FString JsonString;
-    if (FFileHelper::LoadFileToString(JsonString, *JsonPath))
-    {
-        TSharedPtr<FJsonObject> RootObject;
-        const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonString);
-        if (FJsonSerializer::Deserialize(Reader, RootObject) && RootObject.IsValid())
+        if (Definition.ModelType == EModelDefinitionType::Static)
         {
-            FString DisplayName;
-            if (RootObject->TryGetStringField(TEXT("DisplayName"), DisplayName) && !DisplayName.IsEmpty())
-            {
-                return DisplayName;
-            }
-            if (RootObject->TryGetStringField(TEXT("Name"), DisplayName) && !DisplayName.IsEmpty())
-            {
-                return DisplayName;
-            }
+            StaticReferences.Add(FGWorldArchive::MakeModelReference(Definition.UUID));
+            continue;
+        }
+        if (Definition.ModelType != EModelDefinitionType::Dynamic)
+        {
+            continue;
+        }
+        if (Definition.EntityType == EModelEntityType::Vehicle)
+        {
+            VehicleReferences.Add(FGWorldArchive::MakeModelReference(Definition.UUID));
+        }
+        else if (Definition.ItemType == EModelItemType::Weapon)
+        {
+            WeaponReferences.Add(FGWorldArchive::MakeModelReference(Definition.UUID));
         }
     }
 
-    return FPaths::GetBaseFilename(AssetPath);
+    StaticReferences.Sort();
+    VehicleReferences.Sort();
+    WeaponReferences.Sort();
+
+    CurrentStaticIndex = StaticReferences.Num() > 0
+        ? FMath::Clamp(CurrentStaticIndex, 0, StaticReferences.Num() - 1) : 0;
+    CurrentWeaponIndex = WeaponReferences.Num() > 0
+        ? FMath::Clamp(CurrentWeaponIndex, 0, WeaponReferences.Num() - 1) : 0;
 }
 
-FToolbarItem UGameManagerSubSystem::MakeToolbarItem(EToolbarItemKind Kind, const FString& DisplayName, const FString& SourcePath, int32 SourceIndex) const
+FString UGameManagerSubSystem::GetAssetDisplayName(const FString& ModelReference) const
+{
+    const UModelDatabaseSubsystem* Database = GetGameInstance()
+        ? GetGameInstance()->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
+    FGuid UUID;
+    FModelDefinition Definition;
+    FString RuntimeReference;
+    if (Database && Database->FindUUIDForReference(ModelReference, UUID)
+        && Database->Resolve(UUID, Definition, RuntimeReference))
+    {
+        return Definition.DisplayName.IsEmpty() ? Definition.Name : Definition.DisplayName;
+    }
+
+    // Invalid references are displayed as opaque identifiers. Runtime UI never probes resources/.
+    return FPaths::GetBaseFilename(ModelReference);
+}
+
+FToolbarItem UGameManagerSubSystem::MakeToolbarItem(EToolbarItemKind Kind, const FString& DisplayName, const FString& ModelReference, int32 ModelIndex) const
 {
     FToolbarItem Item;
     Item.Kind = Kind;
     Item.DisplayName = DisplayName;
-    Item.SourcePath = SourcePath;
-    Item.SourceIndex = SourceIndex;
+    Item.ModelReference = ModelReference;
+    Item.ModelIndex = ModelIndex;
     Item.bAvailable = Kind != EToolbarItemKind::None;
     return Item;
 }
@@ -2342,30 +2863,30 @@ void UGameManagerSubSystem::BuildAvailableItems()
 
     if (PlayMode == EPlayMode::Creator)
     {
-        for (int32 Index = 0; Index < VehicleFiles.Num(); ++Index)
+        for (int32 Index = 0; Index < VehicleReferences.Num(); ++Index)
         {
             AvailableItems.Add(MakeToolbarItem(
                 EToolbarItemKind::Vehicle,
-                GetAssetDisplayName(VehicleFiles[Index]),
-                VehicleFiles[Index],
+                GetAssetDisplayName(VehicleReferences[Index]),
+                VehicleReferences[Index],
                 Index));
         }
 
-        for (int32 Index = 0; Index < PrefabFiles.Num(); ++Index)
+        for (int32 Index = 0; Index < StaticReferences.Num(); ++Index)
         {
             AvailableItems.Add(MakeToolbarItem(
-                EToolbarItemKind::Prefab,
-                GetAssetDisplayName(PrefabFiles[Index]),
-                PrefabFiles[Index],
+                EToolbarItemKind::Static,
+                GetAssetDisplayName(StaticReferences[Index]),
+                StaticReferences[Index],
                 Index));
         }
 
-        for (int32 Index = 0; Index < WeaponFiles.Num(); ++Index)
+        for (int32 Index = 0; Index < WeaponReferences.Num(); ++Index)
         {
             AvailableItems.Add(MakeToolbarItem(
                 EToolbarItemKind::Weapon,
-                GetAssetDisplayName(WeaponFiles[Index]),
-                WeaponFiles[Index],
+                GetAssetDisplayName(WeaponReferences[Index]),
+                WeaponReferences[Index],
                 Index));
         }
     }
@@ -2406,8 +2927,8 @@ int32 UGameManagerSubSystem::FindAvailableItemIndexMatching(const FToolbarItem& 
             continue;
         }
 
-        if (!Item.SourcePath.IsEmpty()
-            && Candidate.SourcePath.Equals(Item.SourcePath, ESearchCase::IgnoreCase))
+        if (!Item.ModelReference.IsEmpty()
+            && Candidate.ModelReference.Equals(Item.ModelReference, ESearchCase::IgnoreCase))
         {
             return Index;
         }
@@ -2562,7 +3083,7 @@ void UGameManagerSubSystem::SetPlayMode(EPlayMode NewMode)
     }
 
     PlayMode = NewMode;
-    ScanAssetFolders();
+    RefreshBuiltModelLists();
     BuildAvailableItems();
     InitializeToolbarSlotsIfNeeded();
     ApplySelectedToolbarItem(false);
@@ -2577,22 +3098,22 @@ void UGameManagerSubSystem::ApplySelectedToolbarItem(bool bBroadcastChange)
 
     switch (Item.Kind)
     {
-    case EToolbarItemKind::Prefab:
-        if (Item.bAvailable && PrefabFiles.IsValidIndex(Item.SourceIndex))
+    case EToolbarItemKind::Static:
+        if (Item.bAvailable && StaticReferences.IsValidIndex(Item.ModelIndex))
         {
-            CurrentPrefabIndex = Item.SourceIndex;
+            CurrentStaticIndex = Item.ModelIndex;
         }
-        CurrentMode = EToolMode::PlacePrefab;
-        LastSaveMessage = FString::Printf(TEXT("Prefab 선택: %s"), *GetCurrentPrefabName());
+        CurrentMode = EToolMode::PlaceStatic;
+        LastSaveMessage = FString::Printf(TEXT("Static 선택: %s"), *GetCurrentStaticName());
         break;
     case EToolbarItemKind::Vehicle:
         CurrentMode = EToolMode::PlaceVehicle;
         LastSaveMessage = TEXT("차량 만들기: 중앙 십자가 위치에 좌클릭으로 차량을 설치합니다.");
         break;
     case EToolbarItemKind::Weapon:
-        if (Item.bAvailable && WeaponFiles.IsValidIndex(Item.SourceIndex))
+        if (Item.bAvailable && WeaponReferences.IsValidIndex(Item.ModelIndex))
         {
-            CurrentWeaponIndex = Item.SourceIndex;
+            CurrentWeaponIndex = Item.ModelIndex;
         }
         EquipCurrentWeapon();
         if (bBroadcastChange)
@@ -2643,24 +3164,24 @@ void UGameManagerSubSystem::ResetEditorTransactionBufferForWorldTravel(const UOb
 
 void UGameManagerSubSystem::OpenWorldSelectionScreen(
     const UObject* WorldContextObject,
-    TSoftObjectPtr<UWorld> WorldSelectionWorld)
+    TSoftObjectPtr<UWorld> MainWorld)
 {
-    TryOpenWorldSelectionScreen(WorldContextObject, WorldSelectionWorld);
+    TryOpenWorldSelectionScreen(WorldContextObject, MainWorld);
 }
 
 bool UGameManagerSubSystem::TryOpenWorldSelectionScreen(
     const UObject* WorldContextObject,
-    TSoftObjectPtr<UWorld> WorldSelectionWorld)
+    TSoftObjectPtr<UWorld> MainWorld)
 {
     UWorld* SourceWorld = WorldContextObject ? WorldContextObject->GetWorld() : nullptr;
-    if (!WorldContextObject || !SourceWorld || WorldSelectionWorld.IsNull())
+    if (!WorldContextObject || !SourceWorld || MainWorld.IsNull())
     {
         UE_LOG(LogTemp, Error,
             TEXT("[MenuTravel] Cannot open world selection because the context or directly referenced world is invalid."));
         return false;
     }
 
-    if (WorldSelectionWorld.Get() == SourceWorld)
+    if (MainWorld.Get() == SourceWorld)
     {
         UE_LOG(LogTemp, Error,
             TEXT("[MenuTravel] Refused pause Exit because the destination resolves to the active gameplay world."));
@@ -2698,93 +3219,76 @@ bool UGameManagerSubSystem::TryOpenWorldSelectionScreen(
     Manager->RequestWorldSelectionMenuOnNextMainWorld();
     Manager->PrepareForMenuLevelTravelRequest();
 
-    // StartActor clears the pending request only after the destination menu is input-safe.
+    // MainGameMode clears the pending request only after the destination UI is input-safe.
     ResetEditorTransactionBufferForWorldTravel(WorldContextObject, TEXT("Open world-selection screen"));
     UE_LOG(LogTemp, Display, TEXT("[MenuTravel] Calling OpenLevelBySoftObjectPtr for world selection."));
-    UGameplayStatics::OpenLevelBySoftObjectPtr(WorldContextObject, WorldSelectionWorld, true, FString());
+    UGameplayStatics::OpenLevelBySoftObjectPtr(WorldContextObject, MainWorld, true, FString());
     return true;
 }
 
-void UGameManagerSubSystem::OpenMainMenuFromWorldSelection(
-    const UObject* WorldContextObject,
-    TSoftObjectPtr<UWorld> MainMenuWorld)
-{
-    if (!WorldContextObject || MainMenuWorld.IsNull())
-    {
-        UE_LOG(LogTemp, Error,
-            TEXT("GameManagerSubSystem cannot open the main menu because no world asset is assigned."));
-        return;
-    }
 
-    if (UGameManagerSubSystem* Manager = FindGameManager(WorldContextObject))
-    {
-        Manager->ClearWorldSelectionMenuRequest();
-        Manager->SetGamePaused(false);
-    }
-
-    ResetEditorTransactionBufferForWorldTravel(WorldContextObject, TEXT("Open main menu from world selection"));
-    UGameplayStatics::OpenLevelBySoftObjectPtr(WorldContextObject, MainMenuWorld, true, FString());
-}
 
 AActor* UGameManagerSubSystem::GetCrosshairHitActor() const
 {
     return bLastTraceBlockingHit ? LastTraceHit.GetActor() : nullptr;
 }
 
-FString UGameManagerSubSystem::GetCurrentPrefabName() const
+FString UGameManagerSubSystem::GetCurrentStaticName() const
 {
-    return PrefabFiles.IsValidIndex(CurrentPrefabIndex) ? FPaths::GetBaseFilename(PrefabFiles[CurrentPrefabIndex]) : TEXT("없음");
+    return StaticReferences.IsValidIndex(CurrentStaticIndex)
+        ? GetAssetDisplayName(StaticReferences[CurrentStaticIndex]) : TEXT("없음");
 }
 
 FString UGameManagerSubSystem::GetCurrentWeaponName() const
 {
-    return WeaponFiles.IsValidIndex(CurrentWeaponIndex) ? FPaths::GetBaseFilename(WeaponFiles[CurrentWeaponIndex]) : TEXT("없음");
+    return WeaponReferences.IsValidIndex(CurrentWeaponIndex)
+        ? GetAssetDisplayName(WeaponReferences[CurrentWeaponIndex]) : TEXT("없음");
 }
 
-void UGameManagerSubSystem::SelectPreviousPrefab()
+void UGameManagerSubSystem::SelectPreviousStatic()
 {
-    ScanAssetFolders();
+    RefreshBuiltModelLists();
     BuildAvailableItems();
-    if (PrefabFiles.Num() > 0)
+    if (StaticReferences.Num() > 0)
     {
-        CurrentPrefabIndex = (CurrentPrefabIndex - 1 + PrefabFiles.Num()) % PrefabFiles.Num();
-        LastSaveMessage = FString::Printf(TEXT("Prefab 선택: %s"), *GetCurrentPrefabName());
+        CurrentStaticIndex = (CurrentStaticIndex - 1 + StaticReferences.Num()) % StaticReferences.Num();
+        LastSaveMessage = FString::Printf(TEXT("Static 선택: %s"), *GetCurrentStaticName());
     }
     else
     {
-        LastSaveMessage = TEXT("prefab/ 폴더에 gltf 또는 glb가 없습니다.");
+        LastSaveMessage = TEXT("빌드된 Static 모델이 없습니다.");
     }
     NotifyStateChanged();
 }
 
-void UGameManagerSubSystem::SelectNextPrefab()
+void UGameManagerSubSystem::SelectNextStatic()
 {
-    ScanAssetFolders();
+    RefreshBuiltModelLists();
     BuildAvailableItems();
-    if (PrefabFiles.Num() > 0)
+    if (StaticReferences.Num() > 0)
     {
-        CurrentPrefabIndex = (CurrentPrefabIndex + 1) % PrefabFiles.Num();
-        LastSaveMessage = FString::Printf(TEXT("Prefab 선택: %s"), *GetCurrentPrefabName());
+        CurrentStaticIndex = (CurrentStaticIndex + 1) % StaticReferences.Num();
+        LastSaveMessage = FString::Printf(TEXT("Static 선택: %s"), *GetCurrentStaticName());
     }
     else
     {
-        LastSaveMessage = TEXT("prefab/ 폴더에 gltf 또는 glb가 없습니다.");
+        LastSaveMessage = TEXT("빌드된 Static 모델이 없습니다.");
     }
     NotifyStateChanged();
 }
 
-void UGameManagerSubSystem::SelectPrefabPlacementTool()
+void UGameManagerSubSystem::SelectStaticPlacementTool()
 {
-    ScanAssetFolders();
+    RefreshBuiltModelLists();
     BuildAvailableItems();
-    CurrentMode = EToolMode::PlacePrefab;
-    LastSaveMessage = TEXT("Prefab 도구: 중앙 십자가 위치에 좌클릭으로 현재 Prefab을 설치합니다.");
+    CurrentMode = EToolMode::PlaceStatic;
+    LastSaveMessage = TEXT("Static 도구: 중앙 십자가 위치에 좌클릭으로 현재 Static을 설치합니다.");
     NotifyStateChanged();
 }
 
 void UGameManagerSubSystem::SelectVehicleTool()
 {
-    ScanAssetFolders();
+    RefreshBuiltModelLists();
     BuildAvailableItems();
     CurrentMode = EToolMode::PlaceVehicle;
     LastSaveMessage = TEXT("차량 도구: 중앙 십자가 위치에 좌클릭으로 차량을 설치합니다.");
@@ -2793,41 +3297,42 @@ void UGameManagerSubSystem::SelectVehicleTool()
 
 void UGameManagerSubSystem::SelectPreviousWeapon()
 {
-    ScanAssetFolders();
+    RefreshBuiltModelLists();
     BuildAvailableItems();
-    if (WeaponFiles.Num() > 0)
+    if (WeaponReferences.Num() > 0)
     {
-        CurrentWeaponIndex = (CurrentWeaponIndex - 1 + WeaponFiles.Num()) % WeaponFiles.Num();
+        CurrentWeaponIndex = (CurrentWeaponIndex - 1 + WeaponReferences.Num()) % WeaponReferences.Num();
         LastSaveMessage = FString::Printf(TEXT("무기 선택: %s"), *GetCurrentWeaponName());
     }
     else
     {
-        LastSaveMessage = TEXT("item/ 폴더에 gltf 또는 glb 무기가 없습니다.");
+        LastSaveMessage = TEXT("빌드된 Weapon 모델이 없습니다.");
     }
     NotifyStateChanged();
 }
 
 void UGameManagerSubSystem::SelectNextWeapon()
 {
-    ScanAssetFolders();
+    RefreshBuiltModelLists();
     BuildAvailableItems();
-    if (WeaponFiles.Num() > 0)
+    if (WeaponReferences.Num() > 0)
     {
-        CurrentWeaponIndex = (CurrentWeaponIndex + 1) % WeaponFiles.Num();
+        CurrentWeaponIndex = (CurrentWeaponIndex + 1) % WeaponReferences.Num();
         LastSaveMessage = FString::Printf(TEXT("무기 선택: %s"), *GetCurrentWeaponName());
     }
     else
     {
-        LastSaveMessage = TEXT("item/ 폴더에 gltf 또는 glb 무기가 없습니다.");
+        LastSaveMessage = TEXT("빌드된 Weapon 모델이 없습니다.");
     }
     NotifyStateChanged();
 }
 
 void UGameManagerSubSystem::EquipCurrentWeapon()
 {
-    ScanAssetFolders();
+    RefreshBuiltModelLists();
 
-    APlayerController* PC = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr;
+    UWorld* const World = GetWorld();
+    APlayerController* PC = World ? World->GetFirstPlayerController() : nullptr;
     if (!IsValid(PC))
     {
         LastSaveMessage = TEXT("PlayerController를 찾을 수 없습니다.");
@@ -2858,24 +3363,35 @@ void UGameManagerSubSystem::EquipCurrentWeapon()
         return;
     }
 
-    const bool bHasConfiguredWeaponFile = WeaponFiles.IsValidIndex(CurrentWeaponIndex);
-    const FString SelectedWeaponFile = bHasConfiguredWeaponFile ? WeaponFiles[CurrentWeaponIndex] : FString();
+    const bool bHasConfiguredWeaponReference = WeaponReferences.IsValidIndex(CurrentWeaponIndex);
+    const FString SelectedWeaponReference = bHasConfiguredWeaponReference ? WeaponReferences[CurrentWeaponIndex] : FString();
 
     FActorSpawnParameters Params;
-    Params.Owner = PC->GetPawn() ? Cast<AActor>(PC->GetPawn()) : ConfigActor.Get();
+    Params.Owner = PC->GetPawn() ? Cast<AActor>(PC->GetPawn()) : SessionOwner.Get();
     Params.Instigator = PC->GetPawn();
     UClass* WeaponSpawnClass = WeaponActorClass ? WeaponActorClass.Get() : AWeaponActor::StaticClass();
-    AWeaponActor* Weapon = GetWorld()->SpawnActor<AWeaponActor>(WeaponSpawnClass, FTransform::Identity, Params);
+    // Retain the validated world across this game-thread operation; the GameInstance subsystem can
+    // otherwise be called from menu Blueprint code after its gameplay UWorld has been released.
+    AWeaponActor* Weapon = World->SpawnActor<AWeaponActor>(
+        WeaponSpawnClass, FTransform::Identity, Params);
+    if (!IsValid(Weapon) && WeaponSpawnClass != AWeaponActor::StaticClass())
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("Configured weapon actor class failed to spawn; retrying native AWeaponActor. Class=%s"),
+            *GetNameSafe(WeaponSpawnClass));
+        Weapon = World->SpawnActor<AWeaponActor>(
+            AWeaponActor::StaticClass(), FTransform::Identity, Params);
+    }
 
-    const bool bEquipped = IsValid(Weapon) && (bHasConfiguredWeaponFile
-        ? Weapon->EquipFromFile(SelectedWeaponFile, AttachTarget)
+    const bool bEquipped = IsValid(Weapon) && (bHasConfiguredWeaponReference
+        ? Weapon->EquipFromModel(SelectedWeaponReference, AttachTarget)
         : Weapon->EquipDefault(AttachTarget));
 
     if (bEquipped)
     {
         EquippedWeapon = Weapon;
         CurrentMode = EToolMode::Weapon;
-        LastSaveMessage = bHasConfiguredWeaponFile
+        LastSaveMessage = bHasConfiguredWeaponReference
             ? FString::Printf(TEXT("무기 장착: %s"), *GetCurrentWeaponName())
             : TEXT("기본 테스트 무기 장착");
     }
@@ -2930,9 +3446,9 @@ bool UGameManagerSubSystem::TracePlacementLocation(FVector& OutLocation, FHitRes
     if (!IsValid(World) || !IsValid(PC))
     {
         // Fall back to the manager actor location only so callers never read an uninitialized vector.
-        OutLocation = GetManagerActorLocation();
+        OutLocation = GetSessionOwnerLocation();
         // Reset the cached ray to a safe default when there is no player camera.
-        LastTraceStart = GetManagerActorLocation();
+        LastTraceStart = GetSessionOwnerLocation();
         LastTraceDirection = FVector::ForwardVector;
         // Clear the hit result because no collision query was actually possible.
         OutHit = FHitResult();
@@ -2948,9 +3464,9 @@ bool UGameManagerSubSystem::TracePlacementLocation(FVector& OutLocation, FHitRes
     // This subsystem is not an actor, so ignored actors must be added explicitly below.
     FCollisionQueryParams Params(SCENE_QUERY_STAT(PlacementTrace), true);
     // Ignore the manager configuration actor if one exists, matching the old actor-owned trace behavior.
-    if (AGameManagerActor* ManagerActor = ConfigActor.Get())
+    if (AActor* OwnerActor = SessionOwner.Get())
     {
-        Params.AddIgnoredActor(ManagerActor);
+        Params.AddIgnoredActor(OwnerActor);
     }
     // Ignore the controlled pawn so first-person cameras do not immediately hit the player capsule.
     if (APawn* Pawn = PC->GetPawn())
@@ -3056,7 +3572,7 @@ bool UGameManagerSubSystem::ShouldShowPlacementGrid() const
 {
     return PlayMode == EPlayMode::Creator
         && bLastTraceHasPlacementLocation
-        && CurrentMode == EToolMode::PlacePrefab;
+        && CurrentMode == EToolMode::PlaceStatic;
 }
 
 void UGameManagerSubSystem::UpdatePlacementGrid()
@@ -3285,12 +3801,12 @@ void UGameManagerSubSystem::AutoSaveScene()
 int32 UGameManagerSubSystem::CountExistingBaseName(const FString& BaseName, EPlacedObjectKind Kind) const
 {
     int32 Count = 0;
-    if (Kind == EPlacedObjectKind::Prefab)
+    if (Kind == EPlacedObjectKind::Static)
     {
-        for (const TWeakObjectPtr<APrefabActor>& PrefabReference : SpawnedPrefabs)
+        for (const TWeakObjectPtr<AStaticActor>& StaticReference : SpawnedStatics)
         {
-            const APrefabActor* Prefab = PrefabReference.Get();
-            if (IsValid(Prefab) && Prefab->GetBaseName().Equals(BaseName, ESearchCase::IgnoreCase))
+            const AStaticActor* Static = StaticReference.Get();
+            if (IsValid(Static) && Static->GetBaseName().Equals(BaseName, ESearchCase::IgnoreCase))
             {
                 ++Count;
             }
@@ -3314,16 +3830,18 @@ FString UGameManagerSubSystem::MakeObjectName(const FString& BaseName, EPlacedOb
 {
     const FString SafeBaseName = BaseName.IsEmpty() ? TEXT("GeneratedEntity") : BaseName;
     const int32 ExistingCount = CountExistingBaseName(SafeBaseName, Kind);
-    if (ExistingCount <= 0)
-    {
-        return SafeBaseName;
-    }
-    if (ExistingCount == 1)
-    {
-        return SafeBaseName + TEXT(";INST");
-    }
-    return FString::Printf(TEXT("%s;INST_%d"), *SafeBaseName, ExistingCount);
+    return ExistingCount <= 0
+        ? SafeBaseName
+        : FString::Printf(TEXT("%s.%03d"), *SafeBaseName, ExistingCount);
 }
+
+void UGameManagerSubSystem::InputPrimaryAction()
+{
+    // Backward-compatible Blueprint endpoint. Release was always a no-op after placement became
+    // edge-triggered, so forwarding once preserves behavior without manufacturing duplicate work.
+    InputPrimaryPressed();
+}
+
 void UGameManagerSubSystem::InputPrimaryPressed()
 {
     if (bItemListWindowOpen)
@@ -3344,20 +3862,20 @@ void UGameManagerSubSystem::InputPrimaryPressed()
 
     switch (Item.Kind)
     {
-    case EToolbarItemKind::Prefab:
+    case EToolbarItemKind::Static:
         if (bHasPlacementLocation)
         {
-            PlaceCurrentPrefab(Location);
+            PlaceCurrentStatic(Location);
         }
         else
         {
-            LastSaveMessage = TEXT("Prefab을 설치할 중앙 십자가 위치를 계산할 수 없습니다.");
+            LastSaveMessage = TEXT("Static을 설치할 중앙 십자가 위치를 계산할 수 없습니다.");
         }
         break;
     case EToolbarItemKind::Vehicle:
         if (bHasPlacementLocation)
         {
-            PlaceVehicle(Location, Item.SourcePath);
+            PlaceVehicle(Location, Item.ModelReference);
         }
         else
         {
@@ -3377,13 +3895,13 @@ void UGameManagerSubSystem::InputPrimaryPressed()
         break;
     case EToolbarItemKind::None:
     default:
-        if (CurrentMode == EToolMode::PlacePrefab && bHasPlacementLocation)
+        if (CurrentMode == EToolMode::PlaceStatic && bHasPlacementLocation)
         {
-            PlaceCurrentPrefab(Location);
+            PlaceCurrentStatic(Location);
         }
         else if (CurrentMode == EToolMode::PlaceVehicle && bHasPlacementLocation)
         {
-            PlaceVehicle(Location, Item.SourcePath);
+            PlaceVehicle(Location, Item.ModelReference);
         }
         else if (IsValid(EquippedWeapon))
         {
@@ -3394,6 +3912,12 @@ void UGameManagerSubSystem::InputPrimaryPressed()
     }
 
     NotifyStateChanged();
+}
+
+void UGameManagerSubSystem::InputPrimaryReleased()
+{
+    // Intentionally empty. Retaining the reflected symbol prevents old Blueprint graphs from
+    // failing to load while the current input model performs all placement work on button press.
 }
 
 void UGameManagerSubSystem::InputSecondaryAction()
@@ -3467,92 +3991,114 @@ void UGameManagerSubSystem::ConfirmCurrentPendingLocation()
     InputPrimaryPressed();
 }
 
-void UGameManagerSubSystem::PlaceCurrentPrefab(const FVector& Location)
+void UGameManagerSubSystem::PlaceCurrentStatic(const FVector& Location)
 {
-    ScanAssetFolders();
-    if (!PrefabFiles.IsValidIndex(CurrentPrefabIndex))
+    UWorld* const World = GetWorld();
+    if (!IsValid(World) || !World->IsGameWorld())
     {
-        LastSaveMessage = TEXT("prefab/ 폴더에 gltf 또는 glb가 없습니다.");
+        LastSaveMessage = TEXT("활성 게임 월드가 없어 Static을 설치하지 않았습니다.");
         return;
     }
 
-    const FString SourceFile = GlbValidation::NormalizePath(PrefabFiles[CurrentPrefabIndex]);
-    if (SourceFile.IsEmpty() || !IFileManager::Get().FileExists(*SourceFile))
+    RefreshBuiltModelLists();
+    if (!StaticReferences.IsValidIndex(CurrentStaticIndex))
     {
-        LastSaveMessage = TEXT("Prefab 에셋 파일이 없어 설치하지 않았습니다.");
+        LastSaveMessage = TEXT("빌드된 Static 모델이 없습니다.");
         return;
     }
 
-    const FString BaseName = FPaths::GetBaseFilename(SourceFile);
-    const FString ObjectName = MakeObjectName(BaseName, EPlacedObjectKind::Prefab);
+    UModelDatabaseSubsystem* Database = GetGameInstance()
+        ? GetGameInstance()->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
+    FGuid UUID;
+    FModelDefinition Definition;
+    FString ModelReference;
+    if (!Database || !Database->FindUUIDForReference(StaticReferences[CurrentStaticIndex], UUID)
+        || !Database->ResolveLoadable(UUID, Definition, ModelReference)
+        || Definition.ModelType != EModelDefinitionType::Static)
+    {
+        LastSaveMessage = TEXT("빌드된 Static 모델 참조가 유효하지 않습니다.");
+        return;
+    }
+
+    const FString BaseName = Definition.Name;
+    const FString ObjectName = MakeObjectName(BaseName, EPlacedObjectKind::Static);
 
     FActorSpawnParameters Params;
-    Params.Owner = ConfigActor.Get();
+    Params.Owner = SessionOwner.Get();
     Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-    const FRotator SpawnRot = FRotator(0.0f, GetWorld()->GetFirstPlayerController() ? GetWorld()->GetFirstPlayerController()->GetControlRotation().Yaw : 0.0f, 0.0f);
-    UClass* PrefabSpawnClass = PrefabActorClass ? PrefabActorClass.Get() : APrefabActor::StaticClass();
-    APrefabActor* Actor = GetWorld()->SpawnActor<APrefabActor>(PrefabSpawnClass, FTransform(SpawnRot, Location), Params);
-    if (!IsValid(Actor) && PrefabSpawnClass != APrefabActor::StaticClass())
+    APlayerController* const PlayerController = World->GetFirstPlayerController();
+    const FRotator SpawnRot(0.0f,
+        PlayerController ? PlayerController->GetControlRotation().Yaw : 0.0f,
+        0.0f);
+    UClass* StaticSpawnClass = StaticActorClass ? StaticActorClass.Get() : AStaticActor::StaticClass();
+    AStaticActor* Actor = World->SpawnActor<AStaticActor>(
+        StaticSpawnClass, FTransform(SpawnRot, Location), Params);
+    if (!IsValid(Actor) && StaticSpawnClass != AStaticActor::StaticClass())
     {
         UE_LOG(LogTemp, Warning,
-            TEXT("Configured prefab actor class failed to spawn; retrying with native APrefabActor. Class=%s"),
-            *GetNameSafe(PrefabSpawnClass));
-        Actor = GetWorld()->SpawnActor<APrefabActor>(APrefabActor::StaticClass(), FTransform(SpawnRot, Location), Params);
+            TEXT("Configured Static actor class failed to spawn; retrying with native AStaticActor. Class=%s"),
+            *GetNameSafe(StaticSpawnClass));
+        Actor = World->SpawnActor<AStaticActor>(
+            AStaticActor::StaticClass(), FTransform(SpawnRot, Location), Params);
     }
     if (IsValid(Actor))
     {
-        Actor->SetRenderOnlyMode(UMultiplayerWorldSubSystem::ShouldUseClientRenderOnlyStreaming(this));
+        Actor->SetRenderOnlyStreaming(UMultiplayerWorldSubSystem::ShouldUseClientRenderOnlyStreaming(this));
     }
-    if (IsValid(Actor) && Actor->LoadPrefab(SourceFile, ObjectName))
+    if (IsValid(Actor) && Actor->LoadStatic(ModelReference, ObjectName))
     {
-        FGuid UUID;
-        UModelDatabaseSubsystem* Database = GetGameInstance()
-            ? GetGameInstance()->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
-        UWorldObjectStreamingSubsystem* Chunks = GetWorld()
-            ? GetWorld()->GetSubsystem<UWorldObjectStreamingSubsystem>() : nullptr;
-        if (!Database || !Chunks || !Database->FindUUIDForGlb(SourceFile, UUID)
-            || !Chunks->RegisterPlacedObject(Actor, UUID))
+        UWorldObjectStreamingSubsystem* Chunks =
+            World->GetSubsystem<UWorldObjectStreamingSubsystem>();
+        if (!Chunks || !Chunks->RegisterPlacedObject(Actor, UUID))
         {
             Actor->Destroy();
             LastSaveMessage = TEXT("대상 청크 또는 모델 UUID가 아직 준비되지 않아 설치를 보류했습니다.");
             return;
         }
-        SpawnedPrefabs.Add(TWeakObjectPtr<APrefabActor>(Actor));
+        SpawnedStatics.Add(TWeakObjectPtr<AStaticActor>(Actor));
         LastSaveMessage = FString::Printf(TEXT("설치됨: %s"), *ObjectName);
     }
     else if (IsValid(Actor))
     {
         Actor->Destroy();
-        LastSaveMessage = TEXT("Prefab 로드 실패");
+        LastSaveMessage = TEXT("Static 로드 실패");
     }
 }
 
-void UGameManagerSubSystem::PlaceVehicle(const FVector& Location, const FString& SourceFile)
+void UGameManagerSubSystem::PlaceVehicle(const FVector& Location, const FString& ModelReference)
 {
-    const FString NormalizedSourceFile = GlbValidation::NormalizePath(SourceFile);
-    if (NormalizedSourceFile.IsEmpty() || !IFileManager::Get().FileExists(*NormalizedSourceFile))
+    UWorld* const World = GetWorld();
+    if (!IsValid(World) || !World->IsGameWorld())
     {
-        LastSaveMessage = TEXT("차량 에셋 파일이 없어 설치하지 않았습니다.");
+        LastSaveMessage = TEXT("활성 게임 월드가 없어 차량을 설치하지 않았습니다.");
         return;
     }
 
-    FString ValidationReason;
-    if (!GlbValidation::ValidateRuntimeModelFile(NormalizedSourceFile, ValidationReason))
+    UModelDatabaseSubsystem* Database = GetGameInstance()
+        ? GetGameInstance()->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
+    FGuid UUID;
+    FModelDefinition Definition;
+    FString RuntimeReference;
+    if (!Database || !Database->FindUUIDForReference(ModelReference, UUID)
+        || !Database->ResolveLoadable(UUID, Definition, RuntimeReference)
+        || Definition.ModelType != EModelDefinitionType::Dynamic
+        || Definition.EntityType != EModelEntityType::Vehicle)
     {
-        LastSaveMessage = FString::Printf(TEXT("차량 에셋이 유효하지 않아 설치하지 않았습니다: %s"), *ValidationReason);
+        LastSaveMessage = TEXT("빌드된 차량 모델 참조가 유효하지 않습니다.");
         return;
     }
 
     FActorSpawnParameters Params;
-    Params.Owner = ConfigActor.Get();
+    Params.Owner = SessionOwner.Get();
     Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
+    APlayerController* const PlayerController = World->GetFirstPlayerController();
     const FRotator SpawnRot = FRotator(
         0.0f,
-        GetWorld()->GetFirstPlayerController() ? GetWorld()->GetFirstPlayerController()->GetControlRotation().Yaw : 0.0f,
+        PlayerController ? PlayerController->GetControlRotation().Yaw : 0.0f,
         0.0f);
     UClass* VehicleSpawnClass = VehiclePawnClass ? VehiclePawnClass.Get() : AVehiclePawn::StaticClass();
     const FVector SpawnLocation = Location + FVector(0.0f, 0.0f, 220.0f);
-    AVehiclePawn* Vehicle = GetWorld()->SpawnActor<AVehiclePawn>(
+    AVehiclePawn* Vehicle = World->SpawnActor<AVehiclePawn>(
         VehicleSpawnClass,
         FTransform(SpawnRot, SpawnLocation),
         Params);
@@ -3561,7 +4107,7 @@ void UGameManagerSubSystem::PlaceVehicle(const FVector& Location, const FString&
         UE_LOG(LogTemp, Warning,
             TEXT("Configured vehicle actor class failed to spawn; retrying with native AVehiclePawn. Class=%s"),
             *GetNameSafe(VehicleSpawnClass));
-        Vehicle = GetWorld()->SpawnActor<AVehiclePawn>(
+        Vehicle = World->SpawnActor<AVehiclePawn>(
             AVehiclePawn::StaticClass(),
             FTransform(SpawnRot, SpawnLocation),
             Params);
@@ -3572,9 +4118,9 @@ void UGameManagerSubSystem::PlaceVehicle(const FVector& Location, const FString&
         return;
     }
 
-    const FString VehicleBaseName = FPaths::GetBaseFilename(NormalizedSourceFile);
+    const FString VehicleBaseName = Definition.Name;
     const FString VehicleObjectName = MakeObjectName(VehicleBaseName, EPlacedObjectKind::Vehicle);
-    if (!Vehicle->LoadVehicleModel(NormalizedSourceFile, VehicleObjectName))
+    if (!Vehicle->LoadVehicleModel(RuntimeReference, VehicleObjectName))
     {
         Vehicle->Destroy();
         LastSaveMessage = TEXT("차량 모델을 로드하지 못해 액터를 제거했습니다.");
@@ -3582,13 +4128,9 @@ void UGameManagerSubSystem::PlaceVehicle(const FVector& Location, const FString&
     }
 
     SpawnedVehicles.Add(TWeakObjectPtr<AVehiclePawn>(Vehicle));
-    FGuid UUID;
-    UModelDatabaseSubsystem* Database = GetGameInstance()
-        ? GetGameInstance()->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
-    UWorldObjectStreamingSubsystem* Chunks = GetWorld()
-        ? GetWorld()->GetSubsystem<UWorldObjectStreamingSubsystem>() : nullptr;
-    if (!Database || !Chunks || !Database->FindUUIDForGlb(NormalizedSourceFile, UUID)
-        || !Chunks->RegisterPlacedObject(Vehicle, UUID))
+    UWorldObjectStreamingSubsystem* Chunks =
+        World->GetSubsystem<UWorldObjectStreamingSubsystem>();
+    if (!Chunks || !Chunks->RegisterPlacedObject(Vehicle, UUID))
     {
         SpawnedVehicles.Pop(EAllowShrinking::No);
         Vehicle->Destroy();
@@ -3663,13 +4205,177 @@ bool UGameManagerSubSystem::SaveScene()
         LastSaveMessage = TEXT("청크 스트리밍이 준비되지 않아 저장 요청을 건너뜁니다.");
         return false;
     }
-    // Coalesce all mutations observed this tick into one transactional async write per dirty chunk.
-    for (const TWeakObjectPtr<APrefabActor>& Object : SpawnedPrefabs)
+    // Mark tracked actors for the next coalesced .dat checkpoint.
+    for (const TWeakObjectPtr<AStaticActor>& Object : SpawnedStatics)
         if (Object.IsValid()) Chunks->MarkObjectChanged(Object.Get());
     for (const TWeakObjectPtr<AVehiclePawn>& Object : SpawnedVehicles)
         if (Object.IsValid()) Chunks->MarkObjectChanged(Object.Get());
-    LastSaveMessage = TEXT("변경된 객체를 현재 틱의 청크 저장 배치에 등록했습니다.");
+    LastSaveMessage = TEXT("변경된 객체를 다음 .dat 청크 체크포인트에 등록했습니다.");
     NotifyStateChanged();
+    return true;
+}
+
+FString UGameManagerSubSystem::GetProjectsRootPath()
+{
+    return FSafeFileIO::NormalizeFilePath(PATH_PROJECTS);
+}
+
+bool UGameManagerSubSystem::BuildProjectByName(const FString& ProjectName)
+{
+    check(IsInGameThread());
+    FString SafeName;
+    if (!TryNormalizeWorldFolderName(ProjectName, SafeName, false)
+        || bWorldBakeInProgress || !ActiveBuildProjectRoot.IsEmpty())
+    {
+        LastSaveMessage = (bWorldBakeInProgress || !ActiveBuildProjectRoot.IsEmpty())
+            ? TEXT("다른 프로젝트 빌드가 이미 진행 중입니다.")
+            : TEXT("유효하지 않은 프로젝트 이름입니다.");
+        NotifyStateChanged();
+        return false;
+    }
+
+    const FString ProjectRoot = FSafeFileIO::NormalizeFilePath(FPaths::Combine(PATH_PROJECTS, SafeName));
+    const FString ResourcesRoot = FPaths::Combine(ProjectRoot, TEXT("resources"));
+    const FString ConfigPath = FPaths::Combine(ProjectRoot, LEVEL_FILE_NAME);
+    if (!IFileManager::Get().DirectoryExists(*ProjectRoot)
+        || !IFileManager::Get().DirectoryExists(*ResourcesRoot)
+        || !IFileManager::Get().FileExists(*ConfigPath))
+    {
+        LastSaveMessage = TEXT("프로젝트에는 config.json과 resources 폴더가 모두 필요합니다.");
+        NotifyStateChanged();
+        return false;
+    }
+
+    if (!GetGameInstance() || !GetGameInstance()->GetSubsystem<UModelDatabaseSubsystem>())
+    {
+        LastSaveMessage = TEXT("프로젝트 모델 데이터베이스 서브시스템을 사용할 수 없습니다.");
+        NotifyStateChanged();
+        return false;
+    }
+
+    // Reserve the authoring slot before touching disk so repeated UI clicks cannot race two builds.
+    ActiveBuildProjectRoot = ProjectRoot;
+    CurrentWorldName = SafeName;
+    WorldBakeProgressValue = 0.01f;
+    LastSaveMessage = FString::Printf(TEXT("프로젝트 설정 검사 중: %s"), *SafeName);
+    OnWorldBakeProgress.Broadcast(WorldBakeProgressValue);
+    NotifyStateChanged();
+
+    TWeakObjectPtr<UGameManagerSubSystem> WeakThis(this);
+    const bool bQueued = FSafeFileIO::RunTrackedWorker(
+        [WeakThis, ProjectRoot, SafeName, ConfigPath]()
+    {
+        FString ConfigJson;
+        FString ValidationError;
+        const FSafeBinaryLoadResult ConfigBytes =
+            FSafeFileIO::LoadBinaryBlocking(ConfigPath, 64ll * 1024ll * 1024ll);
+        if (!ConfigBytes.IsSuccess())
+        {
+            ValidationError = FString::Printf(
+                TEXT("프로젝트 config.json 읽기 실패: %s"), *ConfigBytes.Error);
+        }
+        else
+        {
+            const FSafeJsonLoadResult ParsedConfig =
+                FSafeFileIO::ParseJsonUtf8Bytes(ConfigBytes.Data, ConfigPath);
+            FString ConfiguredWorldName;
+            if (!ParsedConfig.IsSuccess()
+                || !ParsedConfig.JsonObject->TryGetStringField(
+                    CONFIG_WORLD_NAME_FIELD, ConfiguredWorldName)
+                || ConfiguredWorldName.TrimStartAndEnd().IsEmpty())
+            {
+                ValidationError = TEXT(
+                    "프로젝트 config.json에는 비어 있지 않은 WorldName 문자열이 필요합니다.");
+            }
+            else
+            {
+                FUTF8ToTCHAR Utf8(
+                    reinterpret_cast<const ANSICHAR*>(ConfigBytes.Data.GetData()),
+                    ConfigBytes.Data.Num());
+                ConfigJson = FString(Utf8.Length(), Utf8.Get());
+            }
+        }
+
+        const bool bDispatched = FSafeFileIO::DispatchTrackedGameThread(
+            [WeakThis, ProjectRoot, SafeName,
+                ConfigJson = MoveTemp(ConfigJson), ValidationError = MoveTemp(ValidationError)]() mutable
+        {
+            UGameManagerSubSystem* StrongThis = WeakThis.Get();
+            if (!IsValid(StrongThis) || StrongThis->ActiveBuildProjectRoot != ProjectRoot
+                || StrongThis->CurrentWorldName != SafeName)
+            {
+                return;
+            }
+            if (!ValidationError.IsEmpty())
+            {
+                StrongThis->PendingWorldConfigJson.Reset();
+                StrongThis->ActiveBuildProjectRoot.Reset();
+                StrongThis->LastSaveMessage = ValidationError;
+                StrongThis->OnWorldBakeCompleted.Broadcast(false, StrongThis->LastSaveMessage);
+                StrongThis->NotifyStateChanged();
+                return;
+            }
+
+            UModelDatabaseSubsystem* Database = StrongThis->GetGameInstance()
+                ? StrongThis->GetGameInstance()->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
+            if (!Database)
+            {
+                StrongThis->PendingWorldConfigJson.Reset();
+                StrongThis->ActiveBuildProjectRoot.Reset();
+                StrongThis->LastSaveMessage = TEXT(
+                    "프로젝트 모델 데이터베이스 서브시스템을 사용할 수 없습니다.");
+                StrongThis->OnWorldBakeCompleted.Broadcast(false, StrongThis->LastSaveMessage);
+                StrongThis->NotifyStateChanged();
+                return;
+            }
+
+            StrongThis->PendingWorldConfigJson = MoveTemp(ConfigJson);
+            StrongThis->WorldBakeProgressValue = FMath::Max(StrongThis->WorldBakeProgressValue, 0.03f);
+            StrongThis->OnWorldBakeProgress.Broadcast(StrongThis->WorldBakeProgressValue);
+            // A Projects-screen build is an explicit user retry. Drop stale process-local source
+            // failure history here so a GLB fixed after an earlier attempt is actually re-opened.
+            // Runtime gwd:// failures will be accumulated again independently during gameplay.
+            FglTFRuntimeSafety::ResetRecoverableFailures();
+            StrongThis->LastSaveMessage = FString::Printf(TEXT("프로젝트 모델 검사 중: %s"), *SafeName);
+            StrongThis->NotifyStateChanged();
+            Database->InitializeForAuthoringProject(
+                ProjectRoot, FModelDatabaseReady::CreateLambda(
+                    [WeakThis, ProjectRoot, SafeName](const bool bReady, const FString& Error)
+            {
+                UGameManagerSubSystem* InnerThis = WeakThis.Get();
+                if (!IsValid(InnerThis) || InnerThis->ActiveBuildProjectRoot != ProjectRoot
+                    || InnerThis->CurrentWorldName != SafeName)
+                {
+                    return;
+                }
+                if (!bReady)
+                {
+                    InnerThis->PendingWorldConfigJson.Reset();
+                    InnerThis->ActiveBuildProjectRoot.Reset();
+                    InnerThis->LastSaveMessage = FString::Printf(TEXT("프로젝트 검사 실패: %s"), *Error);
+                    InnerThis->OnWorldBakeCompleted.Broadcast(false, InnerThis->LastSaveMessage);
+                    InnerThis->NotifyStateChanged();
+                    return;
+                }
+                InnerThis->WorldBakeProgressValue = FMath::Max(InnerThis->WorldBakeProgressValue, 0.05f);
+                InnerThis->OnWorldBakeProgress.Broadcast(InnerThis->WorldBakeProgressValue);
+                InnerThis->BakeWorldData();
+            }));
+        });
+        if (!bDispatched)
+        {
+            // Shutdown owns the subsystem lifetime from this point; no UObject may be touched here.
+        }
+    });
+
+    if (!bQueued)
+    {
+        ActiveBuildProjectRoot.Reset();
+        PendingWorldConfigJson.Reset();
+        LastSaveMessage = TEXT("프로젝트 빌드 worker queue가 종료 중입니다.");
+        NotifyStateChanged();
+        return false;
+    }
     return true;
 }
 
@@ -3681,59 +4387,107 @@ void UGameManagerSubSystem::BakeWorldData()
         const FString Message = TEXT("월드 Bake는 권한이 있는 서버/싱글플레이 월드에서만 실행할 수 있습니다.");
         LastSaveMessage = Message;
         OnWorldBakeCompleted.Broadcast(false, Message);
-        NotifyStateChanged();
+        if (bAutoBuildForStartup)
+        {
+            FailWorldStartup(Message);
+        }
+        else
+        {
+            PendingWorldConfigJson.Reset();
+            ActiveBuildProjectRoot.Reset();
+            NotifyStateChanged();
+        }
         return;
     }
 
     if (bWorldBakeInProgress)
     {
-        LastSaveMessage = TEXT("월드 DAT/모델 캐시 Bake가 이미 진행 중입니다.");
-        NotifyStateChanged();
+        const FString Message = TEXT("월드 아카이브 빌드가 이미 진행 중입니다.");
+        LastSaveMessage = Message;
+        if (bAutoBuildForStartup)
+        {
+            FailWorldStartup(Message);
+        }
+        else
+        {
+            NotifyStateChanged();
+        }
         return;
     }
 
-    EnsureAssetFolders();
+    UModelDatabaseSubsystem* ModelDatabase = GetGameInstance()
+        ? GetGameInstance()->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
+    if (!ModelDatabase || !ModelDatabase->IsReady())
+    {
+        const FString Message = TEXT("소스 모델 인덱스가 준비되지 않아 .gwd를 빌드할 수 없습니다.");
+        LastSaveMessage = Message;
+        OnWorldBakeCompleted.Broadcast(false, Message);
+        if (bAutoBuildForStartup)
+        {
+            FailWorldStartup(Message);
+        }
+        else
+        {
+            PendingWorldConfigJson.Reset();
+            ActiveBuildProjectRoot.Reset();
+            NotifyStateChanged();
+        }
+        return;
+    }
+    if (ModelDatabase->IsBuiltWorld())
+    {
+        const FString Message = TEXT("검증된 .gwd가 이미 열려 있어 런타임 중 소스 재빌드를 거부했습니다.");
+        LastSaveMessage = Message;
+        OnWorldBakeCompleted.Broadcast(false, Message);
+        if (bAutoBuildForStartup)
+        {
+            FailWorldStartup(Message);
+        }
+        else
+        {
+            PendingWorldConfigJson.Reset();
+            ActiveBuildProjectRoot.Reset();
+            NotifyStateChanged();
+        }
+        return;
+    }
+
     bWorldBakeInProgress = true;
-    bWorldBakeStateFilesSaved = true;
-    WorldBakeProgressValue = 0.0f;
+    ++WorldBakeGeneration;
+    WorldBakeCancellation = MakeShared<TAtomic<bool>, ESPMode::ThreadSafe>(false);
+    bWorldArchiveCommitInFlight = false;
+    WorldBakeProgressValue = FMath::Max(WorldBakeProgressValue, 0.05f);
     WorldBakeTotalModels = 0;
     WorldBakeCompletedModels = 0;
     WorldBakeFailedModels = 0;
     WorldBakeNextModelIndex = 0;
     PendingWorldBakeModels.Empty();
-    ActiveWorldBakeActor = nullptr;
-    OnWorldBakeProgress.Broadcast(0.0f);
+    CompletedWorldBuildModels.Empty();
+    ActiveWorldBuildTask = nullptr;
+    OnWorldBakeProgress.Broadcast(WorldBakeProgressValue);
 
-    bWorldBakeStateFilesSaved = SaveScene();
-    SavePlayerData(); // Creates one immutable data/level.dat snapshot and saves it asynchronously.
-
-    IFileManager& FileManager = IFileManager::Get();
-    const FString WorldRoot = GetModelDirectory();
-    TArray<FString> GlbFiles;
-    FileManager.FindFilesRecursive(GlbFiles, *WorldRoot, TEXT("*.glb"), true, false, false);
-    PendingWorldBakeModels.Reserve(GlbFiles.Num());
-    for (FString& ModelPath : GlbFiles)
+    TArray<FModelDefinition> Definitions;
+    ModelDatabase->GetDefinitions(Definitions);
+    PendingWorldBakeModels.Reserve(Definitions.Num());
+    // GetDefinitions already returns UUID order. Filtering preserves that deterministic order, so
+    // sorting again would add O(N log N) work (and previously allocated two strings per compare).
+    for (const FModelDefinition& Definition : Definitions)
     {
-        ModelPath = GlbValidation::NormalizePath(ModelPath);
+        const FString ModelPath = GlbValidation::NormalizePath(Definition.GlbPath);
         if (!ModelPath.IsEmpty())
         {
-            PendingWorldBakeModels.AddUnique(ModelPath);
+            PendingWorldBakeModels.Add(Definition);
         }
     }
-    PendingWorldBakeModels.Sort([](const FString& A, const FString& B)
-    {
-        return A.Compare(B, ESearchCase::IgnoreCase) < 0;
-    });
 
     WorldBakeTotalModels = PendingWorldBakeModels.Num();
 
-    // Reserve five percent for the immutable level/chunk snapshots and use
-    // the remaining range for per-model metadata work, including cache-hit and skipped nodes.
+    // Reserve five percent for setup and the last five percent for archive verification/publish.
     WorldBakeProgressValue = FMath::Max(WorldBakeProgressValue, 0.05f);
     OnWorldBakeProgress.Broadcast(WorldBakeProgressValue);
 
     LastSaveMessage = FString::Printf(
-        TEXT("월드 DAT/모델 캐시 Bake 시작: 모델 캐시 %d개"),
+        TEXT(".gwd 빌드 시작: 모델 %d개"),
         WorldBakeTotalModels);
     NotifyStateChanged();
 
@@ -3746,6 +4500,14 @@ void UGameManagerSubSystem::BakeWorldData()
             0.05f,
             true);
     }
+    else
+    {
+        // Never publish an empty archive. A zero count means the resources root was wrong or source
+        // discovery failed, and treating that as a build would suppress every later GLB scan.
+        CompleteWorldArchiveBuild(false, FString(),
+            TEXT("recursive resources scan produced zero buildable GLB models"));
+        return;
+    }
     StartNextWorldBakeModel();
 }
 
@@ -3756,17 +4518,17 @@ void UGameManagerSubSystem::StartNextWorldBakeModel()
         return;
     }
 
-    UWorld* World = GetWorld();
-    if (!World)
+    if (!GetWorld())
     {
-        bWorldBakeStateFilesSaved = false;
-        FinishWorldBake();
+        CompleteWorldArchiveBuild(false, FString(),
+            TEXT("the gameplay world was destroyed during source decoding"));
         return;
     }
 
     while (WorldBakeNextModelIndex < PendingWorldBakeModels.Num())
     {
-        const FString ModelPath = PendingWorldBakeModels[WorldBakeNextModelIndex++];
+        const FModelDefinition Definition = PendingWorldBakeModels[WorldBakeNextModelIndex++];
+        const FString ModelPath = GlbValidation::NormalizePath(Definition.GlbPath);
         if (ModelPath.IsEmpty() || !IFileManager::Get().FileExists(*ModelPath))
         {
             ++WorldBakeCompletedModels;
@@ -3775,16 +4537,27 @@ void UGameManagerSubSystem::StartNextWorldBakeModel()
             continue;
         }
 
-        FActorSpawnParameters Params;
-        Params.Owner = ConfigActor.Get();
-        Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-        UClass* BakeClass = SpawnActorClass ? SpawnActorClass.Get() : AglTFStreamActor::StaticClass();
-        AglTFStreamActor* BakeActor = FActorHelper::SpawnActorDeferred<AglTFStreamActor>(
-            World,
-            BakeClass,
-            FTransform::Identity,
-            Params);
-        if (!IsValid(BakeActor))
+        UModelDatabaseSubsystem* Database = GetGameInstance()
+            ? GetGameInstance()->GetSubsystem<UModelDatabaseSubsystem>()
+            : nullptr;
+        FString DefinitionJson;
+        FString DefinitionError;
+        if (!Database
+            || !Database->GetDefinitionJson(
+                Definition.UUID, DefinitionJson, &DefinitionError))
+        {
+            UE_LOG(LogTemp, Error,
+                TEXT("World source JSON unavailable. GLB=%s Reason=%s"),
+                *ModelPath, *DefinitionError);
+            ++WorldBakeCompletedModels;
+            ++WorldBakeFailedModels;
+            RefreshWorldBakeProgress();
+            continue;
+        }
+
+        UWorldSourceModelBuilder* BuildTask =
+            NewObject<UWorldSourceModelBuilder>(this, NAME_None, RF_Transient);
+        if (!IsValid(BuildTask))
         {
             ++WorldBakeCompletedModels;
             ++WorldBakeFailedModels;
@@ -3792,12 +4565,20 @@ void UGameManagerSubSystem::StartNextWorldBakeModel()
             continue;
         }
 
-        ActiveWorldBakeActor = BakeActor;
-        BakeActor->InitMetadataBake(ModelPath);
-        BakeActor->OnModelSizeCacheBakeFinished.AddUObject(
+        ActiveWorldBuildTask = BuildTask;
+        LastSaveMessage = FString::Printf(
+            TEXT("모델 빌드 중 %d/%d: %s"),
+            WorldBakeCompletedModels + 1,
+            WorldBakeTotalModels,
+            *FPaths::GetCleanFilename(ModelPath));
+        NotifyStateChanged();
+        UE_LOG(LogTemp, Display,
+            TEXT("Building source GLB %d/%d: %s"),
+            WorldBakeCompletedModels + 1, WorldBakeTotalModels, *ModelPath);
+        BuildTask->OnFinished.AddUObject(
             this,
-            &UGameManagerSubSystem::HandleWorldBakeModelFinished);
-        BakeActor->FinishSpawning(FTransform::Identity);
+            &UGameManagerSubSystem::HandleWorldBuildModelFinished);
+        BuildTask->Start(Definition, DefinitionJson);
         return;
     }
 
@@ -3811,8 +4592,8 @@ void UGameManagerSubSystem::RefreshWorldBakeProgress()
         return;
     }
 
-    const float ActiveModelProgress = IsValid(ActiveWorldBakeActor)
-        ? FMath::Clamp(ActiveWorldBakeActor->GetLoadingStatus(), 0.0f, 1.0f)
+    const float ActiveModelProgress = IsValid(ActiveWorldBuildTask)
+        ? FMath::Clamp(ActiveWorldBuildTask->GetProgress(), 0.0f, 1.0f)
         : 0.0f;
     const float ModelProgress = WorldBakeTotalModels > 0
         ? FMath::Clamp(
@@ -3822,28 +4603,65 @@ void UGameManagerSubSystem::RefreshWorldBakeProgress()
             1.0f)
         : 1.0f;
 
-    // Keep 100 percent reserved for FinishWorldBake, after the final snapshot has been committed and
-    // the active actor has released its parser and temporary mesh references.
-    const float CalculatedProgress = FMath::Min(0.05f + ModelProgress * 0.95f, 0.999f);
+    // The final five percent belongs to directory serialization, fsync, re-open and checksum verification.
+    const float CalculatedProgress = FMath::Min(0.05f + ModelProgress * 0.90f, 0.95f);
     const float SafeProgress = FMath::Max(WorldBakeProgressValue, CalculatedProgress);
     if (!FMath::IsNearlyEqual(SafeProgress, WorldBakeProgressValue, KINDA_SMALL_NUMBER))
     {
         WorldBakeProgressValue = SafeProgress;
+        // Automatic source builds are part of startup. Keep the always-available loading overlay
+        // moving even before config.json and scene streaming have begun.
+        if (bAutoBuildForStartup)
+        {
+            SetLoadingStatus(FMath::Clamp(WorldBakeProgressValue * 0.65f, 0.0f, 0.65f));
+        }
         OnWorldBakeProgress.Broadcast(WorldBakeProgressValue);
     }
 }
 
-void UGameManagerSubSystem::HandleWorldBakeModelFinished(AglTFStreamActor* BakeActor, bool bSuccess)
+void UGameManagerSubSystem::HandleWorldBuildModelFinished(
+    UWorldSourceModelBuilder* BuildTask,
+    bool bSuccess)
 {
-    if (!bWorldBakeInProgress || !IsValid(BakeActor) || BakeActor != ActiveWorldBakeActor.Get())
+    if (!bWorldBakeInProgress
+        || !IsValid(BuildTask)
+        || BuildTask != ActiveWorldBuildTask.Get())
     {
         return;
     }
 
-    BakeActor->OnModelSizeCacheBakeFinished.RemoveAll(this);
-    ActiveWorldBakeActor = nullptr;
-    BakeActor->ReleaseRuntimeResourcesForWorldExit();
-    BakeActor->Destroy();
+    BuildTask->OnFinished.RemoveAll(this);
+    if (bSuccess)
+    {
+        FGWorldBuildModel Built = BuildTask->TakeBuildModel();
+        FString ValidationError;
+        if (!Built.Definition.UUID.IsValid()
+            || Built.DefinitionJson.IsEmpty()
+            || !Built.Metadata.IsSane(&ValidationError)
+            || !Built.BakedData.IsSane(&ValidationError)
+            || Built.Metadata.SourceMeshCount != Built.BakedData.Meshes.Num()
+            || Built.Metadata.SourceMaterialCount != Built.BakedData.Materials.Num()
+            || Built.Metadata.SourceTextureCount != Built.BakedData.Textures.Num()
+            || Built.SourceFileSize <= 0)
+        {
+            bSuccess = false;
+            UE_LOG(LogTemp, Error,
+                TEXT("World source build result rejected. Reason=%s"),
+                ValidationError.IsEmpty()
+                    ? TEXT("incomplete build payload") : *ValidationError);
+        }
+        else
+        {
+            CompletedWorldBuildModels.Add(MoveTemp(Built));
+        }
+    }
+    else
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("World source model failed. GLB=%s Reason=%s"),
+            *BuildTask->GetSourcePath(), *BuildTask->GetError());
+    }
+    ActiveWorldBuildTask = nullptr;
 
     ++WorldBakeCompletedModels;
     if (!bSuccess)
@@ -3852,59 +4670,183 @@ void UGameManagerSubSystem::HandleWorldBakeModelFinished(AglTFStreamActor* BakeA
     }
 
     RefreshWorldBakeProgress();
-    StartNextWorldBakeModel();
+    // Leave the completion stack before allocating the next parser-backed task. This also gives
+    // the released source asset one frame boundary before the next large model is decoded.
+    if (UWorld* World = GetWorld())
+    {
+        World->GetTimerManager().SetTimerForNextTick(
+            this, &UGameManagerSubSystem::StartNextWorldBakeModel);
+    }
+    else
+    {
+        StartNextWorldBakeModel();
+    }
 }
 
 void UGameManagerSubSystem::FinishWorldBake()
 {
-    if (!bWorldBakeInProgress)
+    if (!bWorldBakeInProgress || bWorldArchiveCommitInFlight)
     {
         return;
     }
 
+    if (WorldBakeFailedModels > 0
+        || CompletedWorldBuildModels.Num() != WorldBakeTotalModels)
+    {
+        CompleteWorldArchiveBuild(false, FString(),
+            FString::Printf(TEXT("metadata scan failed for %d/%d models"),
+                WorldBakeFailedModels, WorldBakeTotalModels));
+        return;
+    }
+
+    bWorldArchiveCommitInFlight = true;
+    WorldBakeProgressValue = 0.96f;
+    LastSaveMessage = TEXT(".gwd 아카이브 기록 및 무결성 검증 중...");
+    OnWorldBakeProgress.Broadcast(WorldBakeProgressValue);
+    NotifyStateChanged();
+    const FString WorldRoot = GetWorldRootPath();
+    const FString WorldConfigJson = PendingWorldConfigJson;
+    // Transfer the baked maps to the worker. Copying this array would duplicate every node and mesh
+    // record at the exact point where definition/metadata serialization also needs temporary bytes.
+    TArray<FGWorldBuildModel> BuildModels = MoveTemp(CompletedWorldBuildModels);
+    TWeakObjectPtr<UGameManagerSubSystem> WeakThis(this);
+    const uint64 BuildGeneration = WorldBakeGeneration;
+    const TSharedPtr<TAtomic<bool>, ESPMode::ThreadSafe> Cancellation = WorldBakeCancellation;
+    const bool bQueued = FSafeFileIO::RunTrackedWorker(
+        [WeakThis, WorldRoot, WorldConfigJson, BuildGeneration, Cancellation,
+            BuildModels = MoveTemp(BuildModels)]() mutable
+    {
+        FString ArchivePath;
+        FString Error;
+        const bool bSuccess = FGWorldArchive::BuildBlocking(
+            WorldRoot, BuildModels, ArchivePath, Error,
+            [Cancellation]()
+            {
+                return Cancellation.IsValid() && Cancellation->Load();
+            },
+            WorldConfigJson);
+        FSafeFileIO::DispatchTrackedGameThread(
+            [WeakThis, BuildGeneration, bSuccess,
+                ArchivePath = MoveTemp(ArchivePath), Error = MoveTemp(Error)]()
+        {
+            if (UGameManagerSubSystem* StrongThis = WeakThis.Get())
+            {
+                if (StrongThis->WorldBakeGeneration == BuildGeneration)
+                {
+                    StrongThis->CompleteWorldArchiveBuild(bSuccess, ArchivePath, Error);
+                }
+            }
+        });
+    });
+    if (!bQueued)
+    {
+        bWorldArchiveCommitInFlight = false;
+        CompleteWorldArchiveBuild(false, FString(),
+            TEXT("world archive worker queue is shutting down"));
+    }
+}
+
+void UGameManagerSubSystem::CompleteWorldArchiveBuild(
+    const bool bArchiveSuccess,
+    const FString& ArchivePath,
+    const FString& Error)
+{
+    check(IsInGameThread());
+    if (!bWorldBakeInProgress) return;
     if (UWorld* World = GetWorld())
     {
         World->GetTimerManager().ClearTimer(WorldBakeProgressTimerHandle);
     }
 
-    const bool bSuccess = bWorldBakeStateFilesSaved && WorldBakeFailedModels == 0;
-    WorldBakeProgressValue = 1.0f;
+    const bool bSuccess = bArchiveSuccess;
+    const bool bWasAutomaticStartupBuild = bAutoBuildForStartup;
+    const bool bResumeStartup = bWasAutomaticStartupBuild && bArchiveSuccess;
     const FString Message = bSuccess
-        ? FString::Printf(TEXT("월드 DAT/모델 캐시 Bake 완료: 모델 캐시 %d개"), WorldBakeTotalModels)
-        : FString::Printf(
-            TEXT("월드 DAT/모델 캐시 Bake 완료(오류 있음): 상태 DAT=%s, 모델 캐시 실패=%d/%d"),
-            bWorldBakeStateFilesSaved ? TEXT("정상") : TEXT("실패"),
-            WorldBakeFailedModels,
-            WorldBakeTotalModels);
+        ? FString::Printf(TEXT(".gwd 빌드 완료: 모델 %d개 (%s)"),
+            WorldBakeTotalModels, *ArchivePath)
+        : FString::Printf(TEXT(".gwd 빌드 실패: %s"),
+            Error.IsEmpty() ? TEXT("archive build failed") : *Error);
 
     bWorldBakeInProgress = false;
+    bWorldArchiveCommitInFlight = false;
+    WorldBakeCancellation.Reset();
+    bAutoBuildForStartup = false;
     PendingWorldBakeModels.Empty();
-    ActiveWorldBakeActor = nullptr;
+    CompletedWorldBuildModels.Empty();
+    ActiveWorldBuildTask = nullptr;
+    PendingWorldConfigJson.Reset();
+    ActiveBuildProjectRoot.Reset();
     WorldBakeNextModelIndex = 0;
+    WorldBakeProgressValue = 1.0f;
     LastSaveMessage = Message;
     OnWorldBakeProgress.Broadcast(1.0f);
     OnWorldBakeCompleted.Broadcast(bSuccess, Message);
     NotifyStateChanged();
+
+    if (bWasAutomaticStartupBuild && !bSuccess)
+    {
+        HideLoadingWidget();
+        SetWorldLoading(false);
+    }
+
+    if (bResumeStartup)
+    {
+        UModelDatabaseSubsystem* Database = GetGameInstance()
+            ? GetGameInstance()->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
+        if (!Database)
+        {
+            FailWorldStartup(
+                TEXT("월드 시작 실패: 빌드 후 아카이브를 다시 열 데이터베이스가 없습니다."));
+            return;
+        }
+        SetLoadingStatus(0.67f);
+        const FString WorldRoot = GetWorldRootPath();
+        TWeakObjectPtr<UGameManagerSubSystem> WeakThis(this);
+        Database->InitializeForWorld(WorldRoot, FModelDatabaseReady::CreateLambda(
+            [WeakThis](const bool bOpened, const FString& OpenError)
+        {
+            UGameManagerSubSystem* StrongThis = WeakThis.Get();
+            if (!IsValid(StrongThis) || !StrongThis->bManagerStarted) return;
+            UModelDatabaseSubsystem* OpenDatabase = StrongThis->GetGameInstance()
+                ? StrongThis->GetGameInstance()->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
+            if (!bOpened || !OpenDatabase || !OpenDatabase->IsBuiltWorld())
+            {
+                StrongThis->FailWorldStartup(FString::Printf(
+                    TEXT("빌드 파일 재검증 실패: %s"), *OpenError));
+                return;
+            }
+            StrongThis->ContinueWorldStartupAfterDatabase();
+        }));
+    }
 }
 
 void UGameManagerSubSystem::CancelWorldBake()
 {
+    if (WorldBakeCancellation.IsValid())
+    {
+        WorldBakeCancellation->Store(true);
+    }
+    ++WorldBakeGeneration;
     if (UWorld* World = GetWorld())
     {
         World->GetTimerManager().ClearTimer(WorldBakeProgressTimerHandle);
     }
 
-    if (IsValid(ActiveWorldBakeActor))
+    if (IsValid(ActiveWorldBuildTask))
     {
-        ActiveWorldBakeActor->OnModelSizeCacheBakeFinished.RemoveAll(this);
-        ActiveWorldBakeActor->ReleaseRuntimeResourcesForWorldExit();
-        ActiveWorldBakeActor->Destroy();
+        ActiveWorldBuildTask->OnFinished.RemoveAll(this);
+        ActiveWorldBuildTask->Cancel();
     }
 
-    ActiveWorldBakeActor = nullptr;
+    ActiveWorldBuildTask = nullptr;
     PendingWorldBakeModels.Empty();
+    CompletedWorldBuildModels.Empty();
+    PendingWorldConfigJson.Reset();
+    ActiveBuildProjectRoot.Reset();
     bWorldBakeInProgress = false;
-    bWorldBakeStateFilesSaved = false;
+    bWorldArchiveCommitInFlight = false;
+    WorldBakeCancellation.Reset();
+    bAutoBuildForStartup = false;
     WorldBakeTotalModels = 0;
     WorldBakeCompletedModels = 0;
     WorldBakeFailedModels = 0;
@@ -3923,7 +4865,7 @@ bool UGameManagerSubSystem::LoadSavedScene()
         return false;
     }
     if (!Chunks->IsInitialAreaReady()) return false;
-    // Missing UUIDs remain in their prefab/entity DAT files and are intentionally ignored.
+    // Missing model UUIDs remain in their original .dat chunks and are intentionally ignored.
     bSavedSceneLoadInProgress = false;
     bSavedSceneLoaded = true;
     bSavedSceneLoadFailed = false;
@@ -3937,13 +4879,20 @@ bool UGameManagerSubSystem::LoadSavedScene()
 void UGameManagerSubSystem::TrackStreamedWorldObject(AActor* Actor)
 {
     check(IsInGameThread());
-    if (APrefabActor* Prefab = Cast<APrefabActor>(Actor)) SpawnedPrefabs.AddUnique(TWeakObjectPtr<APrefabActor>(Prefab));
-    else if (AVehiclePawn* Vehicle = Cast<AVehiclePawn>(Actor)) SpawnedVehicles.AddUnique(TWeakObjectPtr<AVehiclePawn>(Vehicle));
+
+    if (AStaticActor* Static = Cast<AStaticActor>(Actor))
+    {
+        SpawnedStatics.AddUnique(TWeakObjectPtr<AStaticActor>(Static));
+    }
+    else if (AVehiclePawn* Vehicle = Cast<AVehiclePawn>(Actor))
+    {
+        SpawnedVehicles.AddUnique(TWeakObjectPtr<AVehiclePawn>(Vehicle));
+    }
 }
 
 void UGameManagerSubSystem::RefreshAssetLists()
 {
-    ScanAssetFolders();
+    RefreshBuiltModelLists();
     BuildAvailableItems();
     InitializeToolbarSlotsIfNeeded();
     LastSaveMessage = TEXT("Asset lists refreshed.");
@@ -3955,8 +4904,8 @@ void UGameManagerSubSystem::SetCurrentToolMode(EToolMode NewMode)
 {
     switch (NewMode)
     {
-    case EToolMode::PlacePrefab:
-        SelectPrefabPlacementTool();
+    case EToolMode::PlaceStatic:
+        SelectStaticPlacementTool();
         break;
     case EToolMode::PlaceVehicle:
         SelectVehicleTool();
@@ -3974,34 +4923,34 @@ void UGameManagerSubSystem::SetCurrentToolMode(EToolMode NewMode)
     }
 }
 
-bool UGameManagerSubSystem::SetCurrentPrefabIndex(int32 NewIndex)
+bool UGameManagerSubSystem::SetCurrentStaticIndex(int32 NewIndex)
 {
-    if (PrefabFiles.Num() == 0)
+    if (StaticReferences.Num() == 0)
     {
-        ScanAssetFolders();
+        RefreshBuiltModelLists();
         BuildAvailableItems();
     }
-    if (!PrefabFiles.IsValidIndex(NewIndex))
+    if (!StaticReferences.IsValidIndex(NewIndex))
     {
-        LastSaveMessage = TEXT("Invalid prefab index.");
+        LastSaveMessage = TEXT("Invalid Static index.");
         NotifyStateChanged();
         return false;
     }
 
-    CurrentPrefabIndex = NewIndex;
-    LastSaveMessage = FString::Printf(TEXT("Prefab 선택: %s"), *GetCurrentPrefabName());
+    CurrentStaticIndex = NewIndex;
+    LastSaveMessage = FString::Printf(TEXT("Static 선택: %s"), *GetCurrentStaticName());
     NotifyStateChanged();
     return true;
 }
 
 bool UGameManagerSubSystem::SetCurrentWeaponIndex(int32 NewIndex)
 {
-    if (WeaponFiles.Num() == 0)
+    if (WeaponReferences.Num() == 0)
     {
-        ScanAssetFolders();
+        RefreshBuiltModelLists();
         BuildAvailableItems();
     }
-    if (!WeaponFiles.IsValidIndex(NewIndex))
+    if (!WeaponReferences.IsValidIndex(NewIndex))
     {
         LastSaveMessage = TEXT("Invalid weapon index.");
         NotifyStateChanged();
@@ -4014,24 +4963,36 @@ bool UGameManagerSubSystem::SetCurrentWeaponIndex(int32 NewIndex)
     return true;
 }
 
-FString UGameManagerSubSystem::GetPrefabNameAtIndex(int32 Index) const
+FString UGameManagerSubSystem::GetStaticNameAtIndex(int32 Index) const
 {
-    return PrefabFiles.IsValidIndex(Index) ? FPaths::GetBaseFilename(PrefabFiles[Index]) : FString();
+    return StaticReferences.IsValidIndex(Index) ? GetAssetDisplayName(StaticReferences[Index]) : FString();
 }
 
 FString UGameManagerSubSystem::GetWeaponNameAtIndex(int32 Index) const
 {
-    return WeaponFiles.IsValidIndex(Index) ? FPaths::GetBaseFilename(WeaponFiles[Index]) : FString();
+    return WeaponReferences.IsValidIndex(Index) ? GetAssetDisplayName(WeaponReferences[Index]) : FString();
 }
 
-FString UGameManagerSubSystem::GetPrefabPathAtIndex(int32 Index) const
+FString UGameManagerSubSystem::GetStaticPathAtIndex(const int32 Index) const
 {
-    return PrefabFiles.IsValidIndex(Index) ? PrefabFiles[Index] : FString();
+    // Preserve old Blueprint pins without restoring source-file identity at runtime.
+    return GetStaticReferenceAtIndex(Index);
 }
 
-FString UGameManagerSubSystem::GetWeaponPathAtIndex(int32 Index) const
+FString UGameManagerSubSystem::GetWeaponPathAtIndex(const int32 Index) const
 {
-    return WeaponFiles.IsValidIndex(Index) ? WeaponFiles[Index] : FString();
+    // Preserve old Blueprint pins without restoring source-file identity at runtime.
+    return GetWeaponReferenceAtIndex(Index);
+}
+
+FString UGameManagerSubSystem::GetStaticReferenceAtIndex(int32 Index) const
+{
+    return StaticReferences.IsValidIndex(Index) ? StaticReferences[Index] : FString();
+}
+
+FString UGameManagerSubSystem::GetWeaponReferenceAtIndex(int32 Index) const
+{
+    return WeaponReferences.IsValidIndex(Index) ? WeaponReferences[Index] : FString();
 }
 
 FString UGameManagerSubSystem::BuildStatusText() const
@@ -4047,7 +5008,7 @@ FString UGameManagerSubSystem::BuildStatusText() const
         : (bLastTraceBlockingHit ? TEXT("SURFACE") : TEXT("AIR / FREE-SPACE"));
 
     return FString::Printf(
-        TEXT("[Creator Toolbar]\nMode: %s | PlayMode: %s\nToolbar Slot: %d / 7 | Item: %s (%s)\nInventory Window: %s | Available Items: %d\nSnap: %s / Grid %.0f cm\nCrosshair: X %.0f Y %.0f Z %.0f | Placement: %s | Collision %.0f cm / Max %.0f cm\nControls: MouseWheel=toolbar slot, E=item list, LMB=place/fire, F=enter/exit vehicle, SnapAction/G=toggle snap\nWorld: %s\nData: %s\n%s"),
+        TEXT("[Creator Toolbar]\nMode: %s | PlayMode: %s\nToolbar Slot: %d / 7 | Item: %s (%s)\nInventory Window: %s | Available Items: %d\nSnap: %s / Grid %.0f cm\nCrosshair: X %.0f Y %.0f Z %.0f | Placement: %s | Collision %.0f cm / Max %.0f cm\nControls: MouseWheel=toolbar slot, E=item list, LMB=place/fire, F=enter/exit vehicle, SnapAction/G=toggle snap\nWorld: %s\nEntity: %s\n%s"),
         *ModeString,
         PlayMode == EPlayMode::Creator ? TEXT("Creator") : TEXT("RealLife"),
         SelectedToolbarSlotIndex + 1,
@@ -4064,7 +5025,7 @@ FString UGameManagerSubSystem::BuildStatusText() const
         CrosshairCollisionTraceDistance,
         FreeSpacePlacementDistance,
         *GetWorldRootPath(),
-        *GetDataDirectory(),
+        *FEntityArchiveStore::MakeArchivePath(GetWorldRootPath()),
         *LastSaveMessage);
 }
 

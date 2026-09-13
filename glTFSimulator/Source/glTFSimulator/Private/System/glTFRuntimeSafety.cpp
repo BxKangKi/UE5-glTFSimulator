@@ -2,11 +2,19 @@
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
 /**
+ * File role: glTFRuntimeSafety.cpp
+ * 역할: glTFRuntime의 native 작업과 해제를 직렬 조정합니다.
+ * 핵심 기능: 작업 티켓·대기 큐, GC 참조 보호, 지연 cache 해제, 종료 drain.
+ * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ */
+
+/**
  * @file glTFRuntimeSafety.cpp
  * @brief Serialized native scheduling, cache lifetime barriers, and session quarantine.
  */
 #include "System/glTFRuntimeSafety.h"
 #include "HAL/CriticalSection.h"
+#include "HAL/FileManager.h"
 
 #include "Async/Async.h"
 #include "Async/TaskGraphInterfaces.h"
@@ -15,6 +23,8 @@
 #include "HAL/PlatformTime.h"
 #include "HAL/ThreadSafeCounter.h"
 #include "Misc/ScopeExit.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
 #include "Misc/ScopeLock.h"
 #include "System/GlbValidation.h"
 #include "System/SafeFileIO.h"
@@ -79,7 +89,34 @@ namespace glTFRuntimeSafetyPrivate
     {
         int32 Count = 0;
         FString LastReason;
+        int64 FileSize = INDEX_NONE;
+        FDateTime Timestamp;
     };
+
+    void CaptureSourceFingerprint(const FString& NormalizedPath, int64& OutFileSize, FDateTime& OutTimestamp)
+    {
+        OutFileSize = IFileManager::Get().FileSize(*NormalizedPath);
+        OutTimestamp = OutFileSize == INDEX_NONE
+            ? FDateTime()
+            : IFileManager::Get().GetTimeStamp(*NormalizedPath);
+    }
+
+    bool HasSourceFingerprintChanged(const FString& NormalizedPath, const FFailureRecord& Record)
+    {
+        // URI-style runtime references do not have a disk fingerprint. Their records are cleared on
+        // success or by an explicit retry, while real source GLBs are invalidated automatically
+        // after the author edits/replaces the file.
+        if (NormalizedPath.StartsWith(TEXT("gwd://"), ESearchCase::IgnoreCase)
+            || NormalizedPath.StartsWith(TEXT("gworld://"), ESearchCase::IgnoreCase))
+        {
+            return false;
+        }
+
+        int64 CurrentSize = INDEX_NONE;
+        FDateTime CurrentTimestamp;
+        CaptureSourceFingerprint(NormalizedPath, CurrentSize, CurrentTimestamp);
+        return CurrentSize != Record.FileSize || CurrentTimestamp != Record.Timestamp;
+    }
 
     struct FState
     {
@@ -114,6 +151,18 @@ namespace glTFRuntimeSafetyPrivate
     {
         static FState State;
         return State;
+    }
+
+    FString NormalizeFailureKey(const FString& SourceOrReference)
+    {
+        FString Clean = SourceOrReference.TrimStartAndEnd();
+        if (Clean.StartsWith(TEXT("gwd://"), ESearchCase::IgnoreCase)
+            || Clean.StartsWith(TEXT("gworld://"), ESearchCase::IgnoreCase))
+        {
+            Clean.ToLowerInline();
+            return Clean;
+        }
+        return GlbValidation::NormalizePath(Clean);
     }
 
     constexpr int32 MaximumQueuedOperations = 4096;
@@ -301,42 +350,61 @@ namespace glTFRuntimeSafetyPrivate
 
 TSharedPtr<FglTFRuntimeParser> FglTFRuntimeSafety::CreateParserSafely(
     const FString& FilePath,
-    const FglTFRuntimeConfig& Config)
+    const FglTFRuntimeConfig& Config,
+    FString* OutError)
 {
+    if (OutError)
+    {
+        OutError->Reset();
+    }
+
+    auto Fail = [OutError](const FString& Reason) -> TSharedPtr<FglTFRuntimeParser>
+    {
+        if (OutError)
+        {
+            *OutError = Reason;
+        }
+        return nullptr;
+    };
+
     if (IsInGameThread())
     {
-        UE_LOG(LogTemp, Error, TEXT("Refused glTFRuntime parser construction on the game thread: %s"), *FilePath);
-        return nullptr;
+        const FString Reason = TEXT("glTFRuntime parser construction was requested on the game thread");
+        UE_LOG(LogTemp, Error, TEXT("%s: %s"), *Reason, *FilePath);
+        return Fail(Reason);
     }
 
     FString CoordinatorReason;
     if (glTFRuntimeSafetyPrivate::IsShuttingDown())
     {
+        const FString Reason = TEXT("glTFRuntime coordinator is shutting down");
         UE_LOG(LogTemp, Warning, TEXT("Refused glTFRuntime parser construction during shutdown: %s"), *FilePath);
-        return nullptr;
+        return Fail(Reason);
     }
     if (glTFRuntimeSafetyPrivate::IsCircuitOpen(&CoordinatorReason))
     {
+        const FString Reason = FString::Printf(TEXT("glTFRuntime safety circuit is open: %s"), *CoordinatorReason);
         UE_LOG(LogTemp, Error,
             TEXT("Refused glTFRuntime parser because the safety circuit is open. Path=%s Reason=%s"),
             *FilePath,
             *CoordinatorReason);
-        return nullptr;
+        return Fail(Reason);
     }
 
     FString QuarantineReason;
     if (IsPathQuarantined(FilePath, &QuarantineReason))
     {
+        const FString Reason = FString::Printf(TEXT("source is quarantined from an earlier failure: %s"), *QuarantineReason);
         UE_LOG(LogTemp, Error, TEXT("Refused quarantined glTF file. Path=%s Reason=%s"),
             *FilePath,
             *QuarantineReason);
-        return nullptr;
+        return Fail(Reason);
     }
 
     glTFRuntimeSafetyPrivate::FParserCreationSlot ParserSlot;
     if (!ParserSlot.Acquire())
     {
-        return nullptr;
+        return Fail(TEXT("glTFRuntime parser gate could not be acquired"));
     }
 
     // Each request creates a distinct parser and mutable cache. The single construction slot avoids
@@ -344,14 +412,55 @@ TSharedPtr<FglTFRuntimeParser> FglTFRuntimeSafety::CreateParserSafely(
     if (glTFRuntimeSafetyPrivate::IsShuttingDown() ||
         glTFRuntimeSafetyPrivate::IsCircuitOpen(&CoordinatorReason))
     {
-        return nullptr;
+        return Fail(CoordinatorReason.IsEmpty()
+            ? TEXT("glTFRuntime parser creation was cancelled")
+            : CoordinatorReason);
     }
+
     TSharedPtr<FglTFRuntimeParser> Parser = FglTFRuntimeParser::FromFilename(FilePath, Config);
+
+    // FromFilename is glTFRuntime's normal path and is also what its official async loader uses.
+    // If it fails after our own GLB preflight successfully opened the same file, retry once from
+    // bytes. This avoids platform/path-layer false negatives while preserving the source directory
+    // for any explicitly external URI referenced by an otherwise valid GLB.
+    if (!Parser.IsValid() && FPaths::FileExists(FilePath))
+    {
+        TArray64<uint8> FileBytes;
+        if (FFileHelper::LoadFileToArray(FileBytes, *FilePath))
+        {
+            FglTFRuntimeConfig FallbackConfig = Config;
+            FallbackConfig.bSearchContentDir = false;
+            if (FallbackConfig.bAllowExternalFiles && FallbackConfig.OverrideBaseDirectory.IsEmpty())
+            {
+                FallbackConfig.OverrideBaseDirectory = FPaths::GetPath(FilePath);
+            }
+            Parser = FglTFRuntimeParser::FromData(
+                FileBytes.GetData(), FileBytes.Num(), FallbackConfig);
+            if (Parser.IsValid())
+            {
+                UE_LOG(LogTemp, Warning,
+                    TEXT("glTFRuntime FromFilename failed but direct-data fallback succeeded. Path=%s"),
+                    *FilePath);
+            }
+        }
+    }
+
     ParserSlot.Release();
-    AsyncTask(ENamedThreads::GameThread, []()
+    // This continuation participates in the same shutdown drain as the worker that constructed
+    // the parser, preventing a raw module callback from surviving DLL unload.
+    FSafeFileIO::DispatchTrackedGameThread([]()
     {
         FglTFRuntimeSafety::NotifyGateAvailable_GameThread();
     });
+
+    if (!Parser.IsValid())
+    {
+        return Fail(FString::Printf(
+            TEXT("glTFRuntime rejected the GLB after validated filename and direct-data load attempts (size=%lld)"),
+            IFileManager::Get().FileSize(*FilePath)));
+    }
+
+    ClearRecoverableFailure(FilePath);
     return Parser;
 }
 
@@ -375,12 +484,19 @@ bool FglTFRuntimeSafety::ExecuteSynchronousOperation(
         return false;
     }
 
-    ON_SCOPE_EXIT
     {
-        glTFRuntimeSafetyPrivate::LeaveNativePhase(
-            glTFRuntimeSafetyPrivate::FState::ENativePhase::SynchronousOperation);
-    };
-    Operation();
+        ON_SCOPE_EXIT
+        {
+            glTFRuntimeSafetyPrivate::LeaveNativePhase(
+                glTFRuntimeSafetyPrivate::FState::ENativePhase::SynchronousOperation);
+        };
+        Operation();
+    }
+
+    // Operation() and its plugin stack have fully returned and the scope guard has released the
+    // gate. Pump synchronously to remove watchdog latency without leaving an untracked module
+    // callback queued across shutdown/DLL unload.
+    NotifyGateAvailable_GameThread();
     return true;
 }
 
@@ -611,7 +727,7 @@ void FglTFRuntimeSafety::ReportRecoverableFailure(
     const FString& FilePath,
     const FString& Reason)
 {
-    const FString NormalizedPath = GlbValidation::NormalizePath(FilePath);
+    const FString NormalizedPath = glTFRuntimeSafetyPrivate::NormalizeFailureKey(FilePath);
     if (NormalizedPath.IsEmpty())
     {
         return;
@@ -620,28 +736,77 @@ void FglTFRuntimeSafety::ReportRecoverableFailure(
     glTFRuntimeSafetyPrivate::FState& State = glTFRuntimeSafetyPrivate::GetState();
     FScopeLock FailureScope(&State.FailureLock);
     glTFRuntimeSafetyPrivate::FFailureRecord& Record = State.Failures.FindOrAdd(NormalizedPath);
+
+    // Editing/replacing a source GLB is a new input and must not inherit a previous file's failure
+    // count merely because it kept the same path. This also makes Live Coding authoring retries sane.
+    if (Record.Count > 0
+        && glTFRuntimeSafetyPrivate::HasSourceFingerprintChanged(NormalizedPath, Record))
+    {
+        Record = glTFRuntimeSafetyPrivate::FFailureRecord();
+    }
+
+    if (Record.Count == 0)
+    {
+        glTFRuntimeSafetyPrivate::CaptureSourceFingerprint(
+            NormalizedPath, Record.FileSize, Record.Timestamp);
+    }
     ++Record.Count;
     Record.LastReason = Reason.Left(2048);
 
-    if (Record.Count >= 2)
+    if (Record.Count == 2)
     {
         UE_LOG(LogTemp, Error,
-            TEXT("Quarantined glTF file after %d recoverable failures. Path=%s Reason=%s"),
+            TEXT("Quarantined model source/reference after %d recoverable failures. Key=%s Reason=%s"),
             Record.Count,
             *NormalizedPath,
             *Record.LastReason);
     }
 }
 
+void FglTFRuntimeSafety::ClearRecoverableFailure(const FString& FilePath)
+{
+    const FString NormalizedPath = glTFRuntimeSafetyPrivate::NormalizeFailureKey(FilePath);
+    if (NormalizedPath.IsEmpty())
+    {
+        return;
+    }
+
+    glTFRuntimeSafetyPrivate::FState& State = glTFRuntimeSafetyPrivate::GetState();
+    FScopeLock FailureScope(&State.FailureLock);
+    State.Failures.Remove(NormalizedPath);
+}
+
+void FglTFRuntimeSafety::ResetRecoverableFailures()
+{
+    glTFRuntimeSafetyPrivate::FState& State = glTFRuntimeSafetyPrivate::GetState();
+    FScopeLock FailureScope(&State.FailureLock);
+    State.Failures.Reset();
+}
+
 bool FglTFRuntimeSafety::IsPathQuarantined(
     const FString& FilePath,
     FString* OutReason)
 {
-    const FString NormalizedPath = GlbValidation::NormalizePath(FilePath);
+    const FString NormalizedPath = glTFRuntimeSafetyPrivate::NormalizeFailureKey(FilePath);
+    if (NormalizedPath.IsEmpty())
+    {
+        return false;
+    }
+
     glTFRuntimeSafetyPrivate::FState& State = glTFRuntimeSafetyPrivate::GetState();
     FScopeLock FailureScope(&State.FailureLock);
 
-    const glTFRuntimeSafetyPrivate::FFailureRecord* Record = State.Failures.Find(NormalizedPath);
+    glTFRuntimeSafetyPrivate::FFailureRecord* Record = State.Failures.Find(NormalizedPath);
+    if (Record && Record->Count > 0
+        && glTFRuntimeSafetyPrivate::HasSourceFingerprintChanged(NormalizedPath, *Record))
+    {
+        State.Failures.Remove(NormalizedPath);
+        Record = nullptr;
+        UE_LOG(LogTemp, Display,
+            TEXT("Cleared stale glTF quarantine because the source changed. Path=%s"),
+            *NormalizedPath);
+    }
+
     const bool bQuarantined = Record && Record->Count >= 2;
     if (bQuarantined && OutReason)
     {

@@ -1,6 +1,13 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
+/**
+ * @file ModelData.cpp
+ * 역할: 모델·메시·노드의 런타임 데이터 구조를 정의합니다.
+ * 핵심 기능: JSON 설정 변환, 메시 속성, 경계·노드·LOD 데이터.
+ * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ */
+
 #include "Model/ModelData.h"
 #include "Components/InstancedStaticMeshComponent.h"
 #include "Components/BoxComponent.h"
@@ -114,15 +121,8 @@ TSharedRef<FJsonObject> FModelData::Serialization() const
 {
     TSharedRef<FJsonObject> Json = MakeShared<FJsonObject>();
     Json->SetStringField(JSON_VERSION_FIELD, JSON_SCHEMA_VERSION);
-    // A generic model template is a plain placed entity unless the map author explicitly changes it
-    // to Vehicle or Weapon. Existing JSON is never rewritten, so this default cannot override input.
-    if (!Prefab.IsEmpty())
-    {
-        Json->SetStringField(TEXT("prefab"), Prefab);
-    }
-
-    // JSON is external, user-authored, and read-only at runtime. Program-owned bounds are stored
-    // only in the extensionless /cache binary and must never be mixed into this settings document.
+    // JSON is external, user-authored input. Program-owned bounds are emitted only into .gwd
+    // metadata and must never be mixed into this settings document.
     // Automates TMap struct serialization without duplicate loops.
     FJsonHelper::SetMap<FMeshData>(Json, TEXT("MeshData"), MeshData, [](const FMeshData &Item)
                                           { return Item.Serialization(); });
@@ -138,11 +138,6 @@ bool FModelData::Deserialization(const TSharedPtr<FJsonObject> &Json)
     Center = FVector::ZeroVector;
     Size = FVector::ZeroVector;
     MeshData.Empty();
-    Prefab.Reset();
-
-    Json->TryGetStringField(TEXT("prefab"), Prefab);
-    Prefab.TrimStartAndEndInline();
-
     // Automates TMap struct deserialization while safely restoring JSON keys as FName values.
     FJsonHelper::TryGetMap<FMeshData>(Json, TEXT("MeshData"), MeshData, [](const TSharedPtr<FJsonObject> &Obj, FMeshData &OutItem)
                                              { return OutItem.Deserialization(Obj); });

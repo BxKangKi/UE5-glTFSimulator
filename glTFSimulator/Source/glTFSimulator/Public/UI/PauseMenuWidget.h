@@ -1,5 +1,12 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
+/**
+ * @file PauseMenuWidget.h
+ * 역할: 일시정지 메뉴의 공통 UI 동작을 제공합니다.
+ * 핵심 기능: 버튼 바인딩, 재개·설정·월드 선택 이동.
+ * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"

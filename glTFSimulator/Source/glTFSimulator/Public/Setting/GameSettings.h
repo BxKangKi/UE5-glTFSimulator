@@ -1,6 +1,13 @@
 // Copyright © 2025 BxKangKi. Licensed under the MIT License.
 // Copyright © 2025 Epic Games, Inc. All rights reserved.
 
+/**
+ * @file GameSettings.h
+ * 역할: 사용자 그래픽·게임 설정을 보관하고 적용합니다.
+ * 핵심 기능: 설정 저장·로드, 렌더 품질과 텍스처 제한 해석.
+ * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"
@@ -59,6 +66,26 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Quality", meta=(ClampMin="0", ClampMax="3"))
     int32 ViewDistanceQuality = 2;
 
+    /** Base size-proportional streaming radius multiplier. Effective radius also follows ViewDistanceQuality. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Streaming", meta=(ClampMin="1.0", ClampMax="512.0"))
+    float StreamingDistanceMultiplier = 64.0f;
+
+    /** Hysteresis applied only while a scene/model is already resident, preventing boundary thrash. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Streaming", meta=(ClampMin="1.0", ClampMax="2.0"))
+    float StreamingUnloadDistanceMultiplier = 1.10f;
+
+    /** Base mutable-object chunk radius. Effective radius also follows ViewDistanceQuality. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Streaming", meta=(ClampMin="512.0", ClampMax="4096.0"))
+    float ObjectStreamingRadiusMeters = 2048.0f;
+
+    /** Maximum coarse scene actors spawned per update and mesh-group stream actions activated per frame. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Streaming", meta=(ClampMin="1", ClampMax="32"))
+    int32 StreamingSceneSpawnBudget = 2;
+
+    /** Maximum node load/unload operations scheduled by one stream action frame. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Streaming", meta=(ClampMin="1", ClampMax="256"))
+    int32 StreamingNodeBudgetPerFrame = 32;
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Quality", meta=(ClampMin="0", ClampMax="3"))
     int32 AntiAliasingQuality = 2;
 
@@ -89,6 +116,26 @@ public:
     static UGameSettings *CreateSettingsData(UObject *Onwer = nullptr);
     static int32 GetDefaultMaxTextureResolution() { return 768; }
     int32 GetClampedMaxTextureResolution() const;
+
+    /** Quality scale shared by engine view distance and custom archive streaming. High keeps legacy distances. */
+    UFUNCTION(BlueprintPure, Category="Settings|Streaming")
+    float GetViewDistanceScale() const;
+
+    UFUNCTION(BlueprintPure, Category="Settings|Streaming")
+    float GetEffectiveStreamingDistanceMultiplier() const;
+
+    UFUNCTION(BlueprintPure, Category="Settings|Streaming")
+    float GetEffectiveObjectStreamingRadiusMeters() const;
+
+    UFUNCTION(BlueprintPure, Category="Settings|Streaming")
+    float GetStreamingUnloadDistanceMultiplier() const;
+
+    UFUNCTION(BlueprintPure, Category="Settings|Streaming")
+    int32 GetStreamingSceneSpawnBudget() const;
+
+    UFUNCTION(BlueprintPure, Category="Settings|Streaming")
+    int32 GetStreamingNodeBudgetPerFrame() const;
+
     static int32 ResolveMaxTextureResolution(const UObject* WorldContextObject);
     UFUNCTION()
     void LoadSettingsData();

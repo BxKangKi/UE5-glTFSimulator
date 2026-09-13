@@ -1,16 +1,23 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
+/**
+ * @file PlayerCharacterController.h
+ * 역할: 플레이어 입력과 UI·게임 매니저를 연결합니다.
+ * 핵심 기능: Enhanced Input, 매니저 확보, 메뉴·배치·차량·캐릭터 조작.
+ * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"
 #include "GameFramework/PlayerController.h"
 #include "UI/CreatorHUDWidget.h"
-#include "System/GameManagerActor.h"
+#include "UI/PauseMenuWidget.h"
+#include "UI/SettingsMenuWidget.h"
 #include "TimerManager.h"
 #include "PlayerCharacterController.generated.h"
 
-class AGameManagerActor;
 class APawn;
 class UGameManagerSubSystem;
 class UInputAction;
@@ -29,11 +36,11 @@ struct GLTFSIMULATOR_API FPlayerInputMappingContextConfig
 
 public:
     /** Enhanced Input Mapping Context asset to add for this controller. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Input|Enhanced Input")
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Input|Enhanced Input")
     TObjectPtr<UInputMappingContext> MappingContext = nullptr;
 
     /** Higher priorities override lower priorities when contexts conflict. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Input|Enhanced Input")
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Input|Enhanced Input")
     int32 Priority = 50;
 };
 
@@ -41,7 +48,7 @@ public:
  * Project-level PlayerController input router.
  *
  * Character movement, camera input, vehicle input, and pause can be received from
- * Enhanced Input InputAction assets. Gameplay tool selection, prefab/weapon selection,
+ * Enhanced Input InputAction assets. Gameplay tool selection, static/weapon selection,
  * snap, and scene saving are intentionally handled by a Blueprint UserWidget
  * instead of separate InputAction fields. World placement uses the primary mouse press.
  */
@@ -95,6 +102,11 @@ public:
     UFUNCTION(BlueprintCallable, Category="Input|Mouse")
     void Input_PrimaryPressed();
 
+    /** Legacy Blueprint release event retained as a no-op compatibility bridge. */
+    UFUNCTION(BlueprintCallable, Category="Input|Mouse",
+        meta=(DeprecatedFunction, DeprecationMessage="Primary actions are edge-triggered on press"))
+    void Input_PrimaryReleased();
+
     /** Replaces the old GameManager RightMouseButton BindKey path. */
     UFUNCTION(BlueprintCallable, Category="Input|Mouse")
     void Input_SecondaryPressed();
@@ -107,7 +119,7 @@ public:
     UFUNCTION(BlueprintCallable, Category="Input|Character")
     void Input_ToggleFirstPersonPressed();
 
-    /** U key or assigned InputAction. Cycles through player GLB files managed by glTFStreamSubSystem. */
+    /** U key or assigned InputAction. Cycles through built character records in the active .gwd. */
     UFUNCTION(BlueprintCallable, Category="Input|Character")
     void Input_ChangeCharacterPressed();
 
@@ -193,15 +205,15 @@ protected:
     void RegisterPrimaryCharacterPawn(APawn* InPawn);
 
 public:
-    /** Backward-compatible single IMC slot. Assign your main IMC here in a Blueprint child. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Mapping", meta=(DisplayName="Primary Input Mapping Context"))
+    /** Primary IMC slot. Assign the project's main mapping context in a Blueprint child. */
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Input|Enhanced Input|Mapping", meta=(DisplayName="Primary Input Mapping Context"))
     TObjectPtr<UInputMappingContext> InputMappingContext;
 
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Mapping", meta=(DisplayName="Primary Input Mapping Priority"))
     int32 InputMappingPriority = 50;
 
     /** Optional extra IMCs. Useful when Character, Vehicle, and System actions are separated. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Mapping")
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Input|Enhanced Input|Mapping")
     TArray<FPlayerInputMappingContextConfig> AdditionalInputMappingContexts;
 
     /** Automatically add the assigned IMCs in BeginPlay. Disable only if a Blueprint applies them manually. */
@@ -225,64 +237,25 @@ public:
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Fallback Keys")
     bool bBindFallbackKeysOnlyForUnassignedInputActions = true;
 
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Fallback Keys")
-    bool bAutoSpawnGameManager = true;
-
-    /** BP subclass of AGameManagerActor to spawn when no manager is placed in the level. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Gameplay")
-    TSubclassOf<AGameManagerActor> GameManagerActorClass;
-
-    /** Optional WBP subclass of UCreatorHUDWidget. Nothing is created when this is empty. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Creator HUD")
-    TSubclassOf<UCreatorHUDWidget> CreatorHUDWidgetClass;
-
-    /** Disabled by default because the Creator HUD is now expected to be created explicitly by your own WBP/Blueprint flow. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Creator HUD")
-    bool bAutoCreateCreatorHUD = false;
-
-    /** ZOrder used when the explicitly created Creator HUD is added to the viewport. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Creator HUD")
-    int32 CreatorHUDZOrder = 5;
-
-    /** Creates the explicitly assigned Creator HUD widget if it is missing, then adds it to the viewport. */
+    /** Optional compatibility overrides. Missing top-level UI is auto-created from AssetRegistryClass in BeginPlay. */
     UFUNCTION(BlueprintCallable, Category="Creator HUD")
-    UUserWidget* CreateCreatorHUD();
+    void SetCreatorHUDWidget(UCreatorHUDWidget* InWidget);
 
-    /** Removes the stored Creator HUD instance from the viewport. */
+    UFUNCTION(BlueprintCallable, Category="UI")
+    void SetDebugWidget(UUserWidget* InWidget);
+
+    UFUNCTION(BlueprintCallable, Category="Pause")
+    void SetPauseMenuWidget(UPauseMenuWidget* InWidget);
+
+    UFUNCTION(BlueprintCallable, Category="Pause")
+    void SetSettingsMenuWidget(USettingsMenuWidget* InWidget);
+
+    /** Hides the registered Creator HUD without destroying the Blueprint-owned instance. */
     UFUNCTION(BlueprintCallable, Category="Creator HUD")
     void RemoveCreatorHUD();
 
-    /** Returns the current Creator HUD instance, if one exists. */
     UFUNCTION(BlueprintPure, Category="Creator HUD")
     UUserWidget* GetCreatorHUDWidget() const { return CreatorHUDWidget.Get(); }
-
-    /** Optional WBP subclass of UPauseMenuWidget. Nothing is created when this is empty. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Pause")
-    TSubclassOf<UPauseMenuWidget> PauseMenuWidgetClass;
-
-    /** Optional WBP subclass of USettingsMenuWidget. Nothing is created when this is empty. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Pause")
-    TSubclassOf<USettingsMenuWidget> SettingsMenuWidgetClass;
-
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Pause")
-    int32 PauseMenuZOrder = 100;
-
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Pause")
-    int32 SettingsMenuZOrder = 110;
-
-    /** Menu world that owns the world-selection flow. Assign the world asset directly. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Pause|Navigation")
-    TSoftObjectPtr<UWorld> WorldSelectionWorld;
-
-    /** Menu world shown when leaving the world-selection screen. Assign the world asset directly. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Pause|Navigation")
-    TSoftObjectPtr<UWorld> MainMenuWorld;
-
-    UFUNCTION(BlueprintCallable, Category="Pause")
-    UUserWidget* CreatePauseMenu();
-
-    UFUNCTION(BlueprintCallable, Category="Pause")
-    UUserWidget* CreateSettingsMenu();
 
     UFUNCTION(BlueprintCallable, Category="Pause")
     void OpenPauseMenu();
@@ -306,15 +279,11 @@ public:
     /** Starts pause-menu travel and reports whether this controller now owns an accepted request. */
     bool TryExitToWorldSelectionFromPauseMenu();
 
-    /** Returns whether a directly assigned or StartActor-registered world-selection world is available. */
+    /** Returns whether the central AssetRegistry has a MainWorld available for pause-menu exit. */
     bool CanExitToWorldSelectionFromPauseMenu() const;
 
     /** True after an accepted request, including duplicate listeners fired by the same button click. */
     bool IsMenuWorldTravelPending() const { return bMenuWorldTravelPending; }
-
-    // Assign this to the Back button on the world-selection widget.
-    UFUNCTION(BlueprintCallable, Category="Pause|Navigation")
-    void ReturnToMainMenuFromWorldSelection();
 
     UFUNCTION(BlueprintPure, Category="Pause")
     UUserWidget* GetPauseMenuWidget() const { return PauseMenuWidget.Get(); }
@@ -334,88 +303,87 @@ public:
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Diagnostics")
     bool bShowInputSetupOnScreen = false;
 
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Character Actions")
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Input|Enhanced Input|Character Actions")
     TObjectPtr<UInputAction> MoveAction;
 
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Character Actions")
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Input|Enhanced Input|Character Actions")
     TObjectPtr<UInputAction> LookAction;
 
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Character Actions")
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Input|Enhanced Input|Character Actions")
     TObjectPtr<UInputAction> JumpAction;
 
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Character Actions")
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Input|Enhanced Input|Character Actions")
     TObjectPtr<UInputAction> SprintAction;
 
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Character Actions")
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Input|Enhanced Input|Character Actions")
     TObjectPtr<UInputAction> CrouchAction;
 
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Character Actions")
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Input|Enhanced Input|Character Actions")
     TObjectPtr<UInputAction> FlyAction;
 
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Character Actions")
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Input|Enhanced Input|Character Actions")
     TObjectPtr<UInputAction> RagdollAction;
 
     UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Character Actions")
     float LookSensitivity = 1.0f;
 
     /** Optional action for entering/exiting vehicles. Tool buttons remain UI-only. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Vehicle Actions", meta=(DisplayName="Vehicle Enter/Exit Action"))
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Input|Enhanced Input|Vehicle Actions", meta=(DisplayName="Vehicle Enter/Exit Action"))
     TObjectPtr<UInputAction> InteractAction;
 
     /** Optional action for camera/character first-person toggle. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Character Actions", meta=(DisplayName="Toggle First Person Action"))
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Input|Enhanced Input|Character Actions", meta=(DisplayName="Toggle First Person Action"))
     TObjectPtr<UInputAction> ToggleFirstPersonAction;
 
     /** Optional action for cycling the streamed player character mesh, usually U. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Character Actions", meta=(DisplayName="Change Character Action"))
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Input|Enhanced Input|Character Actions", meta=(DisplayName="Change Character Action"))
     TObjectPtr<UInputAction> ChangeCharacterAction;
 
     /** Axis1D action for Minecraft-style 7-slot toolbar scroll. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Creator Toolbar", meta=(DisplayName="Toolbar Scroll Action"))
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Input|Enhanced Input|Creator Toolbar", meta=(DisplayName="Toolbar Scroll Action"))
     TObjectPtr<UInputAction> ToolbarScrollAction;
 
     /** Boolean action for opening/closing the full item list window, usually E. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Creator Toolbar", meta=(DisplayName="Toggle Item List Action"))
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Input|Enhanced Input|Creator Toolbar", meta=(DisplayName="Toggle Item List Action"))
     TObjectPtr<UInputAction> ToggleItemListAction;
 
     /** Boolean action for toggling grid snap while creating/editing created objects. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Creator Toolbar", meta=(DisplayName="Snap Toggle Action"))
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Input|Enhanced Input|Creator Toolbar", meta=(DisplayName="Snap Toggle Action"))
     TObjectPtr<UInputAction> SnapAction;
 
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Vehicle Actions")
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Input|Enhanced Input|Vehicle Actions")
     TObjectPtr<UInputAction> VehicleMoveAction;
 
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Vehicle Actions")
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Input|Enhanced Input|Vehicle Actions")
     TObjectPtr<UInputAction> VehicleThrottleAction;
 
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Vehicle Actions")
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Input|Enhanced Input|Vehicle Actions")
     TObjectPtr<UInputAction> VehicleSteeringAction;
 
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Input|Enhanced Input|Vehicle Actions")
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Input|Enhanced Input|Vehicle Actions")
     TObjectPtr<UInputAction> VehicleStopAction;
 
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Input|Enhanced Input|System")
+    UPROPERTY(Transient, BlueprintReadOnly, Category = "Input|Enhanced Input|System")
     TObjectPtr<UInputAction> PauseAction;
 
     /** Boolean action for toggling the debug overlay. Assign the InputAction asset directly. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "Input|Enhanced Input|System")
+    UPROPERTY(Transient, BlueprintReadOnly, Category = "Input|Enhanced Input|System")
     TObjectPtr<UInputAction> DebugAction;
 
-    // Assign the debug widget class directly in the editor.
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category = "UI")
-    TSubclassOf<UUserWidget> DebugWidgetClass;
-
 private:
-    // Keep the created widget instance.
-    UPROPERTY()
+    /** Registry-created or explicitly overridden top-level widget instances. */
+    UPROPERTY(Transient)
     TObjectPtr<UUserWidget> DebugWidget;
 
-    UPROPERTY()
-    TObjectPtr<UUserWidget> PauseMenuWidget;
+    UPROPERTY(Transient)
+    TObjectPtr<UPauseMenuWidget> PauseMenuWidget;
 
-    UPROPERTY()
-    TObjectPtr<UUserWidget> SettingsMenuWidget;
+    UPROPERTY(Transient)
+    TObjectPtr<USettingsMenuWidget> SettingsMenuWidget;
 
+    void ResolveCentralAssets();
+    /** Creates missing gameplay UI directly from the central registry and registers the loading widget with GameManager. */
+    void InitializeRegistryDrivenUI();
     void BindConfiguredInputActions();
     void BindFallbackKeyInputs();
     /** Returns true only when the supplied action is present in one of this controller's configured IMCs. */
@@ -445,7 +413,7 @@ private:
     /** Reasserts viewport focus, mapping contexts, and controller input one tick after UI removal. */
     void FinalizeGameplayInputRecovery();
     void LockInputForMenuWorldTravel();
-    TSoftObjectPtr<UWorld> ResolveWorldSelectionWorld() const;
+    TSoftObjectPtr<UWorld> ResolveMainWorld() const;
     void RestorePauseMenuAfterRejectedTravel();
     void ArmMenuWorldTravelWatchdog();
     void HandleMenuWorldTravelWatchdogExpired();
@@ -501,10 +469,8 @@ private:
     TObjectPtr<UGameManagerSubSystem> SubSystem;
 
 
-    /** Auto-created Creator HUD instance. Kept as UUserWidget so WBP subclasses are supported. */
-    UPROPERTY()
-    TObjectPtr<UUserWidget> CreatorHUDWidget;
+    /** Registry-created Creator HUD, or an explicitly registered override. */
+    UPROPERTY(Transient)
+    TObjectPtr<UCreatorHUDWidget> CreatorHUDWidget;
 
-    UPROPERTY()
-    TObjectPtr<AGameManagerActor> CachedGameManagerActor;
 };

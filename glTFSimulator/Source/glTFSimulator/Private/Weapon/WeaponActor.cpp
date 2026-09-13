@@ -1,6 +1,15 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
+/**
+ * @file WeaponActor.cpp
+ * 역할: 장착 무기 모델과 발사 동작을 관리합니다.
+ * 핵심 기능: gworld 참조 로드, 장착·해제, 무기 상태·발사.
+ * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ */
+
 #include "Weapon/WeaponActor.h"
+#include "System/GlTFSimulatorGameInstance.h"
+#include "System/GlTFSimulatorAssetRegistry.h"
 
 #include "Camera/CameraComponent.h"
 #include "Components/SkeletalMeshComponent.h"
@@ -13,16 +22,15 @@
 #include "GameFramework/Pawn.h"
 #include "Kismet/GameplayStatics.h"
 #include "Model/glTFMaterialOverrideUtils.h"
-#include "Misc/Paths.h"
+#include "Simulator/RuntimeModelResolver.h"
 #include "Setting/GameSettings.h"
 #include "System/GameManagerSubSystem.h"
-#include "System/GlbValidation.h"
 #include "System/glTFRuntimeSafety.h"
+#include "System/WorldBakedModelAsset.h"
 #include "System/MacroLibrary.h"
 #include "System/SafeFileIO.h"
 #include "Weapon/WeaponProjectileActor.h"
 #include "glTFRuntimeAsset.h"
-#include "glTFRuntimeFunctionLibrary.h"
 #include "glTFRuntimeParser.h"
 
 namespace
@@ -113,33 +121,6 @@ namespace
         return true;
     }
 
-    TSharedRef<FJsonObject> MakeTransformJson(const FTransform& Transform)
-    {
-        const FVector Location = Transform.GetLocation();
-        const FRotator Rotation = Transform.Rotator();
-        const FVector Scale = Transform.GetScale3D();
-
-        TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
-        Object->SetNumberField(TEXT("X"), Location.X);
-        Object->SetNumberField(TEXT("Y"), Location.Y);
-        Object->SetNumberField(TEXT("Z"), Location.Z);
-        Object->SetNumberField(TEXT("Pitch"), Rotation.Pitch);
-        Object->SetNumberField(TEXT("Yaw"), Rotation.Yaw);
-        Object->SetNumberField(TEXT("Roll"), Rotation.Roll);
-        Object->SetNumberField(TEXT("ScaleX"), Scale.X);
-        Object->SetNumberField(TEXT("ScaleY"), Scale.Y);
-        Object->SetNumberField(TEXT("ScaleZ"), Scale.Z);
-        return Object;
-    }
-
-    TSharedRef<FJsonObject> MakeVectorJson(const FVector& Vector)
-    {
-        TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
-        Object->SetNumberField(TEXT("X"), Vector.X);
-        Object->SetNumberField(TEXT("Y"), Vector.Y);
-        Object->SetNumberField(TEXT("Z"), Vector.Z);
-        return Object;
-    }
 }
 
 AWeaponActor::AWeaponActor()
@@ -151,6 +132,37 @@ AWeaponActor::AWeaponActor()
     Root = CreateDefaultSubobject<USceneComponent>(TEXT("Root"));
     SetRootComponent(Root);
     ProjectileClass = AWeaponProjectileActor::StaticClass();
+}
+
+void AWeaponActor::ResolveCentralWeaponAssets()
+{
+    UGlTFSimulatorAssetRegistry* Registry = UGlTFSimulatorGameInstance::GetAssetRegistryFromContext(this);
+    if (!IsValid(Registry))
+    {
+        if (!ProjectileClass)
+        {
+            ProjectileClass = AWeaponProjectileActor::StaticClass();
+        }
+        return;
+    }
+
+    if (!IsValid(DefaultWeaponMesh) && !Registry->DefaultWeaponMesh.IsNull())
+    {
+        DefaultWeaponMesh = Registry->DefaultWeaponMesh.LoadSynchronous();
+    }
+
+    UClass* ResolvedProjectileClass = Registry->WeaponProjectileActorClass.IsNull()
+        ? nullptr : Registry->WeaponProjectileActorClass.LoadSynchronous();
+    if (IsValid(ResolvedProjectileClass)
+        && ResolvedProjectileClass->IsChildOf(AWeaponProjectileActor::StaticClass())
+        && !ResolvedProjectileClass->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists))
+    {
+        ProjectileClass = ResolvedProjectileClass;
+    }
+    else if (!ProjectileClass)
+    {
+        ProjectileClass = AWeaponProjectileActor::StaticClass();
+    }
 }
 
 void AWeaponActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
@@ -165,23 +177,46 @@ void AWeaponActor::Destroyed()
     Super::Destroyed();
 }
 
-bool AWeaponActor::EquipFromFile(const FString& InFilePath, USceneComponent* AttachTarget)
+bool AWeaponActor::EquipFromModel(const FString& InModelReference, USceneComponent* AttachTarget)
 {
-    if (!ensureMsgf(IsInGameThread(), TEXT("AWeaponActor::EquipFromFile must run on the game thread")))
+    if (!ensureMsgf(IsInGameThread(), TEXT("AWeaponActor::EquipFromModel must run on the game thread")))
     {
         return false;
     }
 
+    // This actor can be reused when the toolbar selection changes. Release the prior baked facade
+    // before assigning a new one; otherwise its manifest and weak dependency cache survive until a
+    // later GC cycle even though the old weapon is no longer visible.
+    ClearLoadedComponents();
+    BakedAsset = nullptr;
     Config = FWeaponConfig();
-    SourceFilePath = InFilePath.IsEmpty() ? FString() : FPaths::ConvertRelativePathToFull(InFilePath);
+    FResolvedRuntimeModel Model;
+    FString ResolveError;
+    const bool bResolved = FRuntimeModelResolver::Resolve(
+        this, InModelReference, Model, ResolveError)
+        && Model.Definition.ModelType == EModelDefinitionType::Dynamic
+        && Model.Definition.ItemType == EModelItemType::Weapon;
+    ModelReference = bResolved ? Model.Reference : FString();
+    bRuntimeResourcesReleased = false;
 
-    if (!SourceFilePath.IsEmpty())
+    if (bResolved)
     {
-        const FString JsonPath = FPaths::ChangeExtension(SourceFilePath, TEXT("json"));
-        LoadConfigJson(JsonPath);
+        LoadConfigJson(Model.DefinitionJson);
+    }
+    else
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("WeaponActor: built weapon model rejected. Reference=%s Reason=%s"),
+            *InModelReference, *ResolveError);
     }
 
-    const bool bLoadedVisual = !SourceFilePath.IsEmpty() && LoadWeaponMesh();
+    const bool bLoadedVisual = bResolved && LoadWeaponMesh(Model);
+    if (!bLoadedVisual && IsValid(BakedAsset))
+    {
+        // A definition may be valid while all of its render nodes are unsupported. The default
+        // mesh does not need that baked facade, so retire it before installing the fallback visual.
+        BakedAsset = nullptr;
+    }
     if (!bLoadedVisual && !CreateDefaultBoxMesh())
     {
         return false;
@@ -191,15 +226,28 @@ bool AWeaponActor::EquipFromFile(const FString& InFilePath, USceneComponent* Att
     return true;
 }
 
+bool AWeaponActor::EquipFromFile(
+    const FString& InFilePath,
+    USceneComponent* AttachTarget)
+{
+    // Compatibility only: the resolver deliberately rejects absolute/relative GLB paths. This
+    // keeps old Blueprint node names loadable while preserving the baked-runtime trust boundary.
+    return EquipFromModel(InFilePath, AttachTarget);
+}
+
 bool AWeaponActor::EquipDefault(USceneComponent* AttachTarget)
 {
+    ResolveCentralWeaponAssets();
     if (!ensureMsgf(IsInGameThread(), TEXT("AWeaponActor::EquipDefault must run on the game thread")))
     {
         return false;
     }
 
+    ClearLoadedComponents();
+    BakedAsset = nullptr;
     Config = FWeaponConfig();
-    SourceFilePath.Reset();
+    ModelReference.Reset();
+    bRuntimeResourcesReleased = false;
     if (!CreateDefaultBoxMesh())
     {
         return false;
@@ -209,7 +257,7 @@ bool AWeaponActor::EquipDefault(USceneComponent* AttachTarget)
     return true;
 }
 
-bool AWeaponActor::LoadConfigJson(const FString& JsonPath)
+bool AWeaponActor::LoadConfigJson(const FString& DefinitionJson)
 {
     FSafeJsonLimits Limits;
     Limits.MaxFileBytes = MaxWeaponConfigBytes;
@@ -219,17 +267,12 @@ bool AWeaponActor::LoadConfigJson(const FString& JsonPath)
     Limits.MaxStringCharacters = 1024 * 1024;
     Limits.bAllowBackupRecovery = false;
 
-    const FSafeJsonLoadResult LoadResult = FSafeFileIO::LoadJsonBlocking(JsonPath, Limits);
+    const FSafeJsonLoadResult LoadResult = FSafeFileIO::ParseJsonText(
+        DefinitionJson, TEXT(".gwd weapon definition"), Limits);
     if (!LoadResult.IsSuccess())
     {
-        if (LoadResult.Status == ESafeFileIOStatus::Missing)
-        {
-            SaveDefaultConfigJson(JsonPath);
-        }
-
         UE_LOG(LogTemp, Warning,
-            TEXT("WeaponActor: read-only config JSON was not loaded. Path=%s Reason=%s"),
-            *JsonPath,
+            TEXT("WeaponActor: embedded definition JSON was not loaded. Reason=%s"),
             *LoadResult.Error);
         return false;
     }
@@ -278,60 +321,17 @@ bool AWeaponActor::LoadConfigJson(const FString& JsonPath)
     return true;
 }
 
-bool AWeaponActor::SaveDefaultConfigJson(const FString& JsonPath) const
-{
-    if (JsonPath.IsEmpty())
-    {
-        return false;
-    }
-
-    TSharedRef<FJsonObject> RootObject = MakeShared<FJsonObject>();
-    RootObject->SetStringField(JSON_VERSION_FIELD, JSON_SCHEMA_VERSION);
-    const FString Name = FPaths::GetBaseFilename(JsonPath);
-    RootObject->SetStringField(TEXT("UUID"), FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower));
-    RootObject->SetStringField(TEXT("Name"), Name);
-    RootObject->SetStringField(TEXT("DisplayName"), Name);
-    RootObject->SetStringField(TEXT("ModelType"), TEXT("Item"));
-    RootObject->SetStringField(TEXT("ItemType"), TEXT("Weapon"));
-    RootObject->SetStringField(TEXT("AttachSocketName"), Config.AttachSocketName.ToString());
-    RootObject->SetObjectField(TEXT("HoldTransform"), MakeTransformJson(Config.HoldTransform));
-    RootObject->SetObjectField(TEXT("RightHandIK"), MakeTransformJson(Config.RightHandIK));
-    RootObject->SetObjectField(TEXT("LeftHandIK"), MakeTransformJson(Config.LeftHandIK));
-    RootObject->SetObjectField(TEXT("MuzzleOffset"), MakeVectorJson(Config.MuzzleOffset));
-    RootObject->SetNumberField(TEXT("Range"), Config.Range);
-    RootObject->SetNumberField(TEXT("Damage"), Config.Damage);
-    RootObject->SetNumberField(TEXT("ImpactImpulse"), Config.ImpactImpulse);
-    RootObject->SetNumberField(TEXT("FireInterval"), Config.FireInterval);
-    RootObject->SetNumberField(TEXT("TraceRadius"), Config.TraceRadius);
-    RootObject->SetBoolField(TEXT("bProjectile"), Config.bProjectile);
-    RootObject->SetNumberField(TEXT("ProjectileSpeed"), Config.ProjectileSpeed);
-    RootObject->SetNumberField(TEXT("ProjectileLifeSeconds"), Config.ProjectileLifeSeconds);
-
-    const FSafeFileWriteResult WriteResult =
-        FSafeFileIO::CreateJsonIfMissingBlocking(RootObject, JsonPath, MaxWeaponConfigBytes);
-    if (!WriteResult.IsSuccess())
-    {
-        UE_LOG(LogTemp, Warning,
-            TEXT("WeaponActor: missing config template could not be created. Path=%s Reason=%s"),
-            *JsonPath,
-            *WriteResult.Error);
-    }
-    return WriteResult.IsSuccess();
-}
-
 void AWeaponActor::ReleaseRuntimeResources()
 {
-    if (!ensureMsgf(IsInGameThread(), TEXT("AWeaponActor runtime release must run on the game thread")))
+    if (!ensureMsgf(IsInGameThread(), TEXT("AWeaponActor runtime release must run on the game thread"))
+        || bRuntimeResourcesReleased)
     {
         return;
     }
+    bRuntimeResourcesReleased = true;
 
     ClearLoadedComponents();
-    if (IsValid(GltfAsset))
-    {
-        FglTFRuntimeSafety::RequestAssetRelease(GltfAsset);
-        GltfAsset = nullptr;
-    }
+    BakedAsset = nullptr;
 }
 
 void AWeaponActor::ClearLoadedComponents()
@@ -375,7 +375,7 @@ void AWeaponActor::ClearLoadedComponents()
 
 UStaticMesh* AWeaponActor::LoadMeshByIndex(int32 MeshIndex)
 {
-    if (!IsValid(GltfAsset) || MeshIndex < 0 || MeshIndex >= GltfAsset->GetNumMeshes())
+    if (!IsValid(BakedAsset) || MeshIndex < 0 || MeshIndex >= BakedAsset->GetNumMeshes())
     {
         return nullptr;
     }
@@ -407,17 +407,7 @@ UStaticMesh* AWeaponActor::LoadMeshByIndex(int32 MeshIndex)
     MeshConfig.bBuildSimpleCollision = false;
     MeshConfig.bBuildComplexCollision = false;
 
-    UStaticMesh* Mesh = nullptr;
-    const bool bExecuted = FglTFRuntimeSafety::ExecuteSynchronousOperation(
-        FString::Printf(TEXT("Weapon LoadStaticMesh %d"), MeshIndex),
-        [this, MeshIndex, &MeshConfig, &Mesh]()
-        {
-            Mesh = GltfAsset->LoadStaticMesh(MeshIndex, MeshConfig);
-        });
-    if (!bExecuted)
-    {
-        return nullptr;
-    }
+    UStaticMesh* Mesh = BakedAsset->LoadStaticMesh(MeshIndex, MeshConfig);
     if (IsValid(Mesh))
     {
         MeshCache.Add(MeshIndex, Mesh);
@@ -425,46 +415,31 @@ UStaticMesh* AWeaponActor::LoadMeshByIndex(int32 MeshIndex)
     return Mesh;
 }
 
-bool AWeaponActor::LoadWeaponMesh()
+bool AWeaponActor::LoadWeaponMesh(const FResolvedRuntimeModel& Model)
 {
     ClearLoadedComponents();
 
-    SourceFilePath = GlbValidation::NormalizePath(SourceFilePath);
-    FString ValidationReason;
-    if (!GlbValidation::ValidateRuntimeMeshFile(SourceFilePath, ValidationReason))
+    FString LoadError;
+    BakedAsset = FRuntimeModelResolver::LoadAssetSynchronously(Model, LoadError);
+    if (!IsValid(BakedAsset))
     {
-        UE_LOG(LogTemp, Warning, TEXT("WeaponActor: invalid GLB skipped. Path=%s Reason=%s"), *SourceFilePath, *ValidationReason);
-        return false;
-    }
-
-    FglTFRuntimeConfig LoaderConfig;
-    LoaderConfig.bAllowExternalFiles = true;
-    const bool bAssetLoadExecuted = FglTFRuntimeSafety::ExecuteSynchronousOperation(
-        TEXT("Weapon parser creation"),
-        [this, &LoaderConfig]()
-        {
-            GltfAsset = UglTFRuntimeFunctionLibrary::glTFLoadAssetFromFilename(
-                SourceFilePath, false, LoaderConfig);
-        });
-    if (!bAssetLoadExecuted)
-    {
-        return false;
-    }
-    if (!IsValid(GltfAsset))
-    {
+        UE_LOG(LogTemp, Warning, TEXT("WeaponActor: archive model load failed: %s"), *LoadError);
         return false;
     }
 
     int32 ComponentIndex = 0;
-    const TArray<FglTFRuntimeNode> Nodes = GltfAsset->GetNodes();
+    // The facade remains strongly referenced throughout assembly, so a const view is safe and
+    // prevents one full node-table copy per equipped weapon.
+    const TArray<FglTFRuntimeNode>& Nodes = BakedAsset->GetNodes();
     if (Nodes.Num() > MaxRuntimeWeaponNodeCount)
     {
-        UE_LOG(LogTemp, Warning, TEXT("WeaponActor: GLB node count exceeds the runtime safety limit. Path=%s Nodes=%d"),
-            *SourceFilePath, Nodes.Num());
-        ReleaseRuntimeResources();
+        UE_LOG(LogTemp, Warning, TEXT("WeaponActor: baked node count exceeds the runtime safety limit. Path=%s Nodes=%d"),
+            *ModelReference, Nodes.Num());
+        // The caller may install the lightweight default visual after this failure. Do not mark the
+        // whole actor as permanently released here, otherwise EndPlay would skip that fallback's cleanup.
         return false;
     }
-    const int32 MeshCount = GltfAsset->GetNumMeshes();
+    const int32 MeshCount = BakedAsset->GetNumMeshes();
     for (const FglTFRuntimeNode& Node : Nodes)
     {
         if (Node.MeshIndex < 0 || Node.MeshIndex >= MeshCount || Node.Transform.ContainsNaN())
@@ -556,6 +531,7 @@ FTransform AWeaponActor::GetLeftHandIKWorldTransform() const
 
 void AWeaponActor::Fire(AController* InstigatorController)
 {
+    ResolveCentralWeaponAssets();
     UWorld* World = GetWorld();
     if (!World || !IsValid(InstigatorController))
     {

@@ -1,5 +1,12 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
+/**
+ * @file StreamingMovementGateSubsystem.cpp
+ * 역할: 아직 로드되지 않은 공간으로의 이동을 제한합니다.
+ * 핵심 기능: 청크·메시 준비 검사, 플레이어·물리 객체 이동 보호.
+ * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ */
+
 #include "System/StreamingMovementGateSubsystem.h"
 
 #include "Components/PrimitiveComponent.h"

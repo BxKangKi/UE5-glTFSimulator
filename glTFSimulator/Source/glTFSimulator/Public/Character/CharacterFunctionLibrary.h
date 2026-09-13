@@ -1,6 +1,13 @@
 // Copyright © 2025 BxKangKi. Licensed under the MIT License.
 // Copyright © 2025 Epic Games, Inc. All rights reserved.
 
+/**
+ * @file CharacterFunctionLibrary.h
+ * 역할: 캐릭터·스켈레톤 관련 공통 작업을 제공합니다.
+ * 핵심 기능: 본·메시·캐릭터 데이터 변환 및 보조 연산.
+ * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"

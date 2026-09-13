@@ -2,6 +2,13 @@
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
 /**
+ * File role: glTFRuntimeSafety.h
+ * 역할: glTFRuntime의 native 작업과 해제를 직렬 조정합니다.
+ * 핵심 기능: 작업 티켓·대기 큐, GC 참조 보호, 지연 cache 해제, 종료 drain.
+ * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ */
+
+/**
  * @file glTFRuntimeSafety.h
  * @brief Serializes native glTFRuntime work and coordinates safe runtime-asset cache teardown.
  */
@@ -24,7 +31,8 @@ struct FglTFRuntimeConfig;
  * Native access violations and memory corruption cannot be recovered with C++ exceptions.
  * This coordinator instead validates external files before entry, keeps UObject work on the
  * game thread, delays cache destruction until native callbacks have finished, and quarantines
- * repeatedly failing files for the remainder of the process.
+ * repeatedly failing files. Authoring retries can explicitly clear stale failure history, and a
+ * changed source file automatically invalidates its previous quarantine record.
  */
 class GLTFSIMULATOR_API FglTFRuntimeSafety
 {
@@ -40,12 +48,13 @@ public:
      */
     static TSharedPtr<FglTFRuntimeParser> CreateParserSafely(
         const FString& FilePath,
-        const FglTFRuntimeConfig& Config);
+        const FglTFRuntimeConfig& Config,
+        FString* OutError = nullptr);
 
     /**
      * Runs one short, synchronous glTFRuntime call on the game thread.
      *
-     * This is the only entry point used by synchronous vehicle, prefab, and weapon loading. It
+     * This is the only entry point used by synchronous vehicle, Static, and weapon loading. It
      * shares the same process-wide gate as parser construction, queued mesh finalization, and
      * ClearCache. The call is rejected instead of blocking the game thread when asynchronous
      * native work already owns the gate.
@@ -92,7 +101,13 @@ public:
     /** Records a recoverable failure and quarantines a path after repeated failures. */
     static void ReportRecoverableFailure(const FString& FilePath, const FString& Reason);
 
-    /** Returns true when a path has been quarantined for the current process. */
+    /** Clears accumulated recoverable failures for one source/reference after a successful use. */
+    static void ClearRecoverableFailure(const FString& FilePath);
+
+    /** Clears process-local recoverable failure history before an explicit authoring retry. */
+    static void ResetRecoverableFailures();
+
+    /** Returns true when a path is quarantined and its source fingerprint has not changed. */
     static bool IsPathQuarantined(const FString& FilePath, FString* OutReason = nullptr);
 
     /** Returns true after a native-operation timeout opens the session circuit breaker. */

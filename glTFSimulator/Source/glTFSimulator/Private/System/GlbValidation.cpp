@@ -1,17 +1,21 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
+/**
+ * @file GlbValidation.cpp
+ * 역할: 외부 GLB 파일의 구조와 읽기 범위를 검사합니다.
+ * 핵심 기능: 헤더·청크·크기 검증, 경로 정규화, 잘못된 입력 거부.
+ * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ */
+
 #include "System/GlbValidation.h"
 #include "System/SafeFileIO.h"
 #include "HAL/CriticalSection.h"
 
 #include "Dom/JsonObject.h"
 #include "HAL/FileManager.h"
-#include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Misc/ScopeLock.h"
 #include "Serialization/Archive.h"
-#include "Serialization/JsonReader.h"
-#include "Serialization/JsonSerializer.h"
 
 namespace
 {
@@ -38,8 +42,6 @@ namespace
     constexpr int64 MAX_RUNTIME_MESH_INDICES = 12000000;
     constexpr int32 MAX_RUNTIME_VALIDATION_CACHE_ENTRIES = 2048;
     constexpr int32 RUNTIME_VALIDATION_SCHEMA_VERSION = 2;
-    constexpr int64 MAX_RUNTIME_GLTF_JSON_BYTES = 64ll * 1024ll * 1024ll;
-    constexpr int32 MAX_RUNTIME_GLTF_BUFFER_COUNT = 1024;
     constexpr int64 MAX_RUNTIME_EXTERNAL_RESOURCE_BYTES = static_cast<int64>(MAX_int32);
     constexpr int32 MAX_RUNTIME_EXTERNAL_RESOURCE_COUNT = 100000;
 
@@ -64,13 +66,6 @@ namespace
             *NormalizedPath,
             RUNTIME_VALIDATION_SCHEMA_VERSION);
     }
-
-    constexpr uint32 MAX_CHARACTER_JSON_CHUNK_BYTES = 64u * 1024u * 1024u;
-    constexpr int64 MAX_CHARACTER_GLB_BYTES = 512ll * 1024ll * 1024ll;
-    constexpr int32 MAX_CHARACTER_NODE_COUNT = 65536;
-    constexpr int32 MAX_CHARACTER_MESH_COUNT = 16384;
-    constexpr int32 MAX_CHARACTER_SKIN_COUNT = 128;
-    constexpr int32 MAX_CHARACTER_JOINT_COUNT = 4096;
 
     struct FGlbHeader
     {
@@ -328,30 +323,6 @@ namespace
         return true;
     }
 
-    bool ValidateOptionalFiniteArray(const TSharedPtr<FJsonObject>& Object, const TCHAR* FieldName, const int32 ExpectedCount)
-    {
-        if (!Object.IsValid() || !Object->HasField(FieldName))
-        {
-            return true;
-        }
-
-        const TArray<TSharedPtr<FJsonValue>>* Values = nullptr;
-        if (!TryGetArrayFieldSafe(Object, FieldName, Values, true, false) || !Values || Values->Num() != ExpectedCount)
-        {
-            return false;
-        }
-
-        for (const TSharedPtr<FJsonValue>& Value : *Values)
-        {
-            double NumberValue = 0.0;
-            if (!Value.IsValid() || !Value->TryGetNumber(NumberValue) || !FMath::IsFinite(NumberValue))
-            {
-                return false;
-            }
-        }
-        return true;
-    }
-
     int32 GetComponentByteSize(const int32 ComponentType)
     {
         switch (ComponentType)
@@ -588,7 +559,7 @@ namespace
             return false;
         }
 
-        // Embedded data URIs are bounded by the .gltf JSON file-size limit and require no disk I/O.
+        // Embedded data URIs are already bounded by the GLB JSON-chunk limit and require no disk I/O.
         if (Uri.StartsWith(TEXT("data:"), ESearchCase::IgnoreCase))
         {
             return true;
@@ -632,68 +603,6 @@ namespace
         {
             OutReason = FString::Printf(TEXT("external resource exceeds the runtime size limit: %s"), *CandidatePath);
             return false;
-        }
-        return true;
-    }
-
-    bool ValidateGltfExternalBuffers(
-        const FString& NormalizedModelPath,
-        const TSharedPtr<FJsonObject>& Root,
-        TArray<FBufferInfo>& OutBuffers,
-        FString& OutReason)
-    {
-        OutBuffers.Reset();
-        if (!Root.IsValid())
-        {
-            OutReason = TEXT("gltf root JSON object is invalid");
-            return false;
-        }
-
-        const TSharedPtr<FJsonObject>* AssetObject = nullptr;
-        FString AssetVersion;
-        if (!Root->TryGetObjectField(TEXT("asset"), AssetObject)
-            || !AssetObject || !AssetObject->IsValid()
-            || !(*AssetObject)->TryGetStringField(TEXT("version"), AssetVersion)
-            || (AssetVersion != TEXT("2") && !AssetVersion.StartsWith(TEXT("2."))))
-        {
-            OutReason = TEXT("gltf asset.version is missing or is not version 2");
-            return false;
-        }
-
-        const TArray<TSharedPtr<FJsonValue>>* Buffers = nullptr;
-        if (!TryGetRequiredArray(Root, TEXT("buffers"), Buffers)
-            || !Buffers
-            || Buffers->Num() > MAX_RUNTIME_GLTF_BUFFER_COUNT)
-        {
-            OutReason = TEXT("gltf buffers field is missing, empty, malformed, or exceeds the safety limit");
-            return false;
-        }
-
-        OutBuffers.Reserve(Buffers->Num());
-        for (int32 BufferIndex = 0; BufferIndex < Buffers->Num(); ++BufferIndex)
-        {
-            TSharedPtr<FJsonObject> BufferObject;
-            if (!TryGetJsonObjectValue((*Buffers)[BufferIndex], BufferObject))
-            {
-                OutReason = FString::Printf(TEXT("buffer %d is not a JSON object"), BufferIndex);
-                return false;
-            }
-
-            int64 ByteLength = 0;
-            FString Uri;
-            if (!TryGetIntegerField(BufferObject, TEXT("byteLength"), true, 0, 1, MAX_int32, ByteLength)
-                || !BufferObject->TryGetStringField(TEXT("uri"), Uri))
-            {
-                OutReason = FString::Printf(TEXT("buffer %d has no valid uri/byteLength"), BufferIndex);
-                return false;
-            }
-            if (!ValidateGltfExternalUri(NormalizedModelPath, Uri, ByteLength, OutReason))
-            {
-                return false;
-            }
-
-            FBufferInfo& BufferInfo = OutBuffers.AddDefaulted_GetRef();
-            BufferInfo.ByteLength = ByteLength;
         }
         return true;
     }
@@ -1386,13 +1295,11 @@ bool GlbValidation::ValidateFile(const FString& FilePath, FString& OutReason)
         OutReason = TEXT("empty path");
         return false;
     }
-    if (!FPaths::GetExtension(NormalizedPath).Equals(TEXT("glb"), ESearchCase::IgnoreCase) &&
-        !NormalizedPath.EndsWith(TEXT(".inst.glb"), ESearchCase::IgnoreCase))
+    if (!FPaths::GetExtension(NormalizedPath).Equals(TEXT("glb"), ESearchCase::IgnoreCase))
     {
-        OutReason = TEXT("file extension is not .glb or .inst.glb");
+        OutReason = TEXT("file extension is not .glb");
         return false;
     }
-
     const int64 FileSize = IFileManager::Get().FileSize(*NormalizedPath);
     if (FileSize == INDEX_NONE)
     {
@@ -1481,14 +1388,9 @@ bool GlbValidation::ValidateFile(const FString& FilePath, FString& OutReason)
     return true;
 }
 
-bool GlbValidation::ValidateRuntimeMeshFile(const FString& FilePath, FString& OutReason)
+bool GlbValidation::ValidateBuildSourceFile(const FString& FilePath, FString& OutReason)
 {
     const FString NormalizedPath = NormalizePath(FilePath);
-    if (NormalizedPath.EndsWith(TEXT(".inst.glb"), ESearchCase::IgnoreCase))
-    {
-        OutReason = TEXT("placement-only .inst.glb files are forbidden from mesh generation");
-        return false;
-    }
     const FString ValidationCacheKey = MakeRuntimeValidationCacheKey(NormalizedPath);
     const int64 FileSize = IFileManager::Get().FileSize(*NormalizedPath);
     const FDateTime Timestamp = IFileManager::Get().GetTimeStamp(*NormalizedPath);
@@ -1536,271 +1438,5 @@ bool GlbValidation::ValidateRuntimeMeshFile(const FString& FilePath, FString& Ou
 
     OutReason.Reset();
     CacheRuntimeValidation(ValidationCacheKey, FileSize, Timestamp, true, OutReason);
-    return true;
-}
-
-bool GlbValidation::ValidateRuntimeModelFile(const FString& FilePath, FString& OutReason)
-{
-    const FString NormalizedPath = NormalizePath(FilePath);
-    if (NormalizedPath.IsEmpty())
-    {
-        OutReason = TEXT("model path is empty");
-        return false;
-    }
-
-    const FString Extension = FPaths::GetExtension(NormalizedPath).ToLower();
-    if (Extension == TEXT("glb"))
-    {
-        return ValidateRuntimeMeshFile(NormalizedPath, OutReason);
-    }
-    if (Extension != TEXT("gltf"))
-    {
-        OutReason = TEXT("runtime entity model extension must be .glb or .gltf");
-        return false;
-    }
-
-    const int64 FileSize = IFileManager::Get().FileSize(*NormalizedPath);
-    if (FileSize == INDEX_NONE)
-    {
-        OutReason = TEXT("file does not exist or cannot be opened");
-        return false;
-    }
-    if (FileSize <= 0 || FileSize > MAX_RUNTIME_GLTF_JSON_BYTES)
-    {
-        OutReason = FString::Printf(
-            TEXT("gltf JSON file is empty or exceeds the runtime size limit (%lld bytes)"),
-            FileSize);
-        return false;
-    }
-
-    FSafeJsonLimits JsonLimits;
-    JsonLimits.MaxFileBytes = MAX_RUNTIME_GLTF_JSON_BYTES;
-    JsonLimits.MaxDepth = 96;
-    JsonLimits.MaxValues = 4000000;
-    JsonLimits.MaxContainerEntries = 1000000;
-    JsonLimits.MaxStringCharacters = 8 * 1024 * 1024;
-    JsonLimits.bAllowBackupRecovery = false;
-    const FSafeJsonLoadResult JsonResult = FSafeFileIO::LoadJsonBlocking(NormalizedPath, JsonLimits);
-    if (!JsonResult.IsSuccess() || !JsonResult.JsonObject.IsValid())
-    {
-        OutReason = JsonResult.Error.IsEmpty()
-            ? TEXT("gltf JSON could not be parsed safely")
-            : FString::Printf(TEXT("gltf JSON validation failed: %s"), *JsonResult.Error);
-        return false;
-    }
-
-    TArray<FBufferInfo> Buffers;
-    TArray<FBufferViewInfo> BufferViews;
-    TArray<FAccessorInfo> Accessors;
-    if (!ValidateGltfExternalBuffers(NormalizedPath, JsonResult.JsonObject, Buffers, OutReason)
-        || !ParseAndValidateBufferViews(JsonResult.JsonObject, Buffers, BufferViews, OutReason)
-        || !ParseAndValidateAccessors(JsonResult.JsonObject, BufferViews, Accessors, OutReason)
-        || !ValidateMeshPrimitives(JsonResult.JsonObject, Accessors, OutReason)
-        || !ValidateGltfImageResources(
-            NormalizedPath,
-            JsonResult.JsonObject,
-            BufferViews.Num(),
-            Buffers.Num(),
-            OutReason))
-    {
-        return false;
-    }
-
-    OutReason.Reset();
-    return true;
-}
-
-bool GlbValidation::ValidateCharacterFile(const FString& FilePath, FString& OutReason)
-{
-    if (!ValidateRuntimeMeshFile(FilePath, OutReason))
-    {
-        return false;
-    }
-
-    const FString NormalizedPath = NormalizePath(FilePath);
-    const int64 CharacterFileSize = IFileManager::Get().FileSize(*NormalizedPath);
-    if (CharacterFileSize < 0 || CharacterFileSize > MAX_CHARACTER_GLB_BYTES)
-    {
-        OutReason = FString::Printf(TEXT("character GLB exceeds the safe runtime size limit (%lld bytes)"), CharacterFileSize);
-        return false;
-    }
-
-    FParsedGlbJson Parsed;
-    if (!LoadRootJsonForValidation(NormalizedPath, Parsed, OutReason))
-    {
-        return false;
-    }
-    if (Parsed.JsonChunkLength > MAX_CHARACTER_JSON_CHUNK_BYTES)
-    {
-        OutReason = FString::Printf(TEXT("character JSON chunk is too large (%u bytes)"), Parsed.JsonChunkLength);
-        return false;
-    }
-
-    const TSharedPtr<FJsonObject>& RootObject = Parsed.Root;
-    const TArray<TSharedPtr<FJsonValue>>* Nodes = nullptr;
-    const TArray<TSharedPtr<FJsonValue>>* Meshes = nullptr;
-    const TArray<TSharedPtr<FJsonValue>>* Skins = nullptr;
-    if (!TryGetRequiredArray(RootObject, TEXT("nodes"), Nodes) ||
-        !TryGetRequiredArray(RootObject, TEXT("meshes"), Meshes) ||
-        !TryGetRequiredArray(RootObject, TEXT("skins"), Skins))
-    {
-        OutReason = TEXT("character GLB requires non-empty nodes, meshes, and skins arrays");
-        return false;
-    }
-    if (Nodes->Num() > MAX_CHARACTER_NODE_COUNT || Meshes->Num() > MAX_CHARACTER_MESH_COUNT ||
-        Skins->Num() > MAX_CHARACTER_SKIN_COUNT)
-    {
-        OutReason = FString::Printf(TEXT("character GLB exceeds safe structure limits (nodes=%d meshes=%d skins=%d)"),
-            Nodes->Num(), Meshes->Num(), Skins->Num());
-        return false;
-    }
-
-    for (int32 SkinIndex = 0; SkinIndex < Skins->Num(); ++SkinIndex)
-    {
-        TSharedPtr<FJsonObject> SkinObject;
-        if (!TryGetJsonObjectValue((*Skins)[SkinIndex], SkinObject))
-        {
-            OutReason = FString::Printf(TEXT("skin %d is not a JSON object"), SkinIndex);
-            return false;
-        }
-
-        const TArray<TSharedPtr<FJsonValue>>* Joints = nullptr;
-        if (!TryGetRequiredArray(SkinObject, TEXT("joints"), Joints) || Joints->Num() > MAX_CHARACTER_JOINT_COUNT)
-        {
-            OutReason = FString::Printf(TEXT("skin %d has no valid joints array or exceeds the joint limit"), SkinIndex);
-            return false;
-        }
-        for (const TSharedPtr<FJsonValue>& JointValue : *Joints)
-        {
-            int32 JointIndex = INDEX_NONE;
-            if (!TryGetArrayIndex(JointValue, JointIndex) || !Nodes->IsValidIndex(JointIndex))
-            {
-                OutReason = FString::Printf(TEXT("skin %d references an invalid joint node"), SkinIndex);
-                return false;
-            }
-        }
-
-        bool bHasSkeleton = false;
-        int32 SkeletonIndex = INDEX_NONE;
-        if (!TryGetOptionalIndex(SkinObject, TEXT("skeleton"), bHasSkeleton, SkeletonIndex) ||
-            (bHasSkeleton && !Nodes->IsValidIndex(SkeletonIndex)))
-        {
-            OutReason = FString::Printf(TEXT("skin %d references an invalid skeleton node"), SkinIndex);
-            return false;
-        }
-    }
-
-    bool bFoundSkinnedMeshNode = false;
-    TArray<TArray<int32>> NodeChildren;
-    NodeChildren.SetNum(Nodes->Num());
-    TArray<int32> NodeParentCounts;
-    NodeParentCounts.Init(0, Nodes->Num());
-    for (int32 NodeIndex = 0; NodeIndex < Nodes->Num(); ++NodeIndex)
-    {
-        TSharedPtr<FJsonObject> NodeObject;
-        if (!TryGetJsonObjectValue((*Nodes)[NodeIndex], NodeObject))
-        {
-            OutReason = FString::Printf(TEXT("node %d is not a JSON object"), NodeIndex);
-            return false;
-        }
-
-        if (!ValidateOptionalFiniteArray(NodeObject, TEXT("matrix"), 16) ||
-            !ValidateOptionalFiniteArray(NodeObject, TEXT("translation"), 3) ||
-            !ValidateOptionalFiniteArray(NodeObject, TEXT("rotation"), 4) ||
-            !ValidateOptionalFiniteArray(NodeObject, TEXT("scale"), 3))
-        {
-            OutReason = FString::Printf(TEXT("node %d contains an invalid transform array"), NodeIndex);
-            return false;
-        }
-
-        bool bHasMesh = false;
-        bool bHasSkin = false;
-        int32 MeshIndex = INDEX_NONE;
-        int32 SkinIndex = INDEX_NONE;
-        if (!TryGetOptionalIndex(NodeObject, TEXT("mesh"), bHasMesh, MeshIndex) ||
-            !TryGetOptionalIndex(NodeObject, TEXT("skin"), bHasSkin, SkinIndex))
-        {
-            OutReason = FString::Printf(TEXT("node %d contains a non-integer mesh or skin index"), NodeIndex);
-            return false;
-        }
-        if ((bHasMesh && !Meshes->IsValidIndex(MeshIndex)) || (bHasSkin && !Skins->IsValidIndex(SkinIndex)))
-        {
-            OutReason = FString::Printf(TEXT("node %d references an out-of-range mesh or skin"), NodeIndex);
-            return false;
-        }
-
-        const TArray<TSharedPtr<FJsonValue>>* Children = nullptr;
-        if (!TryGetArrayFieldSafe(NodeObject, TEXT("children"), Children, false, false))
-        {
-            OutReason = FString::Printf(TEXT("node %d has a malformed children array"), NodeIndex);
-            return false;
-        }
-        if (Children)
-        {
-            for (const TSharedPtr<FJsonValue>& ChildValue : *Children)
-            {
-                int32 ChildIndex = INDEX_NONE;
-                if (!TryGetArrayIndex(ChildValue, ChildIndex) || !Nodes->IsValidIndex(ChildIndex) || ChildIndex == NodeIndex)
-                {
-                    OutReason = FString::Printf(TEXT("node %d references an invalid child node"), NodeIndex);
-                    return false;
-                }
-                if (++NodeParentCounts[ChildIndex] > 1)
-                {
-                    OutReason = FString::Printf(TEXT("node %d is referenced by multiple parents"), ChildIndex);
-                    return false;
-                }
-                NodeChildren[NodeIndex].Add(ChildIndex);
-            }
-        }
-
-        bFoundSkinnedMeshNode |= bHasMesh && bHasSkin;
-    }
-
-    if (!bFoundSkinnedMeshNode)
-    {
-        OutReason = TEXT("no node references both a valid mesh and a valid skin");
-        return false;
-    }
-
-    // Reject cycles before glTFRuntime recursively walks the hierarchy.
-    TArray<uint8> VisitState;
-    VisitState.Init(0, Nodes->Num());
-    for (int32 RootIndex = 0; RootIndex < Nodes->Num(); ++RootIndex)
-    {
-        if (VisitState[RootIndex] != 0)
-        {
-            continue;
-        }
-
-        TArray<TPair<int32, int32>> Stack;
-        Stack.Emplace(RootIndex, 0);
-        VisitState[RootIndex] = 1;
-        while (Stack.Num() > 0)
-        {
-            TPair<int32, int32>& Frame = Stack.Last();
-            const int32 NodeIndex = Frame.Key;
-            if (Frame.Value >= NodeChildren[NodeIndex].Num())
-            {
-                VisitState[NodeIndex] = 2;
-                Stack.Pop(EAllowShrinking::No);
-                continue;
-            }
-
-            const int32 ChildIndex = NodeChildren[NodeIndex][Frame.Value++];
-            if (VisitState[ChildIndex] == 1)
-            {
-                OutReason = FString::Printf(TEXT("character GLB contains a cyclic node hierarchy near node %d"), ChildIndex);
-                return false;
-            }
-            if (VisitState[ChildIndex] == 0)
-            {
-                VisitState[ChildIndex] = 1;
-                Stack.Emplace(ChildIndex, 0);
-            }
-        }
-    }
-
-    OutReason.Reset();
     return true;
 }

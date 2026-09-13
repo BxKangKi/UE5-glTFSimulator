@@ -1,8 +1,16 @@
+/**
+ * @file NodeTokenLibrary.cpp
+ * 역할: glTF 노드 이름의 동작 토큰을 해석합니다.
+ * 핵심 기능: 토큰 정규화, 유효 토큰 조회, 충돌·LOD·물 태그 해석.
+ * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ */
+
 #include "Simulator/NodeTokenLibrary.h"
 
 namespace SimulatorNodeTokens
 {
     static const FName RenderFamily(TEXT("RenderMode"));
+    static const FName InstanceFamily(TEXT("InstanceMode"));
     static const FName NodeTypeFamily(TEXT("NodeType"));
     static const FName CollisionFamily(TEXT("CollisionMode"));
     static const FName VisibilityFamily(TEXT("VisibilityMode"));
@@ -11,32 +19,30 @@ namespace SimulatorNodeTokens
 
     static bool IsLodToken(const FString& Token)
     {
-        if (!Token.StartsWith(TEXT("LOD"), ESearchCase::CaseSensitive) || Token.Len() <= 3)
-        {
-            return false;
-        }
-        for (int32 Index = 3; Index < Token.Len(); ++Index)
-        {
-            if (!FChar::IsDigit(Token[Index]))
-            {
-                return false;
-            }
-        }
-        return true;
+        // The baked/runtime schema has exactly four render LOD slots. Treat larger numeric
+        // suffixes as invalid instead of silently allowing a token that the builder cannot store.
+        return Token == TEXT("LOD0")
+            || Token == TEXT("LOD1")
+            || Token == TEXT("LOD2")
+            || Token == TEXT("LOD3");
     }
 
     static FName ResolveFamily(const FString& Token)
     {
-        // Render selection is mutually exclusive. This is the family relevant to
-        // the common ;INST;LOD0 ambiguity.
-        if (Token == TEXT("INST") || Token == TEXT("MESH") || IsLodToken(Token))
+        // Render selection is mutually exclusive.
+        if (Token == TEXT("MESH") || IsLodToken(Token))
         {
             return RenderFamily;
         }
 
+        if (Token == TEXT("INST"))
+        {
+            return InstanceFamily;
+        }
+
         // A node may still have a render token and a node-role token together.
         if (Token == TEXT("COL") || Token == TEXT("COLLIDER") || Token == TEXT("LIGHT") ||
-            Token == TEXT("CAMERA") || Token == TEXT("SOCKET") || Token == TEXT("PREFAB") ||
+            Token == TEXT("CAMERA") || Token == TEXT("SOCKET") || Token == TEXT("STATIC") || Token == TEXT("PREFAB") /* legacy */ ||
             Token == TEXT("VEHICLE") || Token == TEXT("WHEEL") || Token == TEXT("DOOR") ||
             Token == TEXT("SEAT") || Token == TEXT("SPAWN") || Token == TEXT("NAV") ||
             Token == TEXT("WATER"))

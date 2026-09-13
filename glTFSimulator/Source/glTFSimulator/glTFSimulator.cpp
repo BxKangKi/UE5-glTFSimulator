@@ -1,6 +1,13 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
+/**
+ * @file glTFSimulator.cpp
+ * 역할: 프로젝트 게임 모듈의 수명을 관리합니다.
+ * 핵심 기능: 모듈 시작·종료, 로딩 화면, 추적 작업 종료 대기.
+ * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ */
+
 #include "glTFSimulator.h"
 
 #include "MoviePlayer.h"

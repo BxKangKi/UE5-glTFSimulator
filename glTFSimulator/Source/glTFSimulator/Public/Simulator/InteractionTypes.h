@@ -1,3 +1,10 @@
+/**
+ * @file InteractionTypes.h
+ * 역할: 장비·객체 상호작용 공통 타입을 정의합니다.
+ * 핵심 기능: 부착 위치·상호작용 상태 표현.
+ * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"
@@ -57,7 +64,7 @@ struct GLTFSIMULATOR_API FSimulatorEquipmentInteractionConfig
     UPROPERTY(EditAnywhere, BlueprintReadWrite) FSimulatorGripPoint RightGrip;
     UPROPERTY(EditAnywhere, BlueprintReadWrite) FSimulatorGripPoint LeftGrip;
 
-    /** Longest dimension for a held prefab miniature, in Unreal centimeters. */
+    /** Longest dimension for a held Static miniature, in Unreal centimeters. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, meta=(ClampMin="1", ClampMax="100")) float HeldPreviewLongestDimensionCm = 18.0f;
 
     ESimulatorHand ResolvePrimaryHand(ESimulatorHand CharacterDominantHand) const;

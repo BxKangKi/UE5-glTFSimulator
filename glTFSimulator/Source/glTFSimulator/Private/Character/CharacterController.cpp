@@ -1,13 +1,21 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
+/**
+ * @file CharacterController.cpp
+ * 역할: 런타임 캐릭터 액터와 메시·입력 상태를 연결합니다.
+ * 핵심 기능: 캐릭터 로드, 컴포넌트 초기화, 장비·충돌·상태 관리.
+ * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ */
+
 #include "Character/CharacterController.h"
 #include "Character/CharacterComponent.h"
 #include "Character/CharacterFunctionLibrary.h"
-#include "Character/InputFunctionLibrary.h"
 #include "Character/PlayerCharacterController.h"
 #include "GameFramework/SpringArmComponent.h"
 #include "System/GameManagerSubSystem.h"
+#include "System/GlTFSimulatorGameInstance.h"
+#include "System/GlTFSimulatorAssetRegistry.h"
 #include "System/GameUpdateSubSystem.h"
 #include "System/SafeFileIO.h"
 #include "Components/CapsuleComponent.h"
@@ -134,13 +142,46 @@ ACharacterController::ACharacterController()
 void ACharacterController::BeginPlay()
 {
     Super::BeginPlay();
-    if (DefaultAsset.IMC)
+    if (UGlTFSimulatorAssetRegistry* Registry = UGlTFSimulatorGameInstance::GetAssetRegistryFromContext(this))
     {
-        UInputFunctionLibrary::AddInputMappingContext(this, DefaultAsset.IMC, 0);
+        DefaultPhysicsAsset = Registry->DefaultCharacterPhysicsAsset.IsNull()
+            ? nullptr : Registry->DefaultCharacterPhysicsAsset.LoadSynchronous();
+        DefaultSkeleton = Registry->DefaultCharacterSkeleton.IsNull()
+            ? nullptr : Registry->DefaultCharacterSkeleton.LoadSynchronous();
+        DefaultMaterial = Registry->DefaultCharacterMaterial.IsNull()
+            ? nullptr : Registry->DefaultCharacterMaterial.LoadSynchronous();
+        DefaultSkeletalMesh = Registry->DefaultCharacterSkeletalMesh.IsNull()
+            ? nullptr : Registry->DefaultCharacterSkeletalMesh.LoadSynchronous();
+
+        UClass* ResolvedAnimClass = Registry->DefaultCharacterAnimInstanceClass.IsNull()
+            ? nullptr : Registry->DefaultCharacterAnimInstanceClass.LoadSynchronous();
+        DefaultAnimInstanceClass = IsValid(ResolvedAnimClass)
+            && ResolvedAnimClass->IsChildOf(UAnimInstance::StaticClass())
+            && !ResolvedAnimClass->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists)
+            ? ResolvedAnimClass : nullptr;
     }
-    else
+
+    // The central registry is the authoritative default presentation. Apply it once before any
+    // asynchronous glTF character swap so PrepareForMeshReload captures the configured AnimBP.
+    if (USkeletalMeshComponent* MeshComp = GetMesh())
     {
-        UE_LOG(LogTemp, Warning, TEXT("Input Mapping Context is not assigned in the editor."));
+        if (IsValid(DefaultSkeletalMesh) && MeshComp->GetSkinnedAsset() != DefaultSkeletalMesh.Get())
+        {
+            MeshComp->SetSkinnedAssetAndUpdate(DefaultSkeletalMesh, true);
+        }
+        if (IsValid(DefaultPhysicsAsset) && MeshComp->GetPhysicsAsset() != DefaultPhysicsAsset.Get())
+        {
+            MeshComp->SetPhysicsAsset(DefaultPhysicsAsset, true);
+        }
+        if (IsValid(DefaultMaterial))
+        {
+            MeshComp->SetMaterial(0, DefaultMaterial);
+        }
+        if (DefaultAnimInstanceClass)
+        {
+            MeshComp->SetAnimationMode(EAnimationMode::AnimationBlueprint);
+            MeshComp->SetAnimInstanceClass(DefaultAnimInstanceClass);
+        }
     }
     bIsLoaded = false;
     SavedThirdPersonArmLength = SpringArm->TargetArmLength > 1.0f ? SpringArm->TargetArmLength : CharacterControllerTuning::DefaultThirdPersonArmLength;
@@ -316,13 +357,14 @@ bool ACharacterController::CommitRuntimeCharacterResources(
     MeshComp->PutAllRigidBodiesToSleep();
     MeshComp->SetSkinnedAssetAndUpdate(SkeletalMesh, true);
 
-    UPhysicsAsset* PhysicsToUse = IsValid(PhysicsAsset) ? PhysicsAsset : DefaultAsset.PhysicsAsset.Get();
+    UPhysicsAsset* PhysicsToUse = IsValid(PhysicsAsset) ? PhysicsAsset : DefaultPhysicsAsset.Get();
     if (IsValid(PhysicsToUse))
     {
         MeshComp->SetPhysicsAsset(PhysicsToUse, true);
     }
 
-    MeshComp->SetCollisionProfileName(RAGDOLL);
+    MeshComp->SetCollisionProfileName(TEXT("CharacterMesh"));
+    MeshComp->SetGenerateOverlapEvents(false);
 
     RuntimeSkeletalMesh = SkeletalMesh;
     RuntimePhysicsAsset = IsValid(PhysicsAsset) ? PhysicsAsset : nullptr;
@@ -354,11 +396,11 @@ void ACharacterController::ReleaseRuntimeCharacterResources(bool bRestoreDefault
     const bool bHasRuntimeResources =
         IsValid(RuntimeSkeletalMesh) || IsValid(RuntimePhysicsAsset) || IsValid(RuntimeSkeleton);
     const bool bDefaultMeshAlreadyInstalled =
-        !IsValid(DefaultAsset.SkeletalMesh) ||
-        MeshComp->GetSkinnedAsset() == DefaultAsset.SkeletalMesh.Get();
+        !IsValid(DefaultSkeletalMesh) ||
+        MeshComp->GetSkinnedAsset() == DefaultSkeletalMesh.Get();
     const bool bDefaultPhysicsAlreadyInstalled =
-        !IsValid(DefaultAsset.PhysicsAsset) ||
-        MeshComp->GetPhysicsAsset() == DefaultAsset.PhysicsAsset.Get();
+        !IsValid(DefaultPhysicsAsset) ||
+        MeshComp->GetPhysicsAsset() == DefaultPhysicsAsset.Get();
 
     // Initial world entry normally starts on the directly assigned default character. Avoid an
     // unnecessary animation reset and physics-state recreation when there is nothing to release.
@@ -379,13 +421,13 @@ void ACharacterController::ReleaseRuntimeCharacterResources(bool bRestoreDefault
 
     // Never install a null skinned asset while an AnimBP/ControlRig may still own worker tasks.
     // The directly assigned default mesh is the stable placeholder during the next async load.
-    if (IsValid(DefaultAsset.SkeletalMesh))
+    if (IsValid(DefaultSkeletalMesh))
     {
-        MeshComp->SetSkinnedAssetAndUpdate(DefaultAsset.SkeletalMesh, true);
+        MeshComp->SetSkinnedAssetAndUpdate(DefaultSkeletalMesh, true);
     }
-    if (IsValid(DefaultAsset.PhysicsAsset))
+    if (IsValid(DefaultPhysicsAsset))
     {
-        MeshComp->SetPhysicsAsset(DefaultAsset.PhysicsAsset, true);
+        MeshComp->SetPhysicsAsset(DefaultPhysicsAsset, true);
     }
     RuntimeSkeletalMesh = nullptr;
     RuntimePhysicsAsset = nullptr;
@@ -428,14 +470,14 @@ void ACharacterController::OnLoadCompleted(bool Result)
         // assigned default mesh as the stable fallback rather than attempting to retain every GLB.
         if (USkeletalMeshComponent* MeshComp = GetMesh())
         {
-            if (IsValid(DefaultAsset.SkeletalMesh) &&
-                MeshComp->GetSkinnedAsset() != DefaultAsset.SkeletalMesh.Get())
+            if (IsValid(DefaultSkeletalMesh) &&
+                MeshComp->GetSkinnedAsset() != DefaultSkeletalMesh.Get())
             {
-                MeshComp->SetSkinnedAssetAndUpdate(DefaultAsset.SkeletalMesh, true);
+                MeshComp->SetSkinnedAssetAndUpdate(DefaultSkeletalMesh, true);
             }
-            if (IsValid(DefaultAsset.PhysicsAsset))
+            if (IsValid(DefaultPhysicsAsset))
             {
-                MeshComp->SetPhysicsAsset(DefaultAsset.PhysicsAsset, true);
+                MeshComp->SetPhysicsAsset(DefaultPhysicsAsset, true);
             }
         }
         UE_LOG(LogTemp, Warning, TEXT("Character glTF load failed. The default character remains active."));
@@ -590,6 +632,8 @@ void ACharacterController::RestoreControlAfterRagdollRecovery()
     if (USkeletalMeshComponent* MeshComp = GetMesh())
     {
         UCharacterFunctionLibrary::DisableRagdollPhysicsButKeepSecondary(*MeshComp);
+        MeshComp->SetCollisionProfileName(TEXT("CharacterMesh"));
+        MeshComp->SetGenerateOverlapEvents(false);
         MeshComp->SetSimulatePhysics(false);
         MeshComp->PutAllRigidBodiesToSleep();
         MeshComp->SetComponentTickEnabled(true);
@@ -1068,8 +1112,36 @@ void ACharacterController::Activate(bool bValue)
 
 void ACharacterController::MovementInput(const float X, const float Y)
 {
-    RawMoveInput.X = X;
-    RawMoveInput.Y = Y;
+    constexpr float MovementInputDeadZone = 0.01f;
+    const bool bHadPlanarInput = !FMath::IsNearlyZero(RawMoveInput.X, MovementInputDeadZone)
+        || !FMath::IsNearlyZero(RawMoveInput.Y, MovementInputDeadZone);
+    const float ClampedX = FMath::Clamp(X, -1.0f, 1.0f);
+    const float ClampedY = FMath::Clamp(Y, -1.0f, 1.0f);
+    RawMoveInput.X = FMath::IsNearlyZero(ClampedX, MovementInputDeadZone) ? 0.0f : ClampedX;
+    RawMoveInput.Y = FMath::IsNearlyZero(ClampedY, MovementInputDeadZone) ? 0.0f : ClampedY;
+    const bool bHasPlanarInput = !FMath::IsNearlyZero(RawMoveInput.X, MovementInputDeadZone)
+        || !FMath::IsNearlyZero(RawMoveInput.Y, MovementInputDeadZone);
+
+    if (bHadPlanarInput && !bHasPlanarInput)
+    {
+        if (IsValid(Component.Get()))
+        {
+            Component->ReleasePlanarMovementInput();
+        }
+        if (IsValid(Movement))
+        {
+            Movement->ConsumeInputVector();
+            // Flying has very little implicit drag. Clear the released planar velocity so turning
+            // the camera cannot keep steering an old velocity vector after WASD is released.
+            if (Movement->IsFlying())
+            {
+                FVector Velocity = Movement->Velocity;
+                Velocity.X = 0.0f;
+                Velocity.Y = 0.0f;
+                Movement->Velocity = Velocity;
+            }
+        }
+    }
 }
 
 void ACharacterController::ClearTransientInputState()
@@ -1112,6 +1184,14 @@ void ACharacterController::Jumping(bool bDoJump)
     else
     {
         RawMoveInput.Z = FMath::Min(0.0f, RawMoveInput.Z);
+        if (FMath::IsNearlyZero(RawMoveInput.Z) && IsValid(Component.Get()))
+        {
+            Component->ReleaseVerticalMovementInput();
+        }
+        if (FMath::IsNearlyZero(RawMoveInput.Z) && IsValid(Movement) && Movement->IsFlying())
+        {
+            Movement->Velocity.Z = 0.0f;
+        }
         StopJumping();
         CharacterStateBit &= ~STATE_JUMPING;
     }
@@ -1135,6 +1215,14 @@ void ACharacterController::Crouching(bool Value)
     else
     {
         RawMoveInput.Z = FMath::Max(0.0f, RawMoveInput.Z);
+        if (FMath::IsNearlyZero(RawMoveInput.Z) && IsValid(Component.Get()))
+        {
+            Component->ReleaseVerticalMovementInput();
+        }
+        if (FMath::IsNearlyZero(RawMoveInput.Z) && IsValid(Movement) && Movement->IsFlying())
+        {
+            Movement->Velocity.Z = 0.0f;
+        }
         CharacterStateBit &= ~STATE_CROUCH;
     }
 }
@@ -1567,29 +1655,34 @@ void ACharacterController::OnFootstepTraceCompleted(const FTraceHandle& TraceHan
         UPhysicalMaterial* HitPhysMat = HitResult.PhysMaterial.Get();
         if (HitPhysMat)
         {
-            const FFootstepAssetBinding* Binding = FootstepAssetBindings.FindByPredicate(
-                [HitPhysMat](const FFootstepAssetBinding& Candidate)
-                {
-                    return Candidate.PhysicalMaterial.Get() == HitPhysMat;
-                });
+            UGlTFSimulatorAssetRegistry* Registry =
+                UGlTFSimulatorGameInstance::GetAssetRegistryFromContext(this);
+            if (!IsValid(Registry))
+            {
+                return;
+            }
 
+            const FSoftObjectPath HitMaterialPath(HitPhysMat);
+            const FGlTFSimulatorFootstepBinding* Binding = Registry->FootstepBindings.FindByPredicate(
+                [&HitMaterialPath](const FGlTFSimulatorFootstepBinding& Candidate)
+                {
+                    return !Candidate.PhysicalMaterial.IsNull()
+                        && Candidate.PhysicalMaterial.ToSoftObjectPath() == HitMaterialPath;
+                });
             if (!Binding)
             {
                 return;
             }
 
-            if (IsValid(Binding->Sound.Get()))
+            if (USoundBase* Sound = Binding->Sound.IsNull() ? nullptr : Binding->Sound.LoadSynchronous())
             {
-                UGameplayStatics::PlaySoundAtLocation(this, Binding->Sound.Get(), HitResult.ImpactPoint);
+                UGameplayStatics::PlaySoundAtLocation(this, Sound, HitResult.ImpactPoint);
             }
 
-            if (IsValid(Binding->Effect.Get()))
+            if (UNiagaraSystem* Effect = Binding->Effect.IsNull() ? nullptr : Binding->Effect.LoadSynchronous())
             {
                 UNiagaraFunctionLibrary::SpawnSystemAtLocation(
-                    this,
-                    Binding->Effect.Get(),
-                    HitResult.ImpactPoint,
-                    HitResult.ImpactNormal.Rotation());
+                    this, Effect, HitResult.ImpactPoint, HitResult.ImpactNormal.Rotation());
             }
         }
     }

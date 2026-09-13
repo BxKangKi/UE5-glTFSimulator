@@ -1,26 +1,29 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
+/**
+ * @file CharacterLoadAsyncAction.cpp
+ * 역할: 캐릭터 모델의 비동기 로드를 조정합니다.
+ * 핵심 기능: 런타임 모델 해석, 로드 완료 통지, 취소·수명 관리.
+ * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ */
+
 #include "Character/CharacterLoadAsyncAction.h"
 
 #include "Animation/Skeleton.h"
 #include "Character/CharacterController.h"
 #include "Character/CharacterFunctionLibrary.h"
-#include "Dom/JsonObject.h"
 #include "Engine/SkeletalMesh.h"
 #include "Engine/World.h"
-#include "glTFRuntimeAsset.h"
-#include "glTFRuntimeParser.h"
 #include "Materials/MaterialInterface.h"
-#include "Misc/ScopeExit.h"
 #include "PhysicsEngine/PhysicsAsset.h"
 #include "Setting/GameSettings.h"
 #include "System/FileFunctionLibrary.h"
-#include "System/GlbValidation.h"
 #include "System/SafeFileIO.h"
 #include "System/glTFRuntimeSafety.h"
 #include "System/MacroLibrary.h"
-#include "Simulator/ModelDefinitionJson.h"
+#include "Simulator/RuntimeModelResolver.h"
+#include "System/WorldBakedModelAsset.h"
 #include "TimerManager.h"
 #include "UObject/UObjectGlobals.h"
 
@@ -104,13 +107,9 @@ void UCharacterLoadAsyncAction::Activate()
 
     bCancelled = false;
     bFinished = false;
-    bAssetLoadInFlight = false;
-    bBoneMapLoadInFlight = false;
     bMeshLoadInFlight = false;
-    GlTFRuntimeOperationTicket = 0;
     DetectedMeshIndex = INDEX_NONE;
     DetectedSkinIndex = INDEX_NONE;
-    CancelActiveAssetLoad();
     ClearGameThreadStageTimer();
     CurrentLoadedAsset = nullptr;
     CurrentRuntimeSkeleton = nullptr;
@@ -119,186 +118,47 @@ void UCharacterLoadAsyncAction::Activate()
     PendingBoneMap.Empty();
     OnProgress.Broadcast(0.0f);
 
-    FilePath = GlbValidation::NormalizePath(FilePath);
     if (!OwnerCharacter.IsValid())
     {
-        FailLoad(TEXT("Character GLB preflight failed because the owner pawn is invalid"));
+        FailLoad(TEXT("Character built-model preflight failed because the owner pawn is invalid"));
         return;
     }
 
-    // File I/O, GLB structure validation, and parser construction are intentionally kept off
-    // the game thread. UObject creation and component mutation happen only in later GT stages.
-    LoadAssetAsync();
+    FResolvedRuntimeModel Model;
+    FString ResolveError;
+    if (!FRuntimeModelResolver::Resolve(this, FilePath, Model, ResolveError)
+        || Model.Definition.ModelType != EModelDefinitionType::Character)
+    {
+        FailLoad(FString::Printf(
+            TEXT("Character built-model lookup failed. Reference=%s Reason=%s"),
+            *FilePath, *ResolveError));
+        return;
+    }
+    FilePath = Model.Reference;
+    PendingBoneMap = MoveTemp(Model.Definition.Bones);
+
+    // This creates only the lightweight baked-world facade and reads its node/range tables.
+    // No source GLB bytes are opened, parsed, or retained on the gameplay path.
+    UWorldBakedModelAsset* Asset = FRuntimeModelResolver::LoadAssetSynchronously(Model, ResolveError);
+    if (!IsValid(Asset))
+    {
+        FailLoad(FString::Printf(
+            TEXT("Character baked-data initialization failed. Reference=%s Reason=%s"),
+            *FilePath, *ResolveError));
+        return;
+    }
+    OnBakedAssetLoaded(Asset);
 }
 
-void UCharacterLoadAsyncAction::LoadAssetAsync()
+void UCharacterLoadAsyncAction::OnBakedAssetLoaded(UWorldBakedModelAsset* Asset)
 {
-    if (!ensureMsgf(IsInGameThread(), TEXT("LoadAssetAsync dispatch must originate on the game thread")))
+    if (!ensureMsgf(IsInGameThread(), TEXT("OnBakedAssetLoaded must run on the game thread")))
     {
         return;
     }
 
     if (bCancelled)
     {
-        TryFinishCancelledRequest();
-        return;
-    }
-
-    CancelActiveAssetLoad();
-    const int32 RequestId = AssetLoadRequestSerial;
-    const FString RequestedFilePath = FilePath;
-
-    FglTFRuntimeConfig Config;
-    Config.TransformBaseType = EglTFRuntimeTransformBaseType::YForward;
-    Config.bAllowExternalFiles = true;
-
-    TWeakObjectPtr<UCharacterLoadAsyncAction> WeakThis(this);
-    TSharedPtr<FThreadSafeCounter, ESPMode::ThreadSafe> CancelToken =
-        MakeShared<FThreadSafeCounter, ESPMode::ThreadSafe>(0);
-    AssetLoadCancelToken = CancelToken;
-    bAssetLoadInFlight = true;
-
-    const bool bWorkerQueued = FSafeFileIO::RunTrackedWorker(
-        [WeakThis, RequestedFilePath, RequestId, Config, CancelToken]()
-        {
-            // BACKGROUND THREAD ONLY: filesystem access, GLB validation, and parser construction.
-            // Project code performs no direct UObject creation/access or component mutation here;
-            // glTFRuntime internally marshals any engine-object setup it requires to the game thread.
-            FString ValidationReason;
-            bool bCharacterFileValid = false;
-            TSharedPtr<FglTFRuntimeParser> Parser;
-
-            if (CancelToken.IsValid() && CancelToken->GetValue() == 0)
-            {
-                bCharacterFileValid =
-                    GlbValidation::ValidateCharacterFile(RequestedFilePath, ValidationReason);
-
-                if (bCharacterFileValid && CancelToken->GetValue() == 0)
-                {
-                    // Parser creation is serialized across the process. This project does not
-                    // directly dereference a UObject in this worker stage.
-                    Parser = FglTFRuntimeSafety::CreateParserSafely(RequestedFilePath, Config);
-                    if (!Parser.IsValid() && ValidationReason.IsEmpty())
-                    {
-                        ValidationReason = TEXT("glTFRuntime parser creation was rejected or failed");
-                    }
-                }
-            }
-
-            // Always acknowledge completion on the game thread, including cancellation. The action
-            // stays registered until this callback drains, which prevents a replacement character
-            // request from starting a second parser job at the same time.
-            if (!FSafeFileIO::DispatchTrackedGameThread(
-                [WeakThis, RequestedFilePath, RequestId, Config, Parser, CancelToken,
-                    bCharacterFileValid, ValidationReason]()
-                {
-                    UCharacterLoadAsyncAction* StrongThis = WeakThis.Get();
-                    if (!IsValid(StrongThis))
-                    {
-                        return;
-                    }
-
-                    StrongThis->bAssetLoadInFlight = false;
-                    if (StrongThis->AssetLoadCancelToken == CancelToken)
-                    {
-                        StrongThis->AssetLoadCancelToken.Reset();
-                    }
-
-                    const bool bRequestStillCurrent =
-                        CancelToken.IsValid() && CancelToken->GetValue() == 0 &&
-                        !StrongThis->bCancelled && !StrongThis->bFinished &&
-                        StrongThis->AssetLoadRequestSerial == RequestId &&
-                        StrongThis->OwnerCharacter.IsValid() &&
-                        StrongThis->FilePath == RequestedFilePath &&
-                        !IsGarbageCollecting();
-
-                    if (!bRequestStillCurrent)
-                    {
-                        StrongThis->TryFinishCancelledRequest();
-                        return;
-                    }
-
-                    if (!bCharacterFileValid)
-                    {
-                        StrongThis->FailLoad(FString::Printf(
-                            TEXT("Character GLB structural preflight failed. Path=%s Reason=%s"),
-                            *RequestedFilePath,
-                            *ValidationReason));
-                        return;
-                    }
-
-                    // GAME THREAD ONLY: UObjects, parser attachment, delegates, and component state.
-                    UglTFRuntimeAsset* LoadedAsset = nullptr;
-                    if (Parser.IsValid())
-                    {
-                        LoadedAsset = NewObject<UglTFRuntimeAsset>(StrongThis);
-                        if (LoadedAsset)
-                        {
-                            LoadedAsset->RuntimeContextObject = Config.RuntimeContextObject;
-                            LoadedAsset->RuntimeContextString = Config.RuntimeContextString;
-                            if (!LoadedAsset->SetParser(Parser.ToSharedRef()))
-                            {
-                                // Central release owns cache teardown and keeps the asset alive until
-                                // no native operation can still reference its parser.
-                                FglTFRuntimeSafety::RequestAssetRelease(LoadedAsset);
-                                LoadedAsset = nullptr;
-                            }
-                        }
-                    }
-
-                    StrongThis = WeakThis.Get();
-                    if (!IsValid(StrongThis) || StrongThis->bCancelled || StrongThis->bFinished ||
-                        StrongThis->AssetLoadRequestSerial != RequestId ||
-                        !CancelToken.IsValid() || CancelToken->GetValue() != 0 ||
-                        !StrongThis->OwnerCharacter.IsValid() ||
-                        StrongThis->FilePath != RequestedFilePath)
-                    {
-                        if (IsValid(LoadedAsset))
-                        {
-                            FglTFRuntimeSafety::RequestAssetRelease(LoadedAsset);
-                        }
-                        if (IsValid(StrongThis))
-                        {
-                            StrongThis->TryFinishCancelledRequest();
-                        }
-                        return;
-                    }
-
-                    StrongThis->OnglTFAssetLoaded(LoadedAsset);
-                }))
-            {
-                // No UObject state may be touched from this worker after shutdown starts.
-                CancelToken->Set(1);
-            }
-        });
-
-    if (!bWorkerQueued)
-    {
-        // Queue rejection happens on the game thread, so unwind the request synchronously.
-        CancelToken->Set(1);
-        if (AssetLoadCancelToken == CancelToken)
-        {
-            AssetLoadCancelToken.Reset();
-        }
-        bAssetLoadInFlight = false;
-        bCancelled = true;
-        FinishAndRelease();
-    }
-}
-
-void UCharacterLoadAsyncAction::OnglTFAssetLoaded(UglTFRuntimeAsset* Asset)
-{
-    if (!ensureMsgf(IsInGameThread(), TEXT("OnglTFAssetLoaded must run on the game thread")))
-    {
-        return;
-    }
-
-    if (bCancelled)
-    {
-        if (IsValid(Asset))
-        {
-            FglTFRuntimeSafety::RequestAssetRelease(Asset);
-        }
         FinishAndRelease();
         return;
     }
@@ -307,7 +167,7 @@ void UCharacterLoadAsyncAction::OnglTFAssetLoaded(UglTFRuntimeAsset* Asset)
     {
         CurrentLoadedAsset = Asset;
         FailLoad(FString::Printf(
-            TEXT("Character glTF parser failed or owner became invalid. Path=%s"),
+            TEXT("Character baked-data facade failed or owner became invalid. Path=%s"),
             *FilePath));
         return;
     }
@@ -316,18 +176,18 @@ void UCharacterLoadAsyncAction::OnglTFAssetLoaded(UglTFRuntimeAsset* Asset)
     if (!ResolveCharacterSkin(Asset))
     {
         FailLoad(FString::Printf(
-            TEXT("Character GLB has no valid skinned mesh node: %s"),
+            TEXT("Character baked model has no valid skinned mesh node: %s"),
             *FilePath));
         return;
     }
 
     OnProgress.Broadcast(0.25f);
-    LoadBoneMapAsync();
+    ContinueWithEmbeddedBoneMap();
 }
 
-void UCharacterLoadAsyncAction::LoadBoneMapAsync()
+void UCharacterLoadAsyncAction::ContinueWithEmbeddedBoneMap()
 {
-    if (!ensureMsgf(IsInGameThread(), TEXT("LoadBoneMapAsync dispatch must originate on the game thread")))
+    if (!ensureMsgf(IsInGameThread(), TEXT("ContinueWithEmbeddedBoneMap must run on the game thread")))
     {
         return;
     }
@@ -338,78 +198,15 @@ void UCharacterLoadAsyncAction::LoadBoneMapAsync()
         return;
     }
 
-    TWeakObjectPtr<UCharacterLoadAsyncAction> WeakThis(this);
-    const FString JsonPath = FPaths::ChangeExtension(FilePath, TEXT("json"));
-    const FString CharacterGlbPath = FilePath;
-    bBoneMapLoadInFlight = true;
-
-    const bool bWorkerQueued = FSafeFileIO::RunTrackedWorker([WeakThis, JsonPath, CharacterGlbPath]()
+    if (!IsValid(CurrentLoadedAsset) || !OwnerCharacter.IsValid())
     {
-        // BACKGROUND THREAD ONLY: bounded file I/O and plain JSON/string processing.
-        TMap<FString, FString> LocalBoneMap;
-        FString DefinitionError;
-        FModelDefinition Definition;
-        const bool bDefinitionValid = ModelDefinitionJson::LoadDefinition(
-            JsonPath, CharacterGlbPath, Definition, DefinitionError)
-            && Definition.ModelType == EModelDefinitionType::Character;
-        if (bDefinitionValid)
-        {
-            LocalBoneMap = MoveTemp(Definition.Bones);
-        }
-        else if (DefinitionError.IsEmpty())
-        {
-            DefinitionError = TEXT("ModelType must be Character");
-        }
-
-        if (!FSafeFileIO::DispatchTrackedGameThread(
-            [WeakThis, LocalBoneMap = MoveTemp(LocalBoneMap), bDefinitionValid,
-                DefinitionError = MoveTemp(DefinitionError)]() mutable
-        {
-            UCharacterLoadAsyncAction* StrongThis = WeakThis.Get();
-            if (!IsValid(StrongThis))
-            {
-                return;
-            }
-
-            StrongThis->bBoneMapLoadInFlight = false;
-            if (StrongThis->bCancelled || StrongThis->bFinished)
-            {
-                StrongThis->TryFinishCancelledRequest();
-                return;
-            }
-            if (!IsValid(StrongThis->CurrentLoadedAsset) || !StrongThis->OwnerCharacter.IsValid())
-            {
-                StrongThis->FailLoad(TEXT("Character asset or owner became invalid before mesh creation"));
-                return;
-            }
-            if (!bDefinitionValid)
-            {
-                StrongThis->FailLoad(FString::Printf(
-                    TEXT("Character definition rejected. Path=%s Reason=%s"),
-                    *StrongThis->FilePath,
-                    *DefinitionError));
-                return;
-            }
-
-            // GAME THREAD ONLY from here: UObject-backed state, delegates, timers, and mesh stages.
-            StrongThis->PendingBoneMap = MoveTemp(LocalBoneMap);
-            StrongThis->OnProgress.Broadcast(0.40f);
-            StrongThis->ScheduleGameThreadStage(
-                &UCharacterLoadAsyncAction::BeginSkeletalMeshLoad_GameThread);
-        }))
-        {
-            // The action is owned by shutdown; do not mutate it from this worker.
-            return;
-        }
-    });
-
-    if (!bWorkerQueued)
-    {
-        // The worker never started; clear the drain flag before releasing the registered action.
-        bBoneMapLoadInFlight = false;
-        bCancelled = true;
-        FinishAndRelease();
+        FailLoad(TEXT("Character asset or owner became invalid before mesh creation"));
+        return;
     }
+    // Bone remapping was range-read and validated with this model's definition member. No source
+    // JSON file is touched here, and no redundant worker hop is needed.
+    OnProgress.Broadcast(0.40f);
+    ScheduleGameThreadStage(&UCharacterLoadAsyncAction::BeginSkeletalMeshLoad_GameThread);
 }
 
 void UCharacterLoadAsyncAction::BeginSkeletalMeshLoad_GameThread()
@@ -434,8 +231,8 @@ void UCharacterLoadAsyncAction::BeginSkeletalMeshLoad_GameThread()
         return;
     }
 
-    USkeleton* DefaultSkeleton = Owner->DefaultAsset.Skeleton.Get();
-    UMaterialInterface* Material = Owner->DefaultAsset.Material.Get();
+    USkeleton* DefaultSkeleton = Owner->DefaultSkeleton.Get();
+    UMaterialInterface* Material = Owner->DefaultMaterial.Get();
     if (!IsValid(DefaultSkeleton) || !IsValid(Material))
     {
         FailLoad(TEXT("Character default skeleton or material is not assigned"));
@@ -448,8 +245,8 @@ void UCharacterLoadAsyncAction::BeginSkeletalMeshLoad_GameThread()
     SourceSkeletonReferenceGuard = DefaultSkeleton;
     SourceMaterialReferenceGuard = Material;
 
-    // Creating/duplicating UObjects must remain on the game thread. The expensive glTF primitive,
-    // skin-weight, render-buffer, material, and texture work is performed by glTFRuntime's async API.
+    // Creating/duplicating UObjects must remain on the game thread. Archive range I/O, zlib and
+    // checksums run on a worker; UObject reconstruction/finalization is marshalled back here.
     CurrentRuntimeSkeleton = UCharacterFunctionLibrary::DuplicateSkeleton(DefaultSkeleton);
     if (!IsValid(CurrentRuntimeSkeleton))
     {
@@ -458,8 +255,8 @@ void UCharacterLoadAsyncAction::BeginSkeletalMeshLoad_GameThread()
     }
 
     FglTFRuntimeSkeletalMeshConfig Config;
-    // The parser-owned ReadWrite cache is the single authoritative cache. It is cleared only by
-    // RequestAssetRelease after the final native callback has returned its safety ticket.
+    // These cache flags remain part of the finalizer configuration. The baked facade
+    // does not use a source parser cache and keeps only weak, reclaimable texture reuse entries.
     Config.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
     Config.Skeleton = CurrentRuntimeSkeleton;
     Config.bOverwriteRefSkeleton = false;
@@ -507,70 +304,15 @@ void UCharacterLoadAsyncAction::BeginSkeletalMeshLoad_GameThread()
     OnProgress.Broadcast(0.55f);
     bMeshLoadInFlight = true;
 
-    // Skeletal generation shares the same process-wide native slot as static mesh generation.
-    const FglTFRuntimeSkeletalMeshConfig RequestedConfig = Config;
-    TWeakObjectPtr<UCharacterLoadAsyncAction> WeakThis(this);
-    const uint64 SubmittedTicket = FglTFRuntimeSafety::EnqueueOperation(
-        this,
-        CurrentLoadedAsset,
-        FString::Printf(TEXT("Character mesh %s"), *FPaths::GetCleanFilename(FilePath)),
-        [WeakThis, RequestedConfig](const uint64 Ticket)
-        {
-            UCharacterLoadAsyncAction* StrongThis = WeakThis.Get();
-            if (!IsValid(StrongThis) || StrongThis->bCancelled || StrongThis->bFinished ||
-                !IsValid(StrongThis->CurrentLoadedAsset))
-            {
-                if (IsValid(StrongThis))
-                {
-                    StrongThis->GlTFRuntimeOperationTicket = 0;
-                    StrongThis->bMeshLoadInFlight = false;
-                    StrongThis->TryFinishCancelledRequest();
-                }
-                // Finalize action/asset ownership before releasing the parser slot. The active
-                // ticket is the lifetime barrier that keeps ClearCache from racing this branch.
-                FglTFRuntimeSafety::CompleteOperation(Ticket);
-                return;
-            }
-
-            StrongThis->GlTFRuntimeOperationTicket = Ticket;
-            FglTFRuntimeSkeletalMeshAsync MeshDelegate;
-            MeshDelegate.BindDynamic(StrongThis, &UCharacterLoadAsyncAction::OnMeshLoaded);
-            // Load the exact mesh/skin pair found during validation. The recursive API assumes
-            // scene index 0 when given an empty node name and can accidentally merge unrelated
-            // props, so it is not reliable for arbitrary external character files.
-            StrongThis->CurrentLoadedAsset->LoadSkeletalMeshAsync(
-                StrongThis->DetectedMeshIndex,
-                StrongThis->DetectedSkinIndex,
-                MeshDelegate,
-                RequestedConfig);
-        },
-        [WeakThis](const FString& Reason)
-        {
-            UCharacterLoadAsyncAction* StrongThis = WeakThis.Get();
-            if (!IsValid(StrongThis))
-            {
-                return;
-            }
-
-            StrongThis->GlTFRuntimeOperationTicket = 0;
-            StrongThis->bMeshLoadInFlight = false;
-            if (StrongThis->bCancelled || StrongThis->bFinished)
-            {
-                StrongThis->TryFinishCancelledRequest();
-                return;
-            }
-
-            StrongThis->FailLoad(FString::Printf(
-                TEXT("Character mesh request was rejected by the glTFRuntime safety queue: %s"),
-                *Reason));
-        });
-
-    // A ReadWrite cache hit may complete synchronously from inside EnqueueOperation. Preserve the
-    // callback's terminal state instead of restoring a stale ticket after the call returns.
-    if (bMeshLoadInFlight && GlTFRuntimeOperationTicket == 0)
-    {
-        GlTFRuntimeOperationTicket = SubmittedTicket;
-    }
+    FglTFRuntimeSkeletalMeshAsync MeshDelegate;
+    MeshDelegate.BindDynamic(this, &UCharacterLoadAsyncAction::OnMeshLoaded);
+    // The facade range-reads only this mesh, its selected skin, and directly referenced
+    // material/texture .dat members on a worker. UObject finalization is marshalled back to GT.
+    CurrentLoadedAsset->LoadSkeletalMeshAsync(
+        DetectedMeshIndex,
+        DetectedSkinIndex,
+        MeshDelegate,
+        Config);
 }
 
 void UCharacterLoadAsyncAction::OnMeshLoaded(USkeletalMesh* SkeletalMesh)
@@ -580,17 +322,7 @@ void UCharacterLoadAsyncAction::OnMeshLoaded(USkeletalMesh* SkeletalMesh)
         return;
     }
 
-    const uint64 CompletedTicket = GlTFRuntimeOperationTicket;
-    GlTFRuntimeOperationTicket = 0;
     bMeshLoadInFlight = false;
-
-    // Keep this parser's slot active through every callback-side UObject/reference mutation.
-    // A cancellation/failure below may request cache release; it becomes executable only after
-    // this scope returns the ticket and therefore cannot race this callback.
-    ON_SCOPE_EXIT
-    {
-        FglTFRuntimeSafety::CompleteOperationAfterCallback(CompletedTicket);
-    };
 
     if (bCancelled || bFinished)
     {
@@ -643,7 +375,7 @@ void UCharacterLoadAsyncAction::BuildRuntimePhysics_GameThread()
     }
 
     ACharacterController* Owner = OwnerCharacter.Get();
-    UPhysicsAsset* PhysicsSource = IsValid(Owner) ? Owner->DefaultAsset.PhysicsAsset.Get() : nullptr;
+    UPhysicsAsset* PhysicsSource = IsValid(Owner) ? Owner->DefaultPhysicsAsset.Get() : nullptr;
     if (IsValid(PhysicsSource))
     {
         PendingRuntimePhysicsAsset = DuplicateObject<UPhysicsAsset>(
@@ -765,7 +497,7 @@ void UCharacterLoadAsyncAction::FinalizeRuntimePhysics_GameThread()
         return;
     }
 
-    UPhysicsAsset* PhysicsSource = Owner->DefaultAsset.PhysicsAsset.Get();
+    UPhysicsAsset* PhysicsSource = Owner->DefaultPhysicsAsset.Get();
     if (IsValid(PendingRuntimePhysicsAsset) && IsValid(PhysicsSource))
     {
         PendingRuntimePhysicsAsset = UCharacterFunctionLibrary::MergePhysicsAsset(
@@ -879,7 +611,7 @@ void UCharacterLoadAsyncAction::ClearGameThreadStageTimer()
     GameThreadStageTimer.Invalidate();
 }
 
-bool UCharacterLoadAsyncAction::ResolveCharacterSkin(UglTFRuntimeAsset* Asset)
+bool UCharacterLoadAsyncAction::ResolveCharacterSkin(UWorldBakedModelAsset* Asset)
 {
     if (!ensureMsgf(IsInGameThread(), TEXT("ResolveCharacterSkin must run on the game thread")))
     {
@@ -905,7 +637,8 @@ bool UCharacterLoadAsyncAction::ResolveCharacterSkin(UglTFRuntimeAsset* Asset)
     {
         if (Node.Index >= 0 && Node.Index < Nodes.Num() &&
             Node.MeshIndex >= 0 && Node.MeshIndex < MeshCount &&
-            Node.SkinIndex >= 0 && IsFiniteCharacterLoadTransform(Node.Transform))
+            Node.SkinIndex >= 0 && Asset->HasSkin(Node.SkinIndex)
+            && IsFiniteCharacterLoadTransform(Node.Transform))
         {
             DetectedMeshIndex = Node.MeshIndex;
             DetectedSkinIndex = Node.SkinIndex;
@@ -934,16 +667,6 @@ void UCharacterLoadAsyncAction::FailLoad(const FString& Reason)
     FinishAndRelease();
 }
 
-void UCharacterLoadAsyncAction::CancelActiveAssetLoad()
-{
-    if (AssetLoadCancelToken.IsValid())
-    {
-        AssetLoadCancelToken->Set(1);
-        AssetLoadCancelToken.Reset();
-    }
-    ++AssetLoadRequestSerial;
-}
-
 void UCharacterLoadAsyncAction::ReleaseCurrentAsset()
 {
     if (!ensureMsgf(IsInGameThread(), TEXT("ReleaseCurrentAsset must run on the game thread")))
@@ -951,10 +674,6 @@ void UCharacterLoadAsyncAction::ReleaseCurrentAsset()
         return;
     }
 
-    if (IsValid(CurrentLoadedAsset))
-    {
-        FglTFRuntimeSafety::RequestAssetRelease(CurrentLoadedAsset);
-    }
     CurrentLoadedAsset = nullptr;
 
     ReleaseTransientRuntimeObject(PendingRuntimePhysicsAsset);
@@ -988,22 +707,19 @@ void UCharacterLoadAsyncAction::CancelAndRelease()
     }
 
     bCancelled = true;
-    CancelActiveAssetLoad();
-    FglTFRuntimeSafety::CancelQueuedOperations(this);
     ClearGameThreadStageTimer();
     OnCompleted.Clear();
     OnProgress.Clear();
     OwnerCharacter.Reset();
     FilePath.Reset();
 
-    // Keep the async action alive until every worker has acknowledged cancellation. This prevents
-    // parser, JSON, and glTFRuntime mesh jobs from overlapping with the next character request.
+    // Keep the action alive until the outstanding range read/finalizer callback has drained.
     TryFinishCancelledRequest();
 }
 
 bool UCharacterLoadAsyncAction::HasAsyncWorkInFlight() const
 {
-    return bAssetLoadInFlight || bBoneMapLoadInFlight || bMeshLoadInFlight;
+    return bMeshLoadInFlight;
 }
 
 void UCharacterLoadAsyncAction::TryFinishCancelledRequest()
@@ -1041,12 +757,7 @@ void UCharacterLoadAsyncAction::FinishAndRelease()
 
     bFinished = true;
     bCancelled = true;
-    bAssetLoadInFlight = false;
-    bBoneMapLoadInFlight = false;
     bMeshLoadInFlight = false;
-    GlTFRuntimeOperationTicket = 0;
-    FglTFRuntimeSafety::CancelQueuedOperations(this);
-    CancelActiveAssetLoad();
     ClearGameThreadStageTimer();
     ReleaseCurrentAsset();
     OnCompleted.Clear();
@@ -1065,7 +776,7 @@ void UCharacterLoadAsyncAction::FinishAndRelease()
     }
 }
 
-bool UCharacterLoadAsyncAction::CheckRootBoneName(UglTFRuntimeAsset* Asset)
+bool UCharacterLoadAsyncAction::CheckRootBoneName(UWorldBakedModelAsset* Asset)
 {
     if (!ensureMsgf(IsInGameThread(), TEXT("CheckRootBoneName must run on the game thread")))
     {

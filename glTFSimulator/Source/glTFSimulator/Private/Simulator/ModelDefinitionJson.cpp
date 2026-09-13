@@ -1,3 +1,10 @@
+/**
+ * @file ModelDefinitionJson.cpp
+ * 역할: 원본 GLB의 모델 정의 JSON을 검증합니다.
+ * 핵심 기능: 재귀 발견, 누락 정의 생성, UUID·모델 타입 검증.
+ * UObject/Actor 접근은 게임 스레드에서 수행하고, worker에는 독립된 native 데이터를 전달하십시오.
+ */
+
 #include "Simulator/ModelDefinitionJson.h"
 
 #include "Dom/JsonObject.h"
@@ -25,7 +32,10 @@ namespace
             FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower));
         RootObject->SetStringField(TEXT("Name"), BaseName);
         RootObject->SetStringField(TEXT("DisplayName"), BaseName);
-        RootObject->SetStringField(TEXT("ModelType"), TEXT("None"));
+        // A newly discovered GLB is immediately usable as part of the authored map. Developers
+        // can change this to Dynamic or Character in the generated sibling JSON before the
+        // next build; no hidden editor actor or category folder is required.
+        RootObject->SetStringField(TEXT("ModelType"), TEXT("Static"));
 
         FString SerializedJson;
         const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&SerializedJson);
@@ -73,8 +83,8 @@ namespace
             return false;
         }
 
-        UE_LOG(LogTemp, Warning,
-            TEXT("A GLB had no sibling JSON. Generated a non-loadable ModelType=None definition. GLB='%s', JSON='%s'"),
+        UE_LOG(LogTemp, Display,
+            TEXT("A GLB had no sibling JSON. Generated a ModelType=Static definition. GLB='%s', JSON='%s'"),
             *GlbPath,
             *JsonPath);
         return true;
@@ -83,11 +93,16 @@ namespace
 
 bool ModelDefinitionJson::EnsureMissingDefinitions(
     const FString& ModelRootDirectory,
-    TArray<FString>* OutCreatedJsonFiles)
+    TArray<FString>* OutCreatedJsonFiles,
+    TArray<FString>* OutDiscoveredGlbFiles)
 {
     if (OutCreatedJsonFiles != nullptr)
     {
         OutCreatedJsonFiles->Reset();
+    }
+    if (OutDiscoveredGlbFiles != nullptr)
+    {
+        OutDiscoveredGlbFiles->Reset();
     }
 
     if (ModelRootDirectory.IsEmpty()
@@ -100,12 +115,53 @@ bool ModelDefinitionJson::EnsureMissingDefinitions(
     IFileManager::Get().FindFilesRecursive(
         GlbFiles,
         *ModelRootDirectory,
-        TEXT("*.glb"),
+        // *.* is used instead of an extension wildcard so .glb, .GLB and mixed-case variants are
+        // returned consistently by platform file implementations. The extension is filtered below.
+        TEXT("*.*"),
         true,
         false,
         false);
 
+    // Wildcard extension matching is case-sensitive on some packaged platforms. Enumerate the
+    // authoring root once, then apply the extension contract explicitly and consistently.
+    GlbFiles.RemoveAllSwap(
+        [](const FString& Path)
+        {
+            return !FPaths::GetExtension(Path).Equals(TEXT("glb"), ESearchCase::IgnoreCase);
+        },
+        EAllowShrinking::No);
+
+    // Normalize and de-duplicate before JSON generation. This exact ordered list is handed back to
+    // ModelDatabaseSubsystem, so discovery and build cannot accidentally operate on different
+    // recursive scans while an authoring tool is saving the resources tree.
+    TSet<FString> SeenPaths;
+    TArray<FString> NormalizedGlbFiles;
+    NormalizedGlbFiles.Reserve(GlbFiles.Num());
+    for (const FString& CandidatePath : GlbFiles)
+    {
+        FString Path = FSafeFileIO::NormalizeFilePath(CandidatePath);
+        if (!Path.IsEmpty() && IFileManager::Get().FileExists(*Path)
+            && !SeenPaths.Contains(Path))
+        {
+            SeenPaths.Add(Path);
+            NormalizedGlbFiles.Add(MoveTemp(Path));
+        }
+    }
+    GlbFiles = MoveTemp(NormalizedGlbFiles);
+    constexpr int32 MaxGeneratedDefinitions = 100000; // Must not exceed .gwd's model cap.
+    if (GlbFiles.Num() > MaxGeneratedDefinitions)
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("Model definition generation rejected more than %d GLB files under %s"),
+            MaxGeneratedDefinitions, *ModelRootDirectory);
+        return false;
+    }
+
     GlbFiles.Sort();
+    if (OutDiscoveredGlbFiles != nullptr)
+    {
+        *OutDiscoveredGlbFiles = GlbFiles;
+    }
     bool bAllWritesSucceeded = true;
     for (const FString& GlbPath : GlbFiles)
     {
@@ -133,23 +189,23 @@ bool ModelDefinitionJson::EnsureMissingDefinitions(
 
 bool ModelDefinitionJson::IsLoadableModelType(const FString& ModelType)
 {
-    return ModelType.Equals(TEXT("Scene"), ESearchCase::CaseSensitive)
-        || ModelType.Equals(TEXT("Prefab"), ESearchCase::CaseSensitive)
-        || ModelType.Equals(TEXT("Item"), ESearchCase::CaseSensitive)
+    return ModelType.Equals(TEXT("Static"), ESearchCase::CaseSensitive)
+        || ModelType.Equals(TEXT("Dynamic"), ESearchCase::CaseSensitive)
         || ModelType.Equals(TEXT("Character"), ESearchCase::CaseSensitive)
-        || ModelType.Equals(TEXT("Entity"), ESearchCase::CaseSensitive);
+        // Legacy authoring values are accepted only so old projects can be rebuilt.
+        || ModelType.Equals(TEXT("Scene"), ESearchCase::CaseSensitive)
+        || ModelType.Equals(TEXT("Entity"), ESearchCase::CaseSensitive)
+        || ModelType.Equals(TEXT("Item"), ESearchCase::CaseSensitive);
 }
 
 FString ModelDefinitionJson::ModelTypeToString(const EModelDefinitionType Type)
 {
     switch (Type)
     {
-    case EModelDefinitionType::Scene: return TEXT("Scene");
-    case EModelDefinitionType::Prefab: return TEXT("Prefab");
-    case EModelDefinitionType::Item: return TEXT("Item");
+    case EModelDefinitionType::Static: return TEXT("Static");
+    case EModelDefinitionType::Dynamic: return TEXT("Dynamic");
     case EModelDefinitionType::Character: return TEXT("Character");
-    case EModelDefinitionType::Entity: return TEXT("Entity");
-    default: return TEXT("None");
+    default: return TEXT("Invalid");
     }
 }
 
@@ -157,10 +213,12 @@ bool ModelDefinitionJson::LoadDefinition(
     const FString& JsonPath,
     const FString& ExpectedGlbPath,
     FModelDefinition& OutDefinition,
-    FString& OutError)
+    FString& OutError,
+    FString* OutCanonicalJson)
 {
     OutDefinition = FModelDefinition();
     OutError.Reset();
+    if (OutCanonicalJson) OutCanonicalJson->Reset();
 
     FSafeJsonLimits Limits;
     Limits.MaxFileBytes = 16ll * 1024ll * 1024ll;
@@ -185,10 +243,9 @@ bool ModelDefinitionJson::LoadDefinition(
         return false;
     }
     if (!Root->TryGetStringField(TEXT("Name"), OutDefinition.Name) || OutDefinition.Name.TrimStartAndEnd().IsEmpty()
-        || !Root->TryGetStringField(TEXT("DisplayName"), OutDefinition.DisplayName) || OutDefinition.DisplayName.TrimStartAndEnd().IsEmpty()
-        || !Root->TryGetStringField(TEXT("ModelType"), TypeText))
+        || !Root->TryGetStringField(TEXT("DisplayName"), OutDefinition.DisplayName) || OutDefinition.DisplayName.TrimStartAndEnd().IsEmpty())
     {
-        OutError = TEXT("required Name, DisplayName, or ModelType field is missing/empty");
+        OutError = TEXT("required Name or DisplayName field is missing/empty");
         return false;
     }
     OutDefinition.Name.TrimStartAndEndInline();
@@ -201,61 +258,81 @@ bool ModelDefinitionJson::LoadDefinition(
         return false;
     }
 
-    if (TypeText == TEXT("None")) OutDefinition.ModelType = EModelDefinitionType::None;
-    else if (TypeText == TEXT("Scene")) OutDefinition.ModelType = EModelDefinitionType::Scene;
-    else if (TypeText == TEXT("Prefab")) OutDefinition.ModelType = EModelDefinitionType::Prefab;
-    else if (TypeText == TEXT("Item")) OutDefinition.ModelType = EModelDefinitionType::Item;
+    Root->TryGetStringField(TEXT("ModelType"), TypeText);
+    TypeText.TrimStartAndEndInline();
+    // New authoring schema has only Static, Dynamic and Character. Legacy Scene/Entity/Item
+    // remain readable so an existing project can be rebuilt without a destructive migration.
+    const FString AuthoredType = TypeText;
+    if (TypeText.IsEmpty() || TypeText == TEXT("None") || TypeText == TEXT("Scene"))
+    {
+        TypeText = TEXT("Static");
+    }
+    else if (TypeText == TEXT("Entity") || TypeText == TEXT("Item"))
+    {
+        TypeText = TEXT("Dynamic");
+    }
+    Root->SetStringField(TEXT("ModelType"), TypeText);
+
+    if (TypeText == TEXT("Static")) OutDefinition.ModelType = EModelDefinitionType::Static;
+    else if (TypeText == TEXT("Dynamic")) OutDefinition.ModelType = EModelDefinitionType::Dynamic;
     else if (TypeText == TEXT("Character")) OutDefinition.ModelType = EModelDefinitionType::Character;
-    else if (TypeText == TEXT("Entity")) OutDefinition.ModelType = EModelDefinitionType::Entity;
     else
     {
-        OutError = FString::Printf(TEXT("unknown or case-mismatched ModelType '%s'"), *TypeText);
+        OutError = FString::Printf(
+            TEXT("unsupported or case-mismatched ModelType '%s'; expected Static, Dynamic, or Character"),
+            *TypeText);
         return false;
     }
 
-    if (OutDefinition.ModelType == EModelDefinitionType::Entity)
+    const bool bLegacyEntity = AuthoredType == TEXT("Entity");
+    const bool bLegacyItem = AuthoredType == TEXT("Item");
+    if (OutDefinition.ModelType == EModelDefinitionType::Dynamic)
     {
-        FString Subtype;
-        if (!Root->TryGetStringField(TEXT("EntityType"), Subtype))
+        FString EntitySubtype;
+        FString ItemSubtype;
+        const bool bHasEntityType = Root->TryGetStringField(TEXT("EntityType"), EntitySubtype);
+        const bool bHasItemType = Root->TryGetStringField(TEXT("ItemType"), ItemSubtype);
+        if (bHasEntityType && bHasItemType)
         {
-            OutError = TEXT("Entity requires EntityType=Prop, Vehicle, or Animal");
+            OutError = TEXT("Dynamic cannot specify both EntityType and ItemType");
             return false;
         }
-        if (Subtype == TEXT("Vehicle")) OutDefinition.EntityType = EModelEntityType::Vehicle;
-        else if (Subtype == TEXT("Prop")) OutDefinition.EntityType = EModelEntityType::Prop;
-        else if (Subtype == TEXT("Animal")) OutDefinition.EntityType = EModelEntityType::Animal;
-        else
+        if (bLegacyEntity && !bHasEntityType)
         {
-            OutError = FString::Printf(TEXT("unsupported EntityType '%s'"), *Subtype);
+            OutError = TEXT("legacy Entity requires EntityType=Prop, Vehicle, or Animal");
             return false;
+        }
+        if (bLegacyItem && !bHasItemType)
+        {
+            OutError = TEXT("legacy Item requires ItemType=Weapon, Tool, or Misc");
+            return false;
+        }
+        if (bHasEntityType)
+        {
+            if (EntitySubtype == TEXT("Vehicle")) OutDefinition.EntityType = EModelEntityType::Vehicle;
+            else if (EntitySubtype == TEXT("Prop")) OutDefinition.EntityType = EModelEntityType::Prop;
+            else if (EntitySubtype == TEXT("Animal")) OutDefinition.EntityType = EModelEntityType::Animal;
+            else
+            {
+                OutError = FString::Printf(TEXT("unsupported EntityType '%s'"), *EntitySubtype);
+                return false;
+            }
+        }
+        if (bHasItemType)
+        {
+            if (ItemSubtype == TEXT("Weapon")) OutDefinition.ItemType = EModelItemType::Weapon;
+            else if (ItemSubtype == TEXT("Tool")) OutDefinition.ItemType = EModelItemType::Tool;
+            else if (ItemSubtype == TEXT("Misc")) OutDefinition.ItemType = EModelItemType::Misc;
+            else
+            {
+                OutError = FString::Printf(TEXT("unsupported ItemType '%s'"), *ItemSubtype);
+                return false;
+            }
         }
     }
-    else if (Root->HasField(TEXT("EntityType")))
+    else if (Root->HasField(TEXT("EntityType")) || Root->HasField(TEXT("ItemType")))
     {
-        OutError = TEXT("EntityType is only valid when ModelType is Entity");
-        return false;
-    }
-
-    if (OutDefinition.ModelType == EModelDefinitionType::Item)
-    {
-        FString Subtype;
-        if (!Root->TryGetStringField(TEXT("ItemType"), Subtype))
-        {
-            OutError = TEXT("Item requires ItemType=Weapon, Tool, or Misc");
-            return false;
-        }
-        if (Subtype == TEXT("Weapon")) OutDefinition.ItemType = EModelItemType::Weapon;
-        else if (Subtype == TEXT("Tool")) OutDefinition.ItemType = EModelItemType::Tool;
-        else if (Subtype == TEXT("Misc")) OutDefinition.ItemType = EModelItemType::Misc;
-        else
-        {
-            OutError = FString::Printf(TEXT("unsupported ItemType '%s'"), *Subtype);
-            return false;
-        }
-    }
-    else if (Root->HasField(TEXT("ItemType")))
-    {
-        OutError = TEXT("ItemType is only valid when ModelType is Item");
+        OutError = TEXT("EntityType and ItemType are only valid when ModelType is Dynamic");
         return false;
     }
 
@@ -282,5 +359,19 @@ bool ModelDefinitionJson::LoadDefinition(
 
     OutDefinition.GlbPath = FSafeFileIO::NormalizeFilePath(ExpectedGlbPath);
     OutDefinition.JsonPath = FSafeFileIO::NormalizeFilePath(JsonPath);
+
+    if (OutCanonicalJson)
+    {
+        const TSharedRef<TJsonWriter<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>> Writer =
+            TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(
+                OutCanonicalJson);
+        if (!FJsonSerializer::Serialize(Root.ToSharedRef(), Writer))
+        {
+            OutCanonicalJson->Reset();
+            OutError = TEXT("validated model definition could not be serialized for the archive");
+            OutDefinition = FModelDefinition();
+            return false;
+        }
+    }
     return true;
 }

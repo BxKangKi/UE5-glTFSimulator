@@ -1,6 +1,13 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
+/**
+ * @file JsonHelper.h
+ * 역할: JSON과 Unreal 기본 타입 사이의 변환을 제공합니다.
+ * 핵심 기능: enum·벡터·회전 등 공통 값 직렬화.
+ * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"
@@ -58,13 +65,13 @@ struct FJsonHelper
     static void SetMap(const TSharedRef<FJsonObject>& Json, const FString& Key, const TMap<FName, T>& Map, TFunctionRef<TSharedRef<FJsonObject>(const T&)> SerializeFunc)
     {
         TSharedRef<FJsonObject> MapJsonObj = MakeShared<FJsonObject>();
-        
+
         for (const TPair<FName, T>& KVP : Map)
         {
             // Convert FName to a string key before writing it into the object.
             MapJsonObj->SetObjectField(KVP.Key.ToString(), SerializeFunc(KVP.Value));
         }
-        
+
         Json->SetObjectField(Key, MapJsonObj);
     }
 
@@ -78,7 +85,7 @@ struct FJsonHelper
         if (Json->TryGetObjectField(Key, MapJsonObjPtr) && MapJsonObjPtr && MapJsonObjPtr->IsValid())
         {
             OutMap.Empty((*MapJsonObjPtr)->Values.Num()); // Reserve map storage for efficiency.
-            
+
             // Iterate over every key-value pair in the JSON object.
             for (const auto& KVP : (*MapJsonObjPtr)->Values)
             {

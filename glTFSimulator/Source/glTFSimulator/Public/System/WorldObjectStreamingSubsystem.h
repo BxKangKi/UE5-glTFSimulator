@@ -1,17 +1,25 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
-// 512 m world-object voxel streaming and coalesced persistence.
+// 512 m world-object voxel streaming backed by one random-access .dat file.
+
+/**
+ * @file WorldObjectStreamingSubsystem.h
+ * 역할: entity 청크의 객체 생성·제거·저장을 조정합니다.
+ * 핵심 기능: 비동기 범위 읽기, 초기 복구, 변경 객체 추적, 저장 병합.
+ * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ */
 
 #pragma once
 
 #include "CoreMinimal.h"
 #include "Subsystems/WorldSubsystem.h"
-#include "System/BinaryDataStore.h"
+#include "System/EntityArchive.h"
 #include "WorldObjectStreamingSubsystem.generated.h"
 
 /**
- * Owns data/chunks/chunk.x.y.z.dat and data/entities/entity.x.y.z.dat. Disk work is immutable-snapshot async work; actor creation/destruction and
- * maps are game-thread-only. A dirty chunk is written at most once per tick, and a change made while
- * a write is active advances its revision so the newer snapshot is written afterward.
+ * Owns Worlds/Data/WorldName.dat. Disk work uses immutable snapshots on tracked workers; actor
+ * creation/destruction and maps stay game-thread-only. Periodic writes are coalesced to one-second
+ * checkpoints; unload/stop still flush immediately. A change made during a commit advances its
+ * revision so a newer snapshot follows it.
  */
 UCLASS()
 class GLTFSIMULATOR_API UWorldObjectStreamingSubsystem final : public UTickableWorldSubsystem
@@ -27,21 +35,35 @@ public:
     virtual bool IsTickable() const override { return bRunning && !HasAnyFlags(RF_ClassDefaultObject); }
 
     void Start(const FString& InWorldRoot, float InLoadRadiusMeters = 2048.0f);
+    /** Applies a new settings-derived radius without reopening the .dat archive. */
+    void SetLoadRadiusMeters(float InLoadRadiusMeters);
     void Stop();
     bool IsRunning() const { return bRunning; }
     bool IsInitialAreaReady() const
     {
-        return bRunning && ActiveLoads == 0 && PendingLoads.IsEmpty() && LoadingChunks.IsEmpty();
+        // A failed range remains non-ready while its throttled retry loop is active; reporting ready
+        // here could let shutdown save over state that was never successfully restored.
+        return bRunning && ActiveLoads == 0 && PendingLoads.IsEmpty()
+            && LoadingChunks.IsEmpty() && FailedLoadRetryAt.IsEmpty();
     }
     bool IsLocationLoaded(const FVector& WorldLocation) const;
     /** Boundary crossing prefetch. The transient chunk is saved and released after the object moves. */
     void EnsureLocationLoaded(const FVector& WorldLocation);
     FWorldChunkCoordinate ToChunk(const FVector& WorldLocation) const;
 
-    /** Registers a newly placed object so static prefabs and dynamic entities share chunk storage. */
+    /** Registers a newly placed entity in the sole entity chunk store. */
     bool RegisterPlacedObject(AActor* Actor, const FGuid& ModelUUID);
     void UnregisterObject(AActor* Actor, bool bKeepPersistentRecord);
     void MarkObjectChanged(AActor* Actor);
+
+    /** Loads the non-spatial dynamic state from the same .dat commit log. */
+    void LoadRuntimeStateAsync(
+        TFunction<void(bool, bool, FWorldRuntimeState, FString)> Callback);
+
+    /** Coalesced player/time state save; completion is always delivered on the game thread. */
+    void SaveRuntimeStateAsync(
+        const FWorldRuntimeState& State,
+        FSafeFileIO::FWriteCallback Callback = FSafeFileIO::FWriteCallback());
 
 private:
     struct FRuntimeChunk
@@ -50,12 +72,11 @@ private:
         TArray<TWeakObjectPtr<AActor>> Actors;
         uint64 Revision = 0;
         uint64 SavingRevision = 0;
+        double NextPeriodicSaveAt = 0.0;
         bool bDirty = false;
         bool bSaving = false;
         bool bUnloadAfterSave = false;
         bool bTransientBoundaryLoad = false;
-        int32 PendingSaveParts = 0;
-        bool bSaveBatchFailed = false;
     };
 
     struct FPendingLoad
@@ -67,45 +88,52 @@ private:
     struct FPendingRegistration
     {
         TWeakObjectPtr<AActor> Actor;
-        FGuid UUID;
+        FGuid EntityUUID;
+        FGuid ModelUUID;
         FWorldChunkCoordinate Coordinate;
-        EWorldObjectStorageKind StorageKind = EWorldObjectStorageKind::Prefab;
     };
 
     FString WorldRoot;
-    FString PrefabDataRoot;
-    FString EntityDataRoot;
+    TSharedPtr<FEntityArchiveStore, ESPMode::ThreadSafe> Archive;
     float LoadRadiusCentimeters = 204800.0f;
     uint64 Generation = 0;
     bool bRunning = false;
     float DesiredRefreshAccumulator = 0.0f;
     int32 ActiveLoads = 0;
     static constexpr int32 MaxConcurrentLoads = 8;
+    static constexpr double PeriodicSaveIntervalSeconds = 1.0;
+    static constexpr double FailedLoadRetryDelaySeconds = 1.0;
+    static constexpr float DesiredRefreshIntervalSeconds = 0.25f;
 
     TMap<FWorldChunkCoordinate, FRuntimeChunk> LoadedChunks;
     TSet<FWorldChunkCoordinate> LoadingChunks;
     TSet<FWorldChunkCoordinate> DesiredChunks;
     TArray<FPendingLoad> PendingLoads;
+    /** Corrupt/transient reads are throttled instead of being re-enqueued every frame. */
+    TMap<FWorldChunkCoordinate, double> FailedLoadRetryAt;
     /** Objects accepted while their destination chunk is still loading. */
     TArray<FPendingRegistration> PendingRegistrations;
 
-    FString PrefabChunkPath(const FWorldChunkCoordinate& Coordinate) const;
-    FString EntityChunkPath(const FWorldChunkCoordinate& Coordinate) const;
     void RebuildDesiredChunks();
     void QueueLoad(const FWorldChunkCoordinate& Coordinate, bool bTransientBoundaryLoad);
     void PumpLoads();
+    /** Installs one validated payload (including a known-empty cell) on the game thread. */
+    void InstallLoadedChunk(const FWorldChunkCoordinate& Coordinate, bool bTransientBoundaryLoad,
+        TArray<FWorldChunkObject>&& Entities);
     void FinishLoad(const FWorldChunkCoordinate& Coordinate, bool bTransientBoundaryLoad,
-        bool bSuccess, TArray<FWorldChunkObject>&& Prefabs, TArray<FWorldChunkObject>&& Entities,
-        FString&& Error, uint64 RequestGeneration);
+        bool bSuccess, TArray<FWorldChunkObject>&& Entities, FString&& Error, uint64 RequestGeneration);
     AActor* SpawnObject(const FWorldChunkObject& Object);
     void UpdateObjectsAndCrossings();
-    void BeginSave(const FWorldChunkCoordinate& Coordinate, FRuntimeChunk& Chunk);
-    void CompleteSavePart(const FWorldChunkCoordinate& Coordinate, uint64 SavedRevision,
+    /** Publishes all eligible coordinates beneath one .dat commit footer. */
+    void BeginSaveBatch(const TArray<FWorldChunkCoordinate>& Coordinates);
+    void CompleteSave(const FWorldChunkCoordinate& Coordinate, uint64 SavedRevision,
         uint64 SavedGeneration, const FSafeFileWriteResult& Result);
     void RequestUnload(const FWorldChunkCoordinate& Coordinate);
     void FinalizeUnload(const FWorldChunkCoordinate& Coordinate);
-    FWorldChunkObject SnapshotActor(AActor* Actor, const FGuid& UUID, EWorldObjectStorageKind StorageKind) const;
-    EWorldObjectStorageKind ResolveStorageKind(const FGuid& UUID, bool& bOutValid) const;
-    bool ImportPlacementFilesBlocking();
+    FWorldChunkObject SnapshotActor(
+        AActor* Actor,
+        const FGuid& EntityUUID,
+        const FGuid& ModelUUID) const;
+    bool IsPersistableEntity(const FGuid& UUID) const;
     bool HasPersistenceAuthority() const;
 };

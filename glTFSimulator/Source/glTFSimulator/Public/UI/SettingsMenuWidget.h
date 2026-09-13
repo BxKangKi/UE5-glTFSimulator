@@ -1,15 +1,27 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
+/**
+ * @file SettingsMenuWidget.h
+ * 역할: 설정 메뉴의 보류값과 적용 동작을 관리합니다.
+ * 핵심 기능: 설정 컨트롤 바인딩, 값 변경·확인·적용.
+ * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
 #include "Components/Button.h"
+#include "Components/ComboBoxString.h"
+#include "Components/Slider.h"
 #include "SettingsMenuWidget.generated.h"
 
 class UGameSettings;
 class USettingsMenuWidget;
 class UTextBlock;
+class USettingsControlBinding;
+
+DECLARE_DYNAMIC_MULTICAST_DELEGATE(FSettingsCloseRequested);
 
 UENUM(BlueprintType)
 enum class ESettingsField : uint8
@@ -24,6 +36,11 @@ enum class ESettingsField : uint8
     TextureQuality UMETA(DisplayName="Texture Quality"),
     MaxTextureResolution UMETA(DisplayName="Max Texture Resolution"),
     ViewDistanceQuality UMETA(DisplayName="View Distance Quality"),
+    StreamingDistanceMultiplier UMETA(DisplayName="Streaming Distance Multiplier"),
+    StreamingUnloadDistanceMultiplier UMETA(DisplayName="Streaming Unload Multiplier"),
+    ObjectStreamingRadiusMeters UMETA(DisplayName="Object Streaming Radius"),
+    StreamingSceneSpawnBudget UMETA(DisplayName="Scene Spawn Budget"),
+    StreamingNodeBudgetPerFrame UMETA(DisplayName="Node Budget Per Frame"),
     AntiAliasingQuality UMETA(DisplayName="Anti Aliasing Quality"),
     PostProcessingQuality UMETA(DisplayName="Post Processing Quality"),
     EffectsQuality UMETA(DisplayName="Effects Quality"),
@@ -33,6 +50,57 @@ enum class ESettingsField : uint8
     ReflectionQuality UMETA(DisplayName="Reflection Quality"),
     DynamicGlobalIlluminationMethod UMETA(DisplayName="GI Method"),
     ReflectionMethod UMETA(DisplayName="Reflection Method")
+};
+
+UENUM(BlueprintType)
+enum class ESettingsControlType : uint8
+{
+    Slider UMETA(DisplayName="Slider"),
+    Dropdown UMETA(DisplayName="Dropdown"),
+    Toggle UMETA(DisplayName="Toggle Button")
+};
+
+/**
+ * Per-control delegate adapter. A Blueprint can keep using ordinary Slider/ComboBoxString/Button
+ * widgets; registering the widget creates one adapter that remembers which settings field it owns.
+ */
+UCLASS(Transient)
+class GLTFSIMULATOR_API USettingsControlBinding : public UObject
+{
+    GENERATED_BODY()
+
+public:
+    void BindSlider(USettingsMenuWidget* InOwner, ESettingsField InField, USlider* InSlider);
+    void BindDropdown(USettingsMenuWidget* InOwner, ESettingsField InField, UComboBoxString* InDropdown);
+    void BindToggle(USettingsMenuWidget* InOwner, ESettingsField InField, UButton* InButton);
+    void Unbind();
+
+    UFUNCTION()
+    void HandleSliderValueChanged(float Value);
+
+    UFUNCTION()
+    void HandleDropdownSelectionChanged(FString SelectedItem, ESelectInfo::Type SelectionType);
+
+    UFUNCTION()
+    void HandleToggleClicked();
+
+    ESettingsField GetField() const { return Field; }
+    UObject* GetControlObject() const;
+
+private:
+    UPROPERTY(Transient)
+    TObjectPtr<USettingsMenuWidget> OwnerWidget;
+
+    UPROPERTY(Transient)
+    TObjectPtr<USlider> Slider;
+
+    UPROPERTY(Transient)
+    TObjectPtr<UComboBoxString> Dropdown;
+
+    UPROPERTY(Transient)
+    TObjectPtr<UButton> ToggleButton;
+
+    ESettingsField Field = ESettingsField::BloomIntensity;
 };
 
 /** Backward-compatible helper button. Its click changes only the pending value; Apply/Confirm commits it. */
@@ -102,6 +170,10 @@ public:
     virtual void NativeConstruct() override;
     virtual void NativeDestruct() override;
 
+    /** Shared close contract used by both MainGameMode and the gameplay pause menu. */
+    UPROPERTY(BlueprintAssignable, Category="Settings")
+    FSettingsCloseRequested OnCloseRequested;
+
     UFUNCTION(BlueprintCallable, Category="Settings|Widgets")
     void SetTitleText(UTextBlock* InTitleText);
 
@@ -122,6 +194,42 @@ public:
 
     UFUNCTION(BlueprintCallable, Category="Settings|Widgets")
     void RegisterSettingButton(ESettingsField Field, UButton* InButton);
+
+    /** Preferred range binding: ordinary Blueprint Slider, configured and wired automatically. */
+    UFUNCTION(BlueprintCallable, Category="Settings|Widgets")
+    void RegisterSettingSlider(ESettingsField Field, USlider* InSlider);
+
+    /** Preferred discrete-choice binding: ordinary Blueprint ComboBoxString, populated automatically. */
+    UFUNCTION(BlueprintCallable, Category="Settings|Widgets")
+    void RegisterSettingDropdown(ESettingsField Field, UComboBoxString* InDropdown);
+
+    /** Preferred boolean binding: ordinary Blueprint Button; each click toggles the pending bool. */
+    UFUNCTION(BlueprintCallable, Category="Settings|Widgets")
+    void RegisterSettingToggleButton(ESettingsField Field, UButton* InButton);
+
+    /** Removes any Slider/Dropdown/Toggle adapter currently registered for Field. */
+    UFUNCTION(BlueprintCallable, Category="Settings|Widgets")
+    void UnregisterSettingControl(ESettingsField Field);
+
+    /** Returns which Blueprint control should normally represent this field. */
+    UFUNCTION(BlueprintPure, Category="Settings|Controls")
+    ESettingsControlType GetSettingControlType(ESettingsField Field) const;
+
+    /** Returns the actual Slider min/max/step for range settings. */
+    UFUNCTION(BlueprintPure, Category="Settings|Controls")
+    bool GetSettingSliderRange(ESettingsField Field, float& OutMin, float& OutMax, float& OutStep) const;
+
+    /** Direct graph target for a Slider OnValueChanged event. */
+    UFUNCTION(BlueprintCallable, Category="Settings|Controls")
+    void SetSettingFromSliderValue(ESettingsField Field, float Value);
+
+    /** Direct graph target for a ComboBoxString OnSelectionChanged event. */
+    UFUNCTION(BlueprintCallable, Category="Settings|Controls")
+    void SetSettingFromDropdownSelection(ESettingsField Field, const FString& SelectedOption);
+
+    /** Direct graph target for a boolean Button OnClicked event. */
+    UFUNCTION(BlueprintCallable, Category="Settings|Controls")
+    void ToggleSettingFromUI(ESettingsField Field);
 
     /** Returns the active settings object owned by the GameManager subsystem. */
     UFUNCTION(BlueprintCallable, Category="Settings")
@@ -221,6 +329,16 @@ public:
     UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
     void CycleViewDistanceQualityFromUI();
     UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
+    void CycleStreamingDistanceMultiplierFromUI();
+    UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
+    void CycleStreamingUnloadDistanceMultiplierFromUI();
+    UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
+    void CycleObjectStreamingRadiusMetersFromUI();
+    UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
+    void CycleStreamingSceneSpawnBudgetFromUI();
+    UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
+    void CycleStreamingNodeBudgetPerFrameFromUI();
+    UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
     void CycleAntiAliasingQualityFromUI();
     UFUNCTION(BlueprintCallable, Category="Settings|Cycle")
     void CyclePostProcessingQualityFromUI();
@@ -248,6 +366,10 @@ private:
     void BindAssignedSettingButton(ESettingsField Field, UButton* Button);
     void BindFieldButton(ESettingsField Field, UButton* Button);
     void UnbindFieldButton(ESettingsField Field, UButton* Button);
+    void RefreshRegisteredControls();
+    void RemoveControlBinding(ESettingsField Field);
+    USettingsControlBinding* FindControlBinding(ESettingsField Field) const;
+    float GetPendingNumericValue(ESettingsField Field) const;
     void CopySettingsToPending(const UGameSettings* Settings);
     void ApplyPendingToSettings(UGameSettings* Settings) const;
     void CyclePendingValue(ESettingsField Field, int32 Direction);
@@ -278,6 +400,9 @@ private:
 
     TMap<TWeakObjectPtr<UButton>, ESettingsField> BoundFieldButtons;
 
+    UPROPERTY(Transient)
+    TArray<TObjectPtr<USettingsControlBinding>> ControlBindings;
+
     float PendingBloomIntensity = 0.675f;
     float PendingBloomThreshold = -1.0f;
     float PendingAmbientOcclusionIntensity = 0.5f;
@@ -288,6 +413,11 @@ private:
     int32 PendingTextureQuality = 2;
     int32 PendingMaxTextureResolution = 768;
     int32 PendingViewDistanceQuality = 2;
+    float PendingStreamingDistanceMultiplier = 64.0f;
+    float PendingStreamingUnloadDistanceMultiplier = 1.10f;
+    float PendingObjectStreamingRadiusMeters = 2048.0f;
+    int32 PendingStreamingSceneSpawnBudget = 2;
+    int32 PendingStreamingNodeBudgetPerFrame = 32;
     int32 PendingAntiAliasingQuality = 2;
     int32 PendingPostProcessingQuality = 2;
     int32 PendingEffectsQuality = 2;

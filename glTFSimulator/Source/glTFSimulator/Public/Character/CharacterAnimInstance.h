@@ -1,6 +1,13 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
+/**
+ * @file CharacterAnimInstance.h
+ * 역할: 캐릭터 애니메이션 상태를 AnimGraph에 전달합니다.
+ * 핵심 기능: 이동·회전·공중·물 상태와 애니메이션 변수 갱신.
+ * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"
@@ -53,7 +60,7 @@ public:
 
     UPROPERTY(BlueprintReadOnly, Category = "Character|Animation")
     bool bIsDiving = false;
-    
+
     UPROPERTY(BlueprintReadOnly, Category = "Character|Animation")
     bool bIsRagdoll = false;
 

@@ -1,429 +1,293 @@
 # UE5-glTFSimulator
 
-UE5-glTFSimulator is an Unreal Engine 5 C++ project for loading, streaming, exploring, editing, and saving glTF-based 3D scenes at runtime.
+This `Source` tree contains the glTFRuntime-based world build/streaming code. The current world storage architecture separates the **authoring project** from the **runtime world**.
 
-The project is built around runtime glTF ingestion through `glTFRuntime`, distance-based model streaming, a controllable skeletal character, simple world management, and an in-game creator workflow for placing prefabs, creating procedural meshes, vehicles, and weapons.
+## User Data Folder Structure
 
-## Highlights
-
-- Runtime loading of `.glb` and `.gltf` assets through the bundled `glTFRuntime` plugin.
-- Large-model streaming using node distance checks, instanced static meshes, async loading, and automatic unload boxes.
-- LOD-aware mesh loading using model-node naming conventions.
-- Runtime material overrides for common simulation materials such as glass, tinted glass, and terrain.
-- Optional per-model JSON metadata for collision, entity flags, and runtime point lights.
-- Skeletal character loading from glTF with bone-name mapping, default skeleton merging, generated physics, ragdoll blending, walking, crouching, sprinting, flying, swimming, and first-person toggle support.
-- Runtime creator mode with a 7-slot toolbar, prefab placement, procedural mesh editing, vehicle placement, weapon equipment, grid snap, and item-list UI integration.
-- Runtime scene persistence to `runtime_installed.json` plus a glTF export file.
-- World metadata persistence through `level.json` with automatic periodic saving.
-
-## Requirements
-
-| Requirement | Notes |
-| --- | --- |
-| Unreal Engine | The project file is configured with `EngineAssociation: 5.7`. Use the matching UE version, or update the `.uproject` only after validating plugin compatibility. |
-| C++ toolchain | Required because the main simulator systems are implemented as a C++ UE module. |
-| Bundled plugins | `glTFRuntime`, `ShaderLibrary`, and `glTFSimulatorEditor` are included under `glTFSimulator/Plugins`. |
-| Built-in UE plugins | `ProceduralMeshComponent` and `ModelingToolsEditorMode` are enabled by the project. |
-
-## Repository layout
+The runtime root is `FPlatformProcess::UserDir()/glTFSimulator`.
 
 ```text
-.
-├── README.md
-├── LICENSE
-├── glTFSimulator/
-│   ├── glTFSimulator.uproject
-│   ├── Config/
-│   ├── Content/
-│   │   ├── Blueprints/
-│   │   ├── Input/
-│   │   ├── Maps/
-│   │   └── Resources/
-│   ├── Plugins/
-│   │   ├── glTFRuntime/
-│   │   ├── ShaderLibrary/
-│   │   └── glTFSimulatorEditor/
-│   └── Source/
-│       └── glTFSimulator/
-│           ├── Public/
-│           └── Private/
+glTFSimulator/
+├─ Logs/                         # Existing logs
+├─ Projects/                     # Authoring/build input
+│  └─ MyProject/
+│     ├─ config.json
+│     └─ resources/
+│        ├─ City.glb
+│        ├─ City.json            # Model definition for City.glb
+│        └─ ...                  # Recursive subfolder search is supported
+├─ Worlds/                       # Runtime worlds searched by Singleplay / Multiplay
+│  ├─ MyProject.gwd              # Immutable, shareable, read-only world data
+│  └─ Data/
+│     └─ MyProject.dat           # Mutable state such as time/player/dynamic entities
+└─ settings.json
 ```
 
-Important maps:
+`Projects` is read **only during builds**. The normal game startup path does not fall back to `Projects` or the original GLB files and opens only `Worlds/<World>.gwd`. Therefore, authoring-side `Projects` data does not need to be shipped with a deployed build.
 
-- `Content/Maps/StartWorld.umap` is configured as both the editor startup map and game default map.
-- `Content/Maps/MainWorld.umap` contains the main simulation world flow.
+During a project build, `config.json` is copied into the `.gwd` as an independent CRC-validated member. The `Worlds/*.gwd` list uses the embedded config's `WorldName` as its display name.
 
-## Getting started
+## GameInstance / Central Asset Registry
 
-1. Open `glTFSimulator/glTFSimulator.uproject` with the configured Unreal Engine version.
-2. Let Unreal rebuild project modules if prompted.
-3. If project files are missing, regenerate them from the `.uproject` file and build the `glTFSimulator` target.
-4. Open or play from `StartWorld`.
-5. Create a save-world folder under the simulator runtime data directory, then place glTF files in the expected subfolders described below.
+Asset/class/world references that were previously scattered across multiple Actor/Controller Blueprints are consolidated into a single `UGlTFSimulatorAssetRegistry`. The configuration path now uses **only one Registry Class**.
 
-## Runtime data directory
+1. Create a Blueprint Class derived from `UGlTFSimulatorAssetRegistry`.
+2. In that Blueprint Class's Class Defaults, assign actors, UI, worlds, meshes, materials, input assets, and other resources.
+3. In a GameInstance Blueprint derived from `UGlTFSimulatorGameInstance`, assign only that Registry Blueprint Class to `AssetRegistryClass`.
+4. Set that GameInstance as the Game Instance Class in Project Settings.
 
-The simulator reads and writes world data under the user's platform-specific user directory:
+The GameInstance no longer exposes an external `AssetRegistry` instance variable for configuration. At runtime, it internally creates one transient registry instance from `AssetRegistryClass` and keeps it only through a private strong reference.
 
-```text
-<UserDir>/glTFSimulator/SaveData/<WorldFolder>/
-```
+Actor classes, WBP classes, worlds, meshes, materials, Character assets, InputActions, and IMCs inside the Registry use `TSoftObjectPtr`/`TSoftClassPtr`. As a result, loading the Registry itself does not make all referenced packages resident in memory. Assets are resolved only when the relevant system actually needs them, and resolved UObjects are strongly held only for the required lifetime through the consuming Actor/Subsystem's `UPROPERTY`/`TObjectPtr`/`TSubclassOf`.
 
-At runtime, `<WorldFolder>` is the current world folder name. `StartWorld` scans the folders under `SaveData` and reads each folder's `level.json` to display available worlds.
+The recommended setup order is as follows.
 
-A typical world folder looks like this:
+1. Create one Blueprint Registry derived from `UGlTFSimulatorAssetRegistry`.
+2. Assign the Static/Dynamic/Vehicle/Weapon/Projectile/WorldEnv/Water/Weather Actor classes, along with `MainWorld` and the gameplay/host/client worlds.
+3. Assign each C++ GameMode or its Blueprint subclass to `SingleplayGameModeClass` and `MultiplayGameModeClass`. If left empty, the native GameMode is used as a fallback.
+4. Assign `SkyboxMesh`, Cloud/Water assets, Character SkeletalMesh/PhysicsAsset/Skeleton/Material/**AnimInstanceClass**, Weapon/glTF materials, InputActions, and IMCs to the same Registry.
+5. Also assign the Start/WorldSelection/Project/Pause/Settings/CreatorHUD/Debug/Loading WBP classes to the Registry.
+6. Assign the Registry Blueprint Class to `AssetRegistryClass` in a Blueprint derived from `UGlTFSimulatorGameInstance`.
+7. Select that GameInstance Blueprint in Project Settings. Assign `AMainGameMode` to MainWorld and `ASingleplayGameMode`/`AMultiplayGameMode` to gameplay worlds. Registry-based initialization will then proceed automatically.
 
-```text
-<UserDir>/glTFSimulator/SaveData/DemoWorld/
-├── level.json
-├── model/
-│   ├── city.glb
-│   └── city.json
-├── player/
-│   ├── avatar.glb
-│   └── avatar.json
-├── prefab/
-│   └── table.glb
-├── items/
-│   ├── rifle.glb
-│   └── rifle.json
-├── generated/
-├── runtime_installed.json
-└── runtime_installed.gltf
-```
+The `Skybox` component of `AWorldEnvManager` itself is created in C++, while the StaticMesh it uses is loaded from the Registry's `SkyboxMesh` only when needed at BeginPlay. `ACharacterController` likewise applies the Registry's default SkeletalMesh/PhysicsAsset/Material and `DefaultCharacterAnimInstanceClass` during BeginPlay. When replacing the character mesh with a glTF character mesh, the current AnimBP state is temporarily preserved and restored after the mesh swap so the AnimInstance configuration is not lost during loading.
 
-The project also scans these project-relative fallback folders for runtime creator assets:
+`AStaticActor`, `ADynamicActor`, `AWorldEnvManager`, `AWaterActor`, `AWeaponActor`, `ACharacterController`, `APlayerCharacterController`, and related classes no longer own their own editor asset slots. Required assets are obtained from the Registry. If the Registry is missing or an invalid class is assigned, native-class fallbacks are used where possible, while required functionality emits explicit logs.
 
-```text
-<ProjectDir>/World/prefab/
-<ProjectDir>/World/items/
-<ProjectDir>/World/<WorldFolder>/prefab/
-<ProjectDir>/World/<WorldFolder>/items/
-```
+## GameMode-Based Initialization and Actor Spawn Ownership
 
-## `level.json`
+The initialization lifecycle is no longer owned by level-placed `StartActor`/`GameManagerActor` instances. Responsibilities are divided among three C++ GameModes.
 
-`level.json` stores world settings, time settings, ocean state, player spawn location, and the optional player glTF file name.
+- `AMainGameMode`: Owns the MainWorld menu state, world list, Singleplay/Multiplay travel, and Settings transitions. Projects are also built inside MainWorld by toggling the visibility of the registered Project WBP instead of traveling to another world.
+- `ASingleplayGameMode`: Owns the authority lifecycle of the Singleplay gameplay world and starts/stops the shared gameplay session.
+- `AMultiplayGameMode`: Owns the gameplay lifecycle for listen/dedicated servers. Because GameMode does not exist on clients, the PlayerController starts only the render-side session using the replicated GameMode class/defaults and world state.
+- `AGlTFSimulatorGameplayGameModeBase`: Provides only the common grid/placement/save settings for Singleplay/Multiplay and the connection to the `UGameManagerSubSystem` session lifecycle.
 
-Example:
+Set **World Settings → GameMode Override** in MainWorld to `AMainGameMode` or one of its Blueprint subclasses. The shared gameplay map uses the Registry's `SingleplayGameModeClass` / `MultiplayGameModeClass` as travel overrides. The old `StartActor`, `GameManagerActor`, and `WorldBootstrapSubsystem` sources, along with the automatic actor-spawn fallback, have been removed. If a `.gwd` world is opened with an incorrect gameplay GameMode, the system logs a configuration error instead of silently spawning a replacement manager actor.
+
+Replaceable Actor classes in the Registry are instantiated only when they are actually needed. Their current ownership paths are as follows.
+
+- `WorldEnvManagerClass`: Ensured by the gameplay GameMode when the session starts, before world-data I/O begins. A placed actor is reused if present; if the configured Blueprint fails to spawn, the native `AWorldEnvManager` is used as a fallback.
+- `StaticActorClass`: Created when needed for WorldStream distance streaming, `.dat` Static chunk restoration, Creator Static placement, or Held Static placement.
+- `DynamicActorClass`: Created only when a general Dynamic chunk from `.dat` is loaded.
+- `VehiclePawnClass`: Created when restoring a Vehicle chunk or placing a vehicle through Creator.
+- `WeaponActorClass`: Created only when the user equips a weapon.
+- `WeaponProjectileActorClass`: Created only when a projectile weapon actually fires.
+- `WaterActorClass`: Created only in worlds with an enabled ocean or when a Static `;WATER` node is actually loaded.
+- `RainWeatherActorClass`: Created only when the weather system is active and the preset is not `clear`; it is removed when weather is cleared/stopped.
+
+Unlike the classes above, `ACharacterController` is the Pawn owned by the GameMode's `DefaultPawnClass`. In other words, the Registry does not spawn duplicate character instances on its own. The central Registry provides only the Character content configuration such as mesh, physics asset, material, and AnimInstance.
+
+Configured Blueprint Actor classes are validated immediately before use for base-class compatibility, abstract status, and deprecation. For key creation paths such as Static/Dynamic/Vehicle/Weapon/WorldEnv, the system retries with the native class if spawning the Blueprint itself fails. GameMode is not replaced with a separate manager actor; the correct GameMode configuration is required.
+
+## Actor Terminology and Roles
+
+The runtime model uses three major categories: `Static`, `Dynamic`, and `Character`. The previous terms `WorldSceneActor` and placeable `PrefabActor` have been removed, and static model representation is unified under `AStaticActor`. Existing WorldStream hierarchy names such as `UWorldSceneStreamingSubsystem` and `UWorldSceneStreamAction` remain unchanged because they describe storage/streaming responsibilities.
+
+The previous path in which `PrefabActor` also handled some generic Dynamic models has been separated into `ADynamicActor`. As a result, `AStaticActor` handles only Static/WorldStream representation, while `ADynamicActor` handles physics/collision proxies for general Dynamic models that are not Vehicles. Vehicles continue to use the existing `AVehiclePawn` path, and Characters continue to use the existing Character runtime path.
+
+## UI Lifetime Rules and Shared Settings
+
+Top-level UI is automatically created by C++ based on Registry classes. `AMainGameMode` creates the Start/WorldSelection/Multiplayer/Project/Settings widgets, while `APlayerCharacterController` creates the CreatorHUD/Debug/Pause/Settings widgets. The Loading widget is created immediately by `UGameManagerSubSystem` when needed, and the same instance is reused even if the PlayerController starts first.
+
+Blueprints are primarily responsible for **layout and wiring internal widgets**. For example, a WBP passes its internal Button/Panel references to setters such as `SetStartButton()`, `SetProjectsButton()`, and `SetProjectListPanel()` so that native delegates and list logic can be connected. A separate `CreateWidget → AddToViewport → Set...Widget` BeginPlay graph is not required in the default configuration.
+
+Registration functions such as `SetStartMenuWidget`, `SetPauseMenuWidget`, and `SetSettingsMenuWidget` are retained for compatibility/custom overrides rather than removed. If a Blueprint registers a specific instance first in `ReceiveBeginPlay`, C++ automatic initialization does not overwrite that slot.
+
+Both Start and Pause Settings can use the **same WBP class derived from `USettingsMenuWidget`**. A separate instance is automatically created for each context, but the Apply/Confirm/Back/Cancel behavior, saved-value loading, and close-delegate contract remain identical.
+
+### GameMode / World Configuration
+
+1. In MainWorld's World Settings, set GameMode Override to `AMainGameMode` or one of its Blueprint subclasses. The Registry's menu WBP classes are then created automatically.
+2. The Singleplay gameplay map uses the `ASingleplayGameMode` hierarchy, while the multiplayer host/server map uses the `AMultiplayGameMode` hierarchy. If a travel override is configured in the Registry, that class is used.
+3. `AGlTFSimulatorGameplayGameModeBase` uses `APlayerCharacterController` and `ACharacterController` as its native defaults, so a standard simulator setup does not need to reassign these two classes in a Blueprint GameMode.
+4. Pause Exit returns to the single `MainWorld` configured in the Registry. `MainGameMode` consumes the request flag and shows the WorldSelection UI inside the same MainWorld. Separate WorldSelectionWorld/MainMenuWorld/BuildWorld maps are not used.
+
+## Projects Screen Configuration
+
+Projects do not use a separate Unreal world. If the Registry's `ProjectSelectionWidgetClass` is configured, `AMainGameMode` automatically creates it when MainWorld starts and registers it with the Start WBP.
+
+1. The main-menu WBP inherits from `UStartWorldWidget` and passes the Projects button to `SetProjectsButton()`.
+2. The project WBP inherits from `UProjectSelectionWidget` and is assigned to the Registry's `ProjectSelectionWidgetClass`. No separate Blueprint bootstrap creation/registration is required.
+3. The project WBP passes a `UPanelWidget`, such as a ScrollBox/VerticalBox, to `SetProjectListPanel()` and passes the Back button to `SetBackButton()`. If a Refresh button exists, `SetRefreshButton()` can also be used.
+4. The Projects button changes the registered Project WBP to `Visible` and the main WBP to `Collapsed`. Back changes the Project WBP to `Collapsed` and restores the main WBP. C++ does not call `RemoveFromParent()` on top-level widgets.
+5. Only repeated project entries inside `ProjectListPanel` are built natively from transient buttons/text.
+
+Among entries under `Projects/*`, only those that contain both `config.json` and `resources/`, and whose `config.json` contains a non-empty `WorldName`, are displayed automatically. Clicking a project entry calls `UGameManagerSubSystem::BuildProjectByName()`, which validates `Projects/<Project>` and generates `Worlds/<Project>.gwd`. A single-build guard prevents two projects from being prepared/built at the same time.
+
+## Model JSON
+
+> For the complete current schema, Dynamic/Vehicle/Weapon options, `MeshData`, and collision/light formats, refer to [`MODEL_JSON_GUIDE.md`](MODEL_JSON_GUIDE.md). The section below summarizes only the core classifications.
+
+Every GLB is paired with a JSON file with the same basename in the same folder. Example: `Building.glb` ↔ `Building.json`. If the JSON file does not exist, a UUID is generated during build preparation and a default `ModelType: "Static"` definition is created atomically.
+
+### Static
+
+Replaces the previous `Scene` type. Used for static models placed in the world.
 
 ```json
 {
-  "WorldName": "Demo World",
-  "WorldTime": 0.0,
-  "Latitude": 38.0,
-  "Longitude": 127.0,
-  "AxialTilt": 23.5,
-  "OneYearDays": 365.0,
-  "OneDayTime": 86400.0,
-  "TimeSpeed": 60.0,
-  "bOcean": true,
-  "X": 0.0,
-  "Y": 0.0,
-  "Z": 0.0,
-  "Player": "avatar.glb"
+  "UUID": "3f8434b5-f21a-48ce-9542-cbcf30c78b03",
+  "Name": "Building_A",
+  "DisplayName": "Building A",
+  "ModelType": "Static"
 }
 ```
 
-Notes:
+### Dynamic
 
-- World models are loaded from `model/*.glb`.
-- The player model is loaded from `player/<Player>`. If loading fails or `Player` is empty, the character falls back to the default mesh.
-- World data is saved periodically while the simulation is running.
-
-## Adding static world models
-
-Place `.glb` files in:
-
-```text
-<UserDir>/glTFSimulator/SaveData/<WorldFolder>/model/
-```
-
-For each `example.glb`, the simulator looks for `example.json` beside it. If the JSON file is missing, a default metadata file is generated automatically.
-
-### Model metadata JSON
-
-The sidecar JSON can override collision behavior, simple colliders, entity flags, and runtime point lights per mesh name.
-
-Minimal generated format:
+The parent type replacing the previous `Entity` and `Item` types. Exactly **one** of `EntityType` or `ItemType` may optionally be specified.
 
 ```json
 {
-  "X": 0.0,
-  "Y": 0.0,
-  "Z": 0.0,
-  "MeshData": {}
+  "UUID": "4638205b-4b21-4cd0-98cb-2f4a3b7ca329",
+  "Name": "Sedan",
+  "DisplayName": "Sedan",
+  "ModelType": "Dynamic",
+  "EntityType": "Vehicle"
 }
 ```
 
-Example with mesh-specific metadata:
+Supported `EntityType` values are `Vehicle`, `Prop`, and `Animal`.
 
 ```json
 {
-  "X": 0.0,
-  "Y": 0.0,
-  "Z": 0.0,
-  "MeshData": {
-    "Wall": {
-      "ComplexCollision": true,
-      "SimpleCollision": false,
-      "IsEntity": false,
-      "Colliders": [],
-      "Lights": []
-    },
-    "Lamp": {
-      "ComplexCollision": false,
-      "SimpleCollision": true,
-      "IsEntity": true,
-      "Colliders": [
-        {
-          "Type": "Box",
-          "X": 0.0,
-          "Y": 0.0,
-          "Z": 0.0,
-          "DX": 30.0,
-          "DY": 30.0,
-          "DZ": 80.0
-        }
-      ],
-      "Lights": [
-        {
-          "X": 0.0,
-          "Y": 0.0,
-          "Z": 120.0,
-          "Unit": "Candelas",
-          "Intensity": 500.0,
-          "SourceRadius": 10.0,
-          "SoftSourceRadius": 10.0,
-          "AttenuationRadius": 1000.0,
-          "Length": 10.0
-        }
-      ]
-    }
+  "UUID": "031956f7-9844-4445-9e03-3c75ab6c2820",
+  "Name": "Hammer",
+  "DisplayName": "Hammer",
+  "ModelType": "Dynamic",
+  "ItemType": "Tool"
+}
+```
+
+Supported `ItemType` values are `Weapon`, `Tool`, and `Misc`. Definitions that specify both `EntityType` and `ItemType` are rejected during validation.
+
+### Character
+
+Character definitions require a `Bones` object. In JSON, use the form **semantic alias → actual GLB bone name**.
+
+```json
+{
+  "UUID": "8ebcf0ea-390e-4077-8ee6-a8b595593fbf",
+  "Name": "Human_A",
+  "DisplayName": "Human A",
+  "ModelType": "Character",
+  "Bones": {
+    "Hips": "mixamorig:Hips",
+    "Head": "mixamorig:Head",
+    "LeftHand": "mixamorig:LeftHand",
+    "RightHand": "mixamorig:RightHand"
   }
 }
 ```
 
-Supported simple collider types are `Box`, `Sphere`, and `Capsule`.
+For rebuilding older projects, read compatibility is retained for `Scene → Static`, `Entity → Dynamic`, `Item → Dynamic`, and `None/missing → Static`. New canonical JSON and new projects should use only `Static`, `Dynamic`, and `Character`.
 
-## glTF mesh naming conventions
+## glTF Node Tokens and `;INST`
 
-The loader uses the text before the first semicolon (`;`) as the shared mesh key. Suffixes after the semicolon define loading behavior.
-
-| Suffix | Purpose |
-| --- | --- |
-| No suffix or `;LOD0` | Primary mesh / LOD0. |
-| `;INST` | Instance node that reuses the primary mesh with the same prefix. |
-| `;LOD1` | LOD1 mesh for the same prefix. |
-| `;LOD2` | LOD2 mesh for the same prefix. |
-| `;LOD3` | LOD3 mesh for the same prefix. |
-| `;NCOL` | Disables both complex and simple collision for that mesh key. Can be combined with other suffixes. |
-
-Example:
+Node directives are expressed as semicolon-separated tokens. For example:
 
 ```text
-Building
-Building;INST
-Building;INST.001
-Building;LOD1
-Building;LOD2
-Building;NCOL
+Tree
+Tree;LOD0
+Tree;LOD1
+Tree;LOD2
+Tree;INST
+Tree;LOD0;INST
 ```
 
-In this example, `Building;INST` and `Building;INST.001` reuse the mesh data from `Building`, while `Building;LOD1` and `Building;LOD2` are loaded as lower-detail LODs for the same logical mesh.
+`INST` belongs to a separate token family from LOD tokens, so it can be combined as in `;LOD0;INST`. Substring/underscore aliases such as `_INST` are not recognized as tokens.
 
-Recommendations:
+During a build, `;INST` nodes use `BaseName + LOD` as the canonical key. If a non-INST mesh with the same key exists, its payload is shared. For LOD0, an explicit `Base;LOD0` has higher priority as the canonical candidate than the bare `Base`. Therefore, duplicate mesh payloads belonging to `Tree;INST` itself are removed from the bake list, while the node transforms remain in the static placement metadata.
 
-- Always keep one primary mesh for each instanced prefix.
-- Use `;INST` for repeated nodes to reduce duplicated mesh loading.
-- Use LOD suffixes only for alternate meshes that should not be spawned as separate world objects.
-- Keep naming consistent between the `.glb` node names and the sidecar JSON `MeshData` keys.
+Important details:
 
-## Reserved material names
+- The **reference position of `Tree` or `Tree;LOD0` is also preserved as an actual placement**.
+- Each `Tree;INST` position/rotation/scale is preserved as an individual placement.
+- `LOD1`–`LOD3` nodes are used only for LOD mesh definitions and do not create separate world placements.
+- Supported LODs are `LOD0`–`LOD3`; numeric LOD tokens `LOD4` and above are rejected as build errors.
+- Even if the same glTF node name appears multiple times, all nodes are preserved by NodeIndex, while runtime map keys are safely uniquified.
+- For GLBs with parent/child hierarchies, the placement stores the model-space transform produced by composing all parent transforms.
 
-The streaming loader overrides specific material names with simulator materials.
+When possible, provide an explicit non-INST `Base` or `Base;LOD0` reference mesh for `;INST`. An independent `;INST` mesh with no canonical reference is not arbitrarily merged with unrelated geometry.
 
-Use these exact material names in exported glTF files when you want the simulator override:
+## 8192 m / 512 m Hierarchical Static Streaming
+
+Because Unreal units are centimeters, the following cell sizes are used during builds.
+
+- coarse cell: `8192 m = 819200 cm`
+- fine cell: `512 m = 51200 cm`
+- fine cells per coarse-cell axis: 16
+
+Each Static placement, including `;INST`, stores its `CoarseChunk` and its coarse-local `FineChunk(0..15)` in advance based on its model-space position. When a runtime ISM group is created, it builds the following native index once.
 
 ```text
-glass
-tinted_glass
-terrain
+8192m coarse cell
+  └─ 512m fine cell
+      └─ node keys
 ```
 
-General glTF material types are also mapped to the simulator's default opaque, two-sided, translucent, and two-sided translucent materials.
+Streaming updates do not copy the entire NodeMap on every update. Instead, they snapshot only **nearby coarse/fine candidates + currently loaded nodes + AlwaysLoaded nodes**. Because currently loaded nodes remain in the candidate set, instances that move out of range can still be removed correctly.
 
-## Skeletal character models
+If the maximum axis of a transformed mesh AABB, including rotation and non-uniform scale, is **larger than 8192 m, it is classified as `AlwaysLoaded`** and is not removed by distance-based streaming for the lifetime of the scene. If coordinates or scale values are invalid and a safe chunk address cannot be calculated, the system also favors safety over geometry loss and keeps the geometry as a persistent candidate.
 
-Player models are loaded from:
+### Performance Guide for Map Authors
 
-```text
-<UserDir>/glTFSimulator/SaveData/<WorldFolder>/player/
-```
+**Avoid creating one enormous single mesh/node larger than 8192 m.** Such a mesh becomes AlwaysLoaded and cannot effectively benefit from distance-based streaming. Loading it also makes a large amount of vertex/index/material data resident at once.
 
-A character file can have an optional sidecar JSON file with the same base name. The sidecar JSON maps simulator target bone names to source glTF bone names.
+For assets spanning wide areas, such as cities, terrain structures, long roads/walls, and large industrial facilities, it is better to **split them into multiple glTF nodes and appropriately sized meshes** according to visual/spatial regions. For repeated objects such as trees, streetlights, and columns, use one reference `Base`/`Base;LOD0` mesh and multiple `Base;INST` placements.
 
-Example:
+## `.gwd` Memory / Disk Structure
 
-```json
-{
-  "Root": "Root",
-  "hips": "mixamorig:Hips",
-  "spine": "mixamorig:Spine",
-  "chest": "mixamorig:Spine1",
-  "neck": "mixamorig:Neck",
-  "head": "mixamorig:Head",
-  "leftUpperLeg": "mixamorig:LeftUpLeg",
-  "rightUpperLeg": "mixamorig:RightUpLeg",
-  "leftFoot": "mixamorig:LeftFoot",
-  "rightFoot": "mixamorig:RightFoot",
-  "hairRoot": "hairRoot",
-  "dynRoot": "dynRoot"
-}
-```
+A `.gwd` file is **not loaded into RAM in its entirety**.
 
-Important target bones used by gameplay code include:
+`FGWorldArchiveReader::Open()` reads and retains only the fixed header and a limited root directory. Large data blocks are stored as separately checksummed ranges. When required, only the relevant range is read through a private file handle, validated, and decompressed.
 
-```text
-Root
-hips
-neck
-head
-leftUpperLeg
-rightUpperLeg
-leftFoot
-rightFoot
-hairRoot
-dynRoot
-```
+The main independent members are:
 
-Guidelines:
+- embedded `config.json`
+- model definition JSON / Bones
+- node/LOD/chunk metadata
+- model manifest
+- each mesh payload
+- skin payload
+- material payload
+- texture payload
 
-- The root bone is expected to be named `Root`; the loader can add it if the source asset is missing it.
-- Use a bone-map JSON when the source glTF uses different names, such as Mixamo-style names.
-- Keep `hips`, `head`, `neck`, upper-leg, and foot bones valid because movement, ragdoll recovery, water checks, and foot traces depend on them.
-- `hairRoot` and `dynRoot` are used for generated physics/collider setup below those bones.
-- Invalid or incomplete skeletons may fail to load and fall back to the default character mesh.
+A mesh request range-reads only the requested mesh and the material/texture/skin dependencies referenced by that mesh. Other models or unrequested mesh payloads are not loaded into memory merely because they are stored in the same `.gwd`.
 
-## Runtime creator mode
+`gwd://<UUID>` is the runtime model-reference format. `gworld://<UUID>` is retained only for parser compatibility with older saved data/references.
 
-The runtime gameplay manager supports creator-mode interactions driven by UI buttons and input events:
+The build process does not copy the source GLB itself into the `.gwd`. Instead, it decodes the GLB once through glTFRuntime and stores Unreal-ready data together with static metadata. Before publishing, it rechecks the source size/timestamp, validates member CRCs, bounds, and the manifest, and uses transactional replacement with a backup when an existing `.gwd` is present so that a failed update preserves the previous valid file.
 
-- Place prefabs from `prefab/`.
-- Create procedural mesh objects by placing and connecting vertices.
-- Edit existing generated meshes.
-- Place runtime vehicles.
-- Equip and fire weapons from `items/`.
-- Toggle grid snap and change toolbar slots.
-- Save placed runtime objects and generated meshes.
+## `Worlds/Data/<World>.dat`
 
-Runtime creator assets are scanned from both the save-world folders and project-relative `World/` folders.
+`.dat` stores data that can change during gameplay. It does not store static resources such as meshes, textures, or materials. World time, selected player/state, and dynamic entity/object chunks are stored here.
 
-```text
-prefab/  -> placeable `.glb` or `.gltf` prefabs
-items/   -> weapon/item `.glb` or `.gltf` files
-```
+Dynamic objects retain the existing append/commit + footer recovery structure. If the process terminates before a normal commit and the tail is truncated, the file is designed to recover to the last valid commit. Multiplayer clients continue to follow the existing server-authority rule and do not write unauthorized local state as the authoritative save.
 
-Runtime scene saving writes:
+## UE 5.8 Build Log Notes
 
-```text
-runtime_installed.json
-runtime_installed.gltf
-```
+The large number of `C4430`, `C2143`, and `GENERATED_BODY()` errors in the provided logs appeared simultaneously across multiple reflected classes and cascaded into secondary errors where `Super::BeginPlay()` was interpreted as `UObject`. Because the log came from a `-ModuleWithSuffix` hot-reload style build, a **clean full rebuild** is recommended after reflected-header changes so stale generated code is not reused.
 
-The JSON manifest is used for reloading objects inside the simulator. The `.gltf` file is a lightweight export of generated meshes and placed-object metadata.
+Recommended sequence:
 
-## Default fallback controls
+1. Completely close Unreal Editor and Live Coding.
+2. Delete the project's `Binaries/` and `Intermediate/` directories.
+3. If stale generated output from source-built plugins is suspected, also delete the plugin's `Binaries/` and `Intermediate/` directories.
+4. Regenerate the project files.
+5. Perform a full `Development Editor / Win64` build first. Do not use Live Coding/Hot Reload for the initial verification.
+6. Launch the Editor only after the full build succeeds.
 
-Enhanced Input assets can override or extend controls, but the project keeps fallback key bindings so the simulator remains usable when input assets are not assigned.
+In addition, in response to UE 5.8 incremental GC warnings, the world-bake request guard's raw `UObject*` storage was changed to `TObjectPtr<UObject>`. Replicated world/model keys that failed because `DOREPLIFETIME` accessed private reflected members were also moved to a protected scope accessible by the macro.
 
-| Action | Fallback input |
-| --- | --- |
-| Move | `W`, `A`, `S`, `D` |
-| Look | Mouse X/Y |
-| Jump | `Space` |
-| Sprint | `Left Shift` |
-| Crouch | `Left Ctrl` |
-| Pause | `Esc` |
-| Runtime primary action / placement | Left mouse button press and release |
-| Runtime secondary action / finish vertex edit | Right mouse button |
-| Enter or exit vehicle | `F` |
-| Toggle first-person view | `V` |
-| Scroll toolbar | Mouse wheel |
-| Open or close item list | `E` |
-| Toggle snap | `G` |
+## Stability Principles
 
-## Weapon item JSON
+- The runtime does not automatically fall back to source GLB files.
+- Project building and game-world loading are kept separate.
+- Archive/mutable-state file reads validate size/range/CRC/structural limits before consuming data.
+- For corrupted chunk metadata, explicit failure or a safe fallback is preferred over silently losing geometry.
+- Worker threads process native snapshots only; UObject lifetime transitions are handled on the game thread.
+- Unnecessary copying of enormous full node maps/material/texture collections is avoided.
 
-Weapons can optionally use a JSON file beside the item glTF. The runtime weapon actor reads hold and muzzle settings from this file.
-
-Example:
-
-```json
-{
-  "Hold": {
-    "X": 45.0,
-    "Y": 18.0,
-    "Z": -18.0,
-    "Pitch": 0.0,
-    "Yaw": 0.0,
-    "Roll": 0.0,
-    "Scale": 1.0
-  },
-  "Muzzle": {
-    "X": 70.0,
-    "Y": 0.0,
-    "Z": 0.0
-  },
-  "Range": 20000.0,
-  "Damage": 20.0,
-  "FireInterval": 0.12
-}
-```
-
-## Notes for asset preparation
-
-- Prefer `.glb` for world models in `model/`, because the world loader scans that folder for `.glb` files.
-- `.glb` and `.gltf` are both supported for runtime creator `prefab/` and `items/` folders.
-- External glTF resources are allowed by the runtime loader, but packaged `.glb` files are easier to move between world folders.
-- This repository's `.gitignore` ignores `*.glb`, so large runtime assets are expected to live outside normal source control unless the ignore rules are changed.
-- Keep model sidecar JSON files valid UTF-8 JSON.
-
-## Troubleshooting
-
-### A world does not appear in the start menu
-
-Check that the folder exists under:
-
-```text
-<UserDir>/glTFSimulator/SaveData/
-```
-
-and that it contains a readable `level.json` with a `WorldName` field.
-
-### A model does not stream in
-
-Check the following:
-
-- The file is a `.glb` inside `<WorldFolder>/model/`.
-- The primary mesh exists before using `;INST` nodes.
-- The sidecar JSON, if present, uses mesh keys that match the prefix before `;`.
-- The player is close enough to the node for the stream-distance check.
-
-### Instanced meshes do not appear
-
-Make sure there is a primary mesh with the same prefix. For example, `Tree;INST.001` expects a primary mesh key named `Tree`.
-
-### Character loading fails
-
-Check the character sidecar JSON and ensure the important gameplay bones are present or mapped. If the custom mesh fails, the project falls back to the default character mesh so the world can continue loading.
-
-## License
-
-This project is licensed under the MIT License. See [`LICENSE`](LICENSE) for details.
-
-## Acknowledgements
-
-- `glTFRuntime` by Roberto De Ioris is used for runtime glTF loading.
-- Unreal Engine, Epic Games, and the built-in UE plugin ecosystem provide the underlying rendering, physics, input, UI, and procedural mesh systems.
+For detailed storage formats, see `WORLD_STREAMING_FORMAT.md`. For a review summary of the current changes, see `IMPLEMENTATION_REVIEW.md`.

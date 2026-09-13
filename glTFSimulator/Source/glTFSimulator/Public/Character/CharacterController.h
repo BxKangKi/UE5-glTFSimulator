@@ -1,13 +1,19 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
+/**
+ * @file CharacterController.h
+ * 역할: 런타임 캐릭터 액터와 메시·입력 상태를 연결합니다.
+ * 핵심 기능: 캐릭터 로드, 컴포넌트 초기화, 장비·충돌·상태 관리.
+ * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"
 #include "GameFramework/Character.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Animation/AnimInstance.h"
-#include "Character/CharacterDefaultAsset.h"
 #include "Interface/WaterInteract.h"
 #include "CharacterController.generated.h"
 
@@ -25,26 +31,9 @@ class USkeletalMesh;
 class USkeleton;
 class UPhysicsAsset;
 class UPhysicalMaterial;
+class UMaterialInterface;
 class USoundBase;
 class UNiagaraSystem;
-
-USTRUCT(BlueprintType)
-struct GLTFSIMULATOR_API FFootstepAssetBinding
-{
-    GENERATED_BODY()
-
-    /** Collision physical material matched by direct object reference. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Character|Footsteps")
-    TObjectPtr<UPhysicalMaterial> PhysicalMaterial = nullptr;
-
-    /** Optional sound played when the assigned physical material is hit. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Character|Footsteps")
-    TObjectPtr<USoundBase> Sound = nullptr;
-
-    /** Optional Niagara effect spawned when the assigned physical material is hit. */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Character|Footsteps")
-    TObjectPtr<UNiagaraSystem> Effect = nullptr;
-};
 
 UCLASS()
 class GLTFSIMULATOR_API ACharacterController : public ACharacter, public IWaterInteract
@@ -116,8 +105,17 @@ public:
     float GetCharacterPushForceLimit() const { return CharacterPushForceLimit; }
     UPROPERTY(BlueprintReadOnly)
     bool bIsMoveable; // Current glTF file path.
-    UPROPERTY(EditAnywhere, BlueprintReadWrite)
-    FCharacterDefaultAsset DefaultAsset;
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Character|Runtime Assets")
+    TObjectPtr<UPhysicsAsset> DefaultPhysicsAsset = nullptr;
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Character|Runtime Assets")
+    TObjectPtr<USkeleton> DefaultSkeleton = nullptr;
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Character|Runtime Assets")
+    TObjectPtr<UMaterialInterface> DefaultMaterial = nullptr;
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Character|Runtime Assets")
+    TObjectPtr<USkeletalMesh> DefaultSkeletalMesh = nullptr;
+    /** Resolved from AssetRegistry.DefaultCharacterAnimInstanceClass and pinned while this character lives. */
+    UPROPERTY(Transient, BlueprintReadOnly, Category="Character|Runtime Assets")
+    TSubclassOf<UAnimInstance> DefaultAnimInstanceClass;
     UCharacterComponent *GetCharacterComponent() { return Component.Get(); }
     USpringArmComponent *GetSpringArm() { return SpringArm.Get(); }
     UCameraComponent *GetFollowCameraComponent() const { return FollowCamera.Get(); }
@@ -125,9 +123,6 @@ public:
     UFUNCTION(BlueprintCallable)
     void TriggerFootstepTrace(EControllerHand FootSide); // Foot-side selector for left/right traces.
 
-    /** Direct physical-material bindings used by footsteps. No asset-name matching is performed. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Character|Footsteps")
-    TArray<FFootstepAssetBinding> FootstepAssetBindings;
 
 protected:
     virtual void BeginPlay() override;

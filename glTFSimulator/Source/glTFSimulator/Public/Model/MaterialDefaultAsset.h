@@ -1,9 +1,15 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
+/**
+ * @file MaterialDefaultAsset.h
+ * 역할: 중앙 Asset Registry가 사용하는 glTFRuntime 기본 머티리얼 참조 구조를 정의합니다.
+ * 핵심 기능: soft material 설정과 비동기 요청의 GC-safe runtime cache.
+ * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Engine/DataAsset.h"
 #include "Model/glTFMaterialAssetReferences.h"
 #include "MaterialDefaultAsset.generated.h"
 
@@ -68,20 +74,3 @@ struct GLTFSIMULATOR_API FglTFMaterialSoftAssetReferences
     int32 NumConfiguredReferences() const;
 };
 
-/**
- * One project/game-system level material configuration for all streamed glTF assets, prefabs,
- * vehicles, and weapons. Author these values on a Data Only Blueprint subclass, then assign that
- * class on AGameManagerActor. The game subsystem creates one transient runtime instance after the
- * manager actor begins play.
- */
-UCLASS(BlueprintType, Blueprintable)
-class GLTFSIMULATOR_API UMaterialDefaultAsset : public UDataAsset
-{
-    GENERATED_BODY()
-
-public:
-    UPROPERTY(EditAnywhere, BlueprintReadOnly, Category="glTF Materials")
-    FglTFMaterialSoftAssetReferences Materials;
-
-    bool ResolveMaterials(FglTFMaterialAssetReferences& OutReferences, TArray<FString>& OutFailures) const;
-};

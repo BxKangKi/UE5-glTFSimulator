@@ -1,12 +1,20 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 
+/**
+ * @file WeaponActor.h
+ * 역할: 장착 무기 모델과 발사 동작을 관리합니다.
+ * 핵심 기능: gworld 참조 로드, 장착·해제, 무기 상태·발사.
+ * 인터페이스와 수명·데이터 소유 계약을 선언하며, 동작 구현은 대응 cpp를 참고하십시오.
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
 #include "WeaponActor.generated.h"
 
-class UglTFRuntimeAsset;
+class UWorldBakedModelAsset;
+struct FResolvedRuntimeModel;
 class UStaticMeshComponent;
 class UStaticMesh;
 class USceneComponent;
@@ -69,7 +77,13 @@ class GLTFSIMULATOR_API AWeaponActor : public AActor
 public:
     AWeaponActor();
 
+    /** Equips a model addressed by its immutable gwd:// reference. */
     UFUNCTION(BlueprintCallable, Category="Weapon")
+    bool EquipFromModel(const FString& InModelReference, USceneComponent* AttachTarget);
+
+    /** Legacy Blueprint name; accepts only a built gwd:// reference and never opens a GLB. */
+    UFUNCTION(BlueprintCallable, Category="Weapon",
+        meta=(DeprecatedFunction, DeprecationMessage="Use EquipFromModel with a gworld reference"))
     bool EquipFromFile(const FString& InFilePath, USceneComponent* AttachTarget);
 
     UFUNCTION(BlueprintCallable, Category="Weapon")
@@ -79,7 +93,12 @@ public:
     void Fire(AController* InstigatorController);
 
     UFUNCTION(BlueprintPure, Category="Weapon")
-    FString GetSourceFilePath() const { return SourceFilePath; }
+    FString GetModelReference() const { return ModelReference; }
+
+    /** Legacy Blueprint getter; the value is a gwd:// reference, not a source path. */
+    UFUNCTION(BlueprintPure, Category="Weapon",
+        meta=(DeprecatedFunction, DeprecationMessage="Use GetModelReference"))
+    FString GetSourceFilePath() const { return ModelReference; }
 
     UFUNCTION(BlueprintPure, Category="Weapon")
     FWeaponConfig GetWeaponConfig() const { return Config; }
@@ -98,16 +117,18 @@ protected:
     virtual void Destroyed() override;
 
 private:
+    bool bRuntimeResourcesReleased = false;
 
-    /** Mesh used by EquipDefault and as the visual fallback when an external weapon file cannot be loaded. */
-    UPROPERTY(EditDefaultsOnly, BlueprintReadWrite, Category="Weapon|Assets", meta=(AllowPrivateAccess="true"))
+    /** Runtime default mesh resolved on demand from the central Asset Registry. */
+    UPROPERTY(Transient)
     TObjectPtr<UStaticMesh> DefaultWeaponMesh = nullptr;
 
     UPROPERTY(VisibleAnywhere)
     TObjectPtr<USceneComponent> Root;
 
     UPROPERTY()
-    TObjectPtr<UglTFRuntimeAsset> GltfAsset;
+    /** Range-reading facade for one gwd:// model; it never contains or opens a source GLB. */
+    TObjectPtr<UWorldBakedModelAsset> BakedAsset;
 
     UPROPERTY()
     TArray<TObjectPtr<UStaticMeshComponent>> MeshComponents;
@@ -116,17 +137,17 @@ private:
     TMap<int32, TObjectPtr<UStaticMesh>> MeshCache;
 
     UPROPERTY()
-    FString SourceFilePath;
+    FString ModelReference;
 
-    UPROPERTY(EditDefaultsOnly, Category="Weapon")
+    UPROPERTY(Transient)
     TSubclassOf<AWeaponProjectileActor> ProjectileClass;
 
     FWeaponConfig Config;
     double LastFireTime = -1000.0;
 
-    bool LoadConfigJson(const FString& JsonPath);
-    bool SaveDefaultConfigJson(const FString& JsonPath) const;
-    bool LoadWeaponMesh();
+    void ResolveCentralWeaponAssets();
+    bool LoadConfigJson(const FString& DefinitionJson);
+    bool LoadWeaponMesh(const FResolvedRuntimeModel& Model);
     bool CreateDefaultBoxMesh();
     UStaticMesh* LoadMeshByIndex(int32 MeshIndex);
     void AttachToTarget(USceneComponent* AttachTarget);
