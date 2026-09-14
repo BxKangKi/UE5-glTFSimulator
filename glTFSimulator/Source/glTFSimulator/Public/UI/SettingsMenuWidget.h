@@ -424,8 +424,8 @@ private:
     float PendingStreamingDistanceMultiplier = 64.0f;
     float PendingStreamingUnloadDistanceMultiplier = 1.10f;
     float PendingObjectStreamingRadiusMeters = 2048.0f;
-    int32 PendingStreamingSceneSpawnBudget = 2;
-    int32 PendingStreamingNodeBudgetPerFrame = 32;
+    int32 PendingStreamingSceneSpawnBudget = 24;
+    int32 PendingStreamingNodeBudgetPerFrame = 256;
     int32 PendingAntiAliasingQuality = 2;
     int32 PendingPostProcessingQuality = 2;
     int32 PendingEffectsQuality = 2;

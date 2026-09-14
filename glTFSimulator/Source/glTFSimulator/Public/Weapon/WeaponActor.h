@@ -144,12 +144,21 @@ private:
 
     FWeaponConfig Config;
     double LastFireTime = -1000.0;
+    uint64 AsyncMeshLoadGeneration = 0;
+    int32 PendingAsyncMeshLoads = 0;
+    bool bAsyncMeshLoadFailed = false;
+    bool bResumingAsyncMeshLoad = false;
+    bool bDispatchingAsyncMeshPreload = false;
+    FString PendingAsyncModelReference;
 
     void ResolveCentralWeaponAssets();
     bool LoadConfigJson(const FString& DefinitionJson);
     bool LoadWeaponMesh(const FResolvedRuntimeModel& Model);
     bool CreateDefaultBoxMesh();
     UStaticMesh* LoadMeshByIndex(int32 MeshIndex);
+    bool BeginAsyncMeshPreload();
+    void HandleAsyncMeshPreloadResult(uint64 Generation, int32 MeshIndex, UStaticMesh* Mesh);
+    void FinishAsyncMeshPreload(uint64 Generation);
     void AttachToTarget(USceneComponent* AttachTarget);
     void ClearLoadedComponents();
     void ReleaseRuntimeResources();

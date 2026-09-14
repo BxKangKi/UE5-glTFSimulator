@@ -704,6 +704,16 @@ private:
     UPROPERTY()
     TMap<int32, TObjectPtr<UStaticMesh>> MeshCache;
 
+    // Mesh payloads are prepared concurrently off-thread. Only the final Unreal resource commit
+    // is serialized by UWorldBakedModelAsset/glTFRuntime on the game thread.
+    uint64 AsyncMeshLoadGeneration = 0;
+    int32 PendingAsyncMeshLoads = 0;
+    bool bAsyncMeshLoadFailed = false;
+    bool bResumingAsyncMeshLoad = false;
+    bool bDispatchingAsyncMeshPreload = false;
+    FString PendingAsyncModelReference;
+    FString PendingAsyncObjectName;
+
     int32 InstancedRenderRegistrationId = INDEX_NONE;
     TArray<int32> LoadedWheelRenderPartIndices;
     bool bVehicleModelLoaded = false;
@@ -799,6 +809,9 @@ private:
     void ClearLoadedVehicleModel();
     void ReleaseRuntimeResources();
     UStaticMesh* LoadMeshByIndex(int32 MeshIndex);
+    bool BeginAsyncMeshPreload();
+    void HandleAsyncMeshPreloadResult(uint64 Generation, int32 MeshIndex, UStaticMesh* Mesh);
+    void FinishAsyncMeshPreload(uint64 Generation);
     bool IsWheelMeshName(const FString& Name) const;
     void ApplyConfiguredWheelHeightOffsets();
     float GetConfiguredWheelHeightOffset(int32 WheelIndex, float FrontRearSplitX) const;

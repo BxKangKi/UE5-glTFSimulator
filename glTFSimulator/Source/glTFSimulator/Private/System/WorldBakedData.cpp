@@ -829,6 +829,7 @@ bool FGWorldBakedDataCapture::CaptureSkin(
     const int32 SkinIndex,
     const TSet<int32>& MeshIndicesUsingSkin,
     const TMap<FString, FString>& BoneAliases,
+    USkeleton* TargetSkeleton,
     FGWorldBakedModel& InOutModel,
     FString& OutError)
 {
@@ -855,11 +856,60 @@ bool FGWorldBakedDataCapture::CaptureSkin(
         }
     }
 
+    // Match the legacy direct-GLB character loader exactly at build time. The archive stores the
+    // final target-compatible reference pose, so runtime reconstruction must not clear/copy the
+    // rotations a second time. This also preserves glTFRuntime's parent-aware translation fixup.
     FglTFRuntimeSkeletonConfig Config;
     Config.CacheMode = EglTFRuntimeCacheMode::None;
     Config.BonesNameMap = BoneAliases;
     Config.RootBoneName = TEXT("Root");
-    Config.bAddRootNodeIfMissing = true;
+    Config.RootNodeIndex = -1;
+    Config.MaxNodesTreeDepth = -1;
+
+    if (!BoneAliases.IsEmpty())
+    {
+        if (!IsValid(TargetSkeleton))
+        {
+            OutError = TEXT("Character skin capture requires the configured default character skeleton");
+            return false;
+        }
+
+        // The canonical JSON already identifies exactly one source bone that must become "Root".
+        // Force glTFRuntime to start traversal from that source bone. Relying on the glTF
+        // skin.skeleton/common-root node can leave an Armature/helper node above the canonical Root;
+        // adding a fake Root is worse because it collides after BonesNameMap renames the real root.
+        // Either case produces a reference hierarchy that an AnimBP/ControlRig can deform badly.
+        FString SourceRootBone;
+        for (const TPair<FString, FString>& Alias : BoneAliases)
+        {
+            if (Alias.Value.Equals(TEXT("Root"), ESearchCase::CaseSensitive))
+            {
+                SourceRootBone = Alias.Key;
+                break;
+            }
+        }
+        if (SourceRootBone.IsEmpty())
+        {
+            OutError = TEXT("Character bone map has no source bone mapped to canonical Root");
+            return false;
+        }
+        Config.ForceRootNode = SourceRootBone;
+        Config.bAddRootBone = false;
+        Config.bAddRootNodeIfMissing = false;
+        // Keep helper/Armature orientation even though the helper itself is intentionally pruned
+        // from the canonical hierarchy. This must match MakeCharacterSkeletonConfig() used while
+        // decoding weighted geometry or the baked mesh and baked reference pose diverge.
+        Config.bApplyParentNodesTransformsToRoot = true;
+        Config.bClearRotations = true;
+        Config.CopyRotationsFrom = TargetSkeleton;
+    }
+    else
+    {
+        // Non-character skinned assets retain the permissive glTF fallback used previously.
+        Config.bAddRootNodeIfMissing = true;
+        Config.bAddRootBone = false;
+    }
+
     USkeleton* Skeleton = SourceAsset->LoadSkeleton(SkinIndex, Config);
     if (!IsValid(Skeleton))
     {
@@ -891,38 +941,92 @@ bool FGWorldBakedDataCapture::CaptureSkin(
         Bone.Transform = ReferenceSkeleton.GetRefBonePose()[BoneIndex];
     }
 
-    // Only joint indices actually referenced by decoded vertices are materialized. This avoids
-    // guessing a source skin's joint count and rejects a missing name before publishing the build.
-    TSet<int32> ReferencedJoints;
+    // Do not rebuild joint mappings from raw skin joint names here.  The skin-aware mesh decoder
+    // already resolved ForceRootNode, helper-node pruning and BonesNameMap while generating each
+    // primitive's OverrideBoneMap.  That per-primitive map is the authoritative index namespace
+    // consumed by glTFRuntime's skeletal finalizer.  Re-deriving it can attach weighted vertices to
+    // a different bone even when the reference skeleton itself looks valid.
+    TSet<FName> ReferenceBoneNames;
+    ReferenceBoneNames.Reserve(Skin.Bones.Num());
+    for (const FGWorldBakedBone& Bone : Skin.Bones)
+    {
+        ReferenceBoneNames.Add(FName(*Bone.Name));
+    }
+
     for (const FGWorldBakedMesh& Mesh : InOutModel.Meshes)
     {
-        if (!MeshIndicesUsingSkin.Contains(Mesh.MeshIndex))
+        if (!MeshIndicesUsingSkin.Contains(Mesh.MeshIndex)) continue;
+
+        for (int32 PrimitiveIndex = 0; PrimitiveIndex < Mesh.Primitives.Num(); ++PrimitiveIndex)
         {
-            continue;
-        }
-        for (const FGWorldBakedPrimitive& Primitive : Mesh.Primitives)
-        {
-            for (const TArray<FGWorldBakedJoint4>& JointSet : Primitive.Joints)
+            const FGWorldBakedPrimitive& Primitive = Mesh.Primitives[PrimitiveIndex];
+            if (Primitive.Joints.IsEmpty()) continue;
+            if (Primitive.Joints.Num() != Primitive.Weights.Num())
             {
-                for (const FGWorldBakedJoint4& Joint : JointSet)
+                OutError = FString::Printf(
+                    TEXT("Skin %d mesh %d primitive %d has mismatched joint/weight sets"),
+                    SkinIndex, Mesh.MeshIndex, PrimitiveIndex);
+                return false;
+            }
+
+            for (int32 SetIndex = 0; SetIndex < Primitive.Joints.Num(); ++SetIndex)
+            {
+                const TArray<FGWorldBakedJoint4>& JointSet = Primitive.Joints[SetIndex];
+                const TArray<FVector4f>& WeightSet = Primitive.Weights[SetIndex];
+                if (JointSet.Num() != WeightSet.Num())
                 {
-                    ReferencedJoints.Add(Joint.X); ReferencedJoints.Add(Joint.Y);
-                    ReferencedJoints.Add(Joint.Z); ReferencedJoints.Add(Joint.W);
+                    OutError = FString::Printf(
+                        TEXT("Skin %d mesh %d primitive %d skin stream %d has mismatched lengths"),
+                        SkinIndex, Mesh.MeshIndex, PrimitiveIndex, SetIndex);
+                    return false;
+                }
+
+                for (int32 VertexIndex = 0; VertexIndex < JointSet.Num(); ++VertexIndex)
+                {
+                    const FGWorldBakedJoint4& Joint = JointSet[VertexIndex];
+                    const FVector4f& Weight = WeightSet[VertexIndex];
+                    const int32 JointIndices[4] = {
+                        static_cast<int32>(Joint.X), static_cast<int32>(Joint.Y),
+                        static_cast<int32>(Joint.Z), static_cast<int32>(Joint.W) };
+                    const float JointWeights[4] = { Weight.X, Weight.Y, Weight.Z, Weight.W };
+
+                    for (int32 Influence = 0; Influence < 4; ++Influence)
+                    {
+                        if (FMath::Abs(JointWeights[Influence]) <= UE_SMALL_NUMBER) continue;
+                        const int32 JointIndex = JointIndices[Influence];
+                        const FName* BoneName = Primitive.BoneMap.Find(JointIndex);
+                        if (!BoneName || BoneName->IsNone())
+                        {
+                            OutError = FString::Printf(
+                                TEXT("Skin %d mesh %d primitive %d vertex %d references weighted joint %d without an authoritative bone map"),
+                                SkinIndex, Mesh.MeshIndex, PrimitiveIndex, VertexIndex, JointIndex);
+                            return false;
+                        }
+                        if (!ReferenceBoneNames.Contains(*BoneName))
+                        {
+                            OutError = FString::Printf(
+                                TEXT("Skin %d maps weighted joint %d to missing reference bone '%s'"),
+                                SkinIndex, JointIndex, *BoneName->ToString());
+                            return false;
+                        }
+                        if (const FName* Existing = Skin.JointBoneMap.Find(JointIndex))
+                        {
+                            if (*Existing != *BoneName)
+                            {
+                                OutError = FString::Printf(
+                                    TEXT("Skin %d joint %d resolves to conflicting bones '%s' and '%s'"),
+                                    SkinIndex, JointIndex, *Existing->ToString(), *BoneName->ToString());
+                                return false;
+                            }
+                        }
+                        else
+                        {
+                            Skin.JointBoneMap.Add(JointIndex, *BoneName);
+                        }
+                    }
                 }
             }
         }
-    }
-    for (const int32 JointIndex : ReferencedJoints)
-    {
-        FString BoneName = SourceAsset->GetSkinJointNameFromJointIndex(SkinIndex, JointIndex);
-        if (const FString* Alias = BoneAliases.Find(BoneName)) BoneName = *Alias;
-        if (BoneName.IsEmpty())
-        {
-            OutError = FString::Printf(
-                TEXT("Skin %d has no name for referenced joint %d"), SkinIndex, JointIndex);
-            return false;
-        }
-        Skin.JointBoneMap.Add(JointIndex, FName(*BoneName));
     }
 
     InOutModel.Skins.Add(MoveTemp(Skin));

@@ -10,10 +10,13 @@
 #include "System/WorldSourceModelBuilder.h"
 
 #include "Containers/Ticker.h"
+#include "Animation/Skeleton.h"
+#include "Character/CharacterBoneSchema.h"
 #include "Async/ParallelFor.h"
 #include "Dom/JsonObject.h"
 #include "Engine/Texture2D.h"
 #include "HAL/FileManager.h"
+#include "HAL/PlatformTime.h"
 #include "Runtime/Launch/Resources/Version.h"
 #include "Materials/MaterialInterface.h"
 #include "Misc/Paths.h"
@@ -24,6 +27,8 @@
 #include "Simulator/NodeTokenLibrary.h"
 #include "System/FileFunctionLibrary.h"
 #include "System/GameManagerSubSystem.h"
+#include "System/GlTFSimulatorAssetRegistry.h"
+#include "System/GlTFSimulatorGameInstance.h"
 #include "System/GlbValidation.h"
 #include "System/SafeFileIO.h"
 #include "System/StringHelper.h"
@@ -172,6 +177,191 @@ namespace WorldSourceModelBuilderPrivate
         return Config;
     }
 
+    /**
+     * Builds exactly the same canonical skeleton policy used by CaptureSkin().  Character geometry
+     * must be decoded through glTFRuntime's skin-aware path so each primitive receives the
+     * authoritative joint-index -> canonical-bone map produced while the reference skeleton is
+     * generated.  Reconstructing that map later from raw glTF joint names is not equivalent when
+     * ForceRootNode/helper-node filtering is involved.
+     */
+    bool MakeCharacterSkeletonConfig(
+        const TMap<FString, FString>& BoneAliases,
+        USkeleton* TargetSkeleton,
+        FglTFRuntimeSkeletonConfig& OutConfig,
+        FString& OutError)
+    {
+        OutConfig = FglTFRuntimeSkeletonConfig();
+        OutConfig.CacheMode = EglTFRuntimeCacheMode::None;
+        OutConfig.BonesNameMap = BoneAliases;
+        OutConfig.RootBoneName = TEXT("Root");
+        OutConfig.RootNodeIndex = -1;
+        OutConfig.MaxNodesTreeDepth = -1;
+
+        FString AliasError;
+        if (!CharacterBoneSchema::ValidateSourceToCanonicalMap(BoneAliases, AliasError))
+        {
+            OutError = FString::Printf(TEXT("Character bone map rejected before mesh decode: %s"), *AliasError);
+            return false;
+        }
+        if (!IsValid(TargetSkeleton))
+        {
+            OutError = TEXT("Character mesh decode requires the configured default character skeleton");
+            return false;
+        }
+
+        FString SourceRootBone;
+        for (const TPair<FString, FString>& Alias : BoneAliases)
+        {
+            if (Alias.Value.Equals(TEXT("Root"), ESearchCase::CaseSensitive))
+            {
+                SourceRootBone = Alias.Key;
+                break;
+            }
+        }
+        if (SourceRootBone.IsEmpty())
+        {
+            OutError = TEXT("Character bone map has no source bone mapped to canonical Root");
+            return false;
+        }
+
+        OutConfig.ForceRootNode = SourceRootBone;
+        OutConfig.bAddRootBone = false;
+        OutConfig.bAddRootNodeIfMissing = false;
+        // The canonical Root can sit below an Armature/helper node carrying the glTF-to-model
+        // orientation. ForceRootNode intentionally prunes that helper from the UE skeleton, so fold
+        // its transform into Root instead of silently losing it. The mesh decoder below uses Tree
+        // for the same reason, keeping skinned geometry and the reference hierarchy in one space.
+        OutConfig.bApplyParentNodesTransformsToRoot = true;
+        OutConfig.bClearRotations = true;
+        OutConfig.CopyRotationsFrom = TargetSkeleton;
+        return true;
+    }
+
+    /** Finds one named glTF node that owns the requested skinned source mesh. */
+    bool FindCharacterMeshNode(
+        UglTFRuntimeAsset* SourceAsset,
+        const int32 MeshIndex,
+        FString& OutNodeName,
+        int32& OutSkinIndex,
+        FString& OutError)
+    {
+        OutNodeName.Reset();
+        OutSkinIndex = INDEX_NONE;
+        if (!IsValid(SourceAsset) || MeshIndex < 0)
+        {
+            OutError = TEXT("Cannot locate a skinned node for an invalid character mesh");
+            return false;
+        }
+
+        const TArray<FglTFRuntimeNode>& Nodes = SourceAsset->GetNodes();
+        const FglTFRuntimeNode* Selected = nullptr;
+        for (const FglTFRuntimeNode& Node : Nodes)
+        {
+            if (Node.MeshIndex != MeshIndex || Node.SkinIndex < 0) continue;
+            if (!Selected || Node.Index < Selected->Index) Selected = &Node;
+        }
+        if (!Selected)
+        {
+            OutError = FString::Printf(TEXT("Character source mesh %d has no node with a skin"), MeshIndex);
+            return false;
+        }
+        if (Selected->Name.TrimStartAndEnd().IsEmpty())
+        {
+            OutError = FString::Printf(TEXT("Character source mesh %d is attached to an unnamed glTF node"), MeshIndex);
+            return false;
+        }
+
+        // LoadNodeByName is name based.  Ambiguous node names could silently pick a different
+        // skin/mesh and produce a perfectly sized but semantically wrong bone map.
+        for (const FglTFRuntimeNode& Node : Nodes)
+        {
+            if (Node.Index != Selected->Index
+                && Node.Name.Equals(Selected->Name, ESearchCase::CaseSensitive))
+            {
+                OutError = FString::Printf(
+                    TEXT("Character skinned node name '%s' is duplicated in the GLB"), *Selected->Name);
+                return false;
+            }
+        }
+
+        // The recursive API is used only to obtain glTFRuntime's authoritative skin mapping.
+        // Refuse a mesh node that owns another renderable descendant; otherwise that descendant
+        // would be folded into this baked mesh and later duplicated when its own source mesh is read.
+        TMap<int32, const FglTFRuntimeNode*> NodeByIndex;
+        for (const FglTFRuntimeNode& Node : Nodes) NodeByIndex.Add(Node.Index, &Node);
+        for (const FglTFRuntimeNode& Node : Nodes)
+        {
+            if (Node.Index == Selected->Index || Node.MeshIndex < 0) continue;
+            const FglTFRuntimeNode* Current = &Node;
+            while (Current && Current->ParentIndex >= 0)
+            {
+                if (Current->ParentIndex == Selected->Index)
+                {
+                    OutError = FString::Printf(
+                        TEXT("Character skinned node '%s' contains renderable child node '%s'; split nested character meshes before baking"),
+                        *Selected->Name, *Node.Name);
+                    return false;
+                }
+                const FglTFRuntimeNode* const* Parent = NodeByIndex.Find(Current->ParentIndex);
+                Current = Parent ? *Parent : nullptr;
+            }
+        }
+
+        OutNodeName = Selected->Name;
+        OutSkinIndex = Selected->SkinIndex;
+        return true;
+    }
+
+    /** Rejects the exact corruption that bIgnoreMissingBones used to hide at runtime. */
+    bool ValidateAuthoritativeBoneMaps(const FglTFRuntimeMeshLOD& RuntimeLOD, FString& OutError)
+    {
+        for (int32 PrimitiveIndex = 0; PrimitiveIndex < RuntimeLOD.Primitives.Num(); ++PrimitiveIndex)
+        {
+            const FglTFRuntimePrimitive& Primitive = RuntimeLOD.Primitives[PrimitiveIndex];
+            if (Primitive.Joints.IsEmpty()) continue;
+            if (Primitive.Joints.Num() != Primitive.Weights.Num())
+            {
+                OutError = FString::Printf(TEXT("Character primitive %d has mismatched joint/weight sets"), PrimitiveIndex);
+                return false;
+            }
+
+            for (int32 SetIndex = 0; SetIndex < Primitive.Joints.Num(); ++SetIndex)
+            {
+                const auto& Joints = Primitive.Joints[SetIndex];
+                const auto& Weights = Primitive.Weights[SetIndex];
+                if (Joints.Num() != Weights.Num())
+                {
+                    OutError = FString::Printf(TEXT("Character primitive %d skin stream %d has mismatched lengths"), PrimitiveIndex, SetIndex);
+                    return false;
+                }
+                for (int32 VertexIndex = 0; VertexIndex < Joints.Num(); ++VertexIndex)
+                {
+                    const auto& Joint = Joints[VertexIndex];
+                    const auto& Weight = Weights[VertexIndex];
+                    const int32 JointIndices[4] = {
+                        static_cast<int32>(Joint.X), static_cast<int32>(Joint.Y),
+                        static_cast<int32>(Joint.Z), static_cast<int32>(Joint.W) };
+                    const double JointWeights[4] = {
+                        static_cast<double>(Weight.X), static_cast<double>(Weight.Y),
+                        static_cast<double>(Weight.Z), static_cast<double>(Weight.W) };
+                    for (int32 Influence = 0; Influence < 4; ++Influence)
+                    {
+                        if (FMath::Abs(JointWeights[Influence]) <= UE_SMALL_NUMBER) continue;
+                        const FName* BoneName = Primitive.OverrideBoneMap.Find(JointIndices[Influence]);
+                        if (!BoneName || BoneName->IsNone())
+                        {
+                            OutError = FString::Printf(
+                                TEXT("Character primitive %d vertex %d references joint %d with weight %.6f but glTFRuntime produced no bone mapping"),
+                                PrimitiveIndex, VertexIndex, JointIndices[Influence], JointWeights[Influence]);
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
     bool ParseModelSettings(
         const FString& DefinitionJson,
         FModelData& OutData,
@@ -245,6 +435,15 @@ void UWorldSourceModelBuilder::BeginParserLoad(const uint64 Generation)
     const FString SourcePath = Definition.GlbPath;
     FglTFRuntimeConfig Config;
     Config.bAllowExternalFiles = true;
+    if (Definition.ModelType == EModelDefinitionType::Character)
+    {
+        // glTFRuntime's default glTF basis is correct for ordinary scene assets, but Unreal's
+        // Character convention expects skeletal forward along Y. The plugin's own skeleton
+        // remapping guide explicitly uses YForward for this case. Apply it at parser creation so
+        // nodes, inverse bind matrices, reference poses, animations and skinned vertices all share
+        // one basis; a component-level yaw cannot repair a reference-pose basis mismatch.
+        Config.TransformBaseType = EglTFRuntimeTransformBaseType::YForward;
+    }
     TWeakObjectPtr<UWorldSourceModelBuilder> WeakThis(this);
 
     const bool bQueued = FSafeFileIO::RunTrackedWorker(
@@ -338,7 +537,7 @@ void UWorldSourceModelBuilder::CompleteParserLoad(
     // SetParser also touches native state. Queue behind other parser/mesh operations rather
     // than racing them or treating a busy native gate as a broken GLB.
     TWeakObjectPtr<UWorldSourceModelBuilder> WeakThis(this);
-    FglTFRuntimeSafety::EnqueueOperation(this, SourceAsset, TEXT("Attach source parser"),
+    FglTFRuntimeSafety::EnqueueExclusiveOperation(this, SourceAsset, TEXT("Attach source parser"),
         [WeakThis, Generation, Parser](uint64 Ticket)
         {
             if (auto* Self = WeakThis.Get(); Self && Self->bRunning
@@ -591,7 +790,7 @@ void UWorldSourceModelBuilder::CaptureNextMesh()
     if (!bRunning || bCancelled || !IsValid(SourceAsset)) return;
     const uint64 Generation = RequestGeneration;
     TWeakObjectPtr<UWorldSourceModelBuilder> WeakThis(this);
-    FglTFRuntimeSafety::EnqueueOperation(this, SourceAsset, TEXT("Capture source mesh/metadata"),
+    FglTFRuntimeSafety::EnqueueExclusiveOperation(this, SourceAsset, TEXT("Capture source mesh/metadata"),
         [WeakThis, Generation](uint64 Ticket)
         {
             if (auto* Self = WeakThis.Get(); Self && Self->bRunning
@@ -623,58 +822,175 @@ void UWorldSourceModelBuilder::CaptureNextMeshUnderGate()
         return;
     }
 
-    while (CurrentMeshIndex < MeshCount && !SourceMeshesToCapture.Contains(CurrentMeshIndex))
+    FglTFRuntimeMaterialsConfig MaterialsConfig =
+        WorldSourceModelBuilderPrivate::MakeMaterialsConfig(this);
+
+    // Character materials must be baked against the same master material used by the runtime
+    // character loader. Resolve this once per native batch instead of reconstructing the override
+    // map for every source mesh.
+    if (Definition.ModelType == EModelDefinitionType::Character)
     {
-        ++CurrentMeshIndex;
+        UMaterialInterface* CharacterMaterial = CharacterMaterialOverride.Get();
+        if (IsValid(CharacterMaterial))
+        {
+            TMap<EglTFRuntimeMaterialType, UMaterialInterface*> CharacterMaterialMap;
+            CharacterMaterialMap.Add(EglTFRuntimeMaterialType::Opaque, CharacterMaterial);
+            CharacterMaterialMap.Add(EglTFRuntimeMaterialType::Translucent, CharacterMaterial);
+            CharacterMaterialMap.Add(EglTFRuntimeMaterialType::TwoSided, CharacterMaterial);
+            CharacterMaterialMap.Add(EglTFRuntimeMaterialType::TwoSidedTranslucent, CharacterMaterial);
+            CharacterMaterialMap.Add(EglTFRuntimeMaterialType::Masked, CharacterMaterial);
+            CharacterMaterialMap.Add(EglTFRuntimeMaterialType::TwoSidedMasked, CharacterMaterial);
+            MaterialsConfig.UberMaterialsOverrideMap = CharacterMaterialMap;
+            MaterialsConfig.UnlitOverrideMap = CharacterMaterialMap;
+        }
+        else
+        {
+            UE_LOG(LogTemp, Warning,
+                TEXT("Character build has no injected DefaultCharacterMaterial; falling back to the general glTF material configuration. Model=%s"),
+                *Definition.GlbPath);
+        }
     }
+
+    // The old path intentionally yielded one engine frame after *every* source mesh. A 1,188-mesh
+    // GLB therefore paid ~20 seconds of pure frame-yield latency at 60 Hz before decode/archive
+    // work was counted. Keep the UI responsive, but process a bounded time slice while we already
+    // own the glTFRuntime native gate. This also avoids thousands of enqueue/ticker round trips.
+    constexpr int32 MaxMeshesPerNativeBatch = 32;
+    constexpr double MaxNativeBatchSeconds = 0.040;
+    const double BatchStartSeconds = FPlatformTime::Seconds();
+    int32 CapturedThisBatch = 0;
+
+    while (CurrentMeshIndex < MeshCount && CapturedThisBatch < MaxMeshesPerNativeBatch)
+    {
+        while (CurrentMeshIndex < MeshCount && !SourceMeshesToCapture.Contains(CurrentMeshIndex))
+        {
+            ++CurrentMeshIndex;
+        }
+        if (CurrentMeshIndex >= MeshCount)
+        {
+            CaptureSkinsAndMetadata();
+            return;
+        }
+
+        const int32 MeshIndex = CurrentMeshIndex;
+        const int32 BakedMeshIndex = SourceToBakedMeshIndex.IsValidIndex(MeshIndex)
+            ? SourceToBakedMeshIndex[MeshIndex] : INDEX_NONE;
+        if (BakedMeshIndex == INDEX_NONE)
+        {
+            Complete(false, TEXT("internal source-to-baked mesh map is invalid"));
+            return;
+        }
+
+        FglTFRuntimeMeshLOD RuntimeLOD;
+        FString Error;
+        bool bDecoded = false;
+        bool bCharacterMeshUsesSkin = false;
+        if (Definition.ModelType == EModelDefinitionType::Character)
+        {
+            for (const TPair<int32, TSet<int32>>& SkinEntry : SkinMeshIndices)
+            {
+                if (SkinEntry.Value.Contains(BakedMeshIndex))
+                {
+                    bCharacterMeshUsesSkin = true;
+                    break;
+                }
+            }
+        }
+
+        if (bCharacterMeshUsesSkin)
+        {
+            FString CharacterNodeName;
+            int32 CharacterSkinIndex = INDEX_NONE;
+            FglTFRuntimeSkeletonConfig SkeletonConfig;
+            if (WorldSourceModelBuilderPrivate::FindCharacterMeshNode(
+                    SourceAsset, MeshIndex, CharacterNodeName, CharacterSkinIndex, Error)
+                && WorldSourceModelBuilderPrivate::MakeCharacterSkeletonConfig(
+                    Definition.Bones, CharacterSkeletonOverride.Get(), SkeletonConfig, Error))
+            {
+                int32 DecodedSkinIndex = CharacterSkinIndex;
+                bDecoded = SourceAsset->LoadSkinnedMeshRecursiveAsRuntimeLOD(
+                    CharacterNodeName, TArray<FString>(), RuntimeLOD, MaterialsConfig, SkeletonConfig,
+                    DecodedSkinIndex, CharacterSkinIndex, EglTFRuntimeRecursiveMode::Tree);
+                if (bDecoded && DecodedSkinIndex != CharacterSkinIndex)
+                {
+                    Error = FString::Printf(
+                        TEXT("Character mesh %d decoded skin %d but node declares skin %d"),
+                        MeshIndex, DecodedSkinIndex, CharacterSkinIndex);
+                    bDecoded = false;
+                }
+                if (bDecoded
+                    && !WorldSourceModelBuilderPrivate::ValidateAuthoritativeBoneMaps(RuntimeLOD, Error))
+                {
+                    bDecoded = false;
+                }
+            }
+        }
+        else
+        {
+            bDecoded = SourceAsset->LoadMeshAsRuntimeLOD(MeshIndex, RuntimeLOD, MaterialsConfig);
+        }
+
+        if (!bDecoded
+            || !CaptureMeshBounds(BakedMeshIndex, RuntimeLOD, Error)
+            || !FGWorldBakedDataCapture::CaptureMesh(
+                BakedMeshIndex,
+                SourceMeshNames.IsValidIndex(MeshIndex)
+                    ? SourceMeshNames[MeshIndex] : FString(),
+                RuntimeLOD,
+                BakedData,
+                MaterialIds,
+                TextureIds,
+                Error))
+        {
+            Complete(false, FString::Printf(
+                TEXT("mesh %d decode/capture failed: %s"),
+                MeshIndex,
+                Error.IsEmpty() ? TEXT("glTFRuntime decode failed") : *Error));
+            return;
+        }
+
+        if (Definition.ModelType == EModelDefinitionType::Character)
+        {
+            int32 BaseColorTextureBindings = 0;
+            for (const FGWorldBakedMaterial& BakedMaterial : BakedData.Materials)
+            {
+                for (const FGWorldBakedTextureParameter& TextureParameter : BakedMaterial.Textures)
+                {
+                    if (TextureParameter.Name.Equals(TEXT("baseColorTexture"), ESearchCase::IgnoreCase)
+                        && (TextureParameter.TextureId != INDEX_NONE || !TextureParameter.AssetPath.IsEmpty()))
+                    {
+                        ++BaseColorTextureBindings;
+                    }
+                }
+            }
+            UE_LOG(LogTemp, Display,
+                TEXT("Character bake capture: Mesh=%d MaterialOverride=%s Materials=%d Textures=%d BaseColorBindings=%d"),
+                MeshIndex,
+                *GetNameSafe(CharacterMaterialOverride.Get()),
+                BakedData.Materials.Num(),
+                BakedData.Textures.Num(),
+                BaseColorTextureBindings);
+        }
+
+        ++CurrentMeshIndex;
+        ++CapturedThisBatch;
+        const float MeshFraction = MeshCount > 0
+            ? static_cast<float>(CurrentMeshIndex) / static_cast<float>(MeshCount)
+            : 1.0f;
+        ProgressValue = FMath::Clamp(0.05f + MeshFraction * 0.85f, 0.05f, 0.90f);
+
+        if (CapturedThisBatch > 0
+            && FPlatformTime::Seconds() - BatchStartSeconds >= MaxNativeBatchSeconds)
+        {
+            break;
+        }
+    }
+
     if (CurrentMeshIndex >= MeshCount)
     {
         CaptureSkinsAndMetadata();
         return;
     }
-
-    const int32 MeshIndex = CurrentMeshIndex;
-    const int32 BakedMeshIndex = SourceToBakedMeshIndex.IsValidIndex(MeshIndex)
-        ? SourceToBakedMeshIndex[MeshIndex] : INDEX_NONE;
-    if (BakedMeshIndex == INDEX_NONE)
-    {
-        Complete(false, TEXT("internal source-to-baked mesh map is invalid"));
-        return;
-    }
-    FglTFRuntimeMeshLOD RuntimeLOD;
-    FglTFRuntimeMaterialsConfig MaterialsConfig =
-        WorldSourceModelBuilderPrivate::MakeMaterialsConfig(this);
-    // The queue owns the native gate and GC references for the entire capture.
-    // Build-only glTFRuntime texture streaming stays disabled; CaptureTexture() copies mip BulkData
-    // immediately after this synchronous decode returns.
-    const bool bDecoded = SourceAsset->LoadMeshAsRuntimeLOD(
-        MeshIndex, RuntimeLOD, MaterialsConfig);
-
-    FString Error;
-    if (!bDecoded
-        || !CaptureMeshBounds(BakedMeshIndex, RuntimeLOD, Error)
-        || !FGWorldBakedDataCapture::CaptureMesh(
-            BakedMeshIndex,
-            SourceMeshNames.IsValidIndex(MeshIndex)
-                ? SourceMeshNames[MeshIndex] : FString(),
-            RuntimeLOD,
-            BakedData,
-            MaterialIds,
-            TextureIds,
-            Error))
-    {
-        Complete(false, FString::Printf(
-            TEXT("mesh %d decode/capture failed: %s"),
-            MeshIndex,
-            Error.IsEmpty() ? TEXT("glTFRuntime decode failed") : *Error));
-        return;
-    }
-
-    ++CurrentMeshIndex;
-    const float MeshFraction = MeshCount > 0
-        ? static_cast<float>(CurrentMeshIndex) / static_cast<float>(MeshCount)
-        : 1.0f;
-    ProgressValue = FMath::Clamp(0.05f + MeshFraction * 0.85f, 0.05f, 0.90f);
     ScheduleNextMesh();
 }
 
@@ -717,7 +1033,7 @@ void UWorldSourceModelBuilder::CaptureSkinsAndMetadata()
         // Called only from CaptureNextMeshUnderGate; do not acquire the same gate twice.
         const bool bCaptured = FGWorldBakedDataCapture::CaptureSkin(
             SourceAsset, SkinIndex, SkinMeshIndices.FindChecked(SkinIndex),
-            Definition.Bones, BakedData, Error);
+            Definition.Bones, CharacterSkeletonOverride.Get(), BakedData, Error);
         if (!bCaptured)
         {
             Complete(false, FString::Printf(

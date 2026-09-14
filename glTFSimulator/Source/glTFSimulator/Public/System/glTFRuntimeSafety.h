@@ -10,7 +10,7 @@
 
 /**
  * @file glTFRuntimeSafety.h
- * @brief Serializes native glTFRuntime work and coordinates safe runtime-asset cache teardown.
+ * @brief Bounds parallel RuntimeLOD builds while coordinating exclusive parser/cache teardown.
  */
 #pragma once
 
@@ -24,9 +24,9 @@ struct FglTFRuntimeConfig;
 /**
  * Process-local safety coordinator for third-party glTF parser and mesh-build calls.
  *
- * glTFRuntime keeps mutable caches and runtime mesh-build state inside its parsers. Native
- * operations are globally serialized: this is deliberately conservative, but it prevents the
- * plugin's multi-file startup and LOD builders from overlapping unsafe native allocations.
+ * glTFRuntime keeps mutable caches and runtime mesh-build state inside its parsers. Source parser
+ * construction, synchronous calls and cache teardown remain exclusive, while baked RuntimeLOD
+ * finalizers use independent parser/build contexts and therefore run with bounded concurrency.
  *
  * Native access violations and memory corruption cannot be recovered with C++ exceptions.
  * This coordinator instead validates external files before entry, keeps UObject work on the
@@ -65,10 +65,22 @@ public:
      * Enqueues one game-thread glTFRuntime operation for Asset.
      *
      * Start receives a ticket that the caller must return through CompleteOperation from every
-     * terminal success/failure/cancellation callback. Only one native operation is active process-
-     * wide, including when the operations belong to different runtime assets.
+     * terminal success/failure/cancellation callback. Independent runtime assets may execute in
+     * parallel up to the configured mesh-build concurrency limit.
      */
     static uint64 EnqueueOperation(
+        UObject* Owner,
+        UglTFRuntimeAsset* Asset,
+        const FString& Label,
+        FQueuedStart Start,
+        FRejected Rejected = FRejected());
+
+    /**
+     * Enqueues a parser/source-capture operation that must not overlap any mesh finalizer.
+     * Use this only for mutable source-parser work; baked RuntimeLOD finalizers should use the
+     * bounded-parallel EnqueueOperation path above.
+     */
+    static uint64 EnqueueExclusiveOperation(
         UObject* Owner,
         UglTFRuntimeAsset* Asset,
         const FString& Label,
@@ -122,7 +134,17 @@ public:
     /** Returns queued + active operations + deferred asset releases. Game-thread only. */
     static int32 GetPendingOperationCount();
 
+    /** Effective bounded-parallel RuntimeLOD finalizer count. Game-thread only. */
+    static int32 GetMeshBuildConcurrencyLimit();
+
 private:
+    static uint64 EnqueueOperationInternal(
+        UObject* Owner,
+        UglTFRuntimeAsset* Asset,
+        const FString& Label,
+        FQueuedStart Start,
+        FRejected Rejected,
+        bool bExclusive);
     static void NotifyGateAvailable_GameThread();
     static void PumpQueue_GameThread();
     static void ProcessPendingAssetReleases_GameThread();

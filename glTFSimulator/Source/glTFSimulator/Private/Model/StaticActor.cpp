@@ -30,6 +30,7 @@
 #include "System/GlTFSimulatorAssetRegistry.h"
 #include "TimerManager.h"
 #include "World/WaterActor.h"
+#include "UObject/UObjectGlobals.h"
 
 namespace StaticActorPrivate
 {
@@ -213,7 +214,19 @@ void AStaticActor::BeginPlay()
     }
     if (!WaterClass)
     {
-        WaterClass = AWaterActor::StaticClass();
+        UClass* LegacyWaterClass = LoadClass<AWaterActor>(
+            nullptr, TEXT("/Game/Blueprints/Gameplay/BP_Water.BP_Water_C"));
+        if (IsValid(LegacyWaterClass)
+            && LegacyWaterClass->IsChildOf(AWaterActor::StaticClass())
+            && !LegacyWaterClass->HasAnyClassFlags(
+                CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists))
+        {
+            WaterClass = LegacyWaterClass;
+        }
+        else
+        {
+            WaterClass = AWaterActor::StaticClass();
+        }
     }
 
     StartBuiltLoad();
@@ -829,8 +842,13 @@ FglTFRuntimeStaticMeshConfig AStaticActor::BuildStreamingMeshConfig()
     Config.MaterialsConfig.ImagesConfig.MaxWidth = TextureLimit;
     Config.MaterialsConfig.ImagesConfig.MaxHeight = TextureLimit;
     Config.Outer = nullptr; // The stream action supplies a world-aware transient outer.
-    Config.bAllowCPUAccess = !bRenderOnlyStreaming;
-    Config.bBuildLumenCards = true;
+    // Runtime world streaming should not retain a CPU vertex copy for every visual mesh. The
+    // stream action enables CPU access only for groups that actually request complex collision.
+    Config.bAllowCPUAccess = false;
+    // Runtime Lumen-card generation serializes expensive render-data work and is a major source of
+    // long hitches on large worlds. Dynamic runtime meshes remain visible to normal surface/cache
+    // paths without eagerly generating cards for every streamed group.
+    Config.bBuildLumenCards = false;
     Config.bBuildNavCollision = !bRenderOnlyStreaming;
     if (bRenderOnlyStreaming)
     {

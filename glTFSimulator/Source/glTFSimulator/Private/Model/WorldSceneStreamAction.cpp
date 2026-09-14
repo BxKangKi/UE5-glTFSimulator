@@ -137,20 +137,9 @@ UWorldSceneStreamAction *UWorldSceneStreamAction::StreamAsync(
 
     auto *Action = NewObject<UWorldSceneStreamAction>();
     Action->WorldContextObject = WorldContextObject;
-    UWorld* RuntimeWorld = IsValid(Actor)
-        ? Actor->GetWorld()
-        : (IsValid(WorldContextObject) ? WorldContextObject->GetWorld() : nullptr);
-    if (IsValid(RuntimeWorld) && RuntimeWorld->IsGameWorld())
-    {
-        UWorldGeneratedStaticMeshContext* MeshWorldContext =
-            NewObject<UWorldGeneratedStaticMeshContext>(GetTransientPackage(), NAME_None, RF_Transient);
-        if (IsValid(MeshWorldContext))
-        {
-            MeshWorldContext->Initialize(RuntimeWorld);
-            Action->GeneratedMeshWorldContext = MeshWorldContext;
-        }
-    }
-
+    // Collision build context is allocated lazily per mesh group. Most world groups are visual-only
+    // even when the actor itself is in collision-capable streaming mode; eagerly allocating one
+    // UObject/context per action prevented them from sharing the completed render-mesh cache.
     Action->OwnerActor = Actor;
     Action->MeshActor = InMeshActor;
     Action->DecalLight = Actor->GetDecalLight();
@@ -982,6 +971,22 @@ void UWorldSceneStreamAction::LoadStaticMeshAsync(const FName &MeshName)
     const bool bBuildComplexCollision = !bRenderOnly && Mesh->Data.bComplexCollision;
     const bool bBuildSimpleCollision = !bRenderOnly && Mesh->Data.bSimpleCollision;
     const bool bNeedsCollision = bBuildComplexCollision || bBuildSimpleCollision;
+
+    if (bNeedsCollision && !IsValid(GeneratedMeshWorldContext))
+    {
+        UWorld* RuntimeWorld = IsValid(OwnerActor.Get()) ? OwnerActor->GetWorld() : nullptr;
+        if (IsValid(RuntimeWorld) && RuntimeWorld->IsGameWorld())
+        {
+            UWorldGeneratedStaticMeshContext* MeshWorldContext =
+                NewObject<UWorldGeneratedStaticMeshContext>(GetTransientPackage(), NAME_None, RF_Transient);
+            if (IsValid(MeshWorldContext))
+            {
+                MeshWorldContext->Initialize(RuntimeWorld);
+                GeneratedMeshWorldContext = MeshWorldContext;
+            }
+        }
+    }
+
     UWorld* CollisionWorld = IsValid(GeneratedMeshWorldContext)
         ? GeneratedMeshWorldContext->GetWorld()
         : nullptr;
@@ -998,11 +1003,18 @@ void UWorldSceneStreamAction::LoadStaticMeshAsync(const FName &MeshName)
     }
 
     FglTFRuntimeStaticMeshConfig Config = StaticMeshConfig;
-    Config.Outer = GeneratedMeshWorldContext.Get();
+    // Visual-only world geometry is immutable and safe to share across every placement using the
+    // same baked facade. Using the facade as Outer explicitly opts into the weak completed-mesh
+    // cache + in-flight request coalescing. Collision meshes keep a world-scoped outer.
+    Config.Outer = !bNeedsCollision
+        ? static_cast<UObject*>(MeshSourceAsset)
+        : static_cast<UObject*>(GeneratedMeshWorldContext.Get());
     Config.bBuildComplexCollision = bBuildComplexCollision;
     Config.bBuildSimpleCollision = bBuildSimpleCollision;
-    Config.bBuildNavCollision = !bRenderOnly && Config.bBuildNavCollision;
-    Config.bAllowCPUAccess = !bRenderOnly && (Config.bAllowCPUAccess || bBuildComplexCollision);
+    // Avoid CPU copies and nav data for visual-only groups. Complex collision needs CPU vertex
+    // access while it is built; simple collision does not require retaining the render vertices.
+    Config.bBuildNavCollision = !bRenderOnly && bNeedsCollision && Config.bBuildNavCollision;
+    Config.bAllowCPUAccess = !bRenderOnly && bBuildComplexCollision;
     Config.CollisionComplexity = bBuildComplexCollision
         ? ECollisionTraceFlag::CTF_UseComplexAsSimple
         : ECollisionTraceFlag::CTF_UseDefault;

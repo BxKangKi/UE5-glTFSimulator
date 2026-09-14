@@ -68,8 +68,27 @@ bool UGameSettings::Deserialization(TSharedPtr<FJsonObject> Json)
         Json->TryGetNumberField(TEXT("StreamingDistanceMultiplier"), StreamingDistanceMultiplier);
         Json->TryGetNumberField(TEXT("StreamingUnloadDistanceMultiplier"), StreamingUnloadDistanceMultiplier);
         Json->TryGetNumberField(TEXT("ObjectStreamingRadiusMeters"), ObjectStreamingRadiusMeters);
-        Json->TryGetNumberField(TEXT("StreamingSceneSpawnBudget"), StreamingSceneSpawnBudget);
-        Json->TryGetNumberField(TEXT("StreamingNodeBudgetPerFrame"), StreamingNodeBudgetPerFrame);
+        const int32 PreviousSceneSpawnBudget = StreamingSceneSpawnBudget;
+        const int32 PreviousNodeBudget = StreamingNodeBudgetPerFrame;
+        const bool bHasSceneSpawnBudget = Json->TryGetNumberField(
+            TEXT("StreamingSceneSpawnBudget"), StreamingSceneSpawnBudget);
+        const bool bHasNodeBudget = Json->TryGetNumberField(
+            TEXT("StreamingNodeBudgetPerFrame"), StreamingNodeBudgetPerFrame);
+
+        // The original project defaults (2 scene tasks / 32 nodes) intentionally throttled work so
+        // aggressively that modern SSDs and multicore CPUs spent most startup time underutilized.
+        // Migrate only the exact untouched legacy pair; explicit user tuning is always preserved.
+        if (bHasSceneSpawnBudget && bHasNodeBudget
+            && StreamingSceneSpawnBudget == 2 && StreamingNodeBudgetPerFrame == 32)
+        {
+            StreamingSceneSpawnBudget = 24;
+            StreamingNodeBudgetPerFrame = 256;
+        }
+        else
+        {
+            if (!bHasSceneSpawnBudget) StreamingSceneSpawnBudget = PreviousSceneSpawnBudget;
+            if (!bHasNodeBudget) StreamingNodeBudgetPerFrame = PreviousNodeBudget;
+        }
         StreamingDistanceMultiplier = FMath::Clamp(StreamingDistanceMultiplier, 1.0f, 512.0f);
         StreamingUnloadDistanceMultiplier = FMath::Clamp(StreamingUnloadDistanceMultiplier, 1.0f, 2.0f);
         ObjectStreamingRadiusMeters = FMath::Clamp(ObjectStreamingRadiusMeters, 512.0f, 4096.0f);

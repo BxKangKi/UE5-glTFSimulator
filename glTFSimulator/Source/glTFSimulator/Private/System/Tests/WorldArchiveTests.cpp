@@ -368,6 +368,17 @@ bool FGWorldArchiveRoundTripTest::RunTest(const FString& Parameters)
     }
 
     Bundle.Reset();
+    TSet<int32> ResidentTextureIds;
+    ResidentTextureIds.Add(0);
+    TestTrue(TEXT("Resident texture dependencies can skip repeated member I/O"), Reader->ReadMeshBundle(
+        Model.Definition.UUID, Manifest, RequestedMeshes, INDEX_NONE, true, Bundle, Error,
+        &ResidentTextureIds));
+    TestEqual(TEXT("Referenced material is still loaded when texture I/O is skipped"),
+        Bundle.Materials.Num(), 1);
+    TestEqual(TEXT("Resident texture member is omitted from the decoded bundle"),
+        Bundle.Textures.Num(), 0);
+
+    Bundle.Reset();
     TestTrue(TEXT("Material-skipping read loads only mesh bytes"), Reader->ReadMeshBundle(
         Model.Definition.UUID, Manifest, RequestedMeshes, INDEX_NONE, false, Bundle, Error));
     TestEqual(TEXT("Skipped material table stays empty"), Bundle.Materials.Num(), 0);

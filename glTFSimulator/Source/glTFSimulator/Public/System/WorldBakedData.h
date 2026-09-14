@@ -12,6 +12,7 @@
 #include "CoreMinimal.h"
 
 class UMaterialInterface;
+class USkeleton;
 class UTexture2D;
 class UglTFRuntimeAsset;
 struct FglTFRuntimeMeshLOD;
@@ -190,6 +191,7 @@ public:
         int32 SkinIndex,
         const TSet<int32>& MeshIndicesUsingSkin,
         const TMap<FString, FString>& BoneAliases,
+        USkeleton* TargetSkeleton,
         FGWorldBakedModel& InOutModel,
         FString& OutError);
 };

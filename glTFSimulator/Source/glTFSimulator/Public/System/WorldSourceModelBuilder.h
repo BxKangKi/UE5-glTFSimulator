@@ -18,6 +18,7 @@
 class UglTFRuntimeAsset;
 class UWorldSourceModelBuilder;
 class UMaterialInterface;
+class USkeleton;
 class UTexture2D;
 class FglTFRuntimeParser;
 struct FglTFRuntimeConfig;
@@ -50,6 +51,18 @@ public:
     /** Starts a new one-shot build. DefinitionJson must be the already validated JSON snapshot. */
     bool Start(const FModelDefinition& InDefinition, const FString& InDefinitionJson);
 
+    /** Supplies the authoritative legacy-compatible material used while baking Character models. */
+    void SetCharacterMaterialOverride(UMaterialInterface* InMaterial)
+    {
+        CharacterMaterialOverride = InMaterial;
+    }
+
+    /** Supplies the target skeleton used by the legacy direct-GLB character ref-pose conversion. */
+    void SetCharacterSkeletonOverride(USkeleton* InSkeleton)
+    {
+        CharacterSkeletonOverride = InSkeleton;
+    }
+
     /** Cancels queued work and releases the source parser at the next safe native boundary. */
     void Cancel();
 
@@ -67,6 +80,13 @@ public:
 private:
     UPROPERTY(Transient)
     TObjectPtr<UglTFRuntimeAsset> SourceAsset;
+
+    /** Strong reflected references supplied by GameManagerSubSystem before Character build starts. */
+    UPROPERTY(Transient)
+    TObjectPtr<UMaterialInterface> CharacterMaterialOverride;
+
+    UPROPERTY(Transient)
+    TObjectPtr<USkeleton> CharacterSkeletonOverride;
 
     FModelDefinition Definition;
     FString DefinitionJson;

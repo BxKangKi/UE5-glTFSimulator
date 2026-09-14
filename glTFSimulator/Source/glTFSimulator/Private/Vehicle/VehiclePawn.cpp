@@ -142,6 +142,36 @@ namespace
         }
         return Result;
     }
+
+    static FglTFRuntimeStaticMeshConfig MakeVehicleMeshConfig(
+        AVehiclePawn* Vehicle,
+        UInstancedEntitySubsystem* InstancedEntities)
+    {
+        FglTFRuntimeStaticMeshConfig MeshConfig;
+        MeshConfig.Outer = InstancedEntities ? InstancedEntities->GetRuntimeMeshOuter() : Vehicle;
+        MeshConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
+        MeshConfig.MaterialsConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
+        MeshConfig.MaterialsConfig.bGeneratesMipMaps = false;
+        const int32 TextureDimensionLimit = UGameSettings::ResolveMaxTextureResolution(Vehicle);
+        MeshConfig.MaterialsConfig.ImagesConfig.MaxWidth = TextureDimensionLimit;
+        MeshConfig.MaterialsConfig.ImagesConfig.MaxHeight = TextureDimensionLimit;
+        MeshConfig.MaterialsConfig.ImagesConfig.bCompressMips = false;
+        MeshConfig.MaterialsConfig.ImagesConfig.bStreaming = false;
+        MeshConfig.MaterialsConfig.bLoadMipMaps = false;
+        if (UGameManagerSubSystem* GameManager = UGameManagerSubSystem::GetSubSystem(Vehicle))
+        {
+            glTFMaterialOverrideUtils::ApplyOverrides(
+                GameManager->GetMaterialDefaultReferences(),
+                MeshConfig.MaterialsConfig);
+        }
+        MeshConfig.bAllowCPUAccess = false;
+        MeshConfig.bBuildLumenCards = true;
+        MeshConfig.bBuildSimpleCollision = false;
+        MeshConfig.bBuildComplexCollision = false;
+        MeshConfig.bBuildNavCollision = false;
+        MeshConfig.CollisionComplexity = ECollisionTraceFlag::CTF_UseDefault;
+        return MeshConfig;
+    }
 }
 
 static void GetVehicleExitPawnCapsuleSize(const APawn* PawnToExit, float& OutRadius, float& OutHalfHeight)
@@ -877,6 +907,16 @@ void AVehiclePawn::ReleaseRuntimeResources()
 
 void AVehiclePawn::ClearLoadedVehicleModel()
 {
+    // Invalidate every outstanding native callback before dropping the facade/cache. The worker
+    // jobs may still finish, but stale completions can no longer resume or mutate this vehicle.
+    ++AsyncMeshLoadGeneration;
+    PendingAsyncMeshLoads = 0;
+    bAsyncMeshLoadFailed = false;
+    bResumingAsyncMeshLoad = false;
+    bDispatchingAsyncMeshPreload = false;
+    PendingAsyncModelReference.Reset();
+    PendingAsyncObjectName.Reset();
+
     if (UVehicleSubSystem* VehicleSubSystem = UVehicleSubSystem::Get(this))
     {
         VehicleSubSystem->UnregisterVehicle(this);
@@ -1257,38 +1297,124 @@ UStaticMesh* AVehiclePawn::LoadMeshByIndex(int32 MeshIndex)
         return nullptr;
     }
 
-    FglTFRuntimeStaticMeshConfig MeshConfig;
-    MeshConfig.Outer = InstancedEntities ? InstancedEntities->GetRuntimeMeshOuter() : this;
-    MeshConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
-    MeshConfig.MaterialsConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
-    MeshConfig.MaterialsConfig.bGeneratesMipMaps = false;
-    const int32 TextureDimensionLimit = UGameSettings::ResolveMaxTextureResolution(this);
-    MeshConfig.MaterialsConfig.ImagesConfig.MaxWidth = TextureDimensionLimit;
-    MeshConfig.MaterialsConfig.ImagesConfig.MaxHeight = TextureDimensionLimit;
-    MeshConfig.MaterialsConfig.ImagesConfig.bCompressMips = false;
-    MeshConfig.MaterialsConfig.ImagesConfig.bStreaming = false;
-    MeshConfig.MaterialsConfig.bLoadMipMaps = false;
-    if (UGameManagerSubSystem* GameManager = UGameManagerSubSystem::GetSubSystem(this))
-    {
-        glTFMaterialOverrideUtils::ApplyOverrides(
-            GameManager->GetMaterialDefaultReferences(),
-            MeshConfig.MaterialsConfig);
-    }
-    MeshConfig.bAllowCPUAccess = false;
-    MeshConfig.bBuildLumenCards = true;
-    MeshConfig.bBuildSimpleCollision = false;
-    MeshConfig.bBuildComplexCollision = false;
-    MeshConfig.bBuildNavCollision = false;
-    MeshConfig.CollisionComplexity = ECollisionTraceFlag::CTF_UseDefault;
-
-    UStaticMesh* Mesh = BakedAsset->LoadStaticMesh(MeshIndex, MeshConfig);
-    if (IsValid(Mesh))
-    {
-        MeshCache.Add(MeshIndex, Mesh);
-    }
-    return Mesh;
+    // Vehicle meshes must have completed BeginAsyncMeshPreload before assembly. A synchronous
+    // fallback here creates a long game-thread hitch (and can also race physics setup), so fail fast
+    // and let the caller reject the incomplete vehicle instead.
+    UE_LOG(LogTemp, Error,
+        TEXT("VehiclePawn: preloaded mesh cache miss; refusing synchronous fallback. Model=%s Mesh=%d"),
+        *ModelReference, MeshIndex);
+    return nullptr;
 }
 
+bool AVehiclePawn::BeginAsyncMeshPreload()
+{
+    check(IsInGameThread());
+    if (!IsValid(BakedAsset)) return false;
+
+    UInstancedEntitySubsystem* InstancedEntities = UInstancedEntitySubsystem::Get(this);
+    TSet<int32> UniqueMeshIndices;
+    const int32 MeshCount = BakedAsset->GetNumMeshes();
+    for (const FglTFRuntimeNode& Node : BakedAsset->GetNodes())
+    {
+        if (Node.MeshIndex >= 0 && Node.MeshIndex < MeshCount)
+        {
+            UniqueMeshIndices.Add(Node.MeshIndex);
+        }
+    }
+
+    TArray<int32> MissingMeshIndices;
+    MissingMeshIndices.Reserve(UniqueMeshIndices.Num());
+    for (const int32 MeshIndex : UniqueMeshIndices)
+    {
+        if (TObjectPtr<UStaticMesh>* Existing = MeshCache.Find(MeshIndex); Existing && IsValid(Existing->Get()))
+        {
+            continue;
+        }
+        if (InstancedEntities)
+        {
+            if (UStaticMesh* SharedMesh = InstancedEntities->FindSharedMesh(ModelReference, MeshIndex))
+            {
+                MeshCache.Add(MeshIndex, SharedMesh);
+                continue;
+            }
+        }
+        MissingMeshIndices.Add(MeshIndex);
+    }
+
+    if (MissingMeshIndices.IsEmpty()) return false;
+
+    const uint64 Generation = ++AsyncMeshLoadGeneration;
+    PendingAsyncMeshLoads = MissingMeshIndices.Num();
+    bAsyncMeshLoadFailed = false;
+    bDispatchingAsyncMeshPreload = true;
+    PendingAsyncModelReference = ModelReference;
+    PendingAsyncObjectName = ObjectName;
+    const FglTFRuntimeStaticMeshConfig MeshConfig = MakeVehicleMeshConfig(this, InstancedEntities);
+    TWeakObjectPtr<AVehiclePawn> WeakThis(this);
+
+    // Fire every independent archive request before waiting for any result. Range reads, decode and
+    // RuntimeLOD conversion therefore overlap on workers; independent decoded RuntimeLODs then enter
+    // the bounded-parallel glTFRuntime finalizer while exclusive source-parser work remains isolated.
+    for (const int32 MeshIndex : MissingMeshIndices)
+    {
+        BakedAsset->LoadStaticMeshAsyncNative(
+            MeshIndex,
+            [WeakThis, Generation, MeshIndex](UStaticMesh* Mesh)
+            {
+                if (AVehiclePawn* Self = WeakThis.Get())
+                {
+                    Self->HandleAsyncMeshPreloadResult(Generation, MeshIndex, Mesh);
+                }
+            },
+            MeshConfig);
+    }
+
+    bDispatchingAsyncMeshPreload = false;
+    if (PendingAsyncMeshLoads == 0) FinishAsyncMeshPreload(Generation);
+    return true;
+}
+
+void AVehiclePawn::HandleAsyncMeshPreloadResult(
+    const uint64 Generation, const int32 MeshIndex, UStaticMesh* Mesh)
+{
+    check(IsInGameThread());
+    if (Generation != AsyncMeshLoadGeneration || PendingAsyncMeshLoads <= 0) return;
+
+    if (IsValid(Mesh)) MeshCache.Add(MeshIndex, Mesh);
+    else bAsyncMeshLoadFailed = true;
+
+    --PendingAsyncMeshLoads;
+    if (PendingAsyncMeshLoads == 0 && !bDispatchingAsyncMeshPreload)
+    {
+        FinishAsyncMeshPreload(Generation);
+    }
+}
+
+void AVehiclePawn::FinishAsyncMeshPreload(const uint64 Generation)
+{
+    check(IsInGameThread());
+    if (Generation != AsyncMeshLoadGeneration || PendingAsyncMeshLoads != 0) return;
+
+    if (bAsyncMeshLoadFailed)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("VehiclePawn: asynchronous mesh preload failed: %s"),
+            *PendingAsyncModelReference);
+        ClearLoadedVehicleModel();
+        return;
+    }
+
+    const FString ResumeReference = PendingAsyncModelReference;
+    const FString ResumeObjectName = PendingAsyncObjectName;
+    bResumingAsyncMeshLoad = true;
+    const bool bFinished = LoadVehicleModel(ResumeReference, ResumeObjectName);
+    bResumingAsyncMeshLoad = false;
+    if (!bFinished)
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("VehiclePawn: async-preloaded model failed during final assembly: %s"),
+            *ResumeReference);
+    }
+}
 
 bool AVehiclePawn::LoadVehicleModel(const FString& InModelReference, const FString& InObjectName)
 {
@@ -1309,7 +1435,13 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InModelReference, const FStri
         return false;
     }
 
-    ClearLoadedVehicleModel();
+    const bool bResumeAsyncAssembly = bResumingAsyncMeshLoad
+        && IsValid(BakedAsset)
+        && Model.Reference == ModelReference;
+    if (!bResumeAsyncAssembly)
+    {
+        ClearLoadedVehicleModel();
+    }
     ModelReference = Model.Reference;
     BaseName = Model.Definition.Name;
     ObjectName = InObjectName.IsEmpty() ? BaseName : InObjectName;
@@ -1456,12 +1588,19 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InModelReference, const FStri
             return false;
         }
 
+        // A second vehicle may have populated the shared template while this vehicle was
+        // asynchronously preparing meshes. Drop any now-redundant local preload state.
+        MeshCache.Empty();
+        BakedAsset = nullptr;
         FinishSuccessfulModelLoad();
         return true;
     }
 
     FString LoadError;
-    BakedAsset = FRuntimeModelResolver::LoadAssetSynchronously(Model, LoadError);
+    if (!bResumeAsyncAssembly)
+    {
+        BakedAsset = FRuntimeModelResolver::LoadAssetSynchronously(Model, LoadError);
+    }
     if (!IsValid(BakedAsset))
     {
         UE_LOG(LogTemp, Warning, TEXT("VehiclePawn: failed to load vehicle model %s: %s"),
@@ -1479,6 +1618,14 @@ bool AVehiclePawn::LoadVehicleModel(const FString& InModelReference, const FStri
             *ModelReference, Nodes.Num());
         ClearLoadedVehicleModel();
         return false;
+    }
+
+    if (!bResumeAsyncAssembly && BeginAsyncMeshPreload())
+    {
+        // Keep the vehicle inactive while independent mesh payloads are being prepared. The actor
+        // is accepted immediately; final render registration/physics activation happens on resume.
+        DeactivateVehicleUntilModelLoaded();
+        return true;
     }
 
     const int32 MeshCount = BakedAsset->GetNumMeshes();

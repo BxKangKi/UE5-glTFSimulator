@@ -15,6 +15,7 @@
 #include "Interface/WaterInteract.h"
 #include "Components/BoxComponent.h"
 #include "Components/StaticMeshComponent.h"
+#include "Engine/StaticMesh.h"
 #include "Components/PostProcessComponent.h"
 #include "GameFramework/PhysicsVolume.h"
 #include "Materials/MaterialInterface.h"
@@ -118,19 +119,65 @@ void AWaterActor::BeginPlay()
 
     if (UGlTFSimulatorAssetRegistry* Registry = UGlTFSimulatorGameInstance::GetAssetRegistryFromContext(this))
     {
-        DecalMaterial = Registry->WaterDecalMaterial.IsNull()
-            ? nullptr : Registry->WaterDecalMaterial.LoadSynchronous();
-        UnderWaterMaterial = Registry->UnderWaterMaterial.IsNull()
-            ? nullptr : Registry->UnderWaterMaterial.LoadSynchronous();
+        // Empty registry entries must not erase values authored on BP_Water or another derived class.
+        if (!Registry->WaterDecalMaterial.IsNull())
+        {
+            if (UMaterialInterface* RegistryDecal = Registry->WaterDecalMaterial.LoadSynchronous())
+            {
+                DecalMaterial = RegistryDecal;
+            }
+        }
+        if (!Registry->UnderWaterMaterial.IsNull())
+        {
+            if (UMaterialInterface* RegistryUnderWater = Registry->UnderWaterMaterial.LoadSynchronous())
+            {
+                UnderWaterMaterial = RegistryUnderWater;
+            }
+        }
         if (IsValid(StaticMesh) && !Registry->WaterMesh.IsNull())
         {
-            StaticMesh->SetStaticMesh(Registry->WaterMesh.LoadSynchronous());
+            if (UStaticMesh* RegistryWaterMesh = Registry->WaterMesh.LoadSynchronous())
+            {
+                StaticMesh->SetStaticMesh(RegistryWaterMesh);
+            }
         }
     }
+
+    // Compatibility with the original project assets. This also makes the native AWaterActor
+    // fallback visibly render when the new AssetRegistry has not been populated yet.
+    bool bLoadedLegacyPlane = false;
+    if (IsValid(StaticMesh) && !IsValid(StaticMesh->GetStaticMesh()))
+    {
+        if (UStaticMesh* LegacyPlane = LoadObject<UStaticMesh>(
+                nullptr, TEXT("/Game/Resources/Meshes/SM_Plane.SM_Plane")))
+        {
+            StaticMesh->SetStaticMesh(LegacyPlane);
+            bLoadedLegacyPlane = true;
+        }
+    }
+    if (IsValid(StaticMesh) && bLoadedLegacyPlane)
+    {
+        if (UMaterialInterface* LegacyWaterMaterial = LoadObject<UMaterialInterface>(
+                nullptr, TEXT("/Game/Resources/Materials/MI_Water.MI_Water")))
+        {
+            StaticMesh->SetMaterial(0, LegacyWaterMaterial);
+        }
+    }
+    if (!IsValid(DecalMaterial))
+    {
+        DecalMaterial = LoadObject<UMaterialInterface>(
+            nullptr, TEXT("/Game/Resources/Materials/MI_Caustics.MI_Caustics"));
+    }
+    if (!IsValid(UnderWaterMaterial))
+    {
+        UnderWaterMaterial = LoadObject<UMaterialInterface>(
+            nullptr, TEXT("/Game/Resources/Materials/MPPI_UnderWater.MPPI_UnderWater"));
+    }
+
     if (!IsValid(StaticMesh.Get()) || !IsValid(StaticMesh->GetStaticMesh()))
     {
         UE_LOG(LogTemp, Warning,
-            TEXT("Water actor has no render mesh. Actor=%s Class=%s; configure AssetRegistry.WaterMesh or a derived WaterActor visual."),
+            TEXT("Water actor has no render mesh. Actor=%s Class=%s; configure AssetRegistry.WaterMesh or keep the legacy /Game/Resources/Meshes/SM_Plane asset."),
             *GetName(), *GetNameSafe(GetClass()));
     }
 

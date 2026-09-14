@@ -152,7 +152,13 @@ void UCharacterLoadAsyncAction::ResolveAndLoadModel()
 
     FResolvedRuntimeModel Model;
     FString ResolveError;
-    if (!FRuntimeModelResolver::Resolve(this, FilePath, Model, ResolveError))
+    // Resolve through the owning gameplay character, not this transient async action.
+    // UBlueprintAsyncActionBase registration keeps the action alive but does not make the
+    // action itself a reliable runtime-world context. WorldSceneStreaming starts character
+    // loading only after the verified model database is open, so the owner pawn is the
+    // authoritative UWorld/UGameInstance source for the gwd:// lookup.
+    const ACharacterController* ResolveContext = OwnerCharacter.Get();
+    if (!FRuntimeModelResolver::Resolve(ResolveContext, FilePath, Model, ResolveError))
     {
         const bool bDatabaseNotReady = ResolveError.Equals(
             TEXT("a verified .gwd model database is not open"), ESearchCase::IgnoreCase);
@@ -328,8 +334,9 @@ void UCharacterLoadAsyncAction::BeginSkeletalMeshLoad_GameThread()
     SourceSkeletonReferenceGuard = DefaultSkeleton;
     SourceMaterialReferenceGuard = Material;
 
-    // Creating/duplicating UObjects must remain on the game thread. Archive range I/O, zlib and
-    // checksums run on a worker; UObject reconstruction/finalization is marshalled back here.
+    // Creating/duplicating UObjects must remain on the game thread. Archive range I/O, decode and
+    // RuntimeLOD conversion run on workers; glTFRuntime also builds the native mesh asynchronously.
+    // Only UObject-bound attachment and the plugin's final Unreal resource commit return to GT.
     CurrentRuntimeSkeleton = UCharacterFunctionLibrary::DuplicateSkeleton(DefaultSkeleton);
     if (!IsValid(CurrentRuntimeSkeleton))
     {
@@ -347,14 +354,20 @@ void UCharacterLoadAsyncAction::BeginSkeletalMeshLoad_GameThread()
     Config.bIgnoreSkin = false;
     Config.OverrideSkinIndex = DetectedSkinIndex;
     Config.SkeletonConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
-    Config.SkeletonConfig.bAddRootBone = CheckRootBoneName(CurrentLoadedAsset);
+    // The baked skin was already canonicalized while the archive was built. Applying the original
+    // source-to-canonical map a second time is unnecessary and can accidentally remap an already
+    // canonical bone when a source rig happens to reuse one of the canonical key names.
+    Config.SkeletonConfig.bAddRootBone = false;
     Config.SkeletonConfig.RootBoneName = TEXT("Root");
-    Config.SkeletonConfig.BonesNameMap = PendingBoneMap;
+    Config.SkeletonConfig.BonesNameMap.Empty();
     Config.SkeletonConfig.RootNodeIndex = -1;
-    Config.SkeletonConfig.bClearRotations = true;
-    Config.SkeletonConfig.CopyRotationsFrom = DefaultSkeleton;
+    // Character archives already store the exact legacy-compatible reference pose produced with
+    // bClearRotations + CopyRotationsFrom during build. Repeating that operation here rotates the
+    // parent frame twice and subtly twists hands/limbs. Reconstruct the archived pose verbatim.
+    Config.SkeletonConfig.bClearRotations = false;
+    Config.SkeletonConfig.CopyRotationsFrom = nullptr;
     Config.SkeletonConfig.MaxNodesTreeDepth = -1;
-    Config.SkeletonConfig.bAddRootNodeIfMissing = true;
+    Config.SkeletonConfig.bAddRootNodeIfMissing = false;
     Config.MaterialsConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
 
     TMap<EglTFRuntimeMaterialType, UMaterialInterface*> MaterialMap;
@@ -375,7 +388,10 @@ void UCharacterLoadAsyncAction::BeginSkeletalMeshLoad_GameThread()
     Config.MaterialsConfig.ImagesConfig.bCompressMips = false;
     Config.MaterialsConfig.ImagesConfig.bStreaming = false;
     Config.MaterialsConfig.bLoadMipMaps = false;
-    Config.bIgnoreMissingBones = true;
+    // Missing weighted bones are a corrupt/incompatible archive, not something to repair by
+    // assigning the remaining weight to bone 0.  The permissive path is exactly what turns a
+    // subtle joint-map mismatch into visibly stretched arms/legs.
+    Config.bIgnoreMissingBones = false;
     Config.Outer = GetTransientPackage();
     Config.bIgnoreEmptyMorphTargets = true;
 
@@ -390,7 +406,8 @@ void UCharacterLoadAsyncAction::BeginSkeletalMeshLoad_GameThread()
     FglTFRuntimeSkeletalMeshAsync MeshDelegate;
     MeshDelegate.BindDynamic(this, &UCharacterLoadAsyncAction::OnMeshLoaded);
     // The facade range-reads only this mesh, its selected skin, and directly referenced
-    // material/texture .dat members on a worker. UObject finalization is marshalled back to GT.
+    // material/texture .dat members on a worker, prepares RuntimeLODs there, then uses
+    // glTFRuntime's asynchronous RuntimeLOD finalizer.
     CurrentLoadedAsset->LoadSkeletalMeshAsync(
         DetectedMeshIndex,
         DetectedSkinIndex,
@@ -442,6 +459,23 @@ void UCharacterLoadAsyncAction::OnMeshLoaded(USkeletalMesh* SkeletalMesh)
         FailLoad(FString::Printf(
             TEXT("Character mesh skeleton does not match the canonical target hierarchy: %s"),
             *HierarchyError));
+        return;
+    }
+
+    FString ReferencePoseError;
+    if (!CharacterBoneSchema::ValidateCanonicalReferenceRotationsMatch(
+            SkeletalMesh->GetRefSkeleton(),
+            TargetSkeleton->GetReferenceSkeleton(),
+            1.0f,
+            ReferencePoseError))
+    {
+        ReleaseTransientRuntimeObject(SkeletalMesh);
+        FglTFRuntimeSafety::ReportRecoverableFailure(
+            FilePath,
+            FString::Printf(TEXT("canonical character reference-pose mismatch: %s"), *ReferencePoseError));
+        FailLoad(FString::Printf(
+            TEXT("Character archive reference pose is stale or incompatible; rebuild the .gwd archive. %s"),
+            *ReferencePoseError));
         return;
     }
 

@@ -161,7 +161,9 @@ public:
         int32 SkinIndex,
         bool bLoadMaterialDependencies,
         FGWorldBakedAssetBundle& OutBundle,
-        FString& OutError) const;
+        FString& OutError,
+        const TSet<int32>* SkipTextureIds = nullptr,
+        const TSet<int32>* SkipMaterialIds = nullptr) const;
 
 private:
     FString Path;
@@ -172,6 +174,16 @@ private:
     TMap<FGuid, FGWorldModelRecord> Records;
     /** Sorted root-member intervals used for O(children + roots) manifest overlap checks. */
     TArray<TPair<uint64, uint64>> RootMemberRanges;
+
+    /**
+     * Tiny bounded resident cache for the hottest model tables. Repeated placements normally share
+     * one UWorldBakedModelAsset, but this also avoids synchronous disk reads after GC/recreation.
+     * The reader is shared by worker tasks, so all cache access is protected.
+     */
+    mutable FCriticalSection ResidentTableCacheLock;
+    mutable TMap<FGuid, FGWorldModelMetadata> ResidentMetadataCache;
+    mutable TMap<FGuid, FGWorldModelManifest> ResidentManifestCache;
+    static constexpr int32 MaxResidentModelTableEntries = 64;
 };
 
 /** Static helpers for the immutable world-build file and its opaque runtime model references. */

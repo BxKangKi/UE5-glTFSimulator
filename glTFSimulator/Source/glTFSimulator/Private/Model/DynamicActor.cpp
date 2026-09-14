@@ -81,6 +81,37 @@ namespace
         return !OutTransform.ContainsNaN();
     }
 
+
+    static FglTFRuntimeStaticMeshConfig MakeDynamicMeshConfig(
+        ADynamicActor* Actor,
+        UInstancedEntitySubsystem* InstancedEntities)
+    {
+        FglTFRuntimeStaticMeshConfig MeshConfig;
+        MeshConfig.Outer = InstancedEntities ? InstancedEntities->GetRuntimeMeshOuter() : Actor;
+        MeshConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
+        MeshConfig.MaterialsConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
+        MeshConfig.MaterialsConfig.bGeneratesMipMaps = false;
+        const int32 TextureDimensionLimit = UGameSettings::ResolveMaxTextureResolution(Actor);
+        MeshConfig.MaterialsConfig.ImagesConfig.MaxWidth = TextureDimensionLimit;
+        MeshConfig.MaterialsConfig.ImagesConfig.MaxHeight = TextureDimensionLimit;
+        MeshConfig.MaterialsConfig.ImagesConfig.bCompressMips = false;
+        MeshConfig.MaterialsConfig.ImagesConfig.bStreaming = false;
+        MeshConfig.MaterialsConfig.bLoadMipMaps = false;
+        if (UGameManagerSubSystem* GameManager = UGameManagerSubSystem::GetSubSystem(Actor))
+        {
+            glTFMaterialOverrideUtils::ApplyOverrides(
+                GameManager->GetMaterialDefaultReferences(),
+                MeshConfig.MaterialsConfig);
+        }
+        MeshConfig.bAllowCPUAccess = false;
+        MeshConfig.bBuildLumenCards = true;
+        MeshConfig.bBuildSimpleCollision = false;
+        MeshConfig.bBuildComplexCollision = false;
+        MeshConfig.bBuildNavCollision = false;
+        MeshConfig.CollisionComplexity = ECollisionTraceFlag::CTF_UseDefault;
+        return MeshConfig;
+    }
+
     static FTransform GetDynamicNodeWorldTransform(
         const TMap<int32, FglTFRuntimeNode>& NodeMap,
         const FglTFRuntimeNode& Node)
@@ -231,6 +262,13 @@ void ADynamicActor::ReleaseRuntimeResources()
 
 void ADynamicActor::ClearLoadedComponents()
 {
+    ++AsyncMeshLoadGeneration;
+    PendingAsyncMeshLoads = 0;
+    bAsyncMeshLoadFailed = false;
+    bResumingAsyncMeshLoad = false;
+    bDispatchingAsyncMeshPreload = false;
+    PendingAsyncModelReference.Reset();
+    PendingAsyncObjectName.Reset();
     if (InstancedRegistrationId != INDEX_NONE)
     {
         if (UInstancedEntitySubsystem* InstancedEntities = UInstancedEntitySubsystem::Get(this))
@@ -370,36 +408,119 @@ UStaticMesh* ADynamicActor::LoadMeshByIndex(int32 MeshIndex)
         }
     }
 
-    FglTFRuntimeStaticMeshConfig MeshConfig;
-    MeshConfig.Outer = InstancedEntities ? InstancedEntities->GetRuntimeMeshOuter() : this;
-    MeshConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
-    MeshConfig.MaterialsConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
-    MeshConfig.MaterialsConfig.bGeneratesMipMaps = false;
-    const int32 TextureDimensionLimit = UGameSettings::ResolveMaxTextureResolution(this);
-    MeshConfig.MaterialsConfig.ImagesConfig.MaxWidth = TextureDimensionLimit;
-    MeshConfig.MaterialsConfig.ImagesConfig.MaxHeight = TextureDimensionLimit;
-    MeshConfig.MaterialsConfig.ImagesConfig.bCompressMips = false;
-    MeshConfig.MaterialsConfig.ImagesConfig.bStreaming = false;
-    MeshConfig.MaterialsConfig.bLoadMipMaps = false;
-    if (UGameManagerSubSystem* GameManager = UGameManagerSubSystem::GetSubSystem(this))
-    {
-        glTFMaterialOverrideUtils::ApplyOverrides(
-            GameManager->GetMaterialDefaultReferences(),
-            MeshConfig.MaterialsConfig);
-    }
-    MeshConfig.bAllowCPUAccess = false;
-    MeshConfig.bBuildLumenCards = true;
-    MeshConfig.bBuildSimpleCollision = false;
-    MeshConfig.bBuildComplexCollision = false;
-    MeshConfig.bBuildNavCollision = false;
-    MeshConfig.CollisionComplexity = ECollisionTraceFlag::CTF_UseDefault;
+    // Production loading is preload-only. Falling back to the synchronous facade here would
+    // rebuild a complete mesh on the game thread and reintroduce the exact spawn hitch the async
+    // preload pipeline is designed to remove. A miss means preload coverage/lifetime is broken;
+    // fail the assembly instead of freezing the frame.
+    UE_LOG(LogTemp, Error,
+        TEXT("DynamicActor: preloaded mesh cache miss; refusing synchronous fallback. Model=%s Mesh=%d"),
+        *ModelReference, MeshIndex);
+    return nullptr;
+}
 
-    UStaticMesh* Mesh = BakedAsset->LoadStaticMesh(MeshIndex, MeshConfig);
-    if (IsValid(Mesh))
+bool ADynamicActor::BeginAsyncMeshPreload()
+{
+    check(IsInGameThread());
+    if (!IsValid(BakedAsset)) return false;
+
+    UInstancedEntitySubsystem* InstancedEntities = UInstancedEntitySubsystem::Get(this);
+    TSet<int32> UniqueMeshIndices;
+    const int32 MeshCount = BakedAsset->GetNumMeshes();
+    for (const FglTFRuntimeNode& Node : BakedAsset->GetNodes())
     {
-        MeshCache.Add(MeshIndex, Mesh);
+        if (Node.MeshIndex >= 0 && Node.MeshIndex < MeshCount)
+        {
+            UniqueMeshIndices.Add(Node.MeshIndex);
+        }
     }
-    return Mesh;
+
+    TArray<int32> MissingMeshIndices;
+    MissingMeshIndices.Reserve(UniqueMeshIndices.Num());
+    for (const int32 MeshIndex : UniqueMeshIndices)
+    {
+        if (TObjectPtr<UStaticMesh>* Existing = MeshCache.Find(MeshIndex); Existing && IsValid(Existing->Get()))
+        {
+            continue;
+        }
+        if (InstancedEntities)
+        {
+            if (UStaticMesh* Shared = InstancedEntities->FindSharedMesh(ModelReference, MeshIndex))
+            {
+                MeshCache.Add(MeshIndex, Shared);
+                continue;
+            }
+        }
+        MissingMeshIndices.Add(MeshIndex);
+    }
+
+    if (MissingMeshIndices.IsEmpty()) return false;
+
+    const uint64 Generation = ++AsyncMeshLoadGeneration;
+    PendingAsyncMeshLoads = MissingMeshIndices.Num();
+    bAsyncMeshLoadFailed = false;
+    bDispatchingAsyncMeshPreload = true;
+    PendingAsyncModelReference = ModelReference;
+    PendingAsyncObjectName = ObjectName;
+    const FglTFRuntimeStaticMeshConfig MeshConfig = MakeDynamicMeshConfig(this, InstancedEntities);
+    TWeakObjectPtr<ADynamicActor> WeakThis(this);
+
+    // Submit every independent range/RuntimeLOD request immediately. The archive preparation work
+    // can overlap on workers; independent RuntimeLOD finalizers then run through the bounded-parallel glTFRuntime gate.
+    for (const int32 MeshIndex : MissingMeshIndices)
+    {
+        BakedAsset->LoadStaticMeshAsyncNative(
+            MeshIndex,
+            [WeakThis, Generation, MeshIndex](UStaticMesh* Mesh)
+            {
+                if (ADynamicActor* Self = WeakThis.Get())
+                {
+                    Self->HandleAsyncMeshPreloadResult(Generation, MeshIndex, Mesh);
+                }
+            },
+            MeshConfig);
+    }
+    bDispatchingAsyncMeshPreload = false;
+    if (PendingAsyncMeshLoads == 0) FinishAsyncMeshPreload(Generation);
+    return true;
+}
+
+void ADynamicActor::HandleAsyncMeshPreloadResult(
+    const uint64 Generation, const int32 MeshIndex, UStaticMesh* Mesh)
+{
+    check(IsInGameThread());
+    if (Generation != AsyncMeshLoadGeneration || PendingAsyncMeshLoads <= 0) return;
+    if (IsValid(Mesh)) MeshCache.Add(MeshIndex, Mesh);
+    else bAsyncMeshLoadFailed = true;
+    --PendingAsyncMeshLoads;
+    if (PendingAsyncMeshLoads == 0 && !bDispatchingAsyncMeshPreload)
+    {
+        FinishAsyncMeshPreload(Generation);
+    }
+}
+
+void ADynamicActor::FinishAsyncMeshPreload(const uint64 Generation)
+{
+    check(IsInGameThread());
+    if (Generation != AsyncMeshLoadGeneration || PendingAsyncMeshLoads != 0) return;
+
+    if (bAsyncMeshLoadFailed)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("DynamicActor: asynchronous mesh preload failed: %s"), *PendingAsyncModelReference);
+        MeshCache.Empty();
+        BakedAsset = nullptr;
+        ApplyConfigToPhysicsProxy();
+        return;
+    }
+
+    const FString ResumeReference = PendingAsyncModelReference;
+    const FString ResumeObjectName = PendingAsyncObjectName;
+    bResumingAsyncMeshLoad = true;
+    const bool bFinished = LoadDynamic(ResumeReference, ResumeObjectName);
+    bResumingAsyncMeshLoad = false;
+    if (!bFinished)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("DynamicActor: async-preloaded model failed during final assembly: %s"), *ResumeReference);
+    }
 }
 
 bool ADynamicActor::LoadDynamic(const FString& InModelReference, const FString& InObjectName)
@@ -422,7 +543,13 @@ bool ADynamicActor::LoadDynamic(const FString& InModelReference, const FString& 
         return false;
     }
 
-    ClearLoadedComponents();
+    const bool bResumeAsyncAssembly = bResumingAsyncMeshLoad
+        && IsValid(BakedAsset)
+        && Model.Reference == ModelReference;
+    if (!bResumeAsyncAssembly)
+    {
+        ClearLoadedComponents();
+    }
     ModelReference = Model.Reference;
     bRuntimeResourcesReleased = false;
     BaseName = Model.Definition.Name;
@@ -449,7 +576,7 @@ bool ADynamicActor::LoadDynamic(const FString& InModelReference, const FString& 
     ApplyConfigToPhysicsProxy();
 
     FBox TemplateBounds(ForceInit);
-    InstancedRegistrationId = InstancedEntities->RegisterEntityFromEntityTemplate(
+    InstancedRegistrationId = bResumeAsyncAssembly ? INDEX_NONE : InstancedEntities->RegisterEntityFromEntityTemplate(
         ModelReference,
         this,
         Root,
@@ -474,14 +601,17 @@ bool ADynamicActor::LoadDynamic(const FString& InModelReference, const FString& 
     }
 
     FString LoadError;
-    BakedAsset = FRuntimeModelResolver::LoadAssetSynchronously(Model, LoadError);
-    if (!IsValid(BakedAsset))
+    if (!bResumeAsyncAssembly)
     {
-        const FString FailedPath = ModelReference;
-        UE_LOG(LogTemp, Warning, TEXT("DynamicActor: failed to load %s: %s"),
-            *FailedPath, *LoadError);
-        ClearLoadedComponents();
-        return false;
+        BakedAsset = FRuntimeModelResolver::LoadAssetSynchronously(Model, LoadError);
+        if (!IsValid(BakedAsset))
+        {
+            const FString FailedPath = ModelReference;
+            UE_LOG(LogTemp, Warning, TEXT("DynamicActor: failed to load %s: %s"),
+                *FailedPath, *LoadError);
+            ClearLoadedComponents();
+            return false;
+        }
     }
 
     // The facade owns this immutable baked node table for the duration of this load. Referencing it
@@ -493,6 +623,15 @@ bool ADynamicActor::LoadDynamic(const FString& InModelReference, const FString& 
             *ModelReference, Nodes.Num());
         ClearLoadedComponents();
         return false;
+    }
+
+    if (!bResumeAsyncAssembly && BeginAsyncMeshPreload())
+    {
+        // The actor is accepted immediately but collision/physics stay disabled until every mesh
+        // has completed its worker build and the final shared-render registration succeeds.
+        bLoaded = false;
+        ApplyConfigToPhysicsProxy();
+        return true;
     }
 
     TMap<int32, FglTFRuntimeNode> NodeMap;

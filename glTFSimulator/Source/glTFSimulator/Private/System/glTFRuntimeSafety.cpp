@@ -10,16 +10,18 @@
 
 /**
  * @file glTFRuntimeSafety.cpp
- * @brief Serialized native scheduling, cache lifetime barriers, and session quarantine.
+ * @brief Bounded-parallel mesh scheduling, exclusive parser/cache barriers, and session quarantine.
  */
 #include "System/glTFRuntimeSafety.h"
 #include "HAL/CriticalSection.h"
 #include "HAL/FileManager.h"
+#include "HAL/IConsoleManager.h"
 
 #include "Async/Async.h"
 #include "Async/TaskGraphInterfaces.h"
 #include "Containers/Ticker.h"
 #include "HAL/PlatformProcess.h"
+#include "HAL/PlatformMisc.h"
 #include "HAL/PlatformTime.h"
 #include "HAL/ThreadSafeCounter.h"
 #include "Misc/ScopeExit.h"
@@ -43,6 +45,7 @@ namespace glTFRuntimeSafetyPrivate
         FString Label;
         FglTFRuntimeSafety::FQueuedStart Start;
         FglTFRuntimeSafety::FRejected Rejected;
+        bool bExclusive = false;
     };
 
     /** Metadata retained while one native operation owns a slot. */
@@ -53,12 +56,14 @@ namespace glTFRuntimeSafetyPrivate
             UObject* InOwner,
             UglTFRuntimeAsset* InAsset,
             FString InLabel,
-            const double InStartedAtSeconds)
+            const double InStartedAtSeconds,
+            const bool bInExclusive)
             : Ticket(InTicket)
             , Owner(InOwner)
             , Asset(InAsset)
             , Label(MoveTemp(InLabel))
             , StartedAtSeconds(InStartedAtSeconds)
+            , bExclusive(bInExclusive)
         {
         }
 
@@ -69,6 +74,7 @@ namespace glTFRuntimeSafetyPrivate
         TStrongObjectPtr<UglTFRuntimeAsset> Asset;
         FString Label;
         double StartedAtSeconds = 0.0;
+        bool bExclusive = false;
     };
 
     /**
@@ -120,12 +126,16 @@ namespace glTFRuntimeSafetyPrivate
 
     struct FState
     {
-        // One logical native gate covers parser construction, synchronous loads, asynchronous mesh
-        // finalization, and parser cache teardown. The mutex protects the phase; it is never held
-        // while third-party code executes.
+        // Parser construction, synchronous loads and cache teardown remain globally exclusive.
+        // Independent RuntimeLOD mesh finalizers are counted separately and may run in parallel.
+        // The mutex protects only coordinator state; it is never held while third-party code executes.
         FCriticalSection NativeGateLock;
-        enum class ENativePhase : uint8 { Idle, ParserCreation, MeshOperation, SynchronousOperation, CacheClear };
+        enum class ENativePhase : uint8 { Idle, ParserCreation, MeshOperation, QueuedExclusive, SynchronousOperation, CacheClear };
         ENativePhase NativePhase = ENativePhase::Idle;
+        // RuntimeLOD finalizers use independent parser/build contexts and may execute concurrently.
+        // Parser creation, synchronous plugin calls, and cache teardown remain exclusive against all
+        // mesh finalizers to preserve the original safety boundary around shared plugin state.
+        int32 ActiveMeshOperations = 0;
 
         // Failure records are queried by both game and worker threads.
         FCriticalSection FailureLock;
@@ -166,7 +176,23 @@ namespace glTFRuntimeSafetyPrivate
     }
 
     constexpr int32 MaximumQueuedOperations = 4096;
-    constexpr int32 MaximumConcurrentNativeOperations = 1;
+
+    TAutoConsoleVariable<int32> CVarMaximumConcurrentNativeOperations(
+        TEXT("gltfsim.Streaming.MaxConcurrentMeshBuilds"),
+        0,
+        TEXT("Maximum number of independent baked RuntimeLOD glTFRuntime mesh finalizers. ")
+        TEXT("0 = auto (physical cores - 1, clamped to 1..8); explicit values clamp to 1..16."),
+        ECVF_Default);
+
+    int32 GetMaximumConcurrentNativeOperations()
+    {
+        const int32 Configured = CVarMaximumConcurrentNativeOperations.GetValueOnGameThread();
+        if (Configured > 0)
+        {
+            return FMath::Clamp(Configured, 1, 16);
+        }
+        return FMath::Clamp(FPlatformMisc::NumberOfCores() - 1, 1, 8);
+    }
 
     bool IsShuttingDown()
     {
@@ -284,7 +310,21 @@ namespace glTFRuntimeSafetyPrivate
     {
         FState& State = GetState();
         FScopeLock Lock(&State.NativeGateLock);
-        if (State.NativePhase != FState::ENativePhase::Idle)
+
+        if (Phase == FState::ENativePhase::MeshOperation)
+        {
+            // Every baked finalizer owns a distinct UglTFRuntimeAsset/parser. Allow several of those
+            // independent contexts to build at once, but never overlap an exclusive parser/cache
+            // phase. Global concurrency is bounded again by PumpQueue_GameThread().
+            if (State.NativePhase != FState::ENativePhase::Idle)
+            {
+                return false;
+            }
+            ++State.ActiveMeshOperations;
+            return true;
+        }
+
+        if (State.NativePhase != FState::ENativePhase::Idle || State.ActiveMeshOperations > 0)
         {
             return false;
         }
@@ -296,6 +336,13 @@ namespace glTFRuntimeSafetyPrivate
     {
         FState& State = GetState();
         FScopeLock Lock(&State.NativeGateLock);
+        if (Phase == FState::ENativePhase::MeshOperation)
+        {
+            ensureMsgf(State.ActiveMeshOperations > 0, TEXT("glTFRuntime mesh-operation gate underflow"));
+            State.ActiveMeshOperations = FMath::Max(0, State.ActiveMeshOperations - 1);
+            return;
+        }
+
         ensureMsgf(State.NativePhase == Phase, TEXT("glTFRuntime native gate phase mismatch"));
         if (State.NativePhase == Phase)
         {
@@ -507,10 +554,33 @@ uint64 FglTFRuntimeSafety::EnqueueOperation(
     FQueuedStart Start,
     FRejected Rejected)
 {
-    // EnqueueOperation returns a ticket synchronously. Silently redispatching from a worker would
+    return EnqueueOperationInternal(
+        Owner, Asset, Label, MoveTemp(Start), MoveTemp(Rejected), false);
+}
+
+uint64 FglTFRuntimeSafety::EnqueueExclusiveOperation(
+    UObject* Owner,
+    UglTFRuntimeAsset* Asset,
+    const FString& Label,
+    FQueuedStart Start,
+    FRejected Rejected)
+{
+    return EnqueueOperationInternal(
+        Owner, Asset, Label, MoveTemp(Start), MoveTemp(Rejected), true);
+}
+
+uint64 FglTFRuntimeSafety::EnqueueOperationInternal(
+    UObject* Owner,
+    UglTFRuntimeAsset* Asset,
+    const FString& Label,
+    FQueuedStart Start,
+    FRejected Rejected,
+    const bool bExclusive)
+{
+    // Queue entry points return a ticket synchronously. Silently redispatching from a worker would
     // return 0 to the caller while a real request starts later, leaving its in-flight/ticket state
     // unsynchronized. All project call sites are GT-guarded, so reject misuse instead.
-    if (!ensureMsgf(IsInGameThread(), TEXT("FglTFRuntimeSafety::EnqueueOperation must run on the game thread")))
+    if (!ensureMsgf(IsInGameThread(), TEXT("FglTFRuntimeSafety queue operations must run on the game thread")))
     {
         return 0;
     }
@@ -563,6 +633,7 @@ uint64 FglTFRuntimeSafety::EnqueueOperation(
     Operation.Label = Label.Left(512);
     Operation.Start = MoveTemp(Start);
     Operation.Rejected = MoveTemp(Rejected);
+    Operation.bExclusive = bExclusive;
     const uint64 Ticket = Operation.Ticket;
     State.Queue.Add(MoveTemp(Operation));
     PumpQueue_GameThread();
@@ -611,9 +682,13 @@ void FglTFRuntimeSafety::CompleteOperation(const uint64 Ticket)
         return;
     }
 
+    const glTFRuntimeSafetyPrivate::FActiveOperation* Active = State.ActiveOperations.Find(Ticket);
+    const bool bExclusive = Active && Active->bExclusive;
     State.ActiveOperations.Remove(Ticket);
     glTFRuntimeSafetyPrivate::LeaveNativePhase(
-        glTFRuntimeSafetyPrivate::FState::ENativePhase::MeshOperation);
+        bExclusive
+            ? glTFRuntimeSafetyPrivate::FState::ENativePhase::QueuedExclusive
+            : glTFRuntimeSafetyPrivate::FState::ENativePhase::MeshOperation);
 
     // A release requested during the callback is finalized before another job can reuse that parser.
     ProcessPendingAssetReleases_GameThread();
@@ -936,6 +1011,15 @@ int32 FglTFRuntimeSafety::GetPendingOperationCount()
     return State.Queue.Num() + State.ActiveOperations.Num() + State.PendingAssetReleases.Num();
 }
 
+int32 FglTFRuntimeSafety::GetMeshBuildConcurrencyLimit()
+{
+    if (!ensureMsgf(IsInGameThread(), TEXT("glTFRuntime mesh concurrency must be read on the game thread")))
+    {
+        return 1;
+    }
+    return glTFRuntimeSafetyPrivate::GetMaximumConcurrentNativeOperations();
+}
+
 bool FglTFRuntimeSafety::TickWatchdog(const float DeltaSeconds)
 {
     (void)DeltaSeconds;
@@ -1003,7 +1087,9 @@ void FglTFRuntimeSafety::PumpQueue_GameThread()
         State.bPumpingQueue = false;
     };
 
-    while (State.ActiveOperations.Num() < glTFRuntimeSafetyPrivate::MaximumConcurrentNativeOperations &&
+    const int32 MaximumConcurrentNativeOperations =
+        glTFRuntimeSafetyPrivate::GetMaximumConcurrentNativeOperations();
+    while (State.ActiveOperations.Num() < MaximumConcurrentNativeOperations &&
         glTFRuntimeSafetyPrivate::IsNativeGateIdle())
     {
         int32 SelectedIndex = INDEX_NONE;
@@ -1011,8 +1097,8 @@ void FglTFRuntimeSafety::PumpQueue_GameThread()
         glTFRuntimeSafetyPrivate::FQueuedOperation Operation;
         bool bHasSelectedOperation = false;
 
-        // Preserve queue order and reject stale entries before selecting the next globally
-        // serialized native operation. The per-asset test remains as a defensive invariant.
+        // Preserve queue order and reject stale entries before selecting the next bounded-parallel
+        // native operation. The per-builder test remains as a defensive invariant.
         for (int32 Index = 0; Index < State.Queue.Num(); ++Index)
         {
             glTFRuntimeSafetyPrivate::FQueuedOperation& Candidate = State.Queue[Index];
@@ -1026,6 +1112,18 @@ void FglTFRuntimeSafety::PumpQueue_GameThread()
                 State.Queue.RemoveAt(Index, 1, EAllowShrinking::No);
                 --Index;
                 continue;
+            }
+
+            if (Candidate.bExclusive)
+            {
+                // Exclusive source-parser/capture work is a queue barrier. Once it reaches the
+                // head of the runnable region, let already-active mesh finalizers drain instead of
+                // admitting later mesh work indefinitely and starving the authoring operation.
+                if (State.ActiveOperations.Num() == 0)
+                {
+                    SelectedIndex = Index;
+                }
+                break;
             }
 
             if (!glTFRuntimeSafetyPrivate::IsAssetActive(State, Asset))
@@ -1042,8 +1140,11 @@ void FglTFRuntimeSafety::PumpQueue_GameThread()
             Operation = MoveTemp(State.Queue[SelectedIndex]);
             State.Queue.RemoveAt(SelectedIndex, 1, EAllowShrinking::No);
 
-            if (!glTFRuntimeSafetyPrivate::TryEnterNativePhase(
-                glTFRuntimeSafetyPrivate::FState::ENativePhase::MeshOperation))
+            const glTFRuntimeSafetyPrivate::FState::ENativePhase RequestedPhase =
+                Operation.bExclusive
+                    ? glTFRuntimeSafetyPrivate::FState::ENativePhase::QueuedExclusive
+                    : glTFRuntimeSafetyPrivate::FState::ENativePhase::MeshOperation;
+            if (!glTFRuntimeSafetyPrivate::TryEnterNativePhase(RequestedPhase))
             {
                 // A worker parser acquired the gate between the idle probe and this claim.
                 // Restore queue order; parser completion will pump the queue on the game thread.
@@ -1062,7 +1163,8 @@ void FglTFRuntimeSafety::PumpQueue_GameThread()
                 Operation.Owner.Get(),
                 Operation.Asset.Get(),
                 Operation.Label,
-                FPlatformTime::Seconds());
+                FPlatformTime::Seconds(),
+                Operation.bExclusive);
             State.ActiveOperations.Add(Active.Ticket, MoveTemp(Active));
             bHasSelectedOperation = true;
         }
@@ -1088,11 +1190,12 @@ void FglTFRuntimeSafety::PumpQueue_GameThread()
         }
 
         UE_LOG(LogTemp, Verbose,
-            TEXT("Starting serialized glTFRuntime operation [%llu] %s (active=%d/%d)"),
+            TEXT("Starting %s glTFRuntime operation [%llu] %s (active=%d/%d)"),
+            Operation.bExclusive ? TEXT("exclusive") : TEXT("bounded-parallel"),
             Operation.Ticket,
             *Operation.Label,
             State.ActiveOperations.Num(),
-            glTFRuntimeSafetyPrivate::MaximumConcurrentNativeOperations);
+            MaximumConcurrentNativeOperations);
 
         // Start may synchronously fail and call CompleteOperation. The bPumpingQueue guard prevents
         // recursive pumping while this outer loop safely observes the updated active map.

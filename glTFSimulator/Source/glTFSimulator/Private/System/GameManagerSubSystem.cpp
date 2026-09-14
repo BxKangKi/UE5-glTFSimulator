@@ -59,6 +59,8 @@
 #include "Components/PrimitiveComponent.h"
 #include "Components/SceneComponent.h"
 #include "Components/SkeletalMeshComponent.h"
+#include "Animation/Skeleton.h"
+#include "Engine/SkeletalMesh.h"
 #include "Materials/MaterialInterface.h"
 #include "Engine/World.h"
 #include "Engine/Engine.h"
@@ -92,6 +94,28 @@ namespace
             FVector(0.0, 0.0, 0.0),
             FVector(100000.0, 100000.0, 10000.0));
         return Transform;
+    }
+
+    UClass* ResolveLegacyWaterActorClass()
+    {
+        static TWeakObjectPtr<UClass> CachedLegacyWaterClass;
+        if (CachedLegacyWaterClass.IsValid())
+        {
+            return CachedLegacyWaterClass.Get();
+        }
+
+        UClass* LoadedClass = LoadClass<AWaterActor>(
+            nullptr,
+            TEXT("/Game/Blueprints/Gameplay/BP_Water.BP_Water_C"));
+        if (IsValid(LoadedClass)
+            && LoadedClass->IsChildOf(AWaterActor::StaticClass())
+            && !LoadedClass->HasAnyClassFlags(
+                CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists))
+        {
+            CachedLegacyWaterClass = LoadedClass;
+            return LoadedClass;
+        }
+        return nullptr;
     }
 
     /**
@@ -730,8 +754,24 @@ void UGameManagerSubSystem::ApplyGameModeConfig(const AGlTFSimulatorGameplayGame
         ? ResolvedEnv : AWorldEnvManager::StaticClass();
 
     UClass* ResolvedWater = Registry ? Registry->WaterActorClass.LoadSynchronous() : nullptr;
-    WaterClass = IsUsableClass(ResolvedWater, AWaterActor::StaticClass())
-        ? ResolvedWater : AWaterActor::StaticClass();
+    if (IsUsableClass(ResolvedWater, AWaterActor::StaticClass()))
+    {
+        WaterClass = ResolvedWater;
+    }
+    else if (UClass* LegacyWaterClass = ResolveLegacyWaterActorClass())
+    {
+        // Older project content stores the complete ocean visual in BP_Water. Keep that asset as a
+        // compatibility fallback when the newer GameInstance asset registry has not been configured.
+        WaterClass = LegacyWaterClass;
+        UE_LOG(LogTemp, Display,
+            TEXT("WaterActorClass is not configured in AssetRegistry; using legacy BP_Water compatibility class."));
+    }
+    else
+    {
+        WaterClass = AWaterActor::StaticClass();
+        UE_LOG(LogTemp, Warning,
+            TEXT("No configured or legacy BP_Water class was found; using native AWaterActor visual fallback."));
+    }
 
     UClass* ResolvedRain = Registry ? Registry->RainWeatherActorClass.LoadSynchronous() : nullptr;
     RainWeatherActorClass = IsUsableClass(ResolvedRain, AActor::StaticClass()) ? ResolvedRain : nullptr;
@@ -2536,13 +2576,23 @@ void UGameManagerSubSystem::SpawnOcean()
     SpawnParams.Owner = SessionOwner.Get();
     // Water is an overlap volume. Never let existing world collision suppress the global ocean.
     SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-    UClass* OceanClass = WaterClass ? WaterClass.Get() : AWaterActor::StaticClass();
-    if (!IsValid(OceanClass) || !OceanClass->IsChildOf(AWaterActor::StaticClass()))
+    UClass* OceanClass = WaterClass ? WaterClass.Get() : nullptr;
+    if (!IsValid(OceanClass) || !OceanClass->IsChildOf(AWaterActor::StaticClass())
+        || OceanClass->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists))
+    {
+        OceanClass = ResolveLegacyWaterActorClass();
+    }
+    if (!IsValid(OceanClass))
     {
         OceanClass = AWaterActor::StaticClass();
     }
     const FTransform& HardcodedOceanTransform = GetHardcodedOceanTransform();
     OceanTransform = HardcodedOceanTransform;
+    UE_LOG(LogTemp, Display,
+        TEXT("Spawning global ocean. bOcean=true Class=%s Location=%s Scale=%s"),
+        *GetNameSafe(OceanClass),
+        *HardcodedOceanTransform.GetLocation().ToCompactString(),
+        *HardcodedOceanTransform.GetScale3D().ToCompactString());
     OceanActor = World->SpawnActor<AActor>(OceanClass, HardcodedOceanTransform, SpawnParams);
     if (!IsValid(OceanActor) && OceanClass != AWaterActor::StaticClass())
     {
@@ -4736,6 +4786,58 @@ void UGameManagerSubSystem::StartNextWorldBakeModel()
         BuildTask->OnFinished.AddUObject(
             this,
             &UGameManagerSubSystem::HandleWorldBuildModelFinished);
+
+        if (Definition.ModelType == EModelDefinitionType::Character)
+        {
+            UMaterialInterface* CharacterMaterial = nullptr;
+            USkeleton* CharacterSkeleton = nullptr;
+            USkeletalMesh* CharacterSkeletalMesh = nullptr;
+            if (UGlTFSimulatorAssetRegistry* Registry =
+                    UGlTFSimulatorGameInstance::GetAssetRegistryFromContext(this))
+            {
+                CharacterMaterial = Registry->DefaultCharacterMaterial.IsNull()
+                    ? nullptr
+                    : Registry->DefaultCharacterMaterial.LoadSynchronous();
+                CharacterSkeleton = Registry->DefaultCharacterSkeleton.IsNull()
+                    ? nullptr
+                    : Registry->DefaultCharacterSkeleton.LoadSynchronous();
+                CharacterSkeletalMesh = Registry->DefaultCharacterSkeletalMesh.IsNull()
+                    ? nullptr
+                    : Registry->DefaultCharacterSkeletalMesh.LoadSynchronous();
+            }
+
+            // Preserve compatibility with the original BP_CharacterController defaults when the
+            // central registry has not been migrated yet. The legacy project used MI_Toon and
+            // SK_Humanoid; the skeletal mesh is also a safe source for its USkeleton.
+            if (!IsValid(CharacterMaterial))
+            {
+                CharacterMaterial = LoadObject<UMaterialInterface>(
+                    nullptr,
+                    TEXT("/Game/Resources/Materials/glTFRuntime/MI_Toon.MI_Toon"));
+            }
+            if (!IsValid(CharacterSkeleton))
+            {
+                if (!IsValid(CharacterSkeletalMesh))
+                {
+                    CharacterSkeletalMesh = LoadObject<USkeletalMesh>(
+                        nullptr,
+                        TEXT("/Game/Resources/Humanoid/SK_Humanoid.SK_Humanoid"));
+                }
+                CharacterSkeleton = IsValid(CharacterSkeletalMesh)
+                    ? CharacterSkeletalMesh->GetSkeleton()
+                    : nullptr;
+            }
+
+            BuildTask->SetCharacterMaterialOverride(CharacterMaterial);
+            BuildTask->SetCharacterSkeletonOverride(CharacterSkeleton);
+            if (!IsValid(CharacterMaterial) || !IsValid(CharacterSkeleton))
+            {
+                UE_LOG(LogTemp, Warning,
+                    TEXT("Character build could not resolve the legacy-compatible material/skeleton. Material=%s Skeleton=%s GLB=%s"),
+                    *GetNameSafe(CharacterMaterial), *GetNameSafe(CharacterSkeleton), *ModelPath);
+            }
+        }
+
         BuildTask->Start(Definition, DefinitionJson);
         return;
     }

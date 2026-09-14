@@ -15,6 +15,47 @@
 #include "System/WorldArchive.h"
 #include "System/WorldBakedModelAsset.h"
 
+namespace RuntimeModelResolverPrivate
+{
+    /**
+     * Reuse one baked-model facade for every placement of the same immutable model build.
+     * This avoids re-reading metadata/manifest rows and, more importantly, shares the runtime
+     * material/texture caches across Static/Dynamic/Vehicle/Weapon/Character users. The resolver
+     * is game-thread only, so the weak cache does not need an additional lock.
+     */
+    TMap<FString, TWeakObjectPtr<UWorldBakedModelAsset>>& GetFacadeCache()
+    {
+        static TMap<FString, TWeakObjectPtr<UWorldBakedModelAsset>> Cache;
+        return Cache;
+    }
+
+    FString MakeFacadeCacheKey(const FResolvedRuntimeModel& Model)
+    {
+        return FString::Printf(
+            TEXT("%s|%s|%s"),
+            *Model.ArchiveReader->GetArchivePath(),
+            *Model.ArchiveReader->GetBuildId().ToString(EGuidFormats::Digits),
+            *Model.UUID.ToString(EGuidFormats::Digits));
+    }
+
+    void PruneFacadeCache(TMap<FString, TWeakObjectPtr<UWorldBakedModelAsset>>& Cache)
+    {
+        // Keys are tiny, but long editor sessions can rebuild many worlds. Keep the table bounded
+        // without holding any UObject alive solely for this cache.
+        if (Cache.Num() < 256)
+        {
+            return;
+        }
+        for (auto It = Cache.CreateIterator(); It; ++It)
+        {
+            if (!It.Value().IsValid())
+            {
+                It.RemoveCurrent();
+            }
+        }
+    }
+}
+
 bool FResolvedRuntimeModel::IsValid() const
 {
     FGuid ParsedUUID;
@@ -33,10 +74,26 @@ bool FRuntimeModelResolver::Resolve(
     OutModel = FResolvedRuntimeModel();
     OutError.Reset();
     const UWorld* World = IsValid(WorldContextObject) ? WorldContextObject->GetWorld() : nullptr;
-    const UGameInstance* GameInstance = World ? World->GetGameInstance() : nullptr;
-    const UModelDatabaseSubsystem* Database = GameInstance
-        ? GameInstance->GetSubsystem<UModelDatabaseSubsystem>() : nullptr;
-    if (!Database || !Database->IsBuiltWorld())
+    if (!World)
+    {
+        OutError = TEXT("runtime model resolver has no valid UWorld context");
+        return false;
+    }
+
+    const UGameInstance* GameInstance = World->GetGameInstance();
+    if (!GameInstance)
+    {
+        OutError = TEXT("runtime model resolver has no valid UGameInstance context");
+        return false;
+    }
+
+    const UModelDatabaseSubsystem* Database = GameInstance->GetSubsystem<UModelDatabaseSubsystem>();
+    if (!Database)
+    {
+        OutError = TEXT("the model database subsystem is unavailable");
+        return false;
+    }
+    if (!Database->IsBuiltWorld())
     {
         OutError = TEXT("a verified .gwd model database is not open");
         return false;
@@ -77,6 +134,19 @@ UWorldBakedModelAsset* FRuntimeModelResolver::LoadAssetSynchronously(
         return nullptr;
     }
 
+    using namespace RuntimeModelResolverPrivate;
+    TMap<FString, TWeakObjectPtr<UWorldBakedModelAsset>>& FacadeCache = GetFacadeCache();
+    PruneFacadeCache(FacadeCache);
+    const FString CacheKey = MakeFacadeCacheKey(Model);
+    if (TWeakObjectPtr<UWorldBakedModelAsset>* Cached = FacadeCache.Find(CacheKey))
+    {
+        if (UWorldBakedModelAsset* Existing = Cached->Get(); IsValid(Existing))
+        {
+            return Existing;
+        }
+        FacadeCache.Remove(CacheKey);
+    }
+
     UWorldBakedModelAsset* Asset = NewObject<UWorldBakedModelAsset>(
         GetTransientPackage(), NAME_None, RF_Transient);
     if (!IsValid(Asset) || !Asset->Initialize(Model, OutError))
@@ -84,5 +154,6 @@ UWorldBakedModelAsset* FRuntimeModelResolver::LoadAssetSynchronously(
         if (OutError.IsEmpty()) OutError = TEXT("could not initialize the baked model facade");
         return nullptr;
     }
+    FacadeCache.Add(CacheKey, Asset);
     return Asset;
 }

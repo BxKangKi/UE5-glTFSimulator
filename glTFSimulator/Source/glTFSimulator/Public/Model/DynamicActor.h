@@ -135,10 +135,20 @@ private:
     bool bLoaded = false;
     bool bRenderOnlyMode = false;
     bool bRuntimeResourcesReleased = false;
+    uint64 AsyncMeshLoadGeneration = 0;
+    int32 PendingAsyncMeshLoads = 0;
+    bool bAsyncMeshLoadFailed = false;
+    bool bResumingAsyncMeshLoad = false;
+    bool bDispatchingAsyncMeshPreload = false;
+    FString PendingAsyncModelReference;
+    FString PendingAsyncObjectName;
 
     bool LoadConfigJson(const FString& DefinitionJson);
     void ApplyConfigToPhysicsProxy();
     UStaticMesh* LoadMeshByIndex(int32 MeshIndex);
+    bool BeginAsyncMeshPreload();
+    void HandleAsyncMeshPreloadResult(uint64 Generation, int32 MeshIndex, UStaticMesh* Mesh);
+    void FinishAsyncMeshPreload(uint64 Generation);
     void ClearLoadedComponents();
     void ReleaseRuntimeResources();
 };

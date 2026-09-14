@@ -46,4 +46,15 @@ namespace CharacterBoneSchema
         const FReferenceSkeleton& Candidate,
         const FReferenceSkeleton& Target,
         FString& OutError);
+
+    /**
+     * The character bake copies canonical target rotations into the archived reference pose while
+     * preserving the source rig's proportions. Reject stale archives whose canonical rotations no
+     * longer match the configured target skeleton instead of committing a visibly twisted mesh.
+     */
+    GLTFSIMULATOR_API bool ValidateCanonicalReferenceRotationsMatch(
+        const FReferenceSkeleton& Candidate,
+        const FReferenceSkeleton& Target,
+        float ToleranceDegrees,
+        FString& OutError);
 }

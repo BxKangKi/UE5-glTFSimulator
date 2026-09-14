@@ -271,4 +271,37 @@ namespace CharacterBoneSchema
         return true;
     }
 
+    bool ValidateCanonicalReferenceRotationsMatch(
+        const FReferenceSkeleton& Candidate,
+        const FReferenceSkeleton& Target,
+        const float ToleranceDegrees,
+        FString& OutError)
+    {
+        OutError.Reset();
+        if (!ValidateCanonicalReferenceSkeleton(Candidate, OutError)) return false;
+        if (!ValidateCanonicalReferenceSkeleton(Target, OutError)) return false;
+
+        const float SafeTolerance = FMath::Max(0.0f, ToleranceDegrees);
+        const TArray<FTransform>& CandidatePose = Candidate.GetRefBonePose();
+        const TArray<FTransform>& TargetPose = Target.GetRefBonePose();
+        for (const FName BoneName : GetRequiredKeys())
+        {
+            const int32 CandidateIndex = Candidate.FindBoneIndex(BoneName);
+            const int32 TargetIndex = Target.FindBoneIndex(BoneName);
+            const FQuat CandidateRotation = CandidatePose[CandidateIndex].GetRotation().GetNormalized();
+            const FQuat TargetRotation = TargetPose[TargetIndex].GetRotation().GetNormalized();
+            const double Dot = FMath::Clamp(
+                static_cast<double>(FMath::Abs(CandidateRotation | TargetRotation)), 0.0, 1.0);
+            const double AngularErrorDegrees = FMath::RadiansToDegrees(2.0 * FMath::Acos(Dot));
+            if (!FMath::IsFinite(AngularErrorDegrees) || AngularErrorDegrees > SafeTolerance)
+            {
+                OutError = FString::Printf(
+                    TEXT("Canonical bone '%s' reference rotation differs from the target by %.3f degrees."),
+                    *BoneName.ToString(), AngularErrorDegrees);
+                return false;
+            }
+        }
+        return true;
+    }
+
 }

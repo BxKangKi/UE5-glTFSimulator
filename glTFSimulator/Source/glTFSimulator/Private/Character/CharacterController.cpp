@@ -399,6 +399,12 @@ bool ACharacterController::CommitRuntimeCharacterResources(
     MeshComp->SetAllBodiesSimulatePhysics(false);
     MeshComp->SetSimulatePhysics(false);
     MeshComp->PutAllRigidBodiesToSleep();
+
+    // BeginPlay installs DefaultCharacterMaterial as a component override for the placeholder mesh.
+    // Component overrides survive SetSkinnedAssetAndUpdate(), so leaving it in place masks the
+    // texture-bearing MIDs reconstructed for the runtime glTF mesh and makes the whole character
+    // render with the plain/default material. The generated mesh already owns its correct MIDs.
+    MeshComp->EmptyOverrideMaterials();
     MeshComp->SetSkinnedAssetAndUpdate(SkeletalMesh, true);
 
     UPhysicsAsset* PhysicsToUse = IsValid(PhysicsAsset) ? PhysicsAsset : DefaultPhysicsAsset.Get();
@@ -467,7 +473,12 @@ void ACharacterController::ReleaseRuntimeCharacterResources(bool bRestoreDefault
     // The directly assigned default mesh is the stable placeholder during the next async load.
     if (IsValid(DefaultSkeletalMesh))
     {
+        MeshComp->EmptyOverrideMaterials();
         MeshComp->SetSkinnedAssetAndUpdate(DefaultSkeletalMesh, true);
+        if (IsValid(DefaultMaterial))
+        {
+            MeshComp->SetMaterial(0, DefaultMaterial);
+        }
     }
     if (IsValid(DefaultPhysicsAsset))
     {
@@ -517,7 +528,12 @@ void ACharacterController::OnLoadCompleted(bool Result)
             if (IsValid(DefaultSkeletalMesh) &&
                 MeshComp->GetSkinnedAsset() != DefaultSkeletalMesh.Get())
             {
+                MeshComp->EmptyOverrideMaterials();
                 MeshComp->SetSkinnedAssetAndUpdate(DefaultSkeletalMesh, true);
+            }
+            if (IsValid(DefaultMaterial))
+            {
+                MeshComp->SetMaterial(0, DefaultMaterial);
             }
             if (IsValid(DefaultPhysicsAsset))
             {

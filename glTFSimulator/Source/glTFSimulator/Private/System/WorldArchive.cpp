@@ -7,11 +7,13 @@
  * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
  */
 
+#include "Misc/ScopeLock.h"
 #include "System/WorldArchive.h"
 
 #include "Async/ParallelFor.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformFileManager.h"
+#include "HAL/PlatformMisc.h"
 #include "Misc/Crc.h"
 #include "Misc/Compression.h"
 #include "Misc/Guid.h"
@@ -22,8 +24,9 @@
 
 namespace GWorldArchivePrivate
 {
-    constexpr uint64 Magic = 0x34444C524F574747ull; // ASCII "GGWORLD4", little endian.
-    constexpr uint32 Version = 4;
+    // Development archive identity only. Intentionally no public/spec version is encoded yet;
+    // incompatible development archives are rebuilt instead of carrying premature version logic.
+    constexpr uint64 Magic = 0x00444C524F574747ull; // ASCII "GGWORLD\0", little endian.
     constexpr int32 HeaderBytes = 64;
     constexpr int64 PayloadAlignment = 4096;
     constexpr int32 MaxStringBytes = 64 * 1024 * 1024;
@@ -664,7 +667,6 @@ namespace GWorldArchivePrivate
     {
         FWriter Writer(OutBytes, FGWorldArchive::MaxDirectoryBytes);
         Writer.U32(DefinitionMagic);
-        Writer.U32(Version);
         TArray<FString> BoneNames;
         Definition.Bones.GetKeys(BoneNames);
         BoneNames.Sort();
@@ -691,7 +693,7 @@ namespace GWorldArchivePrivate
         FString& OutError)
     {
         FReader Reader(Bytes);
-        if (Reader.U32() != DefinitionMagic || Reader.U32() != Version)
+        if (Reader.U32() != DefinitionMagic)
         {
             OutError = TEXT("The .gwd model definition member has an invalid header");
             return false;
@@ -735,7 +737,6 @@ namespace GWorldArchivePrivate
     {
         FWriter Writer(OutBytes, FGWorldArchive::MaxDirectoryBytes);
         Writer.U32(MetadataMagic);
-        Writer.U32(Version);
         WriteMetadata(Writer, Metadata, Summary);
         if (!Writer.IsOk() || OutBytes.IsEmpty()
             || static_cast<int64>(OutBytes.Num()) > FGWorldArchive::MaxDirectoryBytes)
@@ -752,7 +753,7 @@ namespace GWorldArchivePrivate
         FString& OutError)
     {
         FReader Reader(Bytes);
-        if (Reader.U32() != MetadataMagic || Reader.U32() != Version
+        if (Reader.U32() != MetadataMagic
             || !ReadMetadata(Reader, OutMetadata) || !Reader.IsAtEnd())
         {
             OutError = TEXT("The .gwd model metadata member is invalid or truncated");
@@ -770,7 +771,6 @@ namespace GWorldArchivePrivate
         }
         FWriter Writer(OutBytes, FGWorldArchive::MaxDirectoryBytes);
         Writer.U32(ConfigMagic);
-        Writer.U32(Version);
         Writer.String(Json);
         if (!Writer.IsOk() || OutBytes.IsEmpty())
         {
@@ -783,7 +783,7 @@ namespace GWorldArchivePrivate
     bool DeserializeWorldConfig(const TArray<uint8>& Bytes, FString& OutJson, FString& OutError)
     {
         FReader Reader(Bytes);
-        if (Reader.U32() != ConfigMagic || Reader.U32() != Version)
+        if (Reader.U32() != ConfigMagic)
         {
             OutError = TEXT("The .gwd config.json member has an invalid header");
             return false;
@@ -1107,7 +1107,8 @@ namespace GWorldArchivePrivate
         const FString& MemberName,
         const TArray<uint8>& RawBytes,
         FGWorldArchiveRange& OutRange,
-        FString& OutError)
+        FString& OutError,
+        bool bPreferFastRead = false)
     {
         const bool bValidName = MemberName.EndsWith(TEXT(".dat"), ESearchCase::CaseSensitive)
             || MemberName.Equals(TEXT("config.json"), ESearchCase::CaseSensitive);
@@ -1134,7 +1135,10 @@ namespace GWorldArchivePrivate
             && Bound64 <= MAX_int32;
         const int32 Bound = bBoundFitsArray ? static_cast<int32>(Bound64) : 0;
         int64 CompressedSize = Bound64;
-        bool bUseCompression = bBoundFitsArray;
+        // Mesh/texture payloads are latency-sensitive range-read members.  Compressing hundreds or
+        // thousands of them creates a long zlib tail at the end of a world build and forces the
+        // first stream of each member to decompress again.  Metadata remains compressed normally.
+        bool bUseCompression = bBoundFitsArray && !bPreferFastRead;
         if (bUseCompression)
         {
             Compressed.SetNumUninitialized(Bound);
@@ -1147,6 +1151,8 @@ namespace GWorldArchivePrivate
                 && CompressedSize > 0
                 && CompressedSize < static_cast<int64>(RawBytes.Num())
                 && CompressedSize <= MAX_int32;
+
+
             if (bUseCompression)
             {
                 Compressed.SetNum(static_cast<int32>(CompressedSize), EAllowShrinking::No);
@@ -1183,8 +1189,8 @@ namespace GWorldArchivePrivate
         TArray<uint8> Bytes;
         FWriter Writer(Bytes, HeaderBytes);
         Writer.U64(Magic);
-        Writer.U32(Version);
         Writer.U32(HeaderBytes);
+        Writer.U32(0); // Reserved for alignment/future non-versioned header flags.
         Writer.U64(DirectoryOffset);
         Writer.U64(DirectorySize);
         Writer.U32(DirectoryCrc);
@@ -1194,7 +1200,7 @@ namespace GWorldArchivePrivate
         return Bytes;
     }
 
-    bool BuildBlockingV4(
+    bool BuildBlocking(
         const FString& ArchivePathInput,
         const TArray<FGWorldBuildModel>& Models,
         FString& OutArchivePath,
@@ -1343,7 +1349,7 @@ namespace GWorldArchivePrivate
                 FGWorldArchiveRange Range;
                 const FString Name = Prefix + FString::Printf(TEXT("meshes/%d.dat"), Mesh.MeshIndex);
                 if (!WorldArchiveCodec::SerializeMesh(Mesh, Bytes, OutError)
-                    || !WriteDatMember(*Output, Offset, Name, Bytes, Range, OutError)) return false;
+                    || !WriteDatMember(*Output, Offset, Name, Bytes, Range, OutError, true)) return false;
                 Manifest.MeshRanges.Add(Mesh.MeshIndex, MoveTemp(Range));
                 Manifest.MeshNames.Add(Mesh.MeshIndex, Mesh.Name);
             }
@@ -1352,7 +1358,7 @@ namespace GWorldArchivePrivate
                 FGWorldArchiveRange Range;
                 const FString Name = Prefix + FString::Printf(TEXT("skins/%d.dat"), Skin.SkinIndex);
                 if (!WorldArchiveCodec::SerializeSkin(Skin, Bytes, OutError)
-                    || !WriteDatMember(*Output, Offset, Name, Bytes, Range, OutError)) return false;
+                    || !WriteDatMember(*Output, Offset, Name, Bytes, Range, OutError, true)) return false;
                 Manifest.SkinRanges.Add(Skin.SkinIndex, MoveTemp(Range));
             }
             for (const FGWorldBakedMaterial& Material : Model->BakedData.Materials)
@@ -1360,7 +1366,7 @@ namespace GWorldArchivePrivate
                 FGWorldArchiveRange Range;
                 const FString Name = Prefix + FString::Printf(TEXT("materials/%d.dat"), Material.MaterialId);
                 if (!WorldArchiveCodec::SerializeMaterial(Material, Bytes, OutError)
-                    || !WriteDatMember(*Output, Offset, Name, Bytes, Range, OutError)) return false;
+                    || !WriteDatMember(*Output, Offset, Name, Bytes, Range, OutError, true)) return false;
                 Manifest.MaterialRanges.Add(Material.MaterialId, MoveTemp(Range));
             }
             for (const FGWorldBakedTexture& Texture : Model->BakedData.Textures)
@@ -1368,7 +1374,7 @@ namespace GWorldArchivePrivate
                 FGWorldArchiveRange Range;
                 const FString Name = Prefix + FString::Printf(TEXT("textures/%d.dat"), Texture.TextureId);
                 if (!WorldArchiveCodec::SerializeTexture(Texture, Bytes, OutError)
-                    || !WriteDatMember(*Output, Offset, Name, Bytes, Range, OutError)) return false;
+                    || !WriteDatMember(*Output, Offset, Name, Bytes, Range, OutError, true)) return false;
                 Manifest.TextureRanges.Add(Texture.TextureId, MoveTemp(Range));
             }
             if (!Manifest.IsSane(Record.Summary, &OutError)
@@ -1881,7 +1887,7 @@ bool FGWorldArchive::BuildBlocking(
     const FString& WorldConfigJson)
 {
     using namespace GWorldArchivePrivate;
-    return BuildBlockingV4(
+    return GWorldArchivePrivate::BuildBlocking(
         MakeArchivePath(WorldRoot), Models, OutArchivePath, OutError, ShouldCancel, WorldConfigJson);
 }
 
@@ -1894,7 +1900,7 @@ bool FGWorldArchive::BuildBlockingToArchivePath(
     const FString& ArchiveConfigJson)
 {
     using namespace GWorldArchivePrivate;
-    return BuildBlockingV4(
+    return GWorldArchivePrivate::BuildBlocking(
         ArchivePath, Models, OutArchivePath, OutError, ShouldCancel, ArchiveConfigJson);
 }
 
@@ -1928,8 +1934,8 @@ TSharedPtr<FGWorldArchiveReader, ESPMode::ThreadSafe> FGWorldArchiveReader::Open
     }
     FReader Header(HeaderBytesArray);
     const uint64 ReadMagic = Header.U64();
-    const uint32 ReadVersion = Header.U32();
     const uint32 ReadHeaderBytes = Header.U32();
+    const uint32 ReservedHeaderFlags = Header.U32();
     const uint64 DirectoryOffset = Header.U64();
     const uint64 DirectorySize = Header.U64();
     const uint32 DirectoryCrc = Header.U32();
@@ -1937,8 +1943,8 @@ TSharedPtr<FGWorldArchiveReader, ESPMode::ThreadSafe> FGWorldArchiveReader::Open
     const FGuid BuildId = Header.Guid();
     (void)Header.U64();
 
-    if (!Header.IsAtEnd() || ReadMagic != Magic || ReadVersion != Version
-        || ReadHeaderBytes != HeaderBytes || !BuildId.IsValid()
+    if (!Header.IsAtEnd() || ReadMagic != Magic || ReadHeaderBytes != HeaderBytes
+        || ReservedHeaderFlags != 0 || !BuildId.IsValid()
         || ModelCount == 0 || ModelCount > FGWorldArchive::MaxModels
         || DirectorySize == 0 || DirectorySize > static_cast<uint64>(FGWorldArchive::MaxDirectoryBytes)
         || DirectoryOffset < static_cast<uint64>(HeaderBytes)
@@ -1947,7 +1953,7 @@ TSharedPtr<FGWorldArchiveReader, ESPMode::ThreadSafe> FGWorldArchiveReader::Open
         || DirectoryOffset + DirectorySize != static_cast<uint64>(TotalSize)
         || DirectorySize > static_cast<uint64>(MAX_int32))
     {
-        OutError = TEXT("The .gwd header, version or bounded offsets are invalid");
+        OutError = TEXT("The .gwd header or bounded offsets are invalid");
         return nullptr;
     }
 
@@ -2082,6 +2088,15 @@ bool FGWorldArchiveReader::ReadModelMetadata(
         return false;
     }
 
+    {
+        FScopeLock Lock(&ResidentTableCacheLock);
+        if (const FGWorldModelMetadata* Cached = ResidentMetadataCache.Find(UUID))
+        {
+            OutMetadata = *Cached;
+            return true;
+        }
+    }
+
     TArray<uint8> Bytes;
     if (!ReadChecksummedRange(
             Path, FileSize, DataEndOffset, Record->MetadataRange, FGWorldArchive::MaxDirectoryBytes,
@@ -2101,6 +2116,16 @@ bool FGWorldArchiveReader::ReadModelMetadata(
         OutError = TEXT("The streamed metadata does not match its .gwd directory summary");
         return false;
     }
+    {
+        FScopeLock Lock(&ResidentTableCacheLock);
+        if (!ResidentMetadataCache.Contains(UUID)
+            && ResidentMetadataCache.Num() >= MaxResidentModelTableEntries)
+        {
+            auto It = ResidentMetadataCache.CreateIterator();
+            if (It) It.RemoveCurrent();
+        }
+        ResidentMetadataCache.Add(UUID, OutMetadata);
+    }
     return true;
 }
 
@@ -2117,6 +2142,14 @@ bool FGWorldArchiveReader::ReadModelManifest(
     {
         OutError = FString::Printf(TEXT("Model UUID is absent from .gwd: %s"), *UUID.ToString());
         return false;
+    }
+    {
+        FScopeLock Lock(&ResidentTableCacheLock);
+        if (const FGWorldModelManifest* Cached = ResidentManifestCache.Find(UUID))
+        {
+            OutManifest = *Cached;
+            return true;
+        }
     }
     TArray<uint8> Bytes;
     if (!ReadChecksummedRange(Path, FileSize, DataEndOffset, Record->ManifestRange,
@@ -2193,6 +2226,16 @@ bool FGWorldArchiveReader::ReadModelManifest(
             return false;
         }
     }
+    {
+        FScopeLock Lock(&ResidentTableCacheLock);
+        if (!ResidentManifestCache.Contains(UUID)
+            && ResidentManifestCache.Num() >= MaxResidentModelTableEntries)
+        {
+            auto It = ResidentManifestCache.CreateIterator();
+            if (It) It.RemoveCurrent();
+        }
+        ResidentManifestCache.Add(UUID, OutManifest);
+    }
     return true;
 }
 
@@ -2203,7 +2246,9 @@ bool FGWorldArchiveReader::ReadMeshBundle(
     const int32 SkinIndex,
     const bool bLoadMaterialDependencies,
     FGWorldBakedAssetBundle& OutBundle,
-    FString& OutError) const
+    FString& OutError,
+    const TSet<int32>* SkipTextureIds,
+    const TSet<int32>* SkipMaterialIds) const
 {
     using namespace GWorldArchivePrivate;
     OutBundle.Reset();
@@ -2220,16 +2265,47 @@ bool FGWorldArchiveReader::ReadMeshBundle(
     }
 
     // Runtime bundle reads are pure file/CPU work and are frequently dominated by texture members.
-    // Read independent archive members in parallel with a private file handle per job. Sharing one
-    // seek cursor across workers is unsafe, while reopening the already-hot .gwd file is cheap on
-    // desktop SSDs and lets CRC + binary deserialization use multiple CPU cores.
-    auto ReadMemberBytes = [this](const FGWorldArchiveRange& Range, TArray<uint8>& Bytes, FString& Error) -> bool
+    // Do NOT open one OS file handle per .dat member: large materials can fan out to hundreds of
+    // texture ranges and handle churn becomes measurable even on NVMe. Instead partition each stage
+    // into a few independent shards. Every shard owns exactly one seek cursor and consumes several
+    // members serially, while CRC + binary deserialization still run across shards in parallel.
+    // Keeping the shard count modest is important because several baked-model requests may already
+    // be running on the engine thread pool at the same time.
+    auto ParallelReadShards = [this](const int32 ItemCount, auto&& ReadOne)
     {
-        IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
-        TUniquePtr<IFileHandle> Handle(PlatformFile.OpenRead(*Path));
-        if (!Handle.IsValid() || Handle->Size() != FileSize)
+        if (ItemCount <= 0)
         {
-            Error = TEXT("The .gwd file changed or could not be opened for a parallel bundle read");
+            return;
+        }
+        const int32 HardwareWorkers = FMath::Max(1, FPlatformMisc::NumberOfCores() - 1);
+        const int32 ShardCount = FMath::Clamp(FMath::Min(ItemCount, HardwareWorkers), 1, 4);
+        ParallelFor(ShardCount, [this, ItemCount, ShardCount, &ReadOne](const int32 ShardIndex)
+        {
+            IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+            TUniquePtr<IFileHandle> Handle(PlatformFile.OpenRead(*Path));
+            FString OpenError;
+            if (!Handle.IsValid() || Handle->Size() != FileSize)
+            {
+                OpenError = TEXT("The .gwd file changed or could not be opened for a sharded bundle read");
+                Handle.Reset();
+            }
+
+            for (int32 Index = ShardIndex; Index < ItemCount; Index += ShardCount)
+            {
+                ReadOne(Index, Handle.Get(), OpenError);
+            }
+        });
+    };
+
+    auto ReadMemberBytes = [this](IFileHandle* Handle, const FGWorldArchiveRange& Range,
+        TArray<uint8>& Bytes, FString& Error) -> bool
+    {
+        if (!Handle)
+        {
+            if (Error.IsEmpty())
+            {
+                Error = TEXT("The .gwd shard file handle is unavailable");
+            }
             return false;
         }
         return ReadChecksummedRange(*Handle, FileSize, DataEndOffset, Range,
@@ -2251,7 +2327,9 @@ bool FGWorldArchiveReader::ReadMeshBundle(
     TArray<uint8> MeshSuccess;
     MeshSuccess.Init(0, UniqueMeshes.Num());
 
-    ParallelFor(UniqueMeshes.Num(), [this, &Manifest, &UniqueMeshes, &MeshResults, &MeshErrors, &MeshSuccess, &ReadMemberBytes](const int32 Index)
+    ParallelReadShards(UniqueMeshes.Num(),
+        [this, &Manifest, &UniqueMeshes, &MeshResults, &MeshErrors, &MeshSuccess, &ReadMemberBytes](
+            const int32 Index, IFileHandle* Handle, const FString& OpenError)
     {
         const int32 MeshIndex = UniqueMeshes[Index];
         const FGWorldArchiveRange* Range = Manifest.MeshRanges.Find(MeshIndex);
@@ -2262,8 +2340,8 @@ bool FGWorldArchiveReader::ReadMeshBundle(
         }
         TArray<uint8> Bytes;
         FGWorldBakedMesh Mesh;
-        FString Error;
-        if (!ReadMemberBytes(*Range, Bytes, Error)
+        FString Error = OpenError;
+        if (!ReadMemberBytes(Handle, *Range, Bytes, Error)
             || !WorldArchiveCodec::DeserializeMesh(Bytes, Mesh, Error)
             || Mesh.MeshIndex != MeshIndex)
         {
@@ -2297,7 +2375,8 @@ bool FGWorldArchiveReader::ReadMeshBundle(
                 OutError = TEXT("Requested mesh.dat refers to a missing material member");
                 return false;
             }
-            if (bLoadMaterialDependencies)
+            if (bLoadMaterialDependencies
+                && (!SkipMaterialIds || !SkipMaterialIds->Contains(Primitive.MaterialId)))
             {
                 MaterialIds.Add(Primitive.MaterialId);
             }
@@ -2314,7 +2393,9 @@ bool FGWorldArchiveReader::ReadMeshBundle(
     TArray<uint8> MaterialSuccess;
     MaterialSuccess.Init(0, SortedMaterials.Num());
 
-    ParallelFor(SortedMaterials.Num(), [this, &Manifest, &SortedMaterials, &MaterialResults, &MaterialErrors, &MaterialSuccess, &ReadMemberBytes](const int32 Index)
+    ParallelReadShards(SortedMaterials.Num(),
+        [this, &Manifest, &SortedMaterials, &MaterialResults, &MaterialErrors, &MaterialSuccess, &ReadMemberBytes](
+            const int32 Index, IFileHandle* Handle, const FString& OpenError)
     {
         const int32 MaterialId = SortedMaterials[Index];
         const FGWorldArchiveRange* Range = Manifest.MaterialRanges.Find(MaterialId);
@@ -2325,8 +2406,8 @@ bool FGWorldArchiveReader::ReadMeshBundle(
         }
         TArray<uint8> Bytes;
         FGWorldBakedMaterial Material;
-        FString Error;
-        if (!ReadMemberBytes(*Range, Bytes, Error)
+        FString Error = OpenError;
+        if (!ReadMemberBytes(Handle, *Range, Bytes, Error)
             || !WorldArchiveCodec::DeserializeMaterial(Bytes, Material, Error)
             || Material.MaterialId != MaterialId)
         {
@@ -2364,6 +2445,19 @@ bool FGWorldArchiveReader::ReadMeshBundle(
     }
     OutBundle.Materials = MoveTemp(MaterialResults);
 
+    // A facade-level runtime cache can guarantee that selected materials/textures remain alive.
+    // Cached materials were removed before material.dat I/O above, which also removes all of their
+    // texture dependencies from this request. For uncached materials, skip any texture.dat member
+    // already retained by the texture cache.
+    // Dependency ids were still validated against the manifest above before any id is skipped.
+    if (SkipTextureIds)
+    {
+        for (const int32 TextureId : *SkipTextureIds)
+        {
+            TextureIds.Remove(TextureId);
+        }
+    }
+
     TArray<int32> SortedTextures = TextureIds.Array();
     SortedTextures.Sort();
     TArray<FGWorldBakedTexture> TextureResults;
@@ -2373,7 +2467,9 @@ bool FGWorldArchiveReader::ReadMeshBundle(
     TArray<uint8> TextureSuccess;
     TextureSuccess.Init(0, SortedTextures.Num());
 
-    ParallelFor(SortedTextures.Num(), [this, &Manifest, &SortedTextures, &TextureResults, &TextureErrors, &TextureSuccess, &ReadMemberBytes](const int32 Index)
+    ParallelReadShards(SortedTextures.Num(),
+        [this, &Manifest, &SortedTextures, &TextureResults, &TextureErrors, &TextureSuccess, &ReadMemberBytes](
+            const int32 Index, IFileHandle* Handle, const FString& OpenError)
     {
         const int32 TextureId = SortedTextures[Index];
         const FGWorldArchiveRange* Range = Manifest.TextureRanges.Find(TextureId);
@@ -2384,8 +2480,8 @@ bool FGWorldArchiveReader::ReadMeshBundle(
         }
         TArray<uint8> Bytes;
         FGWorldBakedTexture Texture;
-        FString Error;
-        if (!ReadMemberBytes(*Range, Bytes, Error)
+        FString Error = OpenError;
+        if (!ReadMemberBytes(Handle, *Range, Bytes, Error)
             || !WorldArchiveCodec::DeserializeTexture(Bytes, Texture, Error)
             || Texture.TextureId != TextureId)
         {
@@ -2418,9 +2514,17 @@ bool FGWorldArchiveReader::ReadMeshBundle(
             OutError = TEXT("Requested skin.dat is missing");
             return false;
         }
+        IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+        TUniquePtr<IFileHandle> Handle(PlatformFile.OpenRead(*Path));
+        if (!Handle.IsValid() || Handle->Size() != FileSize)
+        {
+            OutBundle.Reset();
+            OutError = TEXT("The .gwd file changed or could not be opened for skin.dat");
+            return false;
+        }
         TArray<uint8> Bytes;
         FGWorldBakedSkin Skin;
-        if (!ReadMemberBytes(*Range, Bytes, OutError)
+        if (!ReadMemberBytes(Handle.Get(), *Range, Bytes, OutError)
             || !WorldArchiveCodec::DeserializeSkin(Bytes, Skin, OutError)
             || Skin.SkinIndex != SkinIndex)
         {

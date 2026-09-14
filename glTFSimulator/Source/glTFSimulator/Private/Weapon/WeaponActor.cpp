@@ -40,6 +40,32 @@ namespace
     constexpr int64 MaxWeaponConfigBytes = 16ll * 1024ll * 1024ll;
     constexpr int32 MaxRuntimeWeaponNodeCount = 500000;
 
+    FglTFRuntimeStaticMeshConfig MakeWeaponMeshConfig(AWeaponActor* Actor)
+    {
+        FglTFRuntimeStaticMeshConfig MeshConfig;
+        MeshConfig.Outer = Actor;
+        MeshConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
+        MeshConfig.MaterialsConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
+        MeshConfig.MaterialsConfig.bGeneratesMipMaps = false;
+        const int32 TextureDimensionLimit = UGameSettings::ResolveMaxTextureResolution(Actor);
+        MeshConfig.MaterialsConfig.ImagesConfig.MaxWidth = TextureDimensionLimit;
+        MeshConfig.MaterialsConfig.ImagesConfig.MaxHeight = TextureDimensionLimit;
+        MeshConfig.MaterialsConfig.ImagesConfig.bCompressMips = false;
+        MeshConfig.MaterialsConfig.ImagesConfig.bStreaming = false;
+        MeshConfig.MaterialsConfig.bLoadMipMaps = false;
+        if (UGameManagerSubSystem* GameManager = UGameManagerSubSystem::GetSubSystem(Actor))
+        {
+            glTFMaterialOverrideUtils::ApplyOverrides(
+                GameManager->GetMaterialDefaultReferences(),
+                MeshConfig.MaterialsConfig);
+        }
+        MeshConfig.bAllowCPUAccess = false;
+        MeshConfig.bBuildLumenCards = true;
+        MeshConfig.bBuildSimpleCollision = false;
+        MeshConfig.bBuildComplexCollision = false;
+        return MeshConfig;
+    }
+
     bool TryReadVector(const TSharedPtr<FJsonObject>& Object, const TCHAR* FieldName, FVector& Value)
     {
         if (!Object.IsValid())
@@ -336,6 +362,12 @@ void AWeaponActor::ReleaseRuntimeResources()
 
 void AWeaponActor::ClearLoadedComponents()
 {
+    ++AsyncMeshLoadGeneration;
+    PendingAsyncMeshLoads = 0;
+    bAsyncMeshLoadFailed = false;
+    bResumingAsyncMeshLoad = false;
+    bDispatchingAsyncMeshPreload = false;
+    PendingAsyncModelReference.Reset();
     TSet<UStaticMesh*> MeshesToRelease;
 
     for (UStaticMeshComponent* Component : MeshComponents)
@@ -385,46 +417,116 @@ UStaticMesh* AWeaponActor::LoadMeshByIndex(int32 MeshIndex)
         return Existing->Get();
     }
 
-    FglTFRuntimeStaticMeshConfig MeshConfig;
-    MeshConfig.Outer = this;
-    MeshConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
-    MeshConfig.MaterialsConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
-    MeshConfig.MaterialsConfig.bGeneratesMipMaps = false;
-    const int32 TextureDimensionLimit = UGameSettings::ResolveMaxTextureResolution(this);
-    MeshConfig.MaterialsConfig.ImagesConfig.MaxWidth = TextureDimensionLimit;
-    MeshConfig.MaterialsConfig.ImagesConfig.MaxHeight = TextureDimensionLimit;
-    MeshConfig.MaterialsConfig.ImagesConfig.bCompressMips = false;
-    MeshConfig.MaterialsConfig.ImagesConfig.bStreaming = false;
-    MeshConfig.MaterialsConfig.bLoadMipMaps = false;
-    if (UGameManagerSubSystem* GameManager = UGameManagerSubSystem::GetSubSystem(this))
-    {
-        glTFMaterialOverrideUtils::ApplyOverrides(
-            GameManager->GetMaterialDefaultReferences(),
-            MeshConfig.MaterialsConfig);
-    }
-    MeshConfig.bAllowCPUAccess = false;
-    MeshConfig.bBuildLumenCards = true;
-    MeshConfig.bBuildSimpleCollision = false;
-    MeshConfig.bBuildComplexCollision = false;
+    // Never hide an async-preload coverage bug behind a synchronous RuntimeLOD build. The latter
+    // can stall the game thread for an entire mesh, so a cache miss is treated as an assembly error.
+    UE_LOG(LogTemp, Error,
+        TEXT("WeaponActor: preloaded mesh cache miss; refusing synchronous fallback. Model=%s Mesh=%d"),
+        *ModelReference, MeshIndex);
+    return nullptr;
+}
 
-    UStaticMesh* Mesh = BakedAsset->LoadStaticMesh(MeshIndex, MeshConfig);
-    if (IsValid(Mesh))
+bool AWeaponActor::BeginAsyncMeshPreload()
+{
+    check(IsInGameThread());
+    if (!IsValid(BakedAsset)) return false;
+
+    TSet<int32> UniqueMeshIndices;
+    const int32 MeshCount = BakedAsset->GetNumMeshes();
+    for (const FglTFRuntimeNode& Node : BakedAsset->GetNodes())
     {
-        MeshCache.Add(MeshIndex, Mesh);
+        if (Node.MeshIndex >= 0 && Node.MeshIndex < MeshCount) UniqueMeshIndices.Add(Node.MeshIndex);
     }
-    return Mesh;
+    TArray<int32> MissingMeshIndices;
+    for (const int32 MeshIndex : UniqueMeshIndices)
+    {
+        if (TObjectPtr<UStaticMesh>* Existing = MeshCache.Find(MeshIndex); Existing && IsValid(Existing->Get())) continue;
+        MissingMeshIndices.Add(MeshIndex);
+    }
+    if (MissingMeshIndices.IsEmpty()) return false;
+
+    const uint64 Generation = ++AsyncMeshLoadGeneration;
+    PendingAsyncMeshLoads = MissingMeshIndices.Num();
+    bAsyncMeshLoadFailed = false;
+    bDispatchingAsyncMeshPreload = true;
+    PendingAsyncModelReference = ModelReference;
+    const FglTFRuntimeStaticMeshConfig MeshConfig = MakeWeaponMeshConfig(this);
+    TWeakObjectPtr<AWeaponActor> WeakThis(this);
+    for (const int32 MeshIndex : MissingMeshIndices)
+    {
+        BakedAsset->LoadStaticMeshAsyncNative(
+            MeshIndex,
+            [WeakThis, Generation, MeshIndex](UStaticMesh* Mesh)
+            {
+                if (AWeaponActor* Self = WeakThis.Get())
+                {
+                    Self->HandleAsyncMeshPreloadResult(Generation, MeshIndex, Mesh);
+                }
+            },
+            MeshConfig);
+    }
+    bDispatchingAsyncMeshPreload = false;
+    if (PendingAsyncMeshLoads == 0) FinishAsyncMeshPreload(Generation);
+    return true;
+}
+
+void AWeaponActor::HandleAsyncMeshPreloadResult(
+    const uint64 Generation, const int32 MeshIndex, UStaticMesh* Mesh)
+{
+    check(IsInGameThread());
+    if (Generation != AsyncMeshLoadGeneration || PendingAsyncMeshLoads <= 0) return;
+    if (IsValid(Mesh)) MeshCache.Add(MeshIndex, Mesh);
+    else bAsyncMeshLoadFailed = true;
+    --PendingAsyncMeshLoads;
+    if (PendingAsyncMeshLoads == 0 && !bDispatchingAsyncMeshPreload) FinishAsyncMeshPreload(Generation);
+}
+
+void AWeaponActor::FinishAsyncMeshPreload(const uint64 Generation)
+{
+    check(IsInGameThread());
+    if (Generation != AsyncMeshLoadGeneration || PendingAsyncMeshLoads != 0) return;
+    if (bAsyncMeshLoadFailed)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("WeaponActor: asynchronous mesh preload failed: %s"), *PendingAsyncModelReference);
+        BakedAsset = nullptr;
+        CreateDefaultBoxMesh();
+        return;
+    }
+
+    FResolvedRuntimeModel Model;
+    FString ResolveError;
+    if (!FRuntimeModelResolver::Resolve(this, PendingAsyncModelReference, Model, ResolveError))
+    {
+        UE_LOG(LogTemp, Warning, TEXT("WeaponActor: async-preloaded model no longer resolves: %s"), *ResolveError);
+        BakedAsset = nullptr;
+        CreateDefaultBoxMesh();
+        return;
+    }
+
+    bResumingAsyncMeshLoad = true;
+    const bool bFinished = LoadWeaponMesh(Model);
+    bResumingAsyncMeshLoad = false;
+    if (!bFinished) CreateDefaultBoxMesh();
 }
 
 bool AWeaponActor::LoadWeaponMesh(const FResolvedRuntimeModel& Model)
 {
-    ClearLoadedComponents();
+    const bool bResumeAsyncAssembly = bResumingAsyncMeshLoad
+        && IsValid(BakedAsset)
+        && Model.Reference == ModelReference;
+    if (!bResumeAsyncAssembly)
+    {
+        ClearLoadedComponents();
+    }
 
     FString LoadError;
-    BakedAsset = FRuntimeModelResolver::LoadAssetSynchronously(Model, LoadError);
-    if (!IsValid(BakedAsset))
+    if (!bResumeAsyncAssembly)
     {
-        UE_LOG(LogTemp, Warning, TEXT("WeaponActor: archive model load failed: %s"), *LoadError);
-        return false;
+        BakedAsset = FRuntimeModelResolver::LoadAssetSynchronously(Model, LoadError);
+        if (!IsValid(BakedAsset))
+        {
+            UE_LOG(LogTemp, Warning, TEXT("WeaponActor: archive model load failed: %s"), *LoadError);
+            return false;
+        }
     }
 
     int32 ComponentIndex = 0;
@@ -440,6 +542,12 @@ bool AWeaponActor::LoadWeaponMesh(const FResolvedRuntimeModel& Model)
         return false;
     }
     const int32 MeshCount = BakedAsset->GetNumMeshes();
+    if (!bResumeAsyncAssembly && BeginAsyncMeshPreload())
+    {
+        // EquipFromModel can attach the actor immediately; visual components arrive when the
+        // worker-prepared meshes have crossed the serialized finalization gate.
+        return true;
+    }
     for (const FglTFRuntimeNode& Node : Nodes)
     {
         if (Node.MeshIndex < 0 || Node.MeshIndex >= MeshCount || Node.Transform.ContainsNaN())

@@ -80,11 +80,11 @@ public:
 
     /** Maximum coarse scene actors spawned per update and mesh-group stream actions activated per frame. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Streaming", meta=(ClampMin="1", ClampMax="32"))
-    int32 StreamingSceneSpawnBudget = 2;
+    int32 StreamingSceneSpawnBudget = 24;
 
     /** Maximum node load/unload operations scheduled by one stream action frame. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Streaming", meta=(ClampMin="1", ClampMax="256"))
-    int32 StreamingNodeBudgetPerFrame = 32;
+    int32 StreamingNodeBudgetPerFrame = 256;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="SettingData|Quality", meta=(ClampMin="0", ClampMax="3"))
     int32 AntiAliasingQuality = 2;
