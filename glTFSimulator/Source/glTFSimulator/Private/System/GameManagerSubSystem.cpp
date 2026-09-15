@@ -54,6 +54,7 @@
 #include "System/WorldObjectStreamingSubsystem.h"
 #include "System/WorldSourceModelBuilder.h"
 #include "Camera/CameraComponent.h"
+#include "Camera/PlayerCameraManager.h"
 #include "Weather/WeatherSubsystem.h"
 #include "Blueprint/UserWidget.h"
 #include "Components/PrimitiveComponent.h"
@@ -83,17 +84,46 @@ namespace
     constexpr int32 MaxSavedSceneDataAttempts = 20; // Allow transient model-registration failures to settle for up to five seconds.
     constexpr float SavedSceneLoadRetryDelaySeconds = 0.25f;
 
-    // Global ocean is intentionally independent from Blueprint/GameMode transforms. Keeping one
-    // native transform prevents an unset BP default (Identity) from spawning a 1 cm water volume.
-    // 100000x on XY covers a very large world when the water mesh is authored at UE unit scale;
-    // the smaller Z scale keeps the overlap/post-process volume bounded around sea level.
+    // Global ocean water detection is height-based and infinite in XY; the actor exists only to
+    // render a camera-following surface. Keep the spawn transform unscaled, then size the mesh from
+    // its real asset bounds after BeginPlay has resolved AssetRegistry.WaterMesh. This avoids the old
+    // 100000x transform, which could amplify world-position/material precision artifacts needlessly.
     const FTransform& GetHardcodedOceanTransform()
     {
         static const FTransform Transform(
             FRotator::ZeroRotator,
             FVector(0.0, 0.0, 0.0),
-            FVector(100000.0, 100000.0, 10000.0));
+            FVector::OneVector);
         return Transform;
+    }
+
+    // UE perspective rendering is normally not governed by one finite far-clip distance, so derive
+    // a practical ocean radius from this project's visible-world controls instead. 8192 m at High
+    // tracks the intended long-range scene view; quality scales it to 4/6/8/12 km, while the object
+    // streaming radius can raise the floor. Overscan hides square-plane corners during camera yaw.
+    constexpr float OceanReferenceViewRadiusMeters = 8192.0f;
+    constexpr float OceanRenderOverscan = 1.125f;
+
+    // Keep a single plane below a 16.384 km half-width. This is deliberately much smaller than the
+    // previous giant transform while still exceeding the normal visible range. Camera-following makes
+    // the ocean effectively unbounded without feeding unnecessarily large coordinates into MI_Water.
+    constexpr float OceanMaterialSafeMaxRadiusCm = 1638400.0f;
+
+    float ResolveGlobalOceanRenderRadiusCm(const UGameSettings* Settings)
+    {
+        float ViewScale = 1.0f;
+        float ObjectRadiusMeters = 2048.0f;
+        if (IsValid(Settings))
+        {
+            ViewScale = Settings->GetViewDistanceScale();
+            ObjectRadiusMeters = Settings->GetEffectiveObjectStreamingRadiusMeters();
+        }
+
+        const float ViewRadiusMeters = OceanReferenceViewRadiusMeters
+            * FMath::Max(0.5f, ViewScale);
+        const float DesiredRadiusCm = FMath::Max(ViewRadiusMeters, ObjectRadiusMeters)
+            * OceanRenderOverscan * 100.0f;
+        return FMath::Clamp(DesiredRadiusCm, 100000.0f, OceanMaterialSafeMaxRadiusCm);
     }
 
     UClass* ResolveLegacyWaterActorClass()
@@ -2586,34 +2616,112 @@ void UGameManagerSubSystem::SpawnOcean()
     {
         OceanClass = AWaterActor::StaticClass();
     }
-    const FTransform& HardcodedOceanTransform = GetHardcodedOceanTransform();
-    OceanTransform = HardcodedOceanTransform;
+    FTransform OceanSpawnTransform = GetHardcodedOceanTransform();
+    FVector OceanSpawnLocation = OceanSpawnTransform.GetLocation();
+    OceanSpawnLocation.Z = IsValid(ActiveWorldData) && FMath::IsFinite(ActiveWorldData->OceanHeightCm)
+        ? ActiveWorldData->OceanHeightCm
+        : OceanSpawnLocation.Z;
+    OceanSpawnTransform.SetLocation(OceanSpawnLocation);
+    OceanTransform = OceanSpawnTransform;
     UE_LOG(LogTemp, Display,
         TEXT("Spawning global ocean. bOcean=true Class=%s Location=%s Scale=%s"),
         *GetNameSafe(OceanClass),
-        *HardcodedOceanTransform.GetLocation().ToCompactString(),
-        *HardcodedOceanTransform.GetScale3D().ToCompactString());
-    OceanActor = World->SpawnActor<AActor>(OceanClass, HardcodedOceanTransform, SpawnParams);
+        *OceanSpawnTransform.GetLocation().ToCompactString(),
+        *OceanSpawnTransform.GetScale3D().ToCompactString());
+    auto SpawnGlobalOceanDeferred =
+        [World, &SpawnParams, &OceanSpawnTransform](UClass* Class) -> AActor*
+        {
+            AActor* DeferredActor = FActorHelper::SpawnActorDeferred<AActor>(
+                World, Class, OceanSpawnTransform, SpawnParams);
+            if (!IsValid(DeferredActor))
+            {
+                return nullptr;
+            }
+
+            // Set the global-ocean role before BeginPlay. AWaterActor can therefore skip its
+            // legacy local underwater post-process material and avoid a synchronous shader load.
+            if (AWaterActor* WaterActor = Cast<AWaterActor>(DeferredActor))
+            {
+                WaterActor->SetGlobalOcean(true);
+            }
+            DeferredActor->FinishSpawning(OceanSpawnTransform);
+            return DeferredActor;
+        };
+
+    OceanActor = SpawnGlobalOceanDeferred(OceanClass);
     if (!IsValid(OceanActor) && OceanClass != AWaterActor::StaticClass())
     {
         UE_LOG(LogTemp, Warning,
             TEXT("Configured water actor class failed to spawn ocean; retrying native AWaterActor. Class=%s"),
             *GetNameSafe(OceanClass));
-        OceanActor = World->SpawnActor<AActor>(AWaterActor::StaticClass(), HardcodedOceanTransform, SpawnParams);
+        OceanActor = SpawnGlobalOceanDeferred(AWaterActor::StaticClass());
     }
 
     if (IsValid(OceanActor))
     {
-        OceanActor->SetActorTransform(HardcodedOceanTransform, false, nullptr, ETeleportType::TeleportPhysics);
+        OceanActor->SetActorTransform(OceanSpawnTransform, false, nullptr, ETeleportType::TeleportPhysics);
+        if (AWaterActor* WaterActor = Cast<AWaterActor>(OceanActor))
+        {
+            WaterActor->SetGlobalOceanRenderRadius(
+                ResolveGlobalOceanRenderRadiusCm(GetGameSettings()));
+        }
         UE_LOG(LogTemp, Display,
-            TEXT("Global ocean spawned with native hardcoded transform. Class=%s Location=%s Scale=%s"),
+            TEXT("Global ocean spawned. Height-based water detection enabled. Class=%s Location=%s Scale=%s"),
             *GetNameSafe(OceanActor->GetClass()),
-            *HardcodedOceanTransform.GetLocation().ToCompactString(),
-            *HardcodedOceanTransform.GetScale3D().ToCompactString());
+            *OceanActor->GetActorLocation().ToCompactString(),
+            *OceanActor->GetActorScale3D().ToCompactString());
     }
     else
     {
         UE_LOG(LogTemp, Error, TEXT("Global ocean spawn failed even after native AWaterActor fallback."));
+    }
+}
+
+void UGameManagerSubSystem::UpdateOceanFollow()
+{
+    // Local view effects are updated even without the global ocean because streamed local water
+    // actors and WaterExclusion boxes share the same post-process management path.
+    FVector ViewLocation = PlayerLocation;
+    if (UWorld* World = GetWorld())
+    {
+        if (APlayerController* PlayerController = World->GetFirstPlayerController();
+            IsValid(PlayerController) && IsValid(PlayerController->PlayerCameraManager))
+        {
+            ViewLocation = PlayerController->PlayerCameraManager->GetCameraLocation();
+        }
+        else if (IsValid(CurrentCamera.Get()))
+        {
+            ViewLocation = CurrentCamera->GetComponentLocation();
+        }
+    }
+    else if (IsValid(CurrentCamera.Get()))
+    {
+        ViewLocation = CurrentCamera->GetComponentLocation();
+    }
+
+    AWaterActor::UpdateLocalViewWaterEffects(this, ViewLocation);
+
+    if (!IsValid(OceanActor))
+    {
+        return;
+    }
+
+    if (AWaterActor* WaterActor = Cast<AWaterActor>(OceanActor))
+    {
+        // The call is cheap after the first application and also makes a live View Distance /
+        // streaming-radius setting change resize the surface without recreating the ocean actor.
+        WaterActor->SetGlobalOceanRenderRadius(
+            ResolveGlobalOceanRenderRadiusCm(GetGameSettings()));
+    }
+
+    FVector DesiredLocation = OceanActor->GetActorLocation();
+    DesiredLocation.X = ViewLocation.X;
+    DesiredLocation.Y = ViewLocation.Y;
+    DesiredLocation.Z = OceanTransform.GetLocation().Z;
+
+    if (!DesiredLocation.Equals(OceanActor->GetActorLocation(), 0.01))
+    {
+        OceanActor->SetActorLocation(DesiredLocation, false, nullptr, ETeleportType::TeleportPhysics);
     }
 }
 
@@ -2653,6 +2761,7 @@ void UGameManagerSubSystem::StartGameplayWorldStreaming(const FString& InWorldRo
 
 void UGameManagerSubSystem::UpdateGameManager(float DeltaSeconds)
 {
+    UpdateOceanFollow();
     UpdateWorldTime(DeltaSeconds);
 
     if (PlayMode != EPlayMode::Creator || CurrentMode == EToolMode::None)

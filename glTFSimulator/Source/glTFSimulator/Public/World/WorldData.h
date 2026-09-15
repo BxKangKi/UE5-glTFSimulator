@@ -169,8 +169,12 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level")
     float TimeSpeed;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level")
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level|Water")
     bool bOcean;
+
+    /** Fixed global-ocean surface height. The ocean follows the local camera in XY only. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level|Water", meta=(EditCondition="bOcean", Units="cm"))
+    double OceanHeightCm = 0.0;
 
     /** Allows this world to discover and mount Character/Dynamic .gasset packs from glTFSimulator/Resources. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Level")

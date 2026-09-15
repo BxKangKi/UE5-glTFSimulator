@@ -8,6 +8,8 @@
  */
 
 #include "World/BuoyancyComponent.h"
+#include "World/WaterExclusionBoxComponent.h"
+#include "World/WaterActor.h"
 
 #include "Async/ParallelFor.h"
 #include "Components/PrimitiveComponent.h"
@@ -33,6 +35,20 @@ struct FSkeletalBuoyancyWorkItem
     FName BoneName = NAME_None;
     FBuoyancyPhysicsSettings PhysicsSettings;
 };
+
+static bool IsExcludedFromBuoyancy(
+    const FVector& WorldLocation,
+    const TArray<FWaterExclusionNativeBox>& ExclusionBoxes)
+{
+    for (const FWaterExclusionNativeBox& Box : ExclusionBoxes)
+    {
+        if (Box.Contains(WorldLocation))
+        {
+            return true;
+        }
+    }
+    return false;
+}
 
 static bool IsSkeletalBodySimulatingPhysics(const USkeletalMeshComponent* SkeletalMesh, const FName BoneName)
 {
@@ -546,6 +562,10 @@ void UBuoyancyComponent::BeginPlay()
     TargetPrimitive = ResolveTargetPrimitive();
     RebuildSamplePoints();
     SetComponentTickEnabled(false);
+
+    // Global ocean detection is height-based and intentionally has no overlap volume. Keep a cheap
+    // registered update so a dry object can become submerged solely by crossing OceanHeightCm.
+    RegisterGameUpdate();
 }
 
 void UBuoyancyComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
@@ -697,7 +717,9 @@ void UBuoyancyComponent::RebuildSamplePoints()
 
 void UBuoyancyComponent::EnterWater(const float Level)
 {
+    bOverlapWater = true;
     bInWater = true;
+    OverlapWaterLevel = Level;
     WaterLevel = Level;
 
     UPrimitiveComponent* NewPrimitive = ResolveTargetPrimitive();
@@ -712,12 +734,13 @@ void UBuoyancyComponent::EnterWater(const float Level)
 
 void UBuoyancyComponent::ExitWater(const float Level)
 {
-    WaterLevel = Level;
+    OverlapWaterLevel = Level;
+    bOverlapWater = false;
     bInWater = false;
-    UnregisterGameUpdate();
+    // Do not unregister: the global ocean has no collision event that could register us again.
 }
 
-bool UBuoyancyComponent::ApplySkeletalMeshBuoyancy(USkeletalMeshComponent* SkeletalMesh, float DeltaTime)
+bool UBuoyancyComponent::ApplySkeletalMeshBuoyancy(USkeletalMeshComponent* SkeletalMesh, float DeltaTime, const TArray<FWaterExclusionNativeBox>& ExclusionBoxes)
 {
     if (!SkeletalMeshSettings.bApplyToSimulatingBodies || !IsValid(SkeletalMesh) || DeltaTime <= SMALL_NUMBER)
     {
@@ -830,9 +853,13 @@ bool UBuoyancyComponent::ApplySkeletalMeshBuoyancy(USkeletalMeshComponent* Skele
         TArray<FBuoyancySampleResult> Results;
         Results.SetNum(SampleItems.Num());
 
-        const auto CalculateSkeletalSample = [CurrentWaterLevel, UpVector, GravityMagnitude, TotalMass, PrimarySampleCount, MassPerPrimarySample, &SampleItems, &WorldPoints, &PointVelocities, &PointPhysicsSettings, &Results](int32 Index)
+        const auto CalculateSkeletalSample = [CurrentWaterLevel, UpVector, GravityMagnitude, TotalMass, PrimarySampleCount, MassPerPrimarySample, &SampleItems, &WorldPoints, &PointVelocities, &PointPhysicsSettings, &ExclusionBoxes, &Results](int32 Index)
         {
             const FVector& WorldPoint = WorldPoints[Index];
+            if (IsExcludedFromBuoyancy(WorldPoint, ExclusionBoxes))
+            {
+                return;
+            }
             const FBuoyancyPhysicsSettings& PhysicsSettings = PointPhysicsSettings[Index];
             const float SafeSubmersionDepth = FMath::Max(1.0f, PhysicsSettings.SubmersionDepth);
             const float Depth = CurrentWaterLevel - WorldPoint.Z;
@@ -930,7 +957,12 @@ bool UBuoyancyComponent::ApplySkeletalMeshBuoyancy(USkeletalMeshComponent* Skele
 
                 const FBuoyancyPhysicsSettings& PhysicsSettings = Item.PhysicsSettings;
                 const float SafeSubmersionDepth = FMath::Max(1.0f, PhysicsSettings.SubmersionDepth);
-                const float Depth = CurrentWaterLevel - SkeletalMesh->GetBoneLocation(Item.BoneName).Z;
+                const FVector BoneWorldLocation = SkeletalMesh->GetBoneLocation(Item.BoneName);
+                if (IsExcludedFromBuoyancy(BoneWorldLocation, ExclusionBoxes))
+                {
+                    continue;
+                }
+                const float Depth = CurrentWaterLevel - BoneWorldLocation.Z;
                 if (Depth <= 0.0f)
                 {
                     continue;
@@ -976,6 +1008,10 @@ bool UBuoyancyComponent::ApplySkeletalMeshBuoyancy(USkeletalMeshComponent* Skele
 
     for (const FName& BoneName : SimulatedBones)
     {
+        if (IsExcludedFromBuoyancy(SkeletalMesh->GetBoneLocation(BoneName), ExclusionBoxes))
+        {
+            continue;
+        }
         const FSkeletalBuoyancyBoneRule* Rule = FindSkeletalBuoyancyBoneRule(SkeletalMeshSettings, BoneName);
         const FBuoyancyPhysicsSettings BonePhysicsSettings = ResolveBuoyancyPhysicsSettings(CommonPhysicsSettings, Rule);
         ApplySkeletalBoneWaterVelocityLimits(SkeletalMesh, BoneName, CurrentWaterLevel, DeltaTime, BonePhysicsSettings);
@@ -994,7 +1030,7 @@ void UBuoyancyComponent::UpdateBuoyancyFromGameUpdate(float DeltaTime)
         return;
     }
 
-    if (!bInWater || DeltaTime <= SMALL_NUMBER)
+    if (DeltaTime <= SMALL_NUMBER)
     {
         return;
     }
@@ -1013,13 +1049,44 @@ void UBuoyancyComponent::UpdateBuoyancyFromGameUpdate(float DeltaTime)
 
     if (!IsPrimitiveReadyForForces(Primitive))
     {
+        bInWater = bOverlapWater;
         return;
     }
+
+    float EffectiveWaterLevel = OverlapWaterLevel;
+    bool bHasEffectiveWater = bOverlapWater;
+
+    float GlobalOceanLevel = 0.0f;
+    if (AWaterActor::FindGlobalOceanLevel(this, GlobalOceanLevel))
+    {
+        const FBoxSphereBounds PrimitiveBounds = Primitive->CalcBounds(Primitive->GetComponentTransform());
+        const float LowestPointZ = PrimitiveBounds.Origin.Z - PrimitiveBounds.BoxExtent.Z;
+        if (LowestPointZ <= GlobalOceanLevel)
+        {
+            EffectiveWaterLevel = bHasEffectiveWater
+                ? FMath::Max(EffectiveWaterLevel, GlobalOceanLevel)
+                : GlobalOceanLevel;
+            bHasEffectiveWater = true;
+        }
+    }
+
+    bInWater = bHasEffectiveWater;
+    if (!bHasEffectiveWater)
+    {
+        return;
+    }
+    WaterLevel = EffectiveWaterLevel;
+
+    TArray<FWaterExclusionNativeBox> BuoyancyExclusionBoxes;
+    UWaterExclusionBoxComponent::GatherNativeBoxes(
+        this,
+        EWaterExclusionFeature::Buoyancy,
+        BuoyancyExclusionBoxes);
 
     // Skeletal meshes use per-body sampling and bone rules. The generic primitive path is only for non-skeletal physics.
     if (USkeletalMeshComponent* SkeletalMesh = Cast<USkeletalMeshComponent>(Primitive))
     {
-        ApplySkeletalMeshBuoyancy(SkeletalMesh, DeltaTime);
+        ApplySkeletalMeshBuoyancy(SkeletalMesh, DeltaTime, BuoyancyExclusionBoxes);
         return;
     }
 
@@ -1069,9 +1136,13 @@ void UBuoyancyComponent::UpdateBuoyancyFromGameUpdate(float DeltaTime)
     TArray<FBuoyancySampleResult> Results;
     Results.SetNum(LocalSamplePoints.Num());
 
-    const auto CalculatePrimitiveSample = [CurrentWaterLevel, UpVector, SafeSubmersionDepth, ForceLimitPerSample, DragLimitPerSample, MassPerSample, PhysicsSettings, &WorldPoints, &PointVelocities, &Results](int32 Index)
+    const auto CalculatePrimitiveSample = [CurrentWaterLevel, UpVector, SafeSubmersionDepth, ForceLimitPerSample, DragLimitPerSample, MassPerSample, PhysicsSettings, &WorldPoints, &PointVelocities, &BuoyancyExclusionBoxes, &Results](int32 Index)
     {
         const FVector& WorldPoint = WorldPoints[Index];
+        if (IsExcludedFromBuoyancy(WorldPoint, BuoyancyExclusionBoxes))
+        {
+            return;
+        }
         const float Depth = CurrentWaterLevel - WorldPoint.Z;
         if (Depth <= 0.0f)
         {

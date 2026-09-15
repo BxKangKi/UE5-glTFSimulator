@@ -18,9 +18,14 @@
 #include "Components/SkyLightComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Components/VolumetricCloudComponent.h"
+#include "Engine/AssetManager.h"
+#include "Engine/StreamableManager.h"
+#include "Engine/StaticMesh.h"
 #include "Engine/World.h"
 #include "Materials/MaterialInterface.h"
 #include "Materials/MaterialInstanceDynamic.h"
+#include "Materials/MaterialParameterCollection.h"
+#include "Materials/MaterialParameterCollectionInstance.h"
 #include "Setting/GameSettings.h"
 #include "System/GameManagerSubSystem.h"
 #include "System/GlTFSimulatorGameInstance.h"
@@ -205,17 +210,19 @@ void AWorldEnvManager::BeginPlay()
 {
     Super::BeginPlay();
 
-    if (UGlTFSimulatorAssetRegistry* Registry = UGlTFSimulatorGameInstance::GetAssetRegistryFromContext(this))
+    SubSystem = UGameManagerSubSystem::GetSubSystem(this);
+    if (UGameManagerSubSystem* GameManager = SubSystem.Get())
     {
-        CloudMaterial = Registry->CloudMaterial.IsNull() ? nullptr : Registry->CloudMaterial.LoadSynchronous();
-        if (IsValid(Skybox) && !Registry->SkyboxMesh.IsNull())
-        {
-            Skybox->SetStaticMesh(Registry->SkyboxMesh.LoadSynchronous());
-        }
+        // This is the one project-wide post-process component. GameSettings and the unified
+        // cel/ocean material both target this component rather than maintaining parallel PP actors.
+        GameManager->SetPostProcess(PostProcess);
     }
 
-    SubSystem = UGameManagerSubSystem::GetSubSystem(this);
     PrepareForWorldLoading();
+
+    // Start package I/O before settings/world initialization so shader/sky asset loading overlaps
+    // the remaining startup work instead of sitting behind it on the critical path.
+    QueueEnvironmentAssetLoad();
     ConfigureRenderingSettings();
 
     // Placed WorldEnvManager actors can begin rendering once GameManagerSubSystem has already loaded world data.
@@ -295,8 +302,150 @@ void AWorldEnvManager::EnsureCoreSkyVisible()
     }
 }
 
+void AWorldEnvManager::QueueEnvironmentAssetLoad()
+{
+    check(IsInGameThread());
+
+    UGlTFSimulatorAssetRegistry* Registry =
+        UGlTFSimulatorGameInstance::GetAssetRegistryFromContext(this);
+    if (!IsValid(Registry))
+    {
+        return;
+    }
+
+    TArray<FSoftObjectPath> AssetsToLoad;
+    AssetsToLoad.Reserve(4);
+    const auto AddSoftPath = [&AssetsToLoad](const FSoftObjectPath& Path)
+    {
+        if (Path.IsValid())
+        {
+            AssetsToLoad.AddUnique(Path);
+        }
+    };
+
+    AddSoftPath(Registry->CloudMaterial.ToSoftObjectPath());
+    AddSoftPath(Registry->SkyboxMesh.ToSoftObjectPath());
+    AddSoftPath(Registry->GlobalPostProcessMaterial.ToSoftObjectPath());
+    AddSoftPath(Registry->ShaderLibraryMPC.ToSoftObjectPath());
+
+    if (AssetsToLoad.IsEmpty())
+    {
+        HandleEnvironmentAssetsReady();
+        return;
+    }
+
+    EnvironmentAssetLoadHandle = UAssetManager::GetStreamableManager().RequestAsyncLoad(
+        AssetsToLoad,
+        FStreamableDelegate::CreateUObject(this, &AWorldEnvManager::HandleEnvironmentAssetsReady));
+
+    if (!EnvironmentAssetLoadHandle.IsValid())
+    {
+        // RequestAsyncLoad can fail during teardown. Do not fall back to blocking loads here:
+        // the procedural atmosphere remains a valid dependency-free fallback.
+        UE_LOG(LogTemp, Warning,
+            TEXT("WorldEnvManager could not queue environment shader assets for async loading."));
+    }
+}
+
+void AWorldEnvManager::HandleEnvironmentAssetsReady()
+{
+    check(IsInGameThread());
+
+    UGlTFSimulatorAssetRegistry* Registry =
+        UGlTFSimulatorGameInstance::GetAssetRegistryFromContext(this);
+    if (!IsValid(Registry))
+    {
+        EnvironmentAssetLoadHandle.Reset();
+        return;
+    }
+
+    if (!Registry->CloudMaterial.IsNull())
+    {
+        CloudMaterial = Registry->CloudMaterial.Get();
+    }
+
+    if (IsValid(Skybox) && !Registry->SkyboxMesh.IsNull())
+    {
+        if (UStaticMesh* LoadedSkybox = Registry->SkyboxMesh.Get())
+        {
+            Skybox->SetStaticMesh(LoadedSkybox);
+        }
+    }
+
+    if (!Registry->GlobalPostProcessMaterial.IsNull())
+    {
+        GlobalPostProcessMaterial = Registry->GlobalPostProcessMaterial.Get();
+        if (IsValid(PostProcess) && IsValid(GlobalPostProcessMaterial))
+        {
+            // The shader library is intentionally a single global blendable: cel shading and
+            // underwater rendering are branches of this one material. Remove legacy authored
+            // blendables (including the former standalone cel-shading material) before attaching it.
+            PostProcess->Settings.WeightedBlendables.Array.Reset();
+            PostProcess->AddOrUpdateBlendable(GlobalPostProcessMaterial, 1.0f);
+        }
+    }
+
+    if (!Registry->ShaderLibraryMPC.IsNull())
+    {
+        ShaderLibraryMPC = Registry->ShaderLibraryMPC.Get();
+    }
+
+    // Components/UProperties above now own strong references to every asset we need. Releasing the
+    // streamable handle here cannot make the just-loaded shader assets disappear at the next GC.
+    EnvironmentAssetLoadHandle.Reset();
+
+    ApplyCloudSettings();
+    RefreshShaderLibraryParameters();
+}
+
+void AWorldEnvManager::RefreshShaderLibraryParameters()
+{
+    check(IsInGameThread());
+
+    if (!IsValid(ShaderLibraryMPC))
+    {
+        return;
+    }
+
+    UWorld* World = GetWorld();
+    if (!World)
+    {
+        return;
+    }
+
+    UMaterialParameterCollectionInstance* Parameters =
+        World->GetParameterCollectionInstance(ShaderLibraryMPC);
+    if (!IsValid(Parameters))
+    {
+        return;
+    }
+
+    const bool bOceanEnabled = IsValid(Data) && Data->bOcean;
+    const float OceanHeight = bOceanEnabled && FMath::IsFinite(Data->OceanHeightCm)
+        ? static_cast<float>(Data->OceanHeightCm)
+        : 0.0f;
+
+    float CelShadingMode = 1.0f;
+    if (UGameManagerSubSystem* GameManager = SubSystem.Get())
+    {
+        if (const UGameSettings* Settings = GameManager->GetGameSettings())
+        {
+            CelShadingMode = Settings->CelShadingMode >= 0.5f ? 1.0f : 0.0f;
+        }
+    }
+
+    Parameters->SetScalarParameterValue(TEXT("OceanHeight"), OceanHeight);
+    Parameters->SetScalarParameterValue(TEXT("OceanEnabled"), bOceanEnabled ? 1.0f : 0.0f);
+    Parameters->SetScalarParameterValue(TEXT("CelShadingMode"), CelShadingMode);
+}
+
 void AWorldEnvManager::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+    if (EnvironmentAssetLoadHandle.IsValid())
+    {
+        EnvironmentAssetLoadHandle->CancelHandle();
+        EnvironmentAssetLoadHandle.Reset();
+    }
     StopRendering();
     SubSystem.Reset();
     Super::EndPlay(EndPlayReason);
@@ -315,6 +464,7 @@ void AWorldEnvManager::InitializeRendering(UWorldData* InWorldData)
     PrepareForWorldLoading();
     ConfigureRenderingSettings();
     ApplyCloudSettings();
+    RefreshShaderLibraryParameters();
     RegisterGameUpdate();
     UpdateSkyLighting();
 }
@@ -325,6 +475,9 @@ void AWorldEnvManager::StopRendering()
     UnregisterGameUpdate();
     ReleaseDynamicRenderingResources();
     Data = nullptr;
+    // Clear world-dependent MPC state as soon as rendering stops so a persistent/placed
+    // environment manager cannot leave underwater shading enabled between world loads.
+    RefreshShaderLibraryParameters();
 }
 
 void AWorldEnvManager::ConfigureRenderingSettings()
@@ -412,6 +565,7 @@ void AWorldEnvManager::RefreshRuntimeSettings()
     }
 
     ApplyCloudSettings();
+    RefreshShaderLibraryParameters();
 }
 
 void AWorldEnvManager::ApplyCloudSettings()

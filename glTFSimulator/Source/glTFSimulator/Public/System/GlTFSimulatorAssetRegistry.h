@@ -27,6 +27,7 @@ class UStartWorldWidget;
 class UWorldSelectionWidget;
 class UProjectSelectionWidget;
 class UMaterialInterface;
+class UMaterialParameterCollection;
 class UStaticMesh;
 class USkeletalMesh;
 class UPhysicsAsset;
@@ -190,6 +191,14 @@ public:
 
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Rendering")
     TSoftObjectPtr<UMaterialInterface> StaticDecalLightMaterial;
+
+    /** One unbound post-process material containing cel shading and global ocean underwater effects. */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Rendering")
+    TSoftObjectPtr<UMaterialInterface> GlobalPostProcessMaterial;
+
+    /** Shared shader parameter collection used by global post-process/environment shaders. */
+    UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Rendering")
+    TSoftObjectPtr<UMaterialParameterCollection> ShaderLibraryMPC;
 
     UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category="Environment")
     TSoftObjectPtr<UStaticMesh> SkyboxMesh;

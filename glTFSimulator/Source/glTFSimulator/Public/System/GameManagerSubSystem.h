@@ -901,6 +901,8 @@ private:
     int32 FindAvailableItemIndexMatching(const FToolbarItem& Item) const;
     bool ShouldSpawnOcean() const;
     void SpawnOcean();
+    /** Keeps the global ocean centered on the local camera in XY while preserving authored sea level Z. */
+    void UpdateOceanFollow();
     void StartGameplayWorldStreaming(const FString& InWorldRoot, const FString& InInitialPlayerName);
     void InitializeRuntimeWorldState();
     void SpawnWorldEnvManager();

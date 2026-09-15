@@ -115,6 +115,7 @@ private:
     bool bPendingPlayerIsInitialLoad = false;
     bool bPlayerActivated = false;
     bool bRenderOnlyStreaming = false;
+    bool bInitialBurstUpdateQueued = false;
 
     TWeakObjectPtr<ACharacterController> ActivePlayerCharacter;
     double PlayerActorWaitStartedAt = 0.0;
@@ -128,6 +129,8 @@ private:
     FTimerHandle TimerHandle_WaitPlayer;
 
     void UpdateStreaming();
+    void QueueInitialStreamingBurst();
+    void RunInitialStreamingBurst();
     void ScheduleStreamingUpdates();
     bool IsPlayerInsideSceneRange(const FModelData& Bounds, float RadiusMultiplier) const;
     FVector GetPlayerLocation() const;

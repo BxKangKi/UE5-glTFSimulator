@@ -24,6 +24,8 @@ class USkyLightComponent;
 class UVolumetricCloudComponent;
 class UMaterialInterface;
 class UMaterialInstanceDynamic;
+class UMaterialParameterCollection;
+struct FStreamableHandle;
 class UExponentialHeightFogComponent;
 class UGameUpdateSubSystem;
 
@@ -104,6 +106,11 @@ private:
     /** Re-enables the native core components even when a Blueprint default hid one of them. */
     void EnsureCoreSkyVisible();
 
+    /** Starts one non-blocking batch for environment shader/sky assets from the AssetRegistry. */
+    void QueueEnvironmentAssetLoad();
+    void HandleEnvironmentAssetsReady();
+    void RefreshShaderLibraryParameters();
+
     /** Reads current settings and creates optional fog/cloud components. */
     void ConfigureRenderingSettings();
     void ApplyCloudSettings();
@@ -129,6 +136,15 @@ private:
 
     UPROPERTY(Transient)
     TObjectPtr<UExponentialHeightFogComponent> Fog;
+
+    /** Strong refs for asynchronously resolved global shader assets. */
+    UPROPERTY(Transient)
+    TObjectPtr<UMaterialInterface> GlobalPostProcessMaterial;
+
+    UPROPERTY(Transient)
+    TObjectPtr<UMaterialParameterCollection> ShaderLibraryMPC;
+
+    TSharedPtr<FStreamableHandle> EnvironmentAssetLoadHandle;
 
     /** Non-owning reference: the game-instance subsystem outlives this world actor. */
     UPROPERTY(Transient)

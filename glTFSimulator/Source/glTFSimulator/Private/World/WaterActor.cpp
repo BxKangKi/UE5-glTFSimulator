@@ -9,6 +9,8 @@
  */
 
 #include "World/WaterActor.h"
+#include "World/WaterExclusionBoxComponent.h"
+#include "World/BuoyancyComponent.h"
 #include "System/GlTFSimulatorGameInstance.h"
 #include "System/GlTFSimulatorAssetRegistry.h"
 #include "Character/CharacterController.h"
@@ -17,17 +19,25 @@
 #include "Components/StaticMeshComponent.h"
 #include "Engine/StaticMesh.h"
 #include "Components/PostProcessComponent.h"
-#include "GameFramework/PhysicsVolume.h"
 #include "Materials/MaterialInterface.h"
+#include "Materials/MaterialInstanceDynamic.h"
 #include "Components/DecalComponent.h"
 #include "Components/ActorComponent.h"
 #include "Engine/World.h"
 
 namespace
 {
+    constexpr int32 MaxWaterRenderExclusionBoxes = 8;
+
+    FName MakeIndexedWaterParameterName(const TCHAR* Prefix, const int32 Index)
+    {
+        return FName(*FString::Printf(TEXT("%s_%d"), Prefix, Index));
+    }
+
     // Water probes can execute several times per frame. A weak per-world registry avoids a full
     // actor iterator for each probe while still allowing actors to disappear safely during travel.
     TMap<const UWorld*, TArray<TWeakObjectPtr<AWaterActor>>> GWaterActorsByWorld;
+    TMap<const UWorld*, TWeakObjectPtr<AWaterActor>> GGlobalOceanByWorld;
 
     void RegisterWaterActor(AWaterActor* WaterActor)
     {
@@ -58,6 +68,12 @@ namespace
         if (WaterActors->IsEmpty())
         {
             GWaterActorsByWorld.Remove(World);
+        }
+
+        if (TWeakObjectPtr<AWaterActor>* GlobalOcean = GGlobalOceanByWorld.Find(World);
+            GlobalOcean && (!GlobalOcean->IsValid() || GlobalOcean->Get() == WaterActor))
+        {
+            GGlobalOceanByWorld.Remove(World);
         }
     }
 }
@@ -104,9 +120,9 @@ void AWaterActor::BeginPlay()
     // component presets that override constructor defaults. Water must overlap, never block.
     if (IsValid(Collision.Get()))
     {
-        Collision->SetCollisionEnabled(ECollisionEnabled::QueryOnly);
+        Collision->SetCollisionEnabled(bGlobalOcean ? ECollisionEnabled::NoCollision : ECollisionEnabled::QueryOnly);
         Collision->SetCollisionResponseToAllChannels(ECR_Overlap);
-        Collision->SetGenerateOverlapEvents(true);
+        Collision->SetGenerateOverlapEvents(!bGlobalOcean);
         Collision->SetCanEverAffectNavigation(false);
     }
     if (IsValid(StaticMesh.Get()))
@@ -127,7 +143,7 @@ void AWaterActor::BeginPlay()
                 DecalMaterial = RegistryDecal;
             }
         }
-        if (!Registry->UnderWaterMaterial.IsNull())
+        if (!bGlobalOcean && !Registry->UnderWaterMaterial.IsNull())
         {
             if (UMaterialInterface* RegistryUnderWater = Registry->UnderWaterMaterial.LoadSynchronous())
             {
@@ -168,7 +184,7 @@ void AWaterActor::BeginPlay()
         DecalMaterial = LoadObject<UMaterialInterface>(
             nullptr, TEXT("/Game/Resources/Materials/MI_Caustics.MI_Caustics"));
     }
-    if (!IsValid(UnderWaterMaterial))
+    if (!bGlobalOcean && !IsValid(UnderWaterMaterial))
     {
         UnderWaterMaterial = LoadObject<UMaterialInterface>(
             nullptr, TEXT("/Game/Resources/Materials/MPPI_UnderWater.MPPI_UnderWater"));
@@ -183,21 +199,25 @@ void AWaterActor::BeginPlay()
 
     RegisterWaterActor(this);
     SetCurrentLevel();
-    APhysicsVolume *Volume = Collision->GetPhysicsVolume();
-    if (Volume)
+    if (!bGlobalOcean)
     {
-        Volume->bWaterVolume = true;
+        bAuthoredPostProcessEnabled = IsValid(PostProcess.Get()) ? PostProcess->bEnabled : true;
     }
+    EnsureWaterMaterialInstances();
+    ApplyWaterExclusionRenderParameters();
     UMaterialInstanceDynamic *DecalMID = IsValid(DecalMaterial) ? UMaterialInstanceDynamic::Create(DecalMaterial, this) : nullptr;
     if (DecalMID)
     {
         DecalMID->SetScalarParameterValue(TEXT("WaterLevel"), Level);
         Decal->SetDecalMaterial(DecalMID);
     }
-    UMaterialInstanceDynamic *PostProcessMID = IsValid(UnderWaterMaterial) ? UMaterialInstanceDynamic::Create(UnderWaterMaterial, this) : nullptr;
+    // The global ocean no longer owns an underwater PP material. WorldEnvManager's single
+    // unbound GlobalPostProcessMaterial reads OceanHeight/OceanEnabled from ShaderLibraryMPC.
+    UMaterialInstanceDynamic *PostProcessMID = !bGlobalOcean && IsValid(UnderWaterMaterial)
+        ? UMaterialInstanceDynamic::Create(UnderWaterMaterial, this)
+        : nullptr;
     if (PostProcessMID)
     {
-        // 2. Add this to the post-process component Blendables array with weight 1.0.
         PostProcess->AddOrUpdateBlendable(PostProcessMID, 1.0f);
         PostProcessMID->SetScalarParameterValue(FName("WaterLevel"), Level);
     }
@@ -209,6 +229,109 @@ void AWaterActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
     Super::EndPlay(EndPlayReason);
 }
 
+void AWaterActor::SetGlobalOcean(const bool bInGlobalOcean)
+{
+    bGlobalOcean = bInGlobalOcean;
+    SetCurrentLevel();
+
+    if (UWorld* World = GetWorld())
+    {
+        if (bGlobalOcean)
+        {
+            GGlobalOceanByWorld.Add(World, this);
+        }
+        else if (TWeakObjectPtr<AWaterActor>* Existing = GGlobalOceanByWorld.Find(World);
+            Existing && Existing->Get() == this)
+        {
+            GGlobalOceanByWorld.Remove(World);
+        }
+    }
+
+    // The global ocean is an infinite XY half-space below Level. Its collision box is rendering
+    // scaffolding only and must never determine water presence. Local/streamed water actors retain
+    // their normal overlap volume behaviour.
+    if (IsValid(Collision.Get()))
+    {
+        Collision->SetCollisionEnabled(bGlobalOcean ? ECollisionEnabled::NoCollision : ECollisionEnabled::QueryOnly);
+        Collision->SetGenerateOverlapEvents(!bGlobalOcean);
+        if (!bGlobalOcean)
+        {
+            Collision->SetCollisionResponseToAllChannels(ECR_Overlap);
+        }
+    }
+
+    if (IsValid(PostProcess.Get()))
+    {
+        // Global-ocean underwater rendering is owned exclusively by WorldEnvManager's unbound
+        // post process. Keep this actor's finite PP only for local/streamed water volumes.
+        PostProcess->bUnbound = false;
+        PostProcess->bEnabled = bGlobalOcean ? false : bAuthoredPostProcessEnabled;
+    }
+}
+
+void AWaterActor::SetGlobalOceanRenderRadius(const float RadiusCm)
+{
+    if (!bGlobalOcean || !FMath::IsFinite(RadiusCm) || RadiusCm <= KINDA_SMALL_NUMBER)
+    {
+        return;
+    }
+
+    // This radius is visual only. Global-ocean water presence remains an infinite XY half-space
+    // resolved from OceanHeightCm, so reducing the mesh footprint never changes buoyancy/swimming.
+    const float SafeRadiusCm = FMath::Max(100.0f, RadiusCm);
+    if (FMath::IsNearlyEqual(GlobalOceanRenderRadiusCm, SafeRadiusCm, 1.0f))
+    {
+        return;
+    }
+
+    if (!IsValid(StaticMesh.Get()) || !IsValid(StaticMesh->GetStaticMesh()))
+    {
+        return;
+    }
+
+    const FBoxSphereBounds LocalBounds = StaticMesh->GetStaticMesh()->GetBounds();
+    const FVector RelativeScale = StaticMesh->GetRelativeScale3D().GetAbs();
+    const double BaseHalfExtentX = static_cast<double>(LocalBounds.BoxExtent.X)
+        * static_cast<double>(FMath::Max(RelativeScale.X, UE_SMALL_NUMBER));
+    const double BaseHalfExtentY = static_cast<double>(LocalBounds.BoxExtent.Y)
+        * static_cast<double>(FMath::Max(RelativeScale.Y, UE_SMALL_NUMBER));
+    const double BaseHalfExtent = FMath::Min(BaseHalfExtentX, BaseHalfExtentY);
+    if (!FMath::IsFinite(BaseHalfExtent) || BaseHalfExtent <= UE_SMALL_NUMBER)
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("Global ocean mesh has invalid XY bounds; render-radius sizing skipped. Mesh=%s Bounds=%s"),
+            *GetNameSafe(StaticMesh->GetStaticMesh()),
+            *LocalBounds.BoxExtent.ToCompactString());
+        return;
+    }
+
+    // Use one uniform XY actor scale so a square/rectangular plane fully covers the requested
+    // circular view radius without stretching X/Y at different rates. Z stays unscaled because
+    // collision and underwater detection are independent from this visual surface.
+    const double RequiredScale = static_cast<double>(SafeRadiusCm) / BaseHalfExtent;
+    if (!FMath::IsFinite(RequiredScale) || RequiredScale <= UE_SMALL_NUMBER)
+    {
+        return;
+    }
+
+    FVector NewActorScale = GetActorScale3D();
+    NewActorScale.X = RequiredScale;
+    NewActorScale.Y = RequiredScale;
+    NewActorScale.Z = 1.0;
+
+    if (!NewActorScale.Equals(GetActorScale3D(), 0.001))
+    {
+        SetActorScale3D(NewActorScale);
+    }
+    GlobalOceanRenderRadiusCm = SafeRadiusCm;
+
+    UE_LOG(LogTemp, Display,
+        TEXT("Global ocean visual radius configured. Radius=%.1f m Mesh=%s ActorScaleXY=%.3f"),
+        SafeRadiusCm / 100.0f,
+        *GetNameSafe(StaticMesh->GetStaticMesh()),
+        NewActorScale.X);
+}
+
 void AWaterActor::WaterTrigger(AActor *OtherActor, bool InWater)
 {
     if (!OtherActor)
@@ -216,9 +339,18 @@ void AWaterActor::WaterTrigger(AActor *OtherActor, bool InWater)
         return;
     }
 
+    // WaterInteraction and Buoyancy are intentionally independent switches. Generic swimming /
+    // splash state sees an exclusion as dry, while UBuoyancyComponent keeps the underlying water
+    // overlap latched and suppresses force per sample. Keeping that overlap latched is important:
+    // an object can leave an exclusion box without ever leaving the large ocean overlap and must
+    // resume buoyancy immediately without waiting for a new BeginOverlap event.
+    const bool bInteractionExcluded = InWater && UWaterExclusionBoxComponent::IsLocationExcluded(
+        this, OtherActor->GetActorLocation(), EWaterExclusionFeature::WaterInteraction);
+    const bool bInteractionInWater = InWater && !bInteractionExcluded;
+
     if (IWaterInteract* ActorWaterInteract = Cast<IWaterInteract>(OtherActor))
     {
-        if (InWater)
+        if (bInteractionInWater)
         {
             ActorWaterInteract->EnterWater(Level);
         }
@@ -234,7 +366,18 @@ void AWaterActor::WaterTrigger(AActor *OtherActor, bool InWater)
     {
         if (IWaterInteract* ComponentWaterInteract = Cast<IWaterInteract>(Component))
         {
-            if (InWater)
+            // Global-ocean buoyancy is height-driven inside UBuoyancyComponent and must never be
+            // latched by a synthetic overlap. Local water keeps overlap state, while exclusions are
+            // still applied per buoyancy sample.
+            if (bGlobalOcean && Cast<UBuoyancyComponent>(Component))
+            {
+                continue;
+            }
+
+            const bool bComponentInWater = Cast<UBuoyancyComponent>(Component)
+                ? InWater
+                : bInteractionInWater;
+            if (bComponentInWater)
             {
                 ComponentWaterInteract->EnterWater(Level);
             }
@@ -248,12 +391,18 @@ void AWaterActor::WaterTrigger(AActor *OtherActor, bool InWater)
 
 void AWaterActor::NotifyActorBeginOverlap(AActor* OtherActor)
 {
-    WaterTrigger(OtherActor, true);
+    if (!bGlobalOcean)
+    {
+        WaterTrigger(OtherActor, true);
+    }
 }
 
 void AWaterActor::NotifyActorEndOverlap(AActor* OtherActor)
 {
-    WaterTrigger(OtherActor, false);
+    if (!bGlobalOcean)
+    {
+        WaterTrigger(OtherActor, false);
+    }
 }
 
 void AWaterActor::SetCurrentLevel()
@@ -264,22 +413,34 @@ void AWaterActor::SetCurrentLevel()
 
 void AWaterActor::CheckOverlappingWater(AActor *Target)
 {
-    // 1. Create an array that stores AWaterActor pointers.
-    TArray<AActor *> OverlappingActors;
-    // 2. Set the class filter to AWaterActor, matching the Blueprint ClassFilter pin.
-    TSubclassOf<AActor> ClassFilter = AWaterActor::StaticClass();
-    // 3. Collect only the filtered actors.
-    Target->GetOverlappingActors(OverlappingActors, ClassFilter);
-    // 4. ForEachLoop
-    for (AActor *OverlappedActor : OverlappingActors)
+    if (!IsValid(Target))
     {
-        if (OverlappedActor)
-        {
-            // 1. Cast the AActor to AWaterActor.
-            AWaterActor *WaterActor = Cast<AWaterActor>(OverlappedActor);
+        return;
+    }
 
-            // 2. If the cast succeeds, call the water update function.
-            if (WaterActor)
+    // Local water volumes still use overlap events. The global ocean is intentionally excluded
+    // from overlap detection and is resolved from height below.
+    TArray<AActor*> OverlappingActors;
+    Target->GetOverlappingActors(OverlappingActors, AWaterActor::StaticClass());
+    for (AActor* OverlappedActor : OverlappingActors)
+    {
+        if (AWaterActor* WaterActor = Cast<AWaterActor>(OverlappedActor);
+            IsValid(WaterActor) && !WaterActor->IsGlobalOcean())
+        {
+            WaterActor->WaterTrigger(Target, true);
+        }
+    }
+
+    float GlobalOceanLevel = 0.0f;
+    if (FindGlobalOceanLevel(Target, GlobalOceanLevel)
+        && Target->GetActorLocation().Z <= GlobalOceanLevel + 5.0f
+        && !UWaterExclusionBoxComponent::IsLocationExcluded(
+            Target, Target->GetActorLocation(), EWaterExclusionFeature::WaterInteraction))
+    {
+        const UWorld* World = Target->GetWorld();
+        if (TWeakObjectPtr<AWaterActor>* Entry = GGlobalOceanByWorld.Find(World))
+        {
+            if (AWaterActor* WaterActor = Entry->Get(); IsValid(WaterActor))
             {
                 WaterActor->WaterTrigger(Target, true);
             }
@@ -287,11 +448,40 @@ void AWaterActor::CheckOverlappingWater(AActor *Target)
     }
 }
 
+bool AWaterActor::FindGlobalOceanLevel(const UObject* WorldContextObject, float& OutLevel)
+{
+    const UWorld* World = WorldContextObject ? WorldContextObject->GetWorld() : nullptr;
+    if (!World)
+    {
+        return false;
+    }
+
+    TWeakObjectPtr<AWaterActor>* Entry = GGlobalOceanByWorld.Find(World);
+    AWaterActor* WaterActor = Entry ? Entry->Get() : nullptr;
+    if (!IsValid(WaterActor) || !WaterActor->IsGlobalOcean())
+    {
+        if (Entry)
+        {
+            GGlobalOceanByWorld.Remove(World);
+        }
+        return false;
+    }
+
+    OutLevel = WaterActor->Level;
+    return true;
+}
+
 bool AWaterActor::FindWaterLevelAtLocationStrict(const UObject *WorldContextObject, const FVector &WorldLocation, float &OutLevel)
 {
     const UWorld *ConstWorld = WorldContextObject ? WorldContextObject->GetWorld() : nullptr;
     UWorld *World = const_cast<UWorld *>(ConstWorld);
     if (!World)
+    {
+        return false;
+    }
+
+    if (UWaterExclusionBoxComponent::IsLocationExcluded(
+            WorldContextObject, WorldLocation, EWaterExclusionFeature::WaterInteraction))
     {
         return false;
     }
@@ -316,17 +506,25 @@ bool AWaterActor::FindWaterLevelAtLocationStrict(const UObject *WorldContextObje
             continue;
         }
 
-        const UBoxComponent *WaterCollision = WaterActor->Collision.Get();
         const float WaterLevel = WaterActor->Level;
+        if (WaterActor->IsGlobalOcean())
+        {
+            // Infinite horizontal ocean: only the authored sea level matters. No collision bounds,
+            // no lower-Z cutoff and no camera-following hit box participate in the query.
+            if (WorldLocation.Z <= WaterLevel + SurfaceTolerance)
+            {
+                BestLevel = bFound ? FMath::Max(BestLevel, WaterLevel) : WaterLevel;
+                bFound = true;
+            }
+            continue;
+        }
+
+        const UBoxComponent *WaterCollision = WaterActor->Collision.Get();
         bool bInsideBoxColumn = false;
         bool bInsideVerticalRange = false;
 
         if (WaterCollision)
         {
-            // Strict means the tested point itself must be inside the actual BoxComponent
-            // column.  Do not use the world AABB here: with a rotated/scaled box or a
-            // capsule merely touching the side, the AABB can report water even after
-            // the character has visually left the water volume.
             const FVector LocalPoint = WaterCollision->GetComponentTransform().InverseTransformPosition(WorldLocation);
             const FVector LocalExtent = WaterCollision->GetUnscaledBoxExtent();
 
@@ -376,6 +574,12 @@ bool AWaterActor::FindWaterLevelAtLocation(const UObject *WorldContextObject, co
         return false;
     }
 
+    if (UWaterExclusionBoxComponent::IsLocationExcluded(
+            WorldContextObject, WorldLocation, EWaterExclusionFeature::WaterInteraction))
+    {
+        return false;
+    }
+
     bool bFound = false;
     float BestLevel = OutLevel;
     constexpr float HorizontalTolerance = 35.0f;
@@ -397,6 +601,17 @@ bool AWaterActor::FindWaterLevelAtLocation(const UObject *WorldContextObject, co
             continue;
         }
 
+        const float WaterLevel = WaterActor->Level;
+        if (WaterActor->IsGlobalOcean())
+        {
+            if (WorldLocation.Z <= WaterLevel + SurfaceTolerance)
+            {
+                BestLevel = bFound ? FMath::Max(BestLevel, WaterLevel) : WaterLevel;
+                bFound = true;
+            }
+            continue;
+        }
+
         const UBoxComponent *WaterCollision = WaterActor->Collision.Get();
         const FBox Bounds = WaterCollision ? WaterCollision->Bounds.GetBox() : WaterActor->GetComponentsBoundingBox(true);
         if (!Bounds.IsValid)
@@ -408,16 +623,13 @@ bool AWaterActor::FindWaterLevelAtLocation(const UObject *WorldContextObject, co
             && WorldLocation.X <= Bounds.Max.X + HorizontalTolerance
             && WorldLocation.Y >= Bounds.Min.Y - HorizontalTolerance
             && WorldLocation.Y <= Bounds.Max.Y + HorizontalTolerance;
-
         if (!bInsideXY)
         {
             continue;
         }
 
-        const float WaterLevel = WaterActor->Level;
         const bool bInsideWaterColumn = WorldLocation.Z <= WaterLevel + SurfaceTolerance
             && WorldLocation.Z >= Bounds.Min.Z - LowerBoundsTolerance;
-
         if (!bInsideWaterColumn)
         {
             continue;
@@ -433,3 +645,151 @@ bool AWaterActor::FindWaterLevelAtLocation(const UObject *WorldContextObject, co
     }
     return bFound;
 }
+
+void AWaterActor::EnsureWaterMaterialInstances()
+{
+    if (!IsValid(StaticMesh.Get()))
+    {
+        return;
+    }
+
+    const int32 MaterialCount = StaticMesh->GetNumMaterials();
+    if (MaterialCount <= 0)
+    {
+        WaterMaterialInstances.Reset();
+        return;
+    }
+
+    WaterMaterialInstances.SetNum(MaterialCount);
+    for (int32 MaterialIndex = 0; MaterialIndex < MaterialCount; ++MaterialIndex)
+    {
+        UMaterialInstanceDynamic* ExistingMID = Cast<UMaterialInstanceDynamic>(StaticMesh->GetMaterial(MaterialIndex));
+        UMaterialInstanceDynamic* MID = ExistingMID
+            ? ExistingMID
+            : StaticMesh->CreateDynamicMaterialInstance(MaterialIndex, StaticMesh->GetMaterial(MaterialIndex));
+        WaterMaterialInstances[MaterialIndex] = MID;
+    }
+}
+
+void AWaterActor::ApplyWaterExclusionRenderParameters()
+{
+    EnsureWaterMaterialInstances();
+
+    TArray<FWaterExclusionNativeBox> Boxes;
+    UWaterExclusionBoxComponent::GatherNativeBoxes(
+        this,
+        EWaterExclusionFeature::Rendering,
+        Boxes,
+        MaxWaterRenderExclusionBoxes);
+
+    for (UMaterialInstanceDynamic* MID : WaterMaterialInstances)
+    {
+        if (!IsValid(MID))
+        {
+            continue;
+        }
+
+        MID->SetScalarParameterValue(TEXT("WaterExclusionCount"), static_cast<float>(Boxes.Num()));
+        for (int32 Index = 0; Index < Boxes.Num(); ++Index)
+        {
+            const FWaterExclusionNativeBox& Box = Boxes[Index];
+            const FTransform& Transform = Box.WorldTransform;
+            const FVector Scale = Transform.GetScale3D().GetAbs();
+            const FVector WorldExtent = Box.LocalExtent * Scale;
+            const FQuat Rotation = Transform.GetRotation().GetNormalized();
+
+            MID->SetVectorParameterValue(
+                MakeIndexedWaterParameterName(TEXT("WaterExclusionCenter"), Index),
+                FLinearColor(Transform.GetLocation().X, Transform.GetLocation().Y, Transform.GetLocation().Z, 1.0f));
+            MID->SetVectorParameterValue(
+                MakeIndexedWaterParameterName(TEXT("WaterExclusionExtent"), Index),
+                FLinearColor(WorldExtent.X, WorldExtent.Y, WorldExtent.Z, 0.0f));
+            MID->SetVectorParameterValue(
+                MakeIndexedWaterParameterName(TEXT("WaterExclusionRotation"), Index),
+                FLinearColor(Rotation.X, Rotation.Y, Rotation.Z, Rotation.W));
+        }
+    }
+}
+
+void AWaterActor::UpdateUnderwaterPostProcessForView(const FVector& ViewLocation, const bool bExcluded)
+{
+    if (!IsValid(PostProcess.Get()))
+    {
+        return;
+    }
+
+    if (bGlobalOcean)
+    {
+        // Global-ocean PP is evaluated by the unified WorldEnvManager material through MPC values.
+        PostProcess->bEnabled = false;
+        return;
+    }
+
+    // Local water keeps its authored finite PostProcessComponent bounds. Exclusions can still turn
+    // that effect off while the camera is inside an exclusion box.
+    PostProcess->bEnabled = bAuthoredPostProcessEnabled && !bExcluded;
+}
+
+void AWaterActor::RefreshWaterExclusionRendering(const UObject* WorldContextObject)
+{
+    const UWorld* ConstWorld = WorldContextObject ? WorldContextObject->GetWorld() : nullptr;
+    UWorld* World = const_cast<UWorld*>(ConstWorld);
+    if (!World)
+    {
+        return;
+    }
+
+    TArray<TWeakObjectPtr<AWaterActor>>* WaterActors = GWaterActorsByWorld.Find(World);
+    if (!WaterActors)
+    {
+        return;
+    }
+
+    for (int32 Index = WaterActors->Num() - 1; Index >= 0; --Index)
+    {
+        AWaterActor* WaterActor = (*WaterActors)[Index].Get();
+        if (!IsValid(WaterActor))
+        {
+            WaterActors->RemoveAtSwap(Index, 1, EAllowShrinking::No);
+            continue;
+        }
+        WaterActor->ApplyWaterExclusionRenderParameters();
+    }
+}
+
+void AWaterActor::UpdateLocalViewWaterEffects(const UObject* WorldContextObject, const FVector& ViewLocation)
+{
+    const UWorld* ConstWorld = WorldContextObject ? WorldContextObject->GetWorld() : nullptr;
+    UWorld* World = const_cast<UWorld*>(ConstWorld);
+    if (!World)
+    {
+        return;
+    }
+
+    const bool bSuppressPostProcess = UWaterExclusionBoxComponent::IsLocationExcluded(
+        WorldContextObject,
+        ViewLocation,
+        EWaterExclusionFeature::UnderwaterPostProcess);
+
+    TArray<TWeakObjectPtr<AWaterActor>>* WaterActors = GWaterActorsByWorld.Find(World);
+    if (!WaterActors)
+    {
+        return;
+    }
+
+    for (int32 Index = WaterActors->Num() - 1; Index >= 0; --Index)
+    {
+        AWaterActor* WaterActor = (*WaterActors)[Index].Get();
+        if (!IsValid(WaterActor))
+        {
+            WaterActors->RemoveAtSwap(Index, 1, EAllowShrinking::No);
+            continue;
+        }
+        if (WaterActor->IsGlobalOcean())
+        {
+            continue;
+        }
+        WaterActor->UpdateUnderwaterPostProcessForView(ViewLocation, bSuppressPostProcess);
+    }
+}
+

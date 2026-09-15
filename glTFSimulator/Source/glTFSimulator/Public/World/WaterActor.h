@@ -20,6 +20,7 @@ class UBoxComponent;
 class UPostProcessComponent;
 class UStaticMeshComponent;
 class UMaterialInterface;
+class UMaterialInstanceDynamic;
 
 UCLASS()
 class GLTFSIMULATOR_API AWaterActor : public AActor
@@ -35,7 +36,19 @@ public:
 
     void WaterTrigger(AActor *Actor, bool InWater);
 
+    /** Marks this actor as the world-wide ocean. Global ocean presence is height-based, not overlap-based. */
+    void SetGlobalOcean(bool bInGlobalOcean);
+
+    /** Sizes the camera-following global-ocean render mesh to a world-space radius in centimeters. */
+    void SetGlobalOceanRenderRadius(float RadiusCm);
+
+    UFUNCTION(BlueprintPure, Category="Water")
+    bool IsGlobalOcean() const { return bGlobalOcean; }
+
     static void CheckOverlappingWater(AActor *Target);
+
+    /** Returns the configured global-ocean level without consulting collision or exclusion volumes. */
+    static bool FindGlobalOceanLevel(const UObject* WorldContextObject, float& OutLevel);
 
     /**
      * Returns the water level for a world-space point even when the owning actor did not
@@ -50,6 +63,12 @@ public:
      * as soon as the character reference leaves the water box side.
      */
     static bool FindWaterLevelAtLocationStrict(const UObject *WorldContextObject, const FVector &WorldLocation, float &OutLevel);
+
+    /** Refreshes standardized exclusion-box parameters on every live water render material. */
+    static void RefreshWaterExclusionRendering(const UObject* WorldContextObject);
+
+    /** Enables/disables local underwater post processing according to the active exclusion boxes. */
+    static void UpdateLocalViewWaterEffects(const UObject* WorldContextObject, const FVector& ViewLocation);
 
     UPROPERTY(Transient)
     TObjectPtr<UMaterialInterface> DecalMaterial;
@@ -78,4 +97,18 @@ protected:
 
 private:
     void SetCurrentLevel();
+    void EnsureWaterMaterialInstances();
+    void ApplyWaterExclusionRenderParameters();
+    void UpdateUnderwaterPostProcessForView(const FVector& ViewLocation, bool bExcluded);
+
+    UPROPERTY(Transient)
+    TArray<TObjectPtr<UMaterialInstanceDynamic>> WaterMaterialInstances;
+
+    bool bAuthoredPostProcessEnabled = true;
+
+    UPROPERTY(Transient)
+    bool bGlobalOcean = false;
+
+    /** Last applied camera-following visual radius; does not participate in water-volume queries. */
+    float GlobalOceanRenderRadiusCm = 0.0f;
 };

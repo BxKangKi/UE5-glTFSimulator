@@ -283,6 +283,7 @@ void UWorldSceneStreamingSubsystem::StopWorldStreaming()
     bPendingPlayerIsInitialLoad = false;
     bPlayerActivated = false;
     bRenderOnlyStreaming = false;
+    bInitialBurstUpdateQueued = false;
     PlayerActorWaitStartedAt = 0.0;
     PlayerLoadStartedAt = 0.0;
     LastReportedLoadingStatus = 0.0f;
@@ -500,7 +501,35 @@ void UWorldSceneStreamingSubsystem::UpdateStreaming()
     // Initial readiness remains false while an in-range scene is deliberately deferred to a later
     // update by the spawn budget. Out-of-range archive records never block startup.
     bInitialScenePassComplete = PendingLoads.Num() <= SpawnBudget;
+    if (!bInitialScenePassComplete)
+    {
+        QueueInitialStreamingBurst();
+    }
     BeginInitialPlayerStreamingIfNeeded();
+}
+
+void UWorldSceneStreamingSubsystem::QueueInitialStreamingBurst()
+{
+    if (bInitialBurstUpdateQueued || !bActive || bInitialScenePassComplete || !IsValid(OwnerActor))
+    {
+        return;
+    }
+
+    if (UWorld* World = OwnerActor->GetWorld())
+    {
+        // During startup, advance one bounded scene batch every frame instead of waiting for the
+        // normal 250 ms runtime polling interval. The configured SpawnBudget still caps per-frame
+        // actor/UObject construction and therefore preserves hitch control.
+        bInitialBurstUpdateQueued = true;
+        World->GetTimerManager().SetTimerForNextTick(
+            this, &UWorldSceneStreamingSubsystem::RunInitialStreamingBurst);
+    }
+}
+
+void UWorldSceneStreamingSubsystem::RunInitialStreamingBurst()
+{
+    bInitialBurstUpdateQueued = false;
+    UpdateStreaming();
 }
 
 void UWorldSceneStreamingSubsystem::ScheduleStreamingUpdates()

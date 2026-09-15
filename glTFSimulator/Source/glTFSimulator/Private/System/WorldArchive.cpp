@@ -7,8 +7,9 @@
  * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
  */
 
-#include "Misc/ScopeLock.h"
 #include "System/WorldArchive.h"
+
+#include "Misc/ScopeLock.h"
 
 #include "Async/ParallelFor.h"
 #include "HAL/FileManager.h"

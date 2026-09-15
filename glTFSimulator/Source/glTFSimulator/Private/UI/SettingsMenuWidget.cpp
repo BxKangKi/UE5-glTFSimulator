@@ -57,6 +57,7 @@ namespace
             ESettingsField::RayTracing,
             ESettingsField::HeightFog,
             ESettingsField::Cloud,
+            ESettingsField::CelShadingMode,
             ESettingsField::ShadowQuality,
             ESettingsField::TextureQuality,
             ESettingsField::MaxTextureResolution,
@@ -172,6 +173,7 @@ namespace
         case ESettingsField::RayTracing: return TEXT("RayTracing");
         case ESettingsField::HeightFog: return TEXT("HeightFog");
         case ESettingsField::Cloud: return TEXT("Cloud");
+        case ESettingsField::CelShadingMode: return TEXT("CelShadingMode");
         case ESettingsField::ShadowQuality: return TEXT("ShadowQuality");
         case ESettingsField::TextureQuality: return TEXT("TextureQuality");
         case ESettingsField::MaxTextureResolution: return TEXT("MaxTextureResolution");
@@ -656,6 +658,7 @@ ESettingsControlType USettingsMenuWidget::GetSettingControlType(ESettingsField F
     case ESettingsField::RayTracing:
     case ESettingsField::HeightFog:
     case ESettingsField::Cloud:
+    case ESettingsField::CelShadingMode:
         return ESettingsControlType::Toggle;
 
     case ESettingsField::BloomIntensity:
@@ -707,6 +710,7 @@ bool USettingsMenuWidget::GetPendingBooleanSettingValue(ESettingsField Field) co
     case ESettingsField::RayTracing: return bPendingRayTracing;
     case ESettingsField::HeightFog: return bPendingHeightFog;
     case ESettingsField::Cloud: return bPendingCloud;
+    case ESettingsField::CelShadingMode: return PendingCelShadingMode >= 0.5f;
     default: return false;
     }
 }
@@ -792,6 +796,7 @@ void USettingsMenuWidget::ToggleSettingFromUI(ESettingsField Field)
     case ESettingsField::RayTracing: bPendingRayTracing = !bPendingRayTracing; break;
     case ESettingsField::HeightFog: bPendingHeightFog = !bPendingHeightFog; break;
     case ESettingsField::Cloud: bPendingCloud = !bPendingCloud; break;
+    case ESettingsField::CelShadingMode: PendingCelShadingMode = PendingCelShadingMode >= 0.5f ? 0.0f : 1.0f; break;
     default: return;
     }
     RefreshSettingsValues();
@@ -962,6 +967,10 @@ void USettingsMenuWidget::BindFieldButton(ESettingsField Field, UButton* Button)
         Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleCloudFromUI);
         Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleCloudFromUI);
         break;
+    case ESettingsField::CelShadingMode:
+        Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleCelShadingModeFromUI);
+        Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleCelShadingModeFromUI);
+        break;
     case ESettingsField::ShadowQuality:
         Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleShadowQualityFromUI);
         Button->OnClicked.AddDynamic(this, &USettingsMenuWidget::CycleShadowQualityFromUI);
@@ -1067,6 +1076,7 @@ void USettingsMenuWidget::UnbindFieldButton(ESettingsField Field, UButton* Butto
     case ESettingsField::RayTracing: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleRayTracingFromUI); break;
     case ESettingsField::HeightFog: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleHeightFogFromUI); break;
     case ESettingsField::Cloud: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleCloudFromUI); break;
+    case ESettingsField::CelShadingMode: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleCelShadingModeFromUI); break;
     case ESettingsField::ShadowQuality: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleShadowQualityFromUI); break;
     case ESettingsField::TextureQuality: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleTextureQualityFromUI); break;
     case ESettingsField::MaxTextureResolution: Button->OnClicked.RemoveDynamic(this, &USettingsMenuWidget::CycleMaxTextureResolutionFromUI); break;
@@ -1171,6 +1181,7 @@ void USettingsMenuWidget::CopySettingsToPending(const UGameSettings* Settings)
     bPendingRayTracing = Settings->bRayTracing;
     bPendingHeightFog = Settings->bHeightFog;
     bPendingCloud = Settings->bCloud;
+    PendingCelShadingMode = Settings->CelShadingMode >= 0.5f ? 1.0f : 0.0f;
     PendingShadowQuality = FMath::Clamp(Settings->ShadowQuality, QualityMin, QualityMax);
     PendingTextureQuality = FMath::Clamp(Settings->TextureQuality, QualityMin, QualityMax);
     PendingMaxTextureResolution = FMath::Clamp(Settings->MaxTextureResolution, TextureResolutionMin, TextureResolutionMax);
@@ -1204,6 +1215,7 @@ void USettingsMenuWidget::ApplyPendingToSettings(UGameSettings* Settings) const
     Settings->bRayTracing = bPendingRayTracing;
     Settings->bHeightFog = bPendingHeightFog;
     Settings->bCloud = bPendingCloud;
+    Settings->CelShadingMode = PendingCelShadingMode >= 0.5f ? 1.0f : 0.0f;
     Settings->ShadowQuality = PendingShadowQuality;
     Settings->TextureQuality = PendingTextureQuality;
     Settings->MaxTextureResolution = PendingMaxTextureResolution;
@@ -1324,6 +1336,7 @@ FText USettingsMenuWidget::GetSettingLabelText(ESettingsField Field) const
     case ESettingsField::RayTracing: return FText::FromString(TEXT("Ray Tracing"));
     case ESettingsField::HeightFog: return FText::FromString(TEXT("Height Fog"));
     case ESettingsField::Cloud: return FText::FromString(TEXT("Cloud"));
+    case ESettingsField::CelShadingMode: return FText::FromString(TEXT("Cel Shading"));
     case ESettingsField::ShadowQuality: return FText::FromString(TEXT("Shadow Quality"));
     case ESettingsField::TextureQuality: return FText::FromString(TEXT("Texture Quality"));
     case ESettingsField::MaxTextureResolution: return FText::FromString(TEXT("Max Texture Resolution"));
@@ -1384,6 +1397,7 @@ TArray<FText> USettingsMenuWidget::GetSettingOptionTexts(ESettingsField Field) c
     case ESettingsField::RayTracing:
     case ESettingsField::HeightFog:
     case ESettingsField::Cloud:
+    case ESettingsField::CelShadingMode:
         Options.Add(GetBoolText(false));
         Options.Add(GetBoolText(true));
         break;
@@ -1465,6 +1479,7 @@ void USettingsMenuWidget::CyclePendingValue(ESettingsField Field, int32 Directio
     case ESettingsField::RayTracing: bPendingRayTracing = !bPendingRayTracing; break;
     case ESettingsField::HeightFog: bPendingHeightFog = !bPendingHeightFog; break;
     case ESettingsField::Cloud: bPendingCloud = !bPendingCloud; break;
+    case ESettingsField::CelShadingMode: PendingCelShadingMode = PendingCelShadingMode >= 0.5f ? 0.0f : 1.0f; break;
     case ESettingsField::ShadowQuality: CycleInt(PendingShadowQuality, QualityMin, QualityMax, Direction); break;
     case ESettingsField::TextureQuality: CycleInt(PendingTextureQuality, QualityMin, QualityMax, Direction); break;
     case ESettingsField::MaxTextureResolution: CycleTextureResolution(PendingMaxTextureResolution, Direction); break;
@@ -1513,6 +1528,7 @@ FText USettingsMenuWidget::GetFieldValueTextFromPending(ESettingsField Field) co
     case ESettingsField::RayTracing: return GetBoolText(bPendingRayTracing);
     case ESettingsField::HeightFog: return GetBoolText(bPendingHeightFog);
     case ESettingsField::Cloud: return GetBoolText(bPendingCloud);
+    case ESettingsField::CelShadingMode: return GetBoolText(PendingCelShadingMode >= 0.5f);
     case ESettingsField::ShadowQuality: return GetQualityText(PendingShadowQuality);
     case ESettingsField::TextureQuality: return GetQualityText(PendingTextureQuality);
     case ESettingsField::MaxTextureResolution: return FText::FromString(FString::Printf(TEXT("%d px"), PendingMaxTextureResolution));
@@ -1585,6 +1601,7 @@ void USettingsMenuWidget::CycleAmbientOcclusionIntensityFromUI() { CycleSettingV
 void USettingsMenuWidget::CycleRayTracingFromUI() { CycleSettingValueFromUI(ESettingsField::RayTracing); }
 void USettingsMenuWidget::CycleHeightFogFromUI() { CycleSettingValueFromUI(ESettingsField::HeightFog); }
 void USettingsMenuWidget::CycleCloudFromUI() { CycleSettingValueFromUI(ESettingsField::Cloud); }
+void USettingsMenuWidget::CycleCelShadingModeFromUI() { CycleSettingValueFromUI(ESettingsField::CelShadingMode); }
 void USettingsMenuWidget::CycleShadowQualityFromUI() { CycleSettingValueFromUI(ESettingsField::ShadowQuality); }
 void USettingsMenuWidget::CycleTextureQualityFromUI() { CycleSettingValueFromUI(ESettingsField::TextureQuality); }
 void USettingsMenuWidget::CycleMaxTextureResolutionFromUI() { CycleSettingValueFromUI(ESettingsField::MaxTextureResolution); }

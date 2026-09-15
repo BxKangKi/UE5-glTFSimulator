@@ -193,6 +193,7 @@ UWorldData::UWorldData()
     WorldTime = OneDayTime * 0.5f;
     TimeSpeed = 60.0f;
     bOcean = false;
+    OceanHeightCm = 0.0;
     bAllowExternalAssets = false;
     PlayerLocation = FVector::ZeroVector;
     // An empty value means that no external character has been selected yet. The previous
@@ -218,6 +219,7 @@ TSharedRef<FJsonObject> UWorldData::SerializeData(UWorldData *Data)
     Json->SetNumberField(ONE_DAY_TIME, Data->OneDayTime);
     Json->SetNumberField(TIME_SPEED, Data->TimeSpeed);
     Json->SetBoolField(OCEAN, Data->bOcean);
+    Json->SetNumberField(TEXT("OceanHeightCm"), FMath::IsFinite(Data->OceanHeightCm) ? Data->OceanHeightCm : 0.0);
     Json->SetBoolField(ALLOW_EXTERNAL_ASSETS_FIELD, Data->bAllowExternalAssets);
 
     // Runtime time, selected player, and player transforms are intentionally omitted. config.json
@@ -243,6 +245,11 @@ bool UWorldData::DeserializeData(UWorldData *Data, TSharedPtr<FJsonObject> Json)
         Json->TryGetNumberField(ONE_DAY_TIME, Data->OneDayTime);
         Json->TryGetNumberField(TIME_SPEED, Data->TimeSpeed);
         Json->TryGetBoolField(OCEAN, Data->bOcean);
+        double LoadedOceanHeight = Data->OceanHeightCm;
+        if (Json->TryGetNumberField(TEXT("OceanHeightCm"), LoadedOceanHeight) && FMath::IsFinite(LoadedOceanHeight))
+        {
+            Data->OceanHeightCm = LoadedOceanHeight;
+        }
         Json->TryGetBoolField(ALLOW_EXTERNAL_ASSETS_FIELD, Data->bAllowExternalAssets);
 
         const TSharedPtr<FJsonObject>* CloudObject = nullptr;

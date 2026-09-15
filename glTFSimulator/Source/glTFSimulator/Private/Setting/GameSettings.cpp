@@ -50,6 +50,7 @@ TSharedRef<FJsonObject> UGameSettings::Serialization()
     Json->SetBoolField(TEXT("bRayTracing"), bRayTracing);
     Json->SetBoolField(TEXT("bHeightFog"), bHeightFog);
     Json->SetBoolField(TEXT("bCloud"), bCloud);
+    Json->SetNumberField(TEXT("CelShadingMode"), CelShadingMode >= 0.5f ? 1.0f : 0.0f);
     return Json;
 }
 
@@ -75,13 +76,14 @@ bool UGameSettings::Deserialization(TSharedPtr<FJsonObject> Json)
         const bool bHasNodeBudget = Json->TryGetNumberField(
             TEXT("StreamingNodeBudgetPerFrame"), StreamingNodeBudgetPerFrame);
 
-        // The original project defaults (2 scene tasks / 32 nodes) intentionally throttled work so
-        // aggressively that modern SSDs and multicore CPUs spent most startup time underutilized.
-        // Migrate only the exact untouched legacy pair; explicit user tuning is always preserved.
+        // Untouched legacy/default pairs are migrated to the current startup-oriented budget.
+        // Explicit user tuning is preserved. Initial streaming also advances once per frame while
+        // work remains, so this budget controls hitch size rather than adding a fixed 250 ms delay.
         if (bHasSceneSpawnBudget && bHasNodeBudget
-            && StreamingSceneSpawnBudget == 2 && StreamingNodeBudgetPerFrame == 32)
+            && ((StreamingSceneSpawnBudget == 2 && StreamingNodeBudgetPerFrame == 32)
+                || (StreamingSceneSpawnBudget == 24 && StreamingNodeBudgetPerFrame == 256)))
         {
-            StreamingSceneSpawnBudget = 24;
+            StreamingSceneSpawnBudget = 32;
             StreamingNodeBudgetPerFrame = 256;
         }
         else
@@ -106,6 +108,8 @@ bool UGameSettings::Deserialization(TSharedPtr<FJsonObject> Json)
         Json->TryGetBoolField(TEXT("bRayTracing"), bRayTracing);
         Json->TryGetBoolField(TEXT("bHeightFog"), bHeightFog);
         Json->TryGetBoolField(TEXT("bCloud"), bCloud);
+        Json->TryGetNumberField(TEXT("CelShadingMode"), CelShadingMode);
+        CelShadingMode = CelShadingMode >= 0.5f ? 1.0f : 0.0f;
         return true;
     }
     return false;
