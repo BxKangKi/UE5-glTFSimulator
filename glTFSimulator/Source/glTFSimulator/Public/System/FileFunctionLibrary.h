@@ -1,12 +1,19 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
+/**
+ * @file FileFunctionLibrary.h
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * Declares interface, lifetime, and data-ownership contracts; see the matching implementation for behavior.
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Serialization/BufferArchive.h"
+#include "Dom/JsonObject.h"
+#include "Kismet/BlueprintFunctionLibrary.h"
 #include "Templates/SharedPointer.h"
-#include "HAL/CriticalSection.h"
 #include "FileFunctionLibrary.generated.h"
 
 UCLASS()
@@ -23,15 +30,7 @@ public:
     static bool GenerateDirectory(const FString &FilePath);
 
     UFUNCTION(BlueprintCallable)
-    static TArray<FString> GetFileNamesWithExtension(const FString &Directory,
-                                                    const FString &Extension);
-
-    UFUNCTION(BlueprintCallable)
     static FString GetPathWithoutExtension(const FString &Path);
-
-    static bool ToBinary(FBufferArchive Ar, const FString &FilePath);
-    static void ToBinaryAsync(FBufferArchive Ar, const FString &FilePath);
-    static bool FromBinary(TArray<uint8> &FileData, const FString &FilePath);
 
     // add line function
     UFUNCTION(BlueprintCallable)
@@ -40,6 +39,15 @@ public:
     // async add line function
     UFUNCTION(BlueprintCallable)
     static void AppendLineToFileAsync(const FString &Line, const FString &FilePath);
+
+    // Returns the daily simulator log file under the user-facing Logs directory.
+    static FString GetSimulatorLogFilePath();
+
+    // Writes a categorized simulator log line to the daily Logs/log_YYYYMMDD.txt file.
+    static bool WriteSimulatorLog(const FString& Category, const FString& Message);
+
+    // Thread-pool version of WriteSimulatorLog for heavy streaming systems.
+    static void WriteSimulatorLogAsync(const FString& Category, const FString& Message);
 #pragma region Json File
     // Json related functions
     static void ToJsonAsync(TSharedRef<FJsonObject> Json, const FString &Path);
@@ -54,7 +62,6 @@ public:
     static bool GetSubFolders(const FString &ParentFolderPath, TArray<FString> &OutSubFolders);
 
 private:
-    static FCriticalSection FileWriteCriticalSection;
-    // 파일에 문자열을 추가 저장하는 내부 함수
+    // Internal helper that appends text to a file.
     static bool AppendStringToFileInternal(const FString &Line, const FString &FilePath);
 };

@@ -1,22 +1,26 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
+/**
+ * @file FileFunctionLibrary.cpp
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
+ */
+
 #include "System/FileFunctionLibrary.h"
+#include "System/SafeFileIO.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "HAL/FileManager.h"
-#include "Async/Async.h"
-#include "Misc/ScopeLock.h"
-#include "HAL/PlatformFilemanager.h"
-#include "Serialization/JsonWriter.h"
-#include "Serialization/JsonSerializer.h"
-#include "Serialization/JsonReader.h"
+#include "System/MacroLibrary.h"
 
+namespace
+{
+    constexpr int64 MAX_SAFE_JSON_FILE_BYTES = 64ll * 1024ll * 1024ll;
+}
 
 #pragma region File IO
-// static 멤버 변수 정의
-FCriticalSection UFileFunctionLibrary::FileWriteCriticalSection;
-
 bool UFileFunctionLibrary::CheckFile(const FString &FilePath)
 {
     if (!GenerateDirectory(FilePath) || !IFileManager::Get().FileExists(*FilePath))
@@ -48,98 +52,100 @@ FString UFileFunctionLibrary::GetPathWithoutExtension(const FString &Path)
     return FPaths::Combine(Directory, BaseName);
 }
 
-TArray<FString> UFileFunctionLibrary::GetFileNamesWithExtension(const FString &Directory, const FString &Extension)
-{
-    TArray<FString> FoundFiles;
-    // 확장자가 포함된 검색 패턴 생성 (예: "*.png")
-    FString FilePattern = FString::Printf(TEXT("*.%s"), *Extension);
-    // IFileManager로 파일 검색 (재귀 옵션으로 하위 폴더 포함 가능)
-    IFileManager &FileManager = IFileManager::Get();
-    // 디렉터리 경로가 절대 경로가 아니면 절대 경로로 변환
-    FString AbsoluteDirectory = FPaths::ConvertRelativePathToFull(Directory);
-    FileManager.FindFilesRecursive(FoundFiles, *AbsoluteDirectory, *FilePattern, true, false, false);
-    return FoundFiles;
-}
-
-bool UFileFunctionLibrary::ToBinary(FBufferArchive Ar, const FString &FilePath)
-{
-    return FFileHelper::SaveArrayToFile(Ar, *FilePath);
-}
-
-void UFileFunctionLibrary::ToBinaryAsync(FBufferArchive Ar, const FString &FilePath)
-{
-    Async(EAsyncExecution::ThreadPool, [Ar, FilePath]()
-          {
-              FScopeLock Lock(&FileWriteCriticalSection);
-              bool bSuccess = ToBinary(Ar, FilePath);
-              if (bSuccess)
-              {
-#if WITH_EDITOR
-                  UE_LOG(LogTemp, Log, TEXT("Successfully saved Binary to %s"), *FilePath);
-#endif
-              }
-              else
-              {
-                  UE_LOG(LogTemp, Error, TEXT("Failed to save Binary to : %s"), *FilePath);
-              } });
-}
-
-bool UFileFunctionLibrary::FromBinary(TArray<uint8> &FileData, const FString &FilePath)
-{
-    if (!FFileHelper::LoadFileToArray(FileData, *FilePath))
-    {
-        UE_LOG(LogTemp, Error, TEXT("Failed to load binary file : %s"), *FilePath);
-        return false;
-    }
-    return true;
-}
-
 bool UFileFunctionLibrary::AppendLineToFile(const FString &Line, const FString &FilePath)
 {
-    // 다시 파일에 저장 (덮어쓰기)
-    return AppendStringToFileInternal(Line, *FilePath);
+    // Append exactly one log-style line and create the parent directory when needed.
+    const FString TextToAppend = Line.EndsWith(LINE_TERMINATOR) ? Line : Line + LINE_TERMINATOR;
+    return AppendStringToFileInternal(TextToAppend, FilePath);
 }
 
 void UFileFunctionLibrary::AppendLineToFileAsync(const FString &Line, const FString &FilePath)
 {
-    Async(EAsyncExecution::ThreadPool, [Line, FilePath]()
-          {
-              FScopeLock Lock(&FileWriteCriticalSection);
-              bool bSuccess = AppendStringToFileInternal(Line + LINE_TERMINATOR, FilePath);
-#if WITH_EDITOR
-              if (bSuccess)
-              {
-                  UE_LOG(LogTemp, Log, TEXT("Successfully appended line to %s"), *FilePath);
-              }
-              else
-              {
-                  UE_LOG(LogTemp, Error, TEXT("Failed to append line to %s"), *FilePath);
-              }
-#endif
-          });
+    const FString TextToAppend = Line.EndsWith(LINE_TERMINATOR) ? Line : Line + LINE_TERMINATOR;
+    FSafeFileIO::AppendTextAsync(
+        TextToAppend,
+        FilePath,
+        [FilePath](FSafeFileWriteResult Result)
+        {
+            if (!Result.IsSuccess() && Result.Status != ESafeFileIOStatus::ShuttingDown)
+            {
+                UE_LOG(LogTemp, Error, TEXT("Failed to append line to %s: %s"), *FilePath, *Result.Error);
+            }
+        });
+}
+
+FString UFileFunctionLibrary::GetSimulatorLogFilePath()
+{
+    const FString LogDirectory = FPaths::Combine(DIRECTORY_USER, DIRECTORY_GAME, DIRECTORY_LOG);
+    const FString LogFileName = FString::Printf(TEXT("log_%s.txt"), *FDateTime::Now().ToString(TEXT("%Y%m%d")));
+    return FPaths::Combine(LogDirectory, LogFileName);
+}
+
+bool UFileFunctionLibrary::WriteSimulatorLog(const FString& Category, const FString& Message)
+{
+    const FString SafeCategory = Category.IsEmpty() ? TEXT("General") : Category;
+    const FString Line = FString::Printf(TEXT("[%s][%s] %s"), *FDateTime::Now().ToString(), *SafeCategory, *Message);
+    return AppendLineToFile(Line, GetSimulatorLogFilePath());
+}
+
+void UFileFunctionLibrary::WriteSimulatorLogAsync(const FString& Category, const FString& Message)
+{
+    const FString SafeCategory = Category.IsEmpty() ? TEXT("General") : Category;
+    const FString Line = FString::Printf(
+        TEXT("[%s][%s] %s%s"),
+        *FDateTime::Now().ToString(),
+        *SafeCategory,
+        *Message,
+        LINE_TERMINATOR);
+    const FString SimulatorLogPath = GetSimulatorLogFilePath();
+
+    FSafeFileIO::AppendTextAsync(
+        Line,
+        SimulatorLogPath,
+        [SafeCategory](FSafeFileWriteResult Result)
+        {
+        if (!Result.IsSuccess() && Result.Status != ESafeFileIOStatus::ShuttingDown)
+        {
+            UE_LOG(
+                LogTemp,
+                Error,
+                TEXT("Failed to write simulator log. Category=%s Error=%s"),
+                *SafeCategory,
+                *Result.Error);
+        }
+        });
 }
 
 // CoreSystem/Source/CoreSystem/Private/FileFunctionLibrary.cpp
 bool UFileFunctionLibrary::GetSubFolders(const FString& ParentFolderPath, TArray<FString>& OutSubFolders)
 {
     OutSubFolders.Empty();
-    
-    IFileManager& FileManager = IFileManager::Get();
-    
-    // UE5.7 기준: FindFilesRecursive 또는 DirectoryExists + FindFiles 사용
-    TArray<FString> AllItems;
-    FileManager.FindFiles(AllItems, *(ParentFolderPath + TEXT("*")), true, true);
 
-    // 디렉토리만 필터링
+    IFileManager& FileManager = IFileManager::Get();
+
+    TArray<FString> AllItems;
+    // Ask the platform layer for directories only; enumerating every .gworld/.dat/config file
+    // merely to discard it made world-selection refresh scale with all deployment artifacts.
+    FileManager.FindFiles(
+        AllItems,
+        *FPaths::Combine(ParentFolderPath, TEXT("*")),
+        false,
+        true);
+
+    // Keep only directories.
     for (const FString& Item : AllItems)
     {
-        FString FullPath = ParentFolderPath + Item;
+        const FString FullPath = FPaths::Combine(ParentFolderPath, Item);
         if (FPaths::DirectoryExists(FullPath))
         {
             OutSubFolders.Add(Item);
         }
     }
-    
+
+    OutSubFolders.Sort([](const FString& A, const FString& B)
+    {
+        return A.Compare(B, ESearchCase::IgnoreCase) < 0;
+    });
     return !OutSubFolders.IsEmpty();
 }
 
@@ -148,65 +154,63 @@ bool UFileFunctionLibrary::GetSubFolders(const FString& ParentFolderPath, TArray
 
 void UFileFunctionLibrary::ToJsonAsync(TSharedRef<FJsonObject> Json, const FString &Path)
 {
-    Async(EAsyncExecution::ThreadPool, [Json, Path]()
-          {
-            FScopeLock Lock(&FileWriteCriticalSection);
-            bool bSuccess = ToJson(Json, Path);
-            if (bSuccess)
+    FSafeFileIO::SaveJsonAsync(
+        Json,
+        Path,
+        [Path](FSafeFileWriteResult Result)
+        {
+            if (Result.IsSuccess())
             {
-#if WITH_EDITOR
-                UE_LOG(LogTemp, Log, TEXT("Successfully saved JSON to %s"), *Path);
-#endif
+                UE_LOG(LogTemp, Verbose, TEXT("Successfully saved JSON to %s"), *Path);
             }
-            else
+            else if (Result.Status != ESafeFileIOStatus::ShuttingDown &&
+                Result.Status != ESafeFileIOStatus::Superseded)
             {
-                UE_LOG(LogTemp, Error, TEXT("Failed to saved JSON to %s"), *Path);
-            } });
+                UE_LOG(LogTemp, Error, TEXT("Failed to save JSON to %s: %s"), *Path, *Result.Error);
+            }
+        },
+        MAX_SAFE_JSON_FILE_BYTES);
 }
 
 bool UFileFunctionLibrary::ToJson(TSharedRef<FJsonObject> Json, const FString &FilePath)
 {
-    FString OutputString;
-    if (!FJsonSerializer::Serialize(Json, TJsonWriterFactory<TCHAR>::Create(&OutputString)))
+    const FSafeFileWriteResult Result =
+        FSafeFileIO::SaveJsonBlocking(Json, FilePath, MAX_SAFE_JSON_FILE_BYTES);
+    if (!Result.IsSuccess())
     {
-        UE_LOG(LogTemp, Error, TEXT("JSON serialization failed"));
+        UE_LOG(LogTemp, Error, TEXT("Failed to save JSON to %s: %s"), *FilePath, *Result.Error);
         return false;
     }
-
-    // 폴더 경로 추출 및 존재하지 않을 경우 생성
-    GenerateDirectory(FilePath);
-
-    if (!FFileHelper::SaveStringToFile(OutputString, *FilePath))
-    {
-        UE_LOG(LogTemp, Error, TEXT("Failed to save file: %s"), *FilePath);
-        return false;
-    }
-
     return true;
 }
 
 TSharedPtr<FJsonObject> UFileFunctionLibrary::FromJson(const FString &Path)
 {
-    FString FileContent;
-    if (!FFileHelper::LoadFileToString(FileContent, *Path))
+    FSafeJsonLimits Limits;
+    Limits.MaxFileBytes = MAX_SAFE_JSON_FILE_BYTES;
+    const FSafeJsonLoadResult Result = FSafeFileIO::LoadJsonBlocking(Path, Limits);
+    if (Result.IsSuccess())
     {
-        UE_LOG(LogTemp, Error, TEXT("Failed to load file: %s"), *Path);
+        if (Result.bRecoveredFromBackup)
+        {
+            UE_LOG(LogTemp, Warning, TEXT("Recovered JSON from backup: %s"), *Path);
+        }
+        return Result.JsonObject;
+    }
+
+    if (Result.Status == ESafeFileIOStatus::Missing)
+    {
+        // Several callers intentionally probe optional save files before creating defaults.
+        UE_LOG(LogTemp, Verbose, TEXT("Optional JSON file does not exist: %s"), *Path);
         return nullptr;
     }
 
-    TSharedRef<TJsonReader<TCHAR>> Reader = TJsonReaderFactory<TCHAR>::Create(FileContent);
-    TSharedPtr<FJsonObject> JsonObject;
-    if (!FJsonSerializer::Deserialize(Reader, JsonObject) || !JsonObject.IsValid())
-    {
-        UE_LOG(LogTemp, Error, TEXT("Failed to deserialize JSON from file: %s"), *Path);
-        return nullptr;
-    }
-
-    return JsonObject;
+    UE_LOG(LogTemp, Error, TEXT("Failed to load JSON from %s: %s"), *Path, *Result.Error);
+    return nullptr;
 }
 
-// 파일 경로와 키 이름을 받아서 문자열 값 추출
-// 성공 시 OutValue에 값 저장, true 반환
+// Extracts a string value from a file path and key name.
+// Stores the value in OutValue and returns true on success.
 bool UFileFunctionLibrary::LoadJsonStringValue(
     const FString &JsonFilePath,
     const FString &KeyName,
@@ -214,24 +218,16 @@ bool UFileFunctionLibrary::LoadJsonStringValue(
 {
     OutValue.Reset();
 
-    // 파일 존재 확인 및 내용 읽기
-    FString JsonRaw;
-    if (!FFileHelper::LoadFileToString(JsonRaw, *JsonFilePath))
-    {
-        return false;
-    }
-
-    // JSON 파싱
-    TSharedPtr<FJsonObject> JsonObject;
-    TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonRaw);
-
-    if (!FJsonSerializer::Deserialize(Reader, JsonObject) || !JsonObject.IsValid())
-    {
-        return false;
-    }
-
-    // 키 값 추출
-    return JsonObject->TryGetStringField(*KeyName, OutValue);
+    // Route menu discovery through the same bounded parser as every other external JSON read.
+    // This closes the size-check/read race and applies depth, value-count and string-length limits
+    // before a malformed config can allocate an unbounded DOM on the game thread.
+    FSafeJsonLimits Limits;
+    Limits.MaxFileBytes = MAX_SAFE_JSON_FILE_BYTES;
+    Limits.bAllowBackupRecovery = false;
+    const FSafeJsonLoadResult Result =
+        FSafeFileIO::LoadJsonBlocking(JsonFilePath, Limits);
+    return Result.IsSuccess()
+        && Result.JsonObject->TryGetStringField(*KeyName, OutValue);
 }
 
 

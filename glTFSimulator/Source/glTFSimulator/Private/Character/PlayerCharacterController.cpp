@@ -1,6 +1,13 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
+/**
+ * @file PlayerCharacterController.cpp
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
+ */
+
 #include "Character/PlayerCharacterController.h"
 #include "Character/CharacterController.h"
 #include "EnhancedInputComponent.h"
@@ -11,70 +18,273 @@
 #include "InputActionValue.h"
 #include "InputMappingContext.h"
 #include "InputCoreTypes.h"
-#include "Runtime/RuntimeGameplayManager.h"
-#include "Runtime/RuntimeCreatorHUDWidget.h"
-#include "Runtime/RuntimePauseMenuWidget.h"
-#include "Runtime/RuntimeSettingsMenuWidget.h"
-#include "Runtime/RuntimeVehiclePawn.h"
+#include "Model/WorldSceneStreamingSubsystem.h"
+#include "UI/CreatorHUDWidget.h"
+#include "UI/PauseMenuWidget.h"
+#include "UI/SettingsMenuWidget.h"
+#include "Vehicle/VehiclePawn.h"
 #include "System/GameManagerSubSystem.h"
+#include "System/GlTFSimulatorGameInstance.h"
+#include "System/GlTFSimulatorAssetRegistry.h"
+#include "System/SimulatorCommandSubsystem.h"
+#include "System/GameUpdateSubSystem.h"
 #include "TimerManager.h"
-#include "UObject/ConstructorHelpers.h"
 #include "Blueprint/WidgetBlueprintLibrary.h"
 #include "Blueprint/UserWidget.h"
+#include "Camera/CameraComponent.h"
+#include "Weather/WeatherSubsystem.h"
 #include "Components/Widget.h"
 #include "Engine/Engine.h"
 #include "Kismet/GameplayStatics.h"
 
-APlayerCharacterController::APlayerCharacterController()
+bool APlayerCharacterController::ProcessConsoleExec(const TCHAR* Cmd, FOutputDevice& Ar, UObject* Executor)
 {
-    RuntimeGameplayManagerClass = nullptr;
-
-    static ConstructorHelpers::FObjectFinder<UInputAction> DebugActionFinder(TEXT("/Game/Input/Actions/IA_Debug.IA_Debug"));
-    if (DebugActionFinder.Succeeded())
+    if (USimulatorCommandSubsystem::IsSimulatorCommand(Cmd))
     {
-        DebugAction = DebugActionFinder.Object;
+        const FString CommandLine(Cmd);
+        if (GetNetMode() == NM_Client)
+        {
+            ServerExecuteSimulatorCommand(CommandLine);
+            return true;
+        }
+
+        FString Message;
+        if (UGameInstance* GameInstance = GetGameInstance())
+        {
+            if (USimulatorCommandSubsystem* Commands = GameInstance->GetSubsystem<USimulatorCommandSubsystem>())
+            {
+                Commands->ExecuteCommand(this, CommandLine, Message);
+            }
+        }
+
+        if (!Message.IsEmpty())
+        {
+            Ar.Log(*Message);
+            ClientMessage(Message);
+        }
+        return true;
     }
 
-    static ConstructorHelpers::FClassFinder<UUserWidget> DebugWidgetFinder(TEXT("/Game/Blueprints/MainWorld/WBP_Debug"));
-    if (DebugWidgetFinder.Succeeded())
+    return Super::ProcessConsoleExec(Cmd, Ar, Executor);
+}
+
+void APlayerCharacterController::ServerExecuteSimulatorCommand_Implementation(const FString& CommandLine)
+{
+    FString Message;
+    if (UGameInstance* GameInstance = GetGameInstance())
     {
-        DebugWidgetClass = DebugWidgetFinder.Class;
+        if (USimulatorCommandSubsystem* Commands = GameInstance->GetSubsystem<USimulatorCommandSubsystem>())
+        {
+            Commands->ExecuteCommand(this, CommandLine.Left(1024), Message);
+        }
     }
 
-    bAutoCreateRuntimeCreatorHUD = false;
-    PauseMenuWidgetClass = nullptr;
-    SettingsMenuWidgetClass = nullptr;
+    if (!Message.IsEmpty())
+    {
+        ClientMessage(Message);
+    }
+}
+
+APlayerCharacterController::APlayerCharacterController() = default;
+
+void APlayerCharacterController::ResolveCentralAssets()
+{
+    UGlTFSimulatorAssetRegistry* Registry = UGlTFSimulatorGameInstance::GetAssetRegistryFromContext(this);
+    if (!IsValid(Registry))
+    {
+        return;
+    }
+
+    InputMappingContext = Registry->PrimaryInputMappingContext.IsNull()
+        ? nullptr : Registry->PrimaryInputMappingContext.LoadSynchronous();
+    InputMappingPriority = Registry->PrimaryInputMappingPriority;
+
+    AdditionalInputMappingContexts.Reset();
+    AdditionalInputMappingContexts.Reserve(Registry->AdditionalInputMappingContexts.Num());
+    for (const FGlTFSimulatorInputMappingContextConfig& SoftConfig : Registry->AdditionalInputMappingContexts)
+    {
+        UInputMappingContext* Context = SoftConfig.MappingContext.IsNull()
+            ? nullptr : SoftConfig.MappingContext.LoadSynchronous();
+        if (!IsValid(Context))
+        {
+            continue;
+        }
+
+        FPlayerInputMappingContextConfig RuntimeConfig;
+        RuntimeConfig.MappingContext = Context;
+        RuntimeConfig.Priority = SoftConfig.Priority;
+        AdditionalInputMappingContexts.Add(MoveTemp(RuntimeConfig));
+    }
+
+    const auto ResolveAction = [](const TSoftObjectPtr<UInputAction>& SoftAction) -> UInputAction*
+    {
+        return SoftAction.IsNull() ? nullptr : SoftAction.LoadSynchronous();
+    };
+
+    MoveAction = ResolveAction(Registry->MoveAction);
+    LookAction = ResolveAction(Registry->LookAction);
+    JumpAction = ResolveAction(Registry->JumpAction);
+    SprintAction = ResolveAction(Registry->SprintAction);
+    CrouchAction = ResolveAction(Registry->CrouchAction);
+    FlyAction = ResolveAction(Registry->FlyAction);
+    RagdollAction = ResolveAction(Registry->RagdollAction);
+    InteractAction = ResolveAction(Registry->InteractAction);
+    ToggleFirstPersonAction = ResolveAction(Registry->ToggleFirstPersonAction);
+    ChangeCharacterAction = ResolveAction(Registry->ChangeCharacterAction);
+    ToolbarScrollAction = ResolveAction(Registry->ToolbarScrollAction);
+    ToggleItemListAction = ResolveAction(Registry->ToggleItemListAction);
+    SnapAction = ResolveAction(Registry->SnapAction);
+    VehicleMoveAction = ResolveAction(Registry->VehicleMoveAction);
+    VehicleThrottleAction = ResolveAction(Registry->VehicleThrottleAction);
+    VehicleSteeringAction = ResolveAction(Registry->VehicleSteeringAction);
+    VehicleStopAction = ResolveAction(Registry->VehicleStopAction);
+    PauseAction = ResolveAction(Registry->PauseAction);
+    DebugAction = ResolveAction(Registry->DebugAction);
+
+
+}
+
+
+void APlayerCharacterController::InitializeRegistryDrivenUI()
+{
+    if (!IsLocalController())
+    {
+        return;
+    }
+
+    UGlTFSimulatorAssetRegistry* Registry = UGlTFSimulatorGameInstance::GetAssetRegistryFromContext(this);
+    if (!IsValid(Registry))
+    {
+        UE_LOG(LogTemp, Error, TEXT("PlayerCharacterController cannot initialize registry-driven UI because the central AssetRegistry is unavailable."));
+        return;
+    }
+
+    const auto AddTopLevelWidget = [](UUserWidget* Widget, const int32 ZOrder)
+    {
+        if (IsValid(Widget) && !Widget->IsInViewport())
+        {
+            Widget->AddToPlayerScreen(ZOrder);
+        }
+    };
+
+    if (!IsValid(CreatorHUDWidget) && !Registry->CreatorHUDWidgetClass.IsNull())
+    {
+        if (UClass* WidgetClass = Registry->CreatorHUDWidgetClass.LoadSynchronous())
+        {
+            UCreatorHUDWidget* Widget = CreateWidget<UCreatorHUDWidget>(this, WidgetClass);
+            SetCreatorHUDWidget(Widget);
+            AddTopLevelWidget(Widget, 0);
+        }
+    }
+
+    if (!IsValid(DebugWidget) && !Registry->DebugWidgetClass.IsNull())
+    {
+        if (UClass* WidgetClass = Registry->DebugWidgetClass.LoadSynchronous())
+        {
+            UUserWidget* Widget = CreateWidget<UUserWidget>(this, WidgetClass);
+            SetDebugWidget(Widget);
+            AddTopLevelWidget(Widget, 40);
+        }
+    }
+
+    if (!IsValid(PauseMenuWidget) && !Registry->PauseMenuWidgetClass.IsNull())
+    {
+        if (UClass* WidgetClass = Registry->PauseMenuWidgetClass.LoadSynchronous())
+        {
+            UPauseMenuWidget* Widget = CreateWidget<UPauseMenuWidget>(this, WidgetClass);
+            SetPauseMenuWidget(Widget);
+            AddTopLevelWidget(Widget, 50);
+        }
+    }
+
+    if (!IsValid(SettingsMenuWidget) && !Registry->SettingsMenuWidgetClass.IsNull())
+    {
+        if (UClass* WidgetClass = Registry->SettingsMenuWidgetClass.LoadSynchronous())
+        {
+            USettingsMenuWidget* Widget = CreateWidget<USettingsMenuWidget>(this, WidgetClass);
+            SetSettingsMenuWidget(Widget);
+            AddTopLevelWidget(Widget, 60);
+        }
+    }
+
+    if (IsValid(SubSystem) && !SubSystem->HasLoadingWidget() && !Registry->LoadingWidgetClass.IsNull())
+    {
+        if (UClass* WidgetClass = Registry->LoadingWidgetClass.LoadSynchronous())
+        {
+            UUserWidget* Widget = CreateWidget<UUserWidget>(this, WidgetClass);
+            if (IsValid(Widget))
+            {
+                Widget->SetVisibility(ESlateVisibility::Collapsed);
+                AddTopLevelWidget(Widget, 100);
+                SubSystem->SetLoadingWidget(Widget);
+            }
+        }
+    }
 }
 
 void APlayerCharacterController::BeginPlay()
 {
     Super::BeginPlay();
+    bMenuWorldTravelPending = false;
+    bGameplayInputSuppressed = false;
+    GetWorldTimerManager().ClearTimer(MenuWorldTravelWatchdogHandle);
+    GetWorldTimerManager().ClearTimer(GameplayInputRecoveryHandle);
+
+    // APlayerController ignore-input calls are stack based. Clear any stale state before the
+    // loading/UI flow starts so repeated mode callbacks cannot leave keyboard and mouse look locked.
+    ResetIgnoreMoveInput();
+    ResetIgnoreLookInput();
+    ResolveCentralAssets();
     if (!IsValid(SubSystem))
     {
         SubSystem = UGameManagerSubSystem::GetSubSystem(this);
     }
+    InitializeRegistryDrivenUI();
+
+    // Snapshot the initial state so the update hook can detect the first completed loading/pause
+    // transition instead of repeatedly forcing input mode every frame.
+    bPrevWorldLoading = IsValid(SubSystem) && SubSystem->IsWorldLoading();
+    bPrevGamePaused = IsValid(SubSystem) && SubSystem->GetGamePaused();
+
     if (bApplyInputMappingContextsOnBeginPlay)
     {
         ApplyConfiguredInputMappingContexts();
     }
 
-    if (bAutoSpawnRuntimeGameplayManager)
+    // Authority/standalone runtime initialization is owned exclusively by SingleplayGameMode /
+    // MultiplayGameMode. A network client has no GameMode instance, so only the client schedules a
+    // next-tick render-session reconciliation after GameState/replicated world state can begin arriving.
+    if (GetNetMode() == NM_Client)
     {
         GetWorldTimerManager().SetTimerForNextTick(FTimerDelegate::CreateWeakLambda(this, [this]()
         {
-            if (!IsValid(SubSystem) || !SubSystem->IsWorldLoading())
+            if (IsValid(this) && !IsActorBeingDestroyed())
             {
-                GetRuntimeGameplayManager();
+                GetGameManager();
             }
         }));
     }
 
     if (bForceGameInputModeOnBeginPlay)
     {
-        ApplyGameInputMode();
+        if (IsValid(SubSystem) && SubSystem->IsWorldLoading())
+        {
+            ApplyLoadingInputMode(nullptr);
+        }
+        else
+        {
+            ApplyGameInputMode();
+        }
+
         GetWorldTimerManager().SetTimerForNextTick(FTimerDelegate::CreateWeakLambda(this, [this]()
         {
-            if (IsValid(SubSystem) && (SubSystem->GetGamePaused() || SubSystem->IsWorldLoading()))
+            if (IsValid(SubSystem) && SubSystem->IsWorldLoading())
+            {
+                ApplyLoadingInputMode(nullptr);
+                return;
+            }
+
+            if (IsValid(SubSystem) && SubSystem->GetGamePaused())
             {
                 return;
             }
@@ -84,76 +294,83 @@ void APlayerCharacterController::BeginPlay()
         }));
     }
 
+    if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
+    {
+        GameUpdateTickHandle = GameUpdate->RegisterUpdate(
+            this,
+            [WeakThis = TWeakObjectPtr<APlayerCharacterController>(this)](const float DeltaSeconds)
+            {
+                if (APlayerCharacterController* StrongThis = WeakThis.Get())
+                {
+                    StrongThis->UpdateFromGameUpdate(DeltaSeconds);
+                }
+            },
+            1);
+    }
 }
 
 
-UUserWidget* APlayerCharacterController::CreateRuntimeCreatorHUD()
+void APlayerCharacterController::SetCreatorHUDWidget(UCreatorHUDWidget* InWidget)
 {
-    if (IsValid(SubSystem) && SubSystem->IsWorldLoading())
-    {
-        return nullptr;
-    }
-
-    // No native/WBP fallback class is loaded here anymore. Assign a WBP class explicitly or create the widget in Blueprint.
-    if (!RuntimeCreatorHUDWidgetClass)
-    {
-        UE_LOG(LogTemp, Verbose, TEXT("PlayerCharacterController: RuntimeCreatorHUDWidgetClass is not assigned; skipping Creator HUD creation."));
-        return nullptr;
-    }
-
-    // Reuse the existing HUD instance when it is still alive.
-    if (IsValid(RuntimeCreatorHUDWidget))
-    {
-        if (!RuntimeCreatorHUDWidget->IsInViewport())
-        {
-            RuntimeCreatorHUDWidget->AddToViewport(RuntimeCreatorHUDZOrder);
-        }
-        return RuntimeCreatorHUDWidget.Get();
-    }
-
-    // Only instantiate an explicitly assigned WBP class.
-    RuntimeCreatorHUDWidget = CreateWidget<UUserWidget>(this, RuntimeCreatorHUDWidgetClass);
-
-    // Return nullptr if widget creation fails.
-    if (!IsValid(RuntimeCreatorHUDWidget))
-    {
-        return nullptr;
-    }
-
-    // Add the HUD to the viewport.
-    RuntimeCreatorHUDWidget->AddToViewport(RuntimeCreatorHUDZOrder);
-
-    // Keep GameOnly input so this HUD does not interrupt crosshair-centered gameplay.
-    if (!bRuntimeUIInputMode)
-    {
-        ApplyGameInputMode();
-    }
-
-    // Return the created HUD instance.
-    return RuntimeCreatorHUDWidget.Get();
+    CreatorHUDWidget = InWidget;
 }
 
-void APlayerCharacterController::RemoveRuntimeCreatorHUD()
+void APlayerCharacterController::SetDebugWidget(UUserWidget* InWidget)
 {
-    // Remove the HUD from the viewport if it is valid.
-    if (IsValid(RuntimeCreatorHUDWidget))
+    DebugWidget = InWidget;
+    if (IsValid(DebugWidget))
     {
-        RuntimeCreatorHUDWidget->RemoveFromParent();
+        DebugWidget->SetVisibility(ESlateVisibility::Collapsed);
+    }
+    bIsDebug = false;
+}
+
+void APlayerCharacterController::SetPauseMenuWidget(UPauseMenuWidget* InWidget)
+{
+    PauseMenuWidget = InWidget;
+    if (IsValid(PauseMenuWidget))
+    {
+        PauseMenuWidget->SetVisibility(ESlateVisibility::Collapsed);
+    }
+}
+
+void APlayerCharacterController::SetSettingsMenuWidget(USettingsMenuWidget* InWidget)
+{
+    if (IsValid(SettingsMenuWidget))
+    {
+        SettingsMenuWidget->OnCloseRequested.RemoveDynamic(
+            this, &APlayerCharacterController::ReturnToPauseMenuFromSettings);
     }
 
-    // Clear the reference so the next request can create a fresh instance.
-    RuntimeCreatorHUDWidget = nullptr;
+    SettingsMenuWidget = InWidget;
+    if (IsValid(SettingsMenuWidget))
+    {
+        SettingsMenuWidget->OnCloseRequested.RemoveDynamic(
+            this, &APlayerCharacterController::ReturnToPauseMenuFromSettings);
+        SettingsMenuWidget->OnCloseRequested.AddDynamic(
+            this, &APlayerCharacterController::ReturnToPauseMenuFromSettings);
+        SettingsMenuWidget->SetVisibility(ESlateVisibility::Collapsed);
+    }
+}
+
+void APlayerCharacterController::RemoveCreatorHUD()
+{
+    if (IsValid(CreatorHUDWidget))
+    {
+        CreatorHUDWidget->SetVisibility(ESlateVisibility::Collapsed);
+    }
 }
 
 void APlayerCharacterController::SetupInputComponent()
 {
     Super::SetupInputComponent();
+    ResolveCentralAssets();
     if (bApplyInputMappingContextsOnBeginPlay)
     {
         ApplyConfiguredInputMappingContexts();
     }
     BindConfiguredInputActions();
-    BindFallbackKeyInputs();
+    BindDirectMouseInputs();
 }
 
 void APlayerCharacterController::BeginPlayingState()
@@ -163,46 +380,442 @@ void APlayerCharacterController::BeginPlayingState()
     {
         ApplyConfiguredInputMappingContexts();
     }
-    if (bLogRuntimeInputSetup)
+
+    // BeginPlayingState runs after possession and input-component initialization. Reassert gameplay
+    // focus here because a loading widget created during BeginPlay may have consumed keyboard focus.
+    if (IsLocalController() && !bMenuWorldTravelPending)
     {
-        PrintRuntimeInputSetupStatus();
+        if (!IsValid(SubSystem))
+        {
+            SubSystem = UGameManagerSubSystem::GetSubSystem(this);
+        }
+
+        if (!IsValid(SubSystem) || (!SubSystem->IsWorldLoading() && !SubSystem->GetGamePaused()))
+        {
+            ApplyGameInputMode();
+        }
+    }
+
+    if (bLogInputSetup)
+    {
+        PrintInputSetupStatus();
     }
 }
 
-void APlayerCharacterController::Tick(float DeltaSeconds)
+void APlayerCharacterController::OnPossess(APawn* InPawn)
 {
-    Super::Tick(DeltaSeconds);
+    Super::OnPossess(InPawn);
 
-    if (bEnableFallbackKeyBindings && !bRuntimeUIInputMode &&
-        (bFallbackMoveForward || bFallbackMoveBackward || bFallbackMoveRight || bFallbackMoveLeft))
+    RegisterPrimaryCharacterPawn(InPawn);
+
+    // A streamed character or vehicle can be possessed after the original loading UI has already
+    // changed focus. Clear stale held state and recover mappings/focus on the next game-thread tick.
+    ClearLatchedMovementInput();
+    if (bApplyInputMappingContextsOnBeginPlay)
     {
-        UpdateFallbackMoveInput();
+        ApplyConfiguredInputMappingContexts();
     }
+
+    if (!IsLocalController() || bMenuWorldTravelPending)
+    {
+        return;
+    }
+
+    if (UWorld* World = GetWorld())
+    {
+        GameplayInputRecoveryHandle = World->GetTimerManager().SetTimerForNextTick(
+            FTimerDelegate::CreateWeakLambda(this, [this]()
+            {
+                if (!IsValid(SubSystem))
+                {
+                    SubSystem = UGameManagerSubSystem::GetSubSystem(this);
+                }
+
+                if (IsValid(SubSystem))
+                {
+                    SubSystem->ApplyPendingInitialPlayerControlRotation(this);
+                }
+
+                if (!IsValid(SubSystem) || (!SubSystem->IsWorldLoading() && !SubSystem->GetGamePaused()))
+                {
+                    ApplyGameInputMode();
+                }
+            }));
+    }
+}
+
+void APlayerCharacterController::AcknowledgePossession(APawn* InPawn)
+{
+    Super::AcknowledgePossession(InPawn);
+    RegisterPrimaryCharacterPawn(InPawn);
+}
+
+void APlayerCharacterController::RegisterPrimaryCharacterPawn(APawn* InPawn)
+{
+    if (!IsValid(SubSystem))
+    {
+        SubSystem = UGameManagerSubSystem::GetSubSystem(this);
+    }
+
+    UWorld* World = GetWorld();
+    const bool bIsFirstPlayerController =
+        World && World->GetFirstPlayerController() == this;
+    if (bIsFirstPlayerController)
+    {
+        if (ACharacterController* PlayerCharacter = Cast<ACharacterController>(InPawn))
+        {
+            // Register only the primary character after possession has established ownership.
+            // The next-tick callback below runs after FinishRestartPlayer's rotation override.
+            if (IsValid(SubSystem))
+            {
+                SubSystem->SetPlayerActor(PlayerCharacter);
+                USceneComponent* FollowCamera = PlayerCharacter->GetFollowCameraComponent();
+                SubSystem->SetCameraComponent(FollowCamera);
+                UGameInstance* const GameInstance = GetGameInstance();
+                if (UWeatherSubsystem* Weather = GameInstance
+                    ? GameInstance->GetSubsystem<UWeatherSubsystem>() : nullptr)
+                {
+                    Weather->SetWeatherCamera(FollowCamera);
+                }
+            }
+        }
+    }
+}
+
+void APlayerCharacterController::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+    if (UWorld* World = GetWorld())
+    {
+        World->GetTimerManager().ClearTimer(MenuWorldTravelWatchdogHandle);
+        World->GetTimerManager().ClearTimer(GameplayInputRecoveryHandle);
+    }
+
+    if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
+    {
+        GameUpdate->UnregisterUpdate(GameUpdateTickHandle);
+    }
+    GameUpdateTickHandle = INDEX_NONE;
+
+    if (IsValid(SettingsMenuWidget))
+    {
+        SettingsMenuWidget->OnCloseRequested.RemoveDynamic(
+            this, &APlayerCharacterController::ReturnToPauseMenuFromSettings);
+    }
+    CreatorHUDWidget = nullptr;
+    DebugWidget = nullptr;
+    PauseMenuWidget = nullptr;
+    SettingsMenuWidget = nullptr;
+
+    Super::EndPlay(EndPlayReason);
+}
+
+
+void APlayerCharacterController::UpdateFromGameUpdate(float DeltaSeconds)
+{
+    if (!IsValid(SubSystem))
+    {
+        SubSystem = UGameManagerSubSystem::GetSubSystem(this);
+    }
+
+    const bool bWorldLoadingNow = IsValid(SubSystem) && SubSystem->IsWorldLoading();
+    const bool bGamePausedNow = IsValid(SubSystem) && SubSystem->GetGamePaused();
+
+    // Recover exactly when asynchronous world loading or pause ends. This closes the failure mode
+    // where the UI accepted LMB while keyboard movement and mouse-look remained on an ignore stack.
+    const bool bReturnedToGameplay =
+        (bPrevWorldLoading && !bWorldLoadingNow) ||
+        (bPrevGamePaused && !bGamePausedNow);
+    if (bReturnedToGameplay && !bWorldLoadingNow && !bGamePausedNow && !bMenuWorldTravelPending)
+    {
+        ApplyGameInputMode();
+    }
+
+    bPrevWorldLoading = bWorldLoadingNow;
+    bPrevGamePaused = bGamePausedNow;
+
 }
 
 void APlayerCharacterController::ApplyGameInputMode()
 {
-    bRuntimeUIInputMode = false;
+    // Late UI/Blueprint callbacks must not re-enable gameplay input during level travel.
+    if (bMenuWorldTravelPending)
+    {
+        return;
+    }
+
+    if (IsValid(SubSystem) && SubSystem->IsWorldLoading())
+    {
+        ApplyLoadingInputMode(nullptr);
+        return;
+    }
+
+    if (UWorld* World = GetWorld())
+    {
+        World->GetTimerManager().ClearTimer(GameplayInputRecoveryHandle);
+    }
+
+    // Keep the engine pause flag and the persistent subsystem state synchronized. A stale engine
+    // pause after a loading/pause widget is removed can make UI clicks work while gameplay input
+    // and pawn ticking remain stopped.
+    if ((!IsValid(SubSystem) || !SubSystem->GetGamePaused()) && UGameplayStatics::IsGamePaused(this))
+    {
+        UGameplayStatics::SetGamePaused(this, false);
+    }
+
+    bUIInputMode = false;
     UWidgetBlueprintLibrary::SetInputMode_GameOnly(this, false);
+    UWidgetBlueprintLibrary::SetFocusToGameViewport();
     bShowMouseCursor = !bHideMouseCursorDuringGameplay;
     bEnableClickEvents = false;
     bEnableMouseOverEvents = false;
-    SetIgnoreLookInput(false);
-    SetIgnoreMoveInput(false);
+
+    // Reset the entire controller ignore-input stack. Calling SetIgnore*Input(false) only pops one
+    // layer, while loading, pause, and widget callbacks may previously have pushed several layers.
+    SetGameplayInputSuppressed(false);
+
+    // Reapply configured contexts idempotently in case a level transition or UI flow removed
+    // the Enhanced Input subsystem mappings. Missing actions are configuration errors, not remapped keys.
+    ApplyConfiguredInputMappingContexts();
+    ReapplyHeldGameplayInput();
+
+    // Slate focus changes are finalized at the end of the current frame. Reassert GameOnly mode on
+    // the next tick so a just-removed widget cannot steal keyboard or mouse-axis input afterward.
+    if (UWorld* World = GetWorld())
+    {
+        GameplayInputRecoveryHandle = World->GetTimerManager().SetTimerForNextTick(
+            FTimerDelegate::CreateWeakLambda(this, [this]()
+            {
+                FinalizeGameplayInputRecovery();
+            }));
+    }
 }
 
 void APlayerCharacterController::ApplyUIInputMode(UUserWidget* WidgetToFocus)
 {
-    bRuntimeUIInputMode = true;
+    if (bMenuWorldTravelPending)
+    {
+        return;
+    }
+
+    bUIInputMode = true;
+    UUserWidget* SafeFocusWidget = IsValid(WidgetToFocus) && WidgetToFocus->IsFocusable()
+        ? WidgetToFocus
+        : nullptr;
     UWidgetBlueprintLibrary::SetInputMode_GameAndUIEx(
         this,
-        WidgetToFocus,
+        SafeFocusWidget,
         EMouseLockMode::DoNotLock,
         true,
         false);
     bShowMouseCursor = true;
     bEnableClickEvents = true;
     bEnableMouseOverEvents = true;
+    StopGameplayMotionForUI();
+    SetGameplayInputSuppressed(true);
+}
+
+void APlayerCharacterController::ApplyLoadingInputMode(UUserWidget* WidgetToFocus)
+{
+    bUIInputMode = true;
+    // Loading-screen roots are commonly non-focusable. Passing one to SetInputMode causes Slate
+    // to emit "Attempting to focus Non-Focusable widget SObjectWidget" on every build/load.
+    UUserWidget* SafeFocusWidget = IsValid(WidgetToFocus) && WidgetToFocus->IsFocusable()
+        ? WidgetToFocus
+        : nullptr;
+    UWidgetBlueprintLibrary::SetInputMode_GameAndUIEx(
+        this,
+        SafeFocusWidget,
+        EMouseLockMode::DoNotLock,
+        false,
+        false);
+    bShowMouseCursor = true;
+    bEnableClickEvents = true;
+    bEnableMouseOverEvents = true;
+    StopGameplayMotionForUI();
+    SetGameplayInputSuppressed(true);
+}
+
+void APlayerCharacterController::StopGameplayMotionForUI()
+{
+    // UI/mouse-cursor mode must stop active gameplay input immediately.
+    // Enhanced Input may not emit Completed events while focus is on a widget, so clear
+    // the controlled pawn explicitly instead of waiting for key release callbacks.
+
+    if (AVehiclePawn* Vehicle = Cast<AVehiclePawn>(GetPawn()))
+    {
+        Vehicle->ClearDriveInput();
+        return;
+    }
+
+    if (ACharacterController* CharacterCtrl = Cast<ACharacterController>(GetPawn()))
+    {
+        CharacterCtrl->ClearTransientInputState();
+    }
+}
+
+void APlayerCharacterController::SetGameplayInputSuppressed(const bool bSuppress)
+{
+    if (bSuppress)
+    {
+        // SetIgnoreMoveInput and SetIgnoreLookInput are stack based. Push only once for this
+        // controller-owned UI/loading lock, no matter how many widgets request the same mode.
+        if (!bGameplayInputSuppressed)
+        {
+            SetIgnoreMoveInput(true);
+            SetIgnoreLookInput(true);
+            bGameplayInputSuppressed = true;
+        }
+        return;
+    }
+
+    // Reset rather than popping one layer. This also recovers from stale Blueprint or legacy C++
+    // calls that pushed ignore input more than once and caused the packaged game to accept only LMB.
+    ResetIgnoreMoveInput();
+    ResetIgnoreLookInput();
+    bGameplayInputSuppressed = false;
+}
+
+void APlayerCharacterController::FinalizeGameplayInputRecovery()
+{
+    if (!IsLocalController() || IsActorBeingDestroyed() || bMenuWorldTravelPending || bUIInputMode)
+    {
+        return;
+    }
+
+    if (!IsValid(SubSystem))
+    {
+        SubSystem = UGameManagerSubSystem::GetSubSystem(this);
+    }
+    if (IsValid(SubSystem) && (SubSystem->IsWorldLoading() || SubSystem->GetGamePaused()))
+    {
+        return;
+    }
+
+    if ((!IsValid(SubSystem) || !SubSystem->GetGamePaused()) && UGameplayStatics::IsGamePaused(this))
+    {
+        UGameplayStatics::SetGamePaused(this, false);
+    }
+
+    UWidgetBlueprintLibrary::SetInputMode_GameOnly(this, false);
+    UWidgetBlueprintLibrary::SetFocusToGameViewport();
+    bShowMouseCursor = !bHideMouseCursorDuringGameplay;
+    bEnableClickEvents = false;
+    bEnableMouseOverEvents = false;
+    SetGameplayInputSuppressed(false);
+    ApplyConfiguredInputMappingContexts();
+    ReapplyHeldGameplayInput();
+
+    UE_LOG(LogTemp, Verbose, TEXT("[GameplayInput] Viewport focus and gameplay input were recovered after UI/loading mode."));
+}
+
+void APlayerCharacterController::LockInputForMenuWorldTravel()
+{
+    bUIInputMode = true;
+    StopGameplayMotionForUI();
+
+    // Remove the old menu from hit testing and prevent its initiating click/key release from being
+    // interpreted as gameplay input while OpenLevel is queued.
+    UWidgetBlueprintLibrary::SetInputMode_GameOnly(this, false);
+    SetGameplayInputSuppressed(true);
+    bEnableClickEvents = false;
+    bEnableMouseOverEvents = false;
+    bShowMouseCursor = false;
+}
+
+TSoftObjectPtr<UWorld> APlayerCharacterController::ResolveMainWorld() const
+{
+    if (UGlTFSimulatorAssetRegistry* Registry = UGlTFSimulatorGameInstance::GetAssetRegistryFromContext(this))
+    {
+        return Registry->MainWorld;
+    }
+    return TSoftObjectPtr<UWorld>();
+}
+
+void APlayerCharacterController::RestorePauseMenuAfterRejectedTravel()
+{
+    bMenuWorldTravelPending = false;
+    if (UWorld* World = GetWorld())
+    {
+        World->GetTimerManager().ClearTimer(MenuWorldTravelWatchdogHandle);
+    }
+
+    if (!IsValid(SubSystem))
+    {
+        SubSystem = UGameManagerSubSystem::GetSubSystem(this);
+    }
+    if (IsValid(SubSystem))
+    {
+        SubSystem->CancelWorldSelectionMenuTravel();
+        SubSystem->SetGamePaused(true);
+    }
+
+    if (IsValid(SettingsMenuWidget))
+    {
+        SettingsMenuWidget->SetVisibility(ESlateVisibility::Collapsed);
+    }
+
+    UPauseMenuWidget* Menu = PauseMenuWidget.Get();
+    if (IsValid(Menu))
+    {
+        Menu->SetIsEnabled(true);
+        Menu->SetVisibility(ESlateVisibility::Visible);
+        Menu->ResetExitRequestState();
+    }
+    else
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("Pause travel was rejected but no PauseMenuWidget is available from the central AssetRegistry or an explicit override."));
+    }
+
+    ApplyUIInputMode(Menu);
+    bPrevGamePaused = true;
+}
+
+void APlayerCharacterController::ArmMenuWorldTravelWatchdog()
+{
+    UWorld* World = GetWorld();
+    if (!World)
+    {
+        return;
+    }
+
+    World->GetTimerManager().ClearTimer(MenuWorldTravelWatchdogHandle);
+    World->GetTimerManager().SetTimer(
+        MenuWorldTravelWatchdogHandle,
+        this,
+        &APlayerCharacterController::HandleMenuWorldTravelWatchdogExpired,
+        MenuWorldTravelWatchdogSeconds,
+        false);
+}
+
+void APlayerCharacterController::HandleMenuWorldTravelWatchdogExpired()
+{
+    if (!bMenuWorldTravelPending || IsActorBeingDestroyed())
+    {
+        return;
+    }
+
+    UE_LOG(LogTemp, Error,
+        TEXT("[MenuTravel] World-selection travel did not leave the gameplay world within %.1f seconds. Restoring the pause menu."),
+        MenuWorldTravelWatchdogSeconds);
+    RestorePauseMenuAfterRejectedTravel();
+}
+
+void APlayerCharacterController::ReapplyHeldGameplayInput()
+{
+    if (bUIInputMode)
+    {
+        return;
+    }
+
+    if (ACharacterController* CharacterCtrl = Cast<ACharacterController>(GetPawn()))
+    {
+        // A held sprint key does not always fire another Started event after ragdoll
+        // recovery or an input-mode switch. Reapply the physical held state here.
+        CharacterCtrl->Sprinting(bSprintInputHeld);
+        CharacterCtrl->Crouching(bCrouchInputHeld);
+    }
+
 }
 
 void APlayerCharacterController::ApplyConfiguredInputMappingContexts()
@@ -226,17 +839,21 @@ void APlayerCharacterController::ApplyConfiguredInputMappingContexts()
         EnhancedInputSubsystem->ClearAllMappings();
     }
 
-    const auto AddContextIfValid = [EnhancedInputSubsystem](const UInputMappingContext* MappingContext, int32 Priority) -> bool
+    const auto AddContextIfValid = [EnhancedInputSubsystem](const UInputMappingContext* MappingContext, const int32 Priority) -> bool
     {
-        if (IsValid(MappingContext))
+        if (!IsValid(MappingContext))
         {
-            EnhancedInputSubsystem->AddMappingContext(MappingContext, Priority);
-            return true;
+            return false;
         }
-        return false;
+
+        // Remove first so repeated BeginPlay, possession, loading, and focus-recovery callbacks do
+        // not accumulate duplicate mapping registrations or preserve an obsolete priority.
+        EnhancedInputSubsystem->RemoveMappingContext(MappingContext);
+        EnhancedInputSubsystem->AddMappingContext(MappingContext, Priority);
+        return true;
     };
 
-    bAnyInputMappingContextApplied |= AddContextIfValid(RuntimeInputMappingContext.Get(), RuntimeInputMappingPriority);
+    bAnyInputMappingContextApplied |= AddContextIfValid(InputMappingContext.Get(), InputMappingPriority);
 
     for (const FPlayerInputMappingContextConfig& ContextConfig : AdditionalInputMappingContexts)
     {
@@ -247,36 +864,35 @@ void APlayerCharacterController::ApplyConfiguredInputMappingContexts()
 void APlayerCharacterController::RefreshConfiguredEnhancedInput()
 {
     ApplyConfiguredInputMappingContexts();
-    PrintRuntimeInputSetupStatus();
+    PrintInputSetupStatus();
 }
 
-FString APlayerCharacterController::GetRuntimeInputFixVersion() const
+FString APlayerCharacterController::GetInputFixVersion() const
 {
-    return TEXT("RuntimeInput");
+    return TEXT("GameplayInputRecovery-v4");
 }
 
-FString APlayerCharacterController::GetRuntimeInputSetupStatus() const
+FString APlayerCharacterController::GetInputSetupStatus() const
 {
     return FString::Printf(
-        TEXT("%s | Controller=%s | Class=%s | PrimaryIMC=%s | IMCCount=%d | IAAssigned=%d | EnhancedInputComponent=%s | MappingApplied=%s | RuntimeMouse=%s | ManagerClass=%s"),
-        TEXT("RuntimeInput"),
+        TEXT("%s | Controller=%s | Class=%s | PrimaryIMC=%s | IMCCount=%d | IAAssigned=%d | EnhancedInputComponent=%s | MappingApplied=%s | GameplayMouse=%s"),
+        TEXT("GameplayInputRecovery-v4"),
         *GetNameSafe(this),
         *GetNameSafe(GetClass()),
-        *GetNameSafe(RuntimeInputMappingContext.Get()),
+        *GetNameSafe(InputMappingContext.Get()),
         CountConfiguredInputMappingContexts(),
         CountAssignedEnhancedInputActions(),
         bEnhancedInputComponentWasAvailable ? TEXT("OK") : TEXT("NO"),
         bAnyInputMappingContextApplied ? TEXT("YES") : TEXT("NO"),
-        (bEnableFallbackKeyBindings && bBindRuntimeMouseButtons) ? TEXT("LMB/RMB") : TEXT("OFF"),
-        *GetNameSafe(RuntimeGameplayManagerClass ? RuntimeGameplayManagerClass.Get() : ARuntimeGameplayManager::StaticClass()));
+        bBindMouseButtons ? TEXT("LMB/RMB") : TEXT("OFF"));
 }
 
-void APlayerCharacterController::PrintRuntimeInputSetupStatus() const
+void APlayerCharacterController::PrintInputSetupStatus() const
 {
-    const FString Status = GetRuntimeInputSetupStatus();
-    UE_LOG(LogTemp, Display, TEXT("[RuntimeInput] %s"), *Status);
+    const FString Status = GetInputSetupStatus();
+    UE_LOG(LogTemp, Display, TEXT("[GameplayInput] %s"), *Status);
 
-    if (bShowRuntimeInputSetupOnScreen && GEngine && IsLocalController())
+    if (bShowInputSetupOnScreen && GEngine && IsLocalController())
     {
         GEngine->AddOnScreenDebugMessage(-1, 6.0f, FColor::Green, Status);
     }
@@ -289,7 +905,7 @@ void APlayerCharacterController::BindConfiguredInputActions()
     UEnhancedInputComponent* EnhancedInputComponent = Cast<UEnhancedInputComponent>(InputComponent);
     if (!IsValid(EnhancedInputComponent))
     {
-        UE_LOG(LogTemp, Warning, TEXT("PlayerCharacterController InputComponent is not an EnhancedInputComponent. Fallback keys remain active; Blueprint Input Action events can still call the Input_* functions manually."));
+        UE_LOG(LogTemp, Error, TEXT("PlayerCharacterController InputComponent is not an EnhancedInputComponent. Configure Enhanced Input; only direct placement mouse buttons can be bound without it."));
         return;
     }
 
@@ -332,50 +948,54 @@ void APlayerCharacterController::BindConfiguredInputActions()
         EnhancedInputComponent->BindAction(RagdollAction.Get(), ETriggerEvent::Started, this, &APlayerCharacterController::Input_RagdollPressed);
     }
 
-    if (RuntimeInteractAction)
+    if (InteractAction)
     {
-        EnhancedInputComponent->BindAction(RuntimeInteractAction.Get(), ETriggerEvent::Started, this, &APlayerCharacterController::Input_RuntimeInteractPressed);
+        EnhancedInputComponent->BindAction(InteractAction.Get(), ETriggerEvent::Started, this, &APlayerCharacterController::Input_InteractPressed);
     }
-    if (RuntimeToggleFirstPersonAction)
+    if (ToggleFirstPersonAction)
     {
-        EnhancedInputComponent->BindAction(RuntimeToggleFirstPersonAction.Get(), ETriggerEvent::Started, this, &APlayerCharacterController::Input_RuntimeToggleFirstPersonPressed);
+        EnhancedInputComponent->BindAction(ToggleFirstPersonAction.Get(), ETriggerEvent::Started, this, &APlayerCharacterController::Input_ToggleFirstPersonPressed);
     }
-    if (RuntimeToolbarScrollAction)
+    if (ChangeCharacterAction)
     {
-        EnhancedInputComponent->BindAction(RuntimeToolbarScrollAction.Get(), ETriggerEvent::Triggered, this, &APlayerCharacterController::HandleToolbarScrollTriggered);
+        EnhancedInputComponent->BindAction(ChangeCharacterAction.Get(), ETriggerEvent::Started, this, &APlayerCharacterController::Input_ChangeCharacterPressed);
     }
-    if (RuntimeToggleItemListAction)
+    if (ToolbarScrollAction)
     {
-        EnhancedInputComponent->BindAction(RuntimeToggleItemListAction.Get(), ETriggerEvent::Started, this, &APlayerCharacterController::Input_RuntimeToggleItemListPressed);
+        EnhancedInputComponent->BindAction(ToolbarScrollAction.Get(), ETriggerEvent::Triggered, this, &APlayerCharacterController::HandleToolbarScrollTriggered);
     }
-    if (RuntimeSnapAction)
+    if (ToggleItemListAction)
     {
-        EnhancedInputComponent->BindAction(RuntimeSnapAction.Get(), ETriggerEvent::Started, this, &APlayerCharacterController::Input_RuntimeSnapPressed);
+        EnhancedInputComponent->BindAction(ToggleItemListAction.Get(), ETriggerEvent::Started, this, &APlayerCharacterController::Input_ToggleItemListPressed);
+    }
+    if (SnapAction)
+    {
+        EnhancedInputComponent->BindAction(SnapAction.Get(), ETriggerEvent::Started, this, &APlayerCharacterController::Input_SnapPressed);
     }
 
-    if (RuntimeVehicleMoveAction)
+    if (VehicleMoveAction)
     {
-        EnhancedInputComponent->BindAction(RuntimeVehicleMoveAction.Get(), ETriggerEvent::Triggered, this, &APlayerCharacterController::HandleVehicleMoveTriggered);
-        EnhancedInputComponent->BindAction(RuntimeVehicleMoveAction.Get(), ETriggerEvent::Completed, this, &APlayerCharacterController::HandleVehicleMoveCompleted);
-        EnhancedInputComponent->BindAction(RuntimeVehicleMoveAction.Get(), ETriggerEvent::Canceled, this, &APlayerCharacterController::HandleVehicleMoveCompleted);
+        EnhancedInputComponent->BindAction(VehicleMoveAction.Get(), ETriggerEvent::Triggered, this, &APlayerCharacterController::HandleVehicleMoveTriggered);
+        EnhancedInputComponent->BindAction(VehicleMoveAction.Get(), ETriggerEvent::Completed, this, &APlayerCharacterController::HandleVehicleMoveCompleted);
+        EnhancedInputComponent->BindAction(VehicleMoveAction.Get(), ETriggerEvent::Canceled, this, &APlayerCharacterController::HandleVehicleMoveCompleted);
     }
-    if (RuntimeVehicleThrottleAction)
+    if (VehicleThrottleAction)
     {
-        EnhancedInputComponent->BindAction(RuntimeVehicleThrottleAction.Get(), ETriggerEvent::Triggered, this, &APlayerCharacterController::HandleVehicleThrottleTriggered);
-        EnhancedInputComponent->BindAction(RuntimeVehicleThrottleAction.Get(), ETriggerEvent::Completed, this, &APlayerCharacterController::HandleVehicleThrottleCompleted);
-        EnhancedInputComponent->BindAction(RuntimeVehicleThrottleAction.Get(), ETriggerEvent::Canceled, this, &APlayerCharacterController::HandleVehicleThrottleCompleted);
+        EnhancedInputComponent->BindAction(VehicleThrottleAction.Get(), ETriggerEvent::Triggered, this, &APlayerCharacterController::HandleVehicleThrottleTriggered);
+        EnhancedInputComponent->BindAction(VehicleThrottleAction.Get(), ETriggerEvent::Completed, this, &APlayerCharacterController::HandleVehicleThrottleCompleted);
+        EnhancedInputComponent->BindAction(VehicleThrottleAction.Get(), ETriggerEvent::Canceled, this, &APlayerCharacterController::HandleVehicleThrottleCompleted);
     }
-    if (RuntimeVehicleSteeringAction)
+    if (VehicleSteeringAction)
     {
-        EnhancedInputComponent->BindAction(RuntimeVehicleSteeringAction.Get(), ETriggerEvent::Triggered, this, &APlayerCharacterController::HandleVehicleSteeringTriggered);
-        EnhancedInputComponent->BindAction(RuntimeVehicleSteeringAction.Get(), ETriggerEvent::Completed, this, &APlayerCharacterController::HandleVehicleSteeringCompleted);
-        EnhancedInputComponent->BindAction(RuntimeVehicleSteeringAction.Get(), ETriggerEvent::Canceled, this, &APlayerCharacterController::HandleVehicleSteeringCompleted);
+        EnhancedInputComponent->BindAction(VehicleSteeringAction.Get(), ETriggerEvent::Triggered, this, &APlayerCharacterController::HandleVehicleSteeringTriggered);
+        EnhancedInputComponent->BindAction(VehicleSteeringAction.Get(), ETriggerEvent::Completed, this, &APlayerCharacterController::HandleVehicleSteeringCompleted);
+        EnhancedInputComponent->BindAction(VehicleSteeringAction.Get(), ETriggerEvent::Canceled, this, &APlayerCharacterController::HandleVehicleSteeringCompleted);
     }
-    if (RuntimeVehicleStopAction)
+    if (VehicleStopAction)
     {
-        EnhancedInputComponent->BindAction(RuntimeVehicleStopAction.Get(), ETriggerEvent::Started, this, &APlayerCharacterController::Input_RuntimeVehicleStop);
-        EnhancedInputComponent->BindAction(RuntimeVehicleStopAction.Get(), ETriggerEvent::Completed, this, &APlayerCharacterController::Input_RuntimeVehicleStop);
-        EnhancedInputComponent->BindAction(RuntimeVehicleStopAction.Get(), ETriggerEvent::Canceled, this, &APlayerCharacterController::Input_RuntimeVehicleStop);
+        EnhancedInputComponent->BindAction(VehicleStopAction.Get(), ETriggerEvent::Started, this, &APlayerCharacterController::Input_VehicleStop);
+        EnhancedInputComponent->BindAction(VehicleStopAction.Get(), ETriggerEvent::Completed, this, &APlayerCharacterController::Input_VehicleStop);
+        EnhancedInputComponent->BindAction(VehicleStopAction.Get(), ETriggerEvent::Canceled, this, &APlayerCharacterController::Input_VehicleStop);
     }
     if (PauseAction)
     {
@@ -389,7 +1009,7 @@ void APlayerCharacterController::BindConfiguredInputActions()
 
 int32 APlayerCharacterController::CountConfiguredInputMappingContexts() const
 {
-    int32 Count = IsValid(RuntimeInputMappingContext.Get()) ? 1 : 0;
+    int32 Count = IsValid(InputMappingContext.Get()) ? 1 : 0;
     for (const FPlayerInputMappingContextConfig& ContextConfig : AdditionalInputMappingContexts)
     {
         if (IsValid(ContextConfig.MappingContext.Get()))
@@ -418,203 +1038,34 @@ int32 APlayerCharacterController::CountAssignedEnhancedInputActions() const
     CountIfValid(CrouchAction.Get());
     CountIfValid(FlyAction.Get());
     CountIfValid(RagdollAction.Get());
-    CountIfValid(RuntimeToggleFirstPersonAction.Get());
-    CountIfValid(RuntimeToolbarScrollAction.Get());
-    CountIfValid(RuntimeToggleItemListAction.Get());
-    CountIfValid(RuntimeSnapAction.Get());
-    CountIfValid(RuntimeInteractAction.Get());
-    CountIfValid(RuntimeVehicleMoveAction.Get());
-    CountIfValid(RuntimeVehicleThrottleAction.Get());
-    CountIfValid(RuntimeVehicleSteeringAction.Get());
-    CountIfValid(RuntimeVehicleStopAction.Get());
+    CountIfValid(ToggleFirstPersonAction.Get());
+    CountIfValid(ChangeCharacterAction.Get());
+    CountIfValid(ToolbarScrollAction.Get());
+    CountIfValid(ToggleItemListAction.Get());
+    CountIfValid(SnapAction.Get());
+    CountIfValid(InteractAction.Get());
+    CountIfValid(VehicleMoveAction.Get());
+    CountIfValid(VehicleThrottleAction.Get());
+    CountIfValid(VehicleSteeringAction.Get());
+    CountIfValid(VehicleStopAction.Get());
     CountIfValid(PauseAction.Get());
     CountIfValid(DebugAction.Get());
 
     return Count;
 }
 
-bool APlayerCharacterController::ShouldBindFallbackKeyForAction(const UInputAction* ConfiguredAction) const
+void APlayerCharacterController::BindDirectMouseInputs()
 {
-    if (!bBindFallbackKeysOnlyForUnassignedInputActions)
-    {
-        return true;
-    }
-
-    // If Enhanced Input is not fully ready, keep legacy keys alive instead of silently losing input.
-    if (!bEnhancedInputComponentWasAvailable || !bAnyInputMappingContextApplied)
-    {
-        return true;
-    }
-
-    return !IsValid(ConfiguredAction);
-}
-
-void APlayerCharacterController::BindFallbackKeyInputs()
-{
-    if (!bEnableFallbackKeyBindings || !InputComponent)
+    if (!bBindMouseButtons || !InputComponent)
     {
         return;
     }
 
-    // These fallback keys keep the runtime tools usable even when Enhanced Input
-    // assets are missing. When an InputAction is assigned, the matching fallback
-    // key is skipped by default to avoid the same key firing twice.
-    if (ShouldBindFallbackKeyForAction(MoveAction.Get()))
-    {
-        InputComponent->BindKey(EKeys::W, IE_Pressed, this, &APlayerCharacterController::FallbackMoveForwardPressed);
-        InputComponent->BindKey(EKeys::W, IE_Released, this, &APlayerCharacterController::FallbackMoveForwardReleased);
-        InputComponent->BindKey(EKeys::S, IE_Pressed, this, &APlayerCharacterController::FallbackMoveBackwardPressed);
-        InputComponent->BindKey(EKeys::S, IE_Released, this, &APlayerCharacterController::FallbackMoveBackwardReleased);
-        InputComponent->BindKey(EKeys::D, IE_Pressed, this, &APlayerCharacterController::FallbackMoveRightPressed);
-        InputComponent->BindKey(EKeys::D, IE_Released, this, &APlayerCharacterController::FallbackMoveRightReleased);
-        InputComponent->BindKey(EKeys::A, IE_Pressed, this, &APlayerCharacterController::FallbackMoveLeftPressed);
-        InputComponent->BindKey(EKeys::A, IE_Released, this, &APlayerCharacterController::FallbackMoveLeftReleased);
-    }
-
-    if (ShouldBindFallbackKeyForAction(LookAction.Get()))
-    {
-        InputComponent->BindAxisKey(EKeys::MouseX, this, &APlayerCharacterController::FallbackLookYaw);
-        InputComponent->BindAxisKey(EKeys::MouseY, this, &APlayerCharacterController::FallbackLookPitch);
-    }
-
-    if (ShouldBindFallbackKeyForAction(JumpAction.Get()))
-    {
-        InputComponent->BindKey(EKeys::SpaceBar, IE_Pressed, this, &APlayerCharacterController::Input_JumpStarted);
-        InputComponent->BindKey(EKeys::SpaceBar, IE_Released, this, &APlayerCharacterController::Input_JumpCompleted);
-    }
-    if (ShouldBindFallbackKeyForAction(SprintAction.Get()))
-    {
-        InputComponent->BindKey(EKeys::LeftShift, IE_Pressed, this, &APlayerCharacterController::Input_SprintStarted);
-        InputComponent->BindKey(EKeys::LeftShift, IE_Released, this, &APlayerCharacterController::Input_SprintCompleted);
-    }
-    if (ShouldBindFallbackKeyForAction(CrouchAction.Get()))
-    {
-        InputComponent->BindKey(EKeys::LeftControl, IE_Pressed, this, &APlayerCharacterController::Input_CrouchStarted);
-        InputComponent->BindKey(EKeys::LeftControl, IE_Released, this, &APlayerCharacterController::Input_CrouchCompleted);
-    }
-    if (ShouldBindFallbackKeyForAction(PauseAction.Get()))
-    {
-        InputComponent->BindKey(EKeys::Escape, IE_Pressed, this, &APlayerCharacterController::Input_PausePressed);
-    }
-    // Keep F3 as a hard fallback even when IA_Debug exists. Some project IMC assets may not map the
-    // action yet, and Input_DebugPressed is debounced so a duplicate Enhanced Input event is harmless.
-    InputComponent->BindKey(EKeys::F3, IE_Pressed, this, &APlayerCharacterController::Input_DebugPressed);
-
-    // Runtime tool commands are UI-driven. Only mouse placement and vehicle/camera hotkeys remain here.
-    if (bBindRuntimeMouseButtons)
-    {
-        InputComponent->BindKey(EKeys::LeftMouseButton, IE_Pressed, this, &APlayerCharacterController::Input_RuntimePrimaryPressed);
-        InputComponent->BindKey(EKeys::LeftMouseButton, IE_Released, this, &APlayerCharacterController::Input_RuntimePrimaryReleased);
-        InputComponent->BindKey(EKeys::RightMouseButton, IE_Pressed, this, &APlayerCharacterController::Input_RuntimeSecondaryPressed);
-    }
-
-    if (ShouldBindFallbackKeyForAction(RuntimeInteractAction.Get()))
-    {
-        InputComponent->BindKey(EKeys::F, IE_Pressed, this, &APlayerCharacterController::Input_RuntimeInteractPressed);
-    }
-    if (ShouldBindFallbackKeyForAction(RuntimeToggleFirstPersonAction.Get()))
-    {
-        InputComponent->BindKey(EKeys::V, IE_Pressed, this, &APlayerCharacterController::Input_RuntimeToggleFirstPersonPressed);
-    }
-    if (ShouldBindFallbackKeyForAction(RuntimeToolbarScrollAction.Get()))
-    {
-        InputComponent->BindAxisKey(EKeys::MouseWheelAxis, this, &APlayerCharacterController::Input_RuntimeToolbarScroll);
-    }
-    if (ShouldBindFallbackKeyForAction(RuntimeToggleItemListAction.Get()))
-    {
-        InputComponent->BindKey(EKeys::E, IE_Pressed, this, &APlayerCharacterController::Input_RuntimeToggleItemListPressed);
-    }
-    if (ShouldBindFallbackKeyForAction(RuntimeSnapAction.Get()))
-    {
-        InputComponent->BindKey(EKeys::G, IE_Pressed, this, &APlayerCharacterController::Input_RuntimeSnapPressed);
-    }
+    InputComponent->BindKey(EKeys::LeftMouseButton, IE_Pressed, this, &APlayerCharacterController::Input_PrimaryPressed);
+    InputComponent->BindKey(EKeys::RightMouseButton, IE_Pressed, this, &APlayerCharacterController::Input_SecondaryPressed);
 }
 
-void APlayerCharacterController::FallbackMoveForwardPressed()
-{
-    bFallbackMoveForward = true;
-    UpdateFallbackMoveInput();
-}
-
-void APlayerCharacterController::FallbackMoveForwardReleased()
-{
-    bFallbackMoveForward = false;
-    UpdateFallbackMoveInput();
-}
-
-void APlayerCharacterController::FallbackMoveBackwardPressed()
-{
-    bFallbackMoveBackward = true;
-    UpdateFallbackMoveInput();
-}
-
-void APlayerCharacterController::FallbackMoveBackwardReleased()
-{
-    bFallbackMoveBackward = false;
-    UpdateFallbackMoveInput();
-}
-
-void APlayerCharacterController::FallbackMoveRightPressed()
-{
-    bFallbackMoveRight = true;
-    UpdateFallbackMoveInput();
-}
-
-void APlayerCharacterController::FallbackMoveRightReleased()
-{
-    bFallbackMoveRight = false;
-    UpdateFallbackMoveInput();
-}
-
-void APlayerCharacterController::FallbackMoveLeftPressed()
-{
-    bFallbackMoveLeft = true;
-    UpdateFallbackMoveInput();
-}
-
-void APlayerCharacterController::FallbackMoveLeftReleased()
-{
-    bFallbackMoveLeft = false;
-    UpdateFallbackMoveInput();
-}
-
-void APlayerCharacterController::UpdateFallbackMoveInput()
-{
-    const float X = (bFallbackMoveRight ? 1.0f : 0.0f) - (bFallbackMoveLeft ? 1.0f : 0.0f);
-    const float Y = (bFallbackMoveForward ? 1.0f : 0.0f) - (bFallbackMoveBackward ? 1.0f : 0.0f);
-    Input_Move(FVector2D(X, Y));
-}
-
-void APlayerCharacterController::StopFallbackMovement()
-{
-    bFallbackMoveForward = false;
-    bFallbackMoveBackward = false;
-    bFallbackMoveRight = false;
-    bFallbackMoveLeft = false;
-
-    const bool bWasRuntimeUIInputMode = bRuntimeUIInputMode;
-    bRuntimeUIInputMode = false;
-    Input_Move(FVector2D::ZeroVector);
-    bRuntimeUIInputMode = bWasRuntimeUIInputMode;
-}
-
-void APlayerCharacterController::FallbackLookYaw(float Value)
-{
-    if (!bRuntimeUIInputMode && !FMath::IsNearlyZero(Value))
-    {
-        Input_Look(FVector2D(Value, 0.0f));
-    }
-}
-
-void APlayerCharacterController::FallbackLookPitch(float Value)
-{
-    if (!bRuntimeUIInputMode && !FMath::IsNearlyZero(Value))
-    {
-        Input_Look(FVector2D(0.0f, Value));
-    }
-}
-
-bool APlayerCharacterController::ConsumeRuntimeInput(double& LastInputTime)
+bool APlayerCharacterController::ConsumeInputDebounce(double& LastInputTime)
 {
     const UWorld* World = GetWorld();
     const double Now = World ? World->GetTimeSeconds() : FPlatformTime::Seconds();
@@ -644,47 +1095,47 @@ void APlayerCharacterController::HandleLookTriggered(const FInputActionValue& Va
 
 void APlayerCharacterController::HandleToolbarScrollTriggered(const FInputActionValue& Value)
 {
-    Input_RuntimeToolbarScroll(Value.Get<float>());
+    Input_ToolbarScroll(Value.Get<float>());
 }
 
 void APlayerCharacterController::HandleVehicleMoveTriggered(const FInputActionValue& Value)
 {
-    Input_RuntimeVehicleMove(Value.Get<FVector2D>());
+    Input_VehicleMove(Value.Get<FVector2D>());
 }
 
 void APlayerCharacterController::HandleVehicleMoveCompleted(const FInputActionValue& Value)
 {
-    Input_RuntimeVehicleMove(FVector2D::ZeroVector);
+    Input_VehicleMove(FVector2D::ZeroVector);
 }
 
 void APlayerCharacterController::HandleVehicleThrottleTriggered(const FInputActionValue& Value)
 {
-    Input_RuntimeVehicleThrottle(Value.Get<float>());
+    Input_VehicleThrottle(Value.Get<float>());
 }
 
 void APlayerCharacterController::HandleVehicleThrottleCompleted(const FInputActionValue& Value)
 {
-    Input_RuntimeVehicleThrottle(0.0f);
+    Input_VehicleThrottle(0.0f);
 }
 
 void APlayerCharacterController::HandleVehicleSteeringTriggered(const FInputActionValue& Value)
 {
-    Input_RuntimeVehicleSteering(Value.Get<float>());
+    Input_VehicleSteering(Value.Get<float>());
 }
 
 void APlayerCharacterController::HandleVehicleSteeringCompleted(const FInputActionValue& Value)
 {
-    Input_RuntimeVehicleSteering(0.0f);
+    Input_VehicleSteering(0.0f);
 }
 
 void APlayerCharacterController::Input_Move(const FVector2D& MoveValue)
 {
-    if (bRuntimeUIInputMode)
+    if (bUIInputMode)
     {
         return;
     }
 
-    if (ARuntimeVehiclePawn* Vehicle = Cast<ARuntimeVehiclePawn>(GetPawn()))
+    if (AVehiclePawn* Vehicle = Cast<AVehiclePawn>(GetPawn()))
     {
         Vehicle->SetDriveInput(MoveValue.Y, MoveValue.X);
         return;
@@ -698,7 +1149,7 @@ void APlayerCharacterController::Input_Move(const FVector2D& MoveValue)
 
 void APlayerCharacterController::Input_Look(const FVector2D& LookValue)
 {
-    if (bRuntimeUIInputMode)
+    if (bUIInputMode)
     {
         return;
     }
@@ -716,6 +1167,11 @@ void APlayerCharacterController::Input_Look(const FVector2D& LookValue)
 
 void APlayerCharacterController::Input_JumpStarted()
 {
+    if (bUIInputMode)
+    {
+        return;
+    }
+
     if (ACharacterController* CharacterCtrl = Cast<ACharacterController>(GetPawn()))
     {
         CharacterCtrl->Jumping(true);
@@ -732,6 +1188,12 @@ void APlayerCharacterController::Input_JumpCompleted()
 
 void APlayerCharacterController::Input_SprintStarted()
 {
+    bSprintInputHeld = true;
+    if (bUIInputMode)
+    {
+        return;
+    }
+
     if (ACharacterController* CharacterCtrl = Cast<ACharacterController>(GetPawn()))
     {
         CharacterCtrl->Sprinting(true);
@@ -740,6 +1202,7 @@ void APlayerCharacterController::Input_SprintStarted()
 
 void APlayerCharacterController::Input_SprintCompleted()
 {
+    bSprintInputHeld = false;
     if (ACharacterController* CharacterCtrl = Cast<ACharacterController>(GetPawn()))
     {
         CharacterCtrl->Sprinting(false);
@@ -748,6 +1211,12 @@ void APlayerCharacterController::Input_SprintCompleted()
 
 void APlayerCharacterController::Input_CrouchStarted()
 {
+    bCrouchInputHeld = true;
+    if (bUIInputMode)
+    {
+        return;
+    }
+
     if (ACharacterController* CharacterCtrl = Cast<ACharacterController>(GetPawn()))
     {
         CharacterCtrl->Crouching(true);
@@ -756,6 +1225,7 @@ void APlayerCharacterController::Input_CrouchStarted()
 
 void APlayerCharacterController::Input_CrouchCompleted()
 {
+    bCrouchInputHeld = false;
     if (ACharacterController* CharacterCtrl = Cast<ACharacterController>(GetPawn()))
     {
         CharacterCtrl->Crouching(false);
@@ -764,6 +1234,11 @@ void APlayerCharacterController::Input_CrouchCompleted()
 
 void APlayerCharacterController::Input_FlyPressed()
 {
+    if (bUIInputMode)
+    {
+        return;
+    }
+
     if (ACharacterController* CharacterCtrl = Cast<ACharacterController>(GetPawn()))
     {
         CharacterCtrl->Flying();
@@ -772,98 +1247,113 @@ void APlayerCharacterController::Input_FlyPressed()
 
 void APlayerCharacterController::Input_RagdollPressed()
 {
+    if (bUIInputMode)
+    {
+        return;
+    }
+
     if (ACharacterController* CharacterCtrl = Cast<ACharacterController>(GetPawn()))
     {
         CharacterCtrl->ToggleRagdoll();
     }
 }
 
-void APlayerCharacterController::Input_RuntimePrimaryPressed()
+void APlayerCharacterController::Input_PrimaryPressed()
 {
-    if (bRuntimeUIInputMode || !ConsumeRuntimeInput(LastRuntimePrimaryInputTime))
+    if (bUIInputMode || !ConsumeInputDebounce(LastPrimaryInputTime))
     {
         return;
     }
 
-    if (ARuntimeGameplayManager* Manager = GetRuntimeGameplayManager())
+    if (UGameManagerSubSystem* Manager = GetGameManager())
     {
         Manager->InputPrimaryPressed();
     }
 }
 
-void APlayerCharacterController::Input_RuntimePrimaryReleased()
+void APlayerCharacterController::Input_SecondaryPressed()
 {
-    if (bRuntimeUIInputMode)
+    if (bUIInputMode || !ConsumeInputDebounce(LastSecondaryInputTime))
     {
         return;
     }
 
-    if (ARuntimeGameplayManager* Manager = GetRuntimeGameplayManager())
-    {
-        Manager->InputPrimaryReleased();
-    }
-}
-
-void APlayerCharacterController::Input_RuntimeSecondaryPressed()
-{
-    if (bRuntimeUIInputMode || !ConsumeRuntimeInput(LastRuntimeSecondaryInputTime))
-    {
-        return;
-    }
-
-    if (ARuntimeGameplayManager* Manager = GetRuntimeGameplayManager())
+    if (UGameManagerSubSystem* Manager = GetGameManager())
     {
         Manager->InputSecondaryAction();
     }
 }
 
-void APlayerCharacterController::Input_RuntimeInteractPressed()
+void APlayerCharacterController::Input_InteractPressed()
 {
-    if (!ConsumeRuntimeInput(LastRuntimeInteractInputTime))
+    if (!ConsumeInputDebounce(LastInteractInputTime))
     {
         return;
     }
 
-    if (ARuntimeGameplayManager* Manager = GetRuntimeGameplayManager())
+    if (UGameManagerSubSystem* Manager = GetGameManager())
     {
         Manager->InputInteractAction();
     }
 }
 
-void APlayerCharacterController::Input_RuntimeToggleFirstPersonPressed()
+void APlayerCharacterController::Input_ToggleFirstPersonPressed()
 {
-    if (!ConsumeRuntimeInput(LastRuntimeToggleFirstPersonInputTime))
+    if (!ConsumeInputDebounce(LastToggleFirstPersonInputTime))
     {
         return;
     }
 
-    if (ARuntimeGameplayManager* Manager = GetRuntimeGameplayManager())
+    if (UGameManagerSubSystem* Manager = GetGameManager())
     {
         Manager->InputToggleFirstPersonAction();
     }
 }
 
-void APlayerCharacterController::Input_RuntimeToolbarScroll(float ScrollValue)
+void APlayerCharacterController::Input_ChangeCharacterPressed()
 {
-    if (bRuntimeUIInputMode || FMath::IsNearlyZero(ScrollValue))
+    if (bUIInputMode || !ConsumeInputDebounce(LastChangeCharacterInputTime))
     {
         return;
     }
 
-    if (ARuntimeGameplayManager* Manager = GetRuntimeGameplayManager())
+    if (!IsValid(SubSystem))
+    {
+        SubSystem = UGameManagerSubSystem::GetSubSystem(this);
+    }
+
+    if (IsValid(SubSystem) && SubSystem->IsWorldLoading())
+    {
+        return;
+    }
+
+    if (UWorldSceneStreamingSubsystem* StreamSubSystem = UWorldSceneStreamingSubsystem::Get(this))
+    {
+        StreamSubSystem->CycleNextPlayerCharacter();
+    }
+}
+
+void APlayerCharacterController::Input_ToolbarScroll(float ScrollValue)
+{
+    if (bUIInputMode || FMath::IsNearlyZero(ScrollValue))
+    {
+        return;
+    }
+
+    if (UGameManagerSubSystem* Manager = GetGameManager())
     {
         Manager->InputToolbarScrollAction(ScrollValue);
     }
 }
 
-void APlayerCharacterController::Input_RuntimeToggleItemListPressed()
+void APlayerCharacterController::Input_ToggleItemListPressed()
 {
-    if (!ConsumeRuntimeInput(LastRuntimeToggleItemListInputTime))
+    if (!ConsumeInputDebounce(LastToggleItemListInputTime))
     {
         return;
     }
 
-    if (ARuntimeGameplayManager* Manager = GetRuntimeGameplayManager())
+    if (UGameManagerSubSystem* Manager = GetGameManager())
     {
         Manager->InputToggleItemListAction();
         if (Manager->IsItemListWindowOpen())
@@ -877,70 +1367,85 @@ void APlayerCharacterController::Input_RuntimeToggleItemListPressed()
     }
 }
 
-void APlayerCharacterController::Input_RuntimeSnapPressed()
+void APlayerCharacterController::Input_SnapPressed()
 {
-    if (!ConsumeRuntimeInput(LastRuntimeSnapInputTime))
+    if (!ConsumeInputDebounce(LastSnapInputTime))
     {
         return;
     }
 
-    if (ARuntimeGameplayManager* Manager = GetRuntimeGameplayManager())
+    if (UGameManagerSubSystem* Manager = GetGameManager())
     {
         Manager->InputToggleSnapModeAction();
     }
 }
 
-void APlayerCharacterController::Input_RuntimeVehicleMove(const FVector2D& MoveValue)
+void APlayerCharacterController::Input_VehicleMove(const FVector2D& MoveValue)
 {
-    if (ARuntimeVehiclePawn* Vehicle = Cast<ARuntimeVehiclePawn>(GetPawn()))
+    if (bUIInputMode && !MoveValue.IsNearlyZero())
+    {
+        return;
+    }
+
+    if (AVehiclePawn* Vehicle = Cast<AVehiclePawn>(GetPawn()))
     {
         Vehicle->SetDriveInput(MoveValue.Y, MoveValue.X);
         return;
     }
 
-    if (ARuntimeGameplayManager* Manager = GetRuntimeGameplayManager())
+    if (UGameManagerSubSystem* Manager = GetGameManager())
     {
         Manager->InputVehicleMoveAction(MoveValue);
     }
 }
 
-void APlayerCharacterController::Input_RuntimeVehicleThrottle(float Throttle)
+void APlayerCharacterController::Input_VehicleThrottle(float Throttle)
 {
-    if (ARuntimeVehiclePawn* Vehicle = Cast<ARuntimeVehiclePawn>(GetPawn()))
+    if (bUIInputMode && !FMath::IsNearlyZero(Throttle))
+    {
+        return;
+    }
+
+    if (AVehiclePawn* Vehicle = Cast<AVehiclePawn>(GetPawn()))
     {
         Vehicle->SetThrottleInput(Throttle);
         return;
     }
 
-    if (ARuntimeGameplayManager* Manager = GetRuntimeGameplayManager())
+    if (UGameManagerSubSystem* Manager = GetGameManager())
     {
         Manager->InputVehicleThrottleAction(Throttle);
     }
 }
 
-void APlayerCharacterController::Input_RuntimeVehicleSteering(float Steering)
+void APlayerCharacterController::Input_VehicleSteering(float Steering)
 {
-    if (ARuntimeVehiclePawn* Vehicle = Cast<ARuntimeVehiclePawn>(GetPawn()))
+    if (bUIInputMode && !FMath::IsNearlyZero(Steering))
+    {
+        return;
+    }
+
+    if (AVehiclePawn* Vehicle = Cast<AVehiclePawn>(GetPawn()))
     {
         Vehicle->SetSteeringInput(Steering);
         return;
     }
 
-    if (ARuntimeGameplayManager* Manager = GetRuntimeGameplayManager())
+    if (UGameManagerSubSystem* Manager = GetGameManager())
     {
         Manager->InputVehicleSteeringAction(Steering);
     }
 }
 
-void APlayerCharacterController::Input_RuntimeVehicleStop()
+void APlayerCharacterController::Input_VehicleStop()
 {
-    if (ARuntimeVehiclePawn* Vehicle = Cast<ARuntimeVehiclePawn>(GetPawn()))
+    if (AVehiclePawn* Vehicle = Cast<AVehiclePawn>(GetPawn()))
     {
         Vehicle->ClearDriveInput();
         return;
     }
 
-    if (ARuntimeGameplayManager* Manager = GetRuntimeGameplayManager())
+    if (UGameManagerSubSystem* Manager = GetGameManager())
     {
         Manager->InputVehicleMoveAction(FVector2D::ZeroVector);
     }
@@ -948,9 +1453,7 @@ void APlayerCharacterController::Input_RuntimeVehicleStop()
 
 void APlayerCharacterController::ClearLatchedMovementInput()
 {
-    StopFallbackMovement();
-
-    if (ARuntimeVehiclePawn* Vehicle = Cast<ARuntimeVehiclePawn>(GetPawn()))
+    if (AVehiclePawn* Vehicle = Cast<AVehiclePawn>(GetPawn()))
     {
         Vehicle->ClearDriveInput();
     }
@@ -959,12 +1462,14 @@ void APlayerCharacterController::ClearLatchedMovementInput()
     {
         CharacterCtrl->ClearTransientInputState();
     }
+
+    ReapplyHeldGameplayInput();
 }
 
 // Debug toggle translated from the Blueprint flow into C++.
 void APlayerCharacterController::Input_DebugPressed()
 {
-    if (!ConsumeRuntimeInput(LastRuntimeDebugInputTime))
+    if (!ConsumeInputDebounce(LastDebugInputTime))
     {
         return;
     }
@@ -974,43 +1479,24 @@ void APlayerCharacterController::Input_DebugPressed()
         return;
     }
 
-    if (bIsDebug)
+    if (!IsValid(DebugWidget))
     {
-        // When bIsDebug is true, remove the widget from the screen.
-        if (IsValid(DebugWidget))
-        {
-            DebugWidget->RemoveFromParent();
-        }
-        bIsDebug = false;
+        UE_LOG(LogTemp, Verbose,
+            TEXT("Debug toggle ignored because no DebugWidget is available from the central AssetRegistry or an explicit override."));
+        return;
     }
-    else
-    {
-        // When bIsDebug is false, create the widget and add it to the screen.
-        if (DebugWidgetClass)
-        {
-            // Create the widget if it does not exist yet, matching Blueprint CreateWidget.
-            // Cache the widget instead of recreating it every toggle.
-            if (!IsValid(DebugWidget))
-            {
-                DebugWidget = CreateWidget<UUserWidget>(this, DebugWidgetClass);
-            }
 
-            // Add the widget to the viewport, matching Blueprint AddToViewport.
-            if (IsValid(DebugWidget))
-            {
-                DebugWidget->AddToViewport(0); // ZOrder 0
-                bIsDebug = true;
-            }
-        }
-        else
-        {
-            UE_LOG(LogTemp, Warning, TEXT("DebugWidgetClass is not assigned in PlayerCharacterController!"));
-        }
-    }
+    bIsDebug = !bIsDebug;
+    DebugWidget->SetVisibility(bIsDebug ? ESlateVisibility::Visible : ESlateVisibility::Collapsed);
 }
 
 void APlayerCharacterController::Input_PausePressed()
 {
+    if (bMenuWorldTravelPending)
+    {
+        return;
+    }
+
     if (!IsValid(SubSystem))
     {
         SubSystem = UGameManagerSubSystem::GetSubSystem(this);
@@ -1021,13 +1507,20 @@ void APlayerCharacterController::Input_PausePressed()
         return;
     }
 
-    if (IsValid(SettingsMenuWidget) && SettingsMenuWidget->IsInViewport())
+    const auto IsMenuWidgetVisible = [](const UWidget* Widget)
+    {
+        return IsValid(Widget)
+            && Widget->GetVisibility() != ESlateVisibility::Collapsed
+            && Widget->GetVisibility() != ESlateVisibility::Hidden;
+    };
+
+    if (IsMenuWidgetVisible(SettingsMenuWidget.Get()))
     {
         ReturnToPauseMenuFromSettings();
         return;
     }
 
-    if (SubSystem->GetGamePaused() || (IsValid(PauseMenuWidget) && PauseMenuWidget->IsInViewport()))
+    if (SubSystem->GetGamePaused() || IsMenuWidgetVisible(PauseMenuWidget.Get()))
     {
         ClosePauseMenu(true);
     }
@@ -1038,78 +1531,13 @@ void APlayerCharacterController::Input_PausePressed()
 }
 
 
-UUserWidget* APlayerCharacterController::CreatePauseMenu()
-{
-    if (!IsValid(SubSystem))
-    {
-        SubSystem = UGameManagerSubSystem::GetSubSystem(this);
-    }
-    if (IsValid(SubSystem) && SubSystem->IsWorldLoading())
-    {
-        return nullptr;
-    }
-
-    if (!PauseMenuWidgetClass)
-    {
-        UE_LOG(LogTemp, Verbose, TEXT("PlayerCharacterController: PauseMenuWidgetClass is not assigned; skipping pause menu creation."));
-        return nullptr;
-    }
-
-    if (IsValid(PauseMenuWidget))
-    {
-        if (!PauseMenuWidget->IsInViewport())
-        {
-            PauseMenuWidget->AddToViewport(PauseMenuZOrder);
-        }
-        return PauseMenuWidget.Get();
-    }
-
-    PauseMenuWidget = CreateWidget<UUserWidget>(this, PauseMenuWidgetClass.Get());
-    if (IsValid(PauseMenuWidget))
-    {
-        PauseMenuWidget->AddToViewport(PauseMenuZOrder);
-    }
-    return PauseMenuWidget.Get();
-}
-
-UUserWidget* APlayerCharacterController::CreateSettingsMenu()
-{
-    if (!IsValid(SubSystem))
-    {
-        SubSystem = UGameManagerSubSystem::GetSubSystem(this);
-    }
-    if (IsValid(SubSystem) && SubSystem->IsWorldLoading())
-    {
-        return nullptr;
-    }
-
-    if (!SettingsMenuWidgetClass)
-    {
-        UE_LOG(LogTemp, Verbose, TEXT("PlayerCharacterController: SettingsMenuWidgetClass is not assigned; skipping settings menu creation."));
-        return nullptr;
-    }
-
-    if (!IsValid(SettingsMenuWidget))
-    {
-        SettingsMenuWidget = CreateWidget<UUserWidget>(this, SettingsMenuWidgetClass.Get());
-    }
-
-    if (IsValid(SettingsMenuWidget))
-    {
-        SettingsMenuWidget->SetVisibility(ESlateVisibility::Visible);
-        if (!SettingsMenuWidget->IsInViewport())
-        {
-            SettingsMenuWidget->AddToViewport(SettingsMenuZOrder);
-        }
-        return SettingsMenuWidget.Get();
-    }
-
-    UE_LOG(LogTemp, Warning, TEXT("PlayerCharacterController: failed to create settings menu widget."));
-    return nullptr;
-}
-
 void APlayerCharacterController::OpenPauseMenu()
 {
+    if (bMenuWorldTravelPending)
+    {
+        return;
+    }
+
     if (!IsValid(SubSystem))
     {
         SubSystem = UGameManagerSubSystem::GetSubSystem(this);
@@ -1121,17 +1549,31 @@ void APlayerCharacterController::OpenPauseMenu()
 
     if (IsValid(SettingsMenuWidget))
     {
-        SettingsMenuWidget->RemoveFromParent();
+        SettingsMenuWidget->SetVisibility(ESlateVisibility::Collapsed);
     }
 
-    UUserWidget* Menu = CreatePauseMenu();
+    if (!IsValid(PauseMenuWidget))
+    {
+        UE_LOG(LogTemp, Warning,
+            TEXT("Pause requested but no PauseMenuWidget is available from the central AssetRegistry or an explicit override."));
+        return;
+    }
+
+    PauseMenuWidget->SetIsEnabled(true);
+    PauseMenuWidget->SetVisibility(ESlateVisibility::Visible);
+    PauseMenuWidget->ResetExitRequestState();
     SubSystem->SetGamePaused(true);
-    ApplyUIInputMode(Menu);
+    ApplyUIInputMode(PauseMenuWidget.Get());
     bPrevGamePaused = true;
 }
 
 void APlayerCharacterController::ClosePauseMenu(bool bResumeGame)
 {
+    if (bMenuWorldTravelPending)
+    {
+        return;
+    }
+
     if (!IsValid(SubSystem))
     {
         SubSystem = UGameManagerSubSystem::GetSubSystem(this);
@@ -1139,11 +1581,11 @@ void APlayerCharacterController::ClosePauseMenu(bool bResumeGame)
 
     if (IsValid(SettingsMenuWidget))
     {
-        SettingsMenuWidget->RemoveFromParent();
+        SettingsMenuWidget->SetVisibility(ESlateVisibility::Collapsed);
     }
     if (IsValid(PauseMenuWidget))
     {
-        PauseMenuWidget->RemoveFromParent();
+        PauseMenuWidget->SetVisibility(ESlateVisibility::Collapsed);
     }
 
     if (bResumeGame && IsValid(SubSystem))
@@ -1157,6 +1599,11 @@ void APlayerCharacterController::ClosePauseMenu(bool bResumeGame)
 
 void APlayerCharacterController::ShowSettingsMenuFromPause()
 {
+    if (bMenuWorldTravelPending)
+    {
+        return;
+    }
+
     if (!IsValid(SubSystem))
     {
         SubSystem = UGameManagerSubSystem::GetSubSystem(this);
@@ -1166,30 +1613,35 @@ void APlayerCharacterController::ShowSettingsMenuFromPause()
         return;
     }
 
-    if (IsValid(PauseMenuWidget))
+    if (!IsValid(SettingsMenuWidget))
     {
-        PauseMenuWidget->RemoveFromParent();
-    }
-
-    UUserWidget* Settings = CreateSettingsMenu();
-    if (!IsValid(Settings))
-    {
-        // Keep the pause menu visible if the settings widget could not be built.
-        CreatePauseMenu();
-        ApplyUIInputMode(PauseMenuWidget.Get());
+        UE_LOG(LogTemp, Warning,
+            TEXT("Settings requested from pause but no SettingsMenuWidget is available from the central AssetRegistry or an explicit override."));
         return;
     }
 
+    if (IsValid(PauseMenuWidget))
+    {
+        PauseMenuWidget->SetVisibility(ESlateVisibility::Collapsed);
+    }
+
+    SettingsMenuWidget->InitializeSettingsFromSavedData();
+    SettingsMenuWidget->SetVisibility(ESlateVisibility::Visible);
     SubSystem->SetGamePaused(true);
-    ApplyUIInputMode(Settings);
+    ApplyUIInputMode(SettingsMenuWidget.Get());
     bPrevGamePaused = true;
 }
 
 void APlayerCharacterController::ReturnToPauseMenuFromSettings()
 {
+    if (bMenuWorldTravelPending)
+    {
+        return;
+    }
+
     if (IsValid(SettingsMenuWidget))
     {
-        SettingsMenuWidget->RemoveFromParent();
+        SettingsMenuWidget->SetVisibility(ESlateVisibility::Collapsed);
     }
 
     if (!IsValid(SubSystem))
@@ -1201,99 +1653,81 @@ void APlayerCharacterController::ReturnToPauseMenuFromSettings()
         SubSystem->SetGamePaused(true);
     }
 
-    UUserWidget* Menu = CreatePauseMenu();
-    ApplyUIInputMode(Menu);
+    if (IsValid(PauseMenuWidget))
+    {
+        PauseMenuWidget->SetIsEnabled(true);
+        PauseMenuWidget->SetVisibility(ESlateVisibility::Visible);
+        PauseMenuWidget->ResetExitRequestState();
+    }
+    ApplyUIInputMode(PauseMenuWidget.Get());
     bPrevGamePaused = true;
 }
 
-void APlayerCharacterController::ExitToStartWorldFromPauseMenu()
+void APlayerCharacterController::ExitToWorldSelectionFromPauseMenu()
 {
-    ARuntimeGameplayManager* Manager = GetRuntimeGameplayManager();
-    if (IsValid(Manager))
+    TryExitToWorldSelectionFromPauseMenu();
+}
+
+bool APlayerCharacterController::TryExitToWorldSelectionFromPauseMenu()
+{
+    // Multiple listeners may be serialized on the same WBP button. Once one listener has started
+    // a valid request, every later listener should treat the request as accepted rather than
+    // re-enabling the pause UI or attempting a second OpenLevel.
+    if (bMenuWorldTravelPending)
     {
-        Manager->SaveRuntimeScene();
+        UE_LOG(LogTemp, Verbose, TEXT("[MenuTravel] Pause Exit is already pending on this controller."));
+        return true;
     }
+
+    const TSoftObjectPtr<UWorld> DestinationWorld = ResolveMainWorld();
+    if (DestinationWorld.IsNull())
+    {
+        UE_LOG(LogTemp, Error,
+            TEXT("[MenuTravel] Cannot leave gameplay: AssetRegistry.MainWorld is empty."));
+        return false;
+    }
+
+    bMenuWorldTravelPending = true;
 
     if (IsValid(SettingsMenuWidget))
     {
-        SettingsMenuWidget->RemoveFromParent();
+        SettingsMenuWidget->SetIsEnabled(false);
+        SettingsMenuWidget->SetVisibility(ESlateVisibility::Collapsed);
     }
     if (IsValid(PauseMenuWidget))
     {
-        PauseMenuWidget->RemoveFromParent();
+        PauseMenuWidget->SetIsEnabled(false);
+        PauseMenuWidget->SetVisibility(ESlateVisibility::Collapsed);
     }
 
-    if (!IsValid(SubSystem))
+    LockInputForMenuWorldTravel();
+    UE_LOG(LogTemp, Display, TEXT("[MenuTravel] Pause Exit accepted; requesting MainWorld with WorldSelection UI."));
+
+    if (!UGameManagerSubSystem::TryOpenWorldSelectionScreen(this, DestinationWorld))
     {
-        SubSystem = UGameManagerSubSystem::GetSubSystem(this);
-    }
-    if (IsValid(SubSystem))
-    {
-        SubSystem->SetGamePaused(false);
+        UE_LOG(LogTemp, Error, TEXT("[MenuTravel] World-selection travel request was rejected before OpenLevel."));
+        RestorePauseMenuAfterRejectedTravel();
+        return false;
     }
 
-    ApplyGameInputMode();
-    if (ExitLevelName != NAME_None)
-    {
-        UGameplayStatics::OpenLevel(this, ExitLevelName);
-    }
+    ArmMenuWorldTravelWatchdog();
+    return true;
 }
 
-ARuntimeGameplayManager *APlayerCharacterController::GetRuntimeGameplayManager()
+
+
+UGameManagerSubSystem* APlayerCharacterController::GetGameManager()
 {
-    const UClass* DesiredManagerClass = RuntimeGameplayManagerClass ? RuntimeGameplayManagerClass.Get() : ARuntimeGameplayManager::StaticClass();
-
-    if (IsValid(CachedRuntimeGameplayManager))
-    {
-        if (CachedRuntimeGameplayManager->IsA(DesiredManagerClass))
-        {
-            return CachedRuntimeGameplayManager;
-        }
-        CachedRuntimeGameplayManager = nullptr;
-    }
-
-    UWorld* World = GetWorld();
-    if (!World)
+    UGameManagerSubSystem* Manager = UGameManagerSubSystem::GetSubSystem(this);
+    if (!IsValid(Manager))
     {
         return nullptr;
     }
 
-    ARuntimeGameplayManager* FirstCompatibleManager = nullptr;
-    for (TActorIterator<ARuntimeGameplayManager> It(World); It; ++It)
+    SubSystem = Manager;
+    if (GetNetMode() == NM_Client)
     {
-        ARuntimeGameplayManager* ExistingManager = *It;
-        if (!IsValid(ExistingManager))
-        {
-            continue;
-        }
-
-        if (ExistingManager->IsA(DesiredManagerClass))
-        {
-            CachedRuntimeGameplayManager = ExistingManager;
-            return CachedRuntimeGameplayManager;
-        }
-
-        if (!FirstCompatibleManager && DesiredManagerClass == ARuntimeGameplayManager::StaticClass())
-        {
-            FirstCompatibleManager = ExistingManager;
-        }
+        Manager->StartClientGameplaySession(this);
     }
-
-    if (FirstCompatibleManager)
-    {
-        CachedRuntimeGameplayManager = FirstCompatibleManager;
-        return CachedRuntimeGameplayManager;
-    }
-
-    if (IsValid(SubSystem) && SubSystem->IsWorldLoading())
-    {
-        return nullptr;
-    }
-
-    FActorSpawnParameters Params;
-    Params.Owner = this;
-    Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-    UClass* ManagerSpawnClass = RuntimeGameplayManagerClass ? RuntimeGameplayManagerClass.Get() : ARuntimeGameplayManager::StaticClass();
-    CachedRuntimeGameplayManager = World->SpawnActor<ARuntimeGameplayManager>(ManagerSpawnClass, FTransform::Identity, Params);
-    return CachedRuntimeGameplayManager;
+    return Manager;
 }

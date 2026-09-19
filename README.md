@@ -1,117 +1,76 @@
-# UE5-glTFSimulator
+# glTFSimulator
 
-UE5-glTFSimulator is an Unreal Engine 5 C++ project for loading, streaming, exploring, editing, and saving glTF-based 3D scenes at runtime.
+glTFSimulator is an Unreal Engine 5.8 runtime simulation project built around glTFRuntime. Authoring projects are file-system based: a project is described by `config.json`, and its GLB/WAV assets plus same-basename JSON definitions live recursively under the project's lower-case `resources/` directory. A build converts those authoring files into immutable random-access archives used by runtime streaming.
 
-The project is built around runtime glTF ingestion through `glTFRuntime`, distance-based model streaming, a controllable skeletal character, simple world management, and an in-game creator workflow for placing prefabs, creating procedural meshes, vehicles, and weapons.
+The runtime archive formats are:
 
-## Highlights
+- World project → `glTFSimulator/Worlds/<ProjectFolder>.gworld`
+- Character project → `glTFSimulator/Resources/<ProjectName>.gasset`
+- Dynamic project → `glTFSimulator/Resources/<ProjectName>.gasset`
 
-- Runtime loading of `.glb` and `.gltf` assets through the bundled `glTFRuntime` plugin.
-- Large-model streaming using node distance checks, instanced static meshes, async loading, and automatic unload boxes.
-- LOD-aware mesh loading using model-node naming conventions.
-- Runtime material overrides for common simulation materials such as glass, tinted glass, and terrain.
-- Optional per-model JSON metadata for collision, entity flags, and runtime point lights.
-- Skeletal character loading from glTF with bone-name mapping, default skeleton merging, generated physics, ragdoll blending, walking, crouching, sprinting, flying, swimming, and first-person toggle support.
-- Runtime creator mode with a 7-slot toolbar, prefab placement, procedural mesh editing, vehicle placement, weapon equipment, grid snap, and item-list UI integration.
-- Runtime scene persistence to `runtime_installed.json` plus a glTF export file.
-- World metadata persistence through `level.json` with automatic periodic saving.
+Runtime model references use `gworld://model/<UUID>`. Runtime sound references use `gworld://sound/<UUID>`.
 
-## Requirements
+## Project layout
 
-| Requirement | Notes |
-| --- | --- |
-| Unreal Engine | The project file is configured with `EngineAssociation: 5.7`. Use the matching UE version, or update the `.uproject` only after validating plugin compatibility. |
-| C++ toolchain | Required because the main simulator systems are implemented as a C++ UE module. |
-| Bundled plugins | `glTFRuntime`, `ShaderLibrary`, and `glTFSimulatorEditor` are included under `glTFSimulator/Plugins`. |
-| Built-in UE plugins | `ProceduralMeshComponent` and `ModelingToolsEditorMode` are enabled by the project. |
-
-## Repository layout
+`Projects` is authoring input. `Worlds` and the upper-case global `Resources` directory are runtime build outputs/discovery locations. They are intentionally separate.
 
 ```text
-.
-├── README.md
-├── LICENSE
-├── glTFSimulator/
-│   ├── glTFSimulator.uproject
-│   ├── Config/
-│   ├── Content/
-│   │   ├── Blueprints/
-│   │   ├── Input/
-│   │   ├── Maps/
-│   │   └── Resources/
-│   ├── Plugins/
-│   │   ├── glTFRuntime/
-│   │   ├── ShaderLibrary/
-│   │   └── glTFSimulatorEditor/
-│   └── Source/
-│       └── glTFSimulator/
-│           ├── Public/
-│           └── Private/
+glTFSimulator/
+├─ Projects/
+│  └─ MyWorld/
+│     ├─ config.json
+│     └─ resources/                 # lower-case: authoring input only
+│        ├─ city.glb
+│        ├─ city.json
+│        ├─ ambience.wav
+│        ├─ ambience.json
+│        └─ subfolders/...          # scanned recursively
+├─ Worlds/
+│  └─ MyWorld.gworld               # built World archive
+├─ Resources/                       # upper-case: built external runtime packs only
+│  ├─ MyCharacter.gasset
+│  └─ MyDynamicPack.gasset
+└─ settings.json
 ```
 
-Important maps:
-
-- `Content/Maps/StartWorld.umap` is configured as both the editor startup map and game default map.
-- `Content/Maps/MainWorld.umap` contains the main simulation world flow.
-
-## Getting started
-
-1. Open `glTFSimulator/glTFSimulator.uproject` with the configured Unreal Engine version.
-2. Let Unreal rebuild project modules if prompted.
-3. If project files are missing, regenerate them from the `.uproject` file and build the `glTFSimulator` target.
-4. Open or play from `StartWorld`.
-5. Create a save-world folder under the simulator runtime data directory, then place glTF files in the expected subfolders described below.
-
-## Runtime data directory
-
-The simulator reads and writes world data under the user's platform-specific user directory:
+A project is discoverable only when both of these exist:
 
 ```text
-<UserDir>/glTFSimulator/SaveData/<WorldFolder>/
+Projects/<ProjectName>/config.json
+Projects/<ProjectName>/resources/
 ```
 
-At runtime, `<WorldFolder>` is the current world folder name. `StartWorld` scans the folders under `SaveData` and reads each folder's `level.json` to display available worlds.
+The Projects UI always inserts `+ Create Project` as the first generated list entry. A project-name input is generated natively when the WBP does not provide one. Creating a project creates the project directory, `config.json`, and `resources/` automatically. For a newly created project, `ProjectType`, `ProjectName`, and `WorldName` are initialized as a World project.
 
-A typical world folder looks like this:
+## JSON specifications
 
-```text
-<UserDir>/glTFSimulator/SaveData/DemoWorld/
-├── level.json
-├── model/
-│   ├── city.glb
-│   └── city.json
-├── player/
-│   ├── avatar.glb
-│   └── avatar.json
-├── prefab/
-│   └── table.glb
-├── items/
-│   ├── rifle.glb
-│   └── rifle.json
-├── generated/
-├── runtime_installed.json
-└── runtime_installed.gltf
-```
+All field names and string enum values below are case-sensitive unless stated otherwise. Only the keys and enum values documented below are accepted.
 
-The project also scans these project-relative fallback folders for runtime creator assets:
+### `Projects/<Project>/config.json`
 
-```text
-<ProjectDir>/World/prefab/
-<ProjectDir>/World/items/
-<ProjectDir>/World/<WorldFolder>/prefab/
-<ProjectDir>/World/<WorldFolder>/items/
-```
+`ProjectType` accepts exactly `World`, `Character`, or `Dynamic`. If omitted, it defaults to `World`. `ProjectName` defaults to the project folder name when omitted. For a World project, `WorldName` also defaults to the project folder name when omitted.
 
-## `level.json`
+`bAllowExternalAssets` applies only to World projects. Character and Dynamic asset packs cannot recursively mount other packs.
 
-`level.json` stores world settings, time settings, ocean state, player spawn location, and the optional player glTF file name.
-
-Example:
+Minimal World project:
 
 ```json
 {
-  "WorldName": "Demo World",
-  "WorldTime": 0.0,
+  "ProjectType": "World",
+  "ProjectName": "MyWorld",
+  "WorldName": "MyWorld",
+  "bAllowExternalAssets": false
+}
+```
+
+For a World project, the same `config.json` is embedded in the `.gworld` archive and may also contain the current world configuration:
+
+```json
+{
+  "Version": "1.0.0",
+  "ProjectType": "World",
+  "ProjectName": "MyWorld",
+  "WorldName": "MyWorld",
   "Latitude": 38.0,
   "Longitude": 127.0,
   "AxialTilt": 23.5,
@@ -119,311 +78,277 @@ Example:
   "OneDayTime": 86400.0,
   "TimeSpeed": 60.0,
   "bOcean": true,
-  "X": 0.0,
-  "Y": 0.0,
-  "Z": 0.0,
-  "Player": "avatar.glb"
-}
-```
-
-Notes:
-
-- World models are loaded from `model/*.glb`.
-- The player model is loaded from `player/<Player>`. If loading fails or `Player` is empty, the character falls back to the default mesh.
-- World data is saved periodically while the simulation is running.
-
-## Adding static world models
-
-Place `.glb` files in:
-
-```text
-<UserDir>/glTFSimulator/SaveData/<WorldFolder>/model/
-```
-
-For each `example.glb`, the simulator looks for `example.json` beside it. If the JSON file is missing, a default metadata file is generated automatically.
-
-### Model metadata JSON
-
-The sidecar JSON can override collision behavior, simple colliders, entity flags, and runtime point lights per mesh name.
-
-Minimal generated format:
-
-```json
-{
-  "X": 0.0,
-  "Y": 0.0,
-  "Z": 0.0,
-  "MeshData": {}
-}
-```
-
-Example with mesh-specific metadata:
-
-```json
-{
-  "X": 0.0,
-  "Y": 0.0,
-  "Z": 0.0,
-  "MeshData": {
-    "Wall": {
-      "ComplexCollision": true,
-      "SimpleCollision": false,
-      "IsEntity": false,
-      "Colliders": [],
-      "Lights": []
-    },
-    "Lamp": {
-      "ComplexCollision": false,
-      "SimpleCollision": true,
-      "IsEntity": true,
-      "Colliders": [
-        {
-          "Type": "Box",
-          "X": 0.0,
-          "Y": 0.0,
-          "Z": 0.0,
-          "DX": 30.0,
-          "DY": 30.0,
-          "DZ": 80.0
-        }
-      ],
-      "Lights": [
-        {
-          "X": 0.0,
-          "Y": 0.0,
-          "Z": 120.0,
-          "Unit": "Candelas",
-          "Intensity": 500.0,
-          "SourceRadius": 10.0,
-          "SoftSourceRadius": 10.0,
-          "AttenuationRadius": 1000.0,
-          "Length": 10.0
-        }
-      ]
-    }
+  "OceanHeightCm": 0.0,
+  "bAllowExternalAssets": false,
+  "Cloud": {
+    "bEnabled": true,
+    "Coverage": 0.55,
+    "Density": 0.70,
+    "Opacity": 1.0,
+    "WindSpeed": 1.0,
+    "Tint": { "R": 1.0, "G": 1.0, "B": 1.0, "A": 1.0 }
+  },
+  "Weather": {
+    "bEnabled": false,
+    "Preset": "Rain",
+    "Intensity": 1.0,
+    "TickIntervalSeconds": 1.0,
+    "bAutoCycle": true,
+    "MinDurationTicks": 300,
+    "MaxDurationTicks": 1200,
+    "ClearWeight": 0.55,
+    "RainWeight": 0.35,
+    "SnowWeight": 0.10
+  },
+  "Gameplay": {
+    "WorldGameMode": "Default",
+    "bCheatsEnabled": false,
+    "PlayerMaxHealth": 100.0,
+    "PlayerMassKg": 80.0,
+    "PlayerPushTractionCoefficient": 0.30
   }
 }
 ```
 
-Supported simple collider types are `Box`, `Sphere`, and `Capsule`.
+`Gameplay.WorldGameMode` accepts exactly `Default`, `Creator`, or `RealLife`. Mutable state such as current world time, player location, selected player character, and dynamic entity state is not authored in `config.json`; it is stored separately in the world's runtime `.dat` state.
 
-## glTF mesh naming conventions
+### Model asset pair: `<name>.glb` + `<name>.json`
 
-The loader uses the text before the first semicolon (`;`) as the shared mesh key. Suffixes after the semicolon define loading behavior.
+Every GLB is paired only with the JSON file that has the exact same basename in the same directory. Asset discovery is recursive below the project's `resources/` directory.
 
-| Suffix | Purpose |
-| --- | --- |
-| No suffix or `;LOD0` | Primary mesh / LOD0. |
-| `;INST` | Instance node that reuses the primary mesh with the same prefix. |
-| `;LOD1` | LOD1 mesh for the same prefix. |
-| `;LOD2` | LOD2 mesh for the same prefix. |
-| `;LOD3` | LOD3 mesh for the same prefix. |
-| `;NCOL` | Disables both complex and simple collision for that mesh key. Can be combined with other suffixes. |
+`AssetType` is the top-level asset category. For GLB definitions it may be omitted, in which case it defaults to `Model`. `ModelType` defaults to `Static` when omitted.
 
-Example:
-
-```text
-Building
-Building;INST
-Building;INST.001
-Building;LOD1
-Building;LOD2
-Building;NCOL
-```
-
-In this example, `Building;INST` and `Building;INST.001` reuse the mesh data from `Building`, while `Building;LOD1` and `Building;LOD2` are loaded as lower-detail LODs for the same logical mesh.
-
-Recommendations:
-
-- Always keep one primary mesh for each instanced prefix.
-- Use `;INST` for repeated nodes to reduce duplicated mesh loading.
-- Use LOD suffixes only for alternate meshes that should not be spawned as separate world objects.
-- Keep naming consistent between the `.glb` node names and the sidecar JSON `MeshData` keys.
-
-## Reserved material names
-
-The streaming loader overrides specific material names with simulator materials.
-
-Use these exact material names in exported glTF files when you want the simulator override:
-
-```text
-glass
-tinted_glass
-terrain
-```
-
-General glTF material types are also mapped to the simulator's default opaque, two-sided, translucent, and two-sided translucent materials.
-
-## Skeletal character models
-
-Player models are loaded from:
-
-```text
-<UserDir>/glTFSimulator/SaveData/<WorldFolder>/player/
-```
-
-A character file can have an optional sidecar JSON file with the same base name. The sidecar JSON maps simulator target bone names to source glTF bone names.
-
-Example:
+Static model:
 
 ```json
 {
-  "Root": "Root",
-  "hips": "mixamorig:Hips",
-  "spine": "mixamorig:Spine",
-  "chest": "mixamorig:Spine1",
-  "neck": "mixamorig:Neck",
-  "head": "mixamorig:Head",
-  "leftUpperLeg": "mixamorig:LeftUpLeg",
-  "rightUpperLeg": "mixamorig:RightUpLeg",
-  "leftFoot": "mixamorig:LeftFoot",
-  "rightFoot": "mixamorig:RightFoot",
-  "hairRoot": "hairRoot",
-  "dynRoot": "dynRoot"
+  "AssetType": "Model",
+  "UUID": "11111111-1111-1111-1111-111111111111",
+  "Name": "building_a",
+  "DisplayName": "Building A",
+  "ModelType": "Static"
 }
 ```
 
-Important target bones used by gameplay code include:
-
-```text
-Root
-hips
-neck
-head
-leftUpperLeg
-rightUpperLeg
-leftFoot
-rightFoot
-hairRoot
-dynRoot
-```
-
-Guidelines:
-
-- The root bone is expected to be named `Root`; the loader can add it if the source asset is missing it.
-- Use a bone-map JSON when the source glTF uses different names, such as Mixamo-style names.
-- Keep `hips`, `head`, `neck`, upper-leg, and foot bones valid because movement, ragdoll recovery, water checks, and foot traces depend on them.
-- `hairRoot` and `dynRoot` are used for generated physics/collider setup below those bones.
-- Invalid or incomplete skeletons may fail to load and fall back to the default character mesh.
-
-## Runtime creator mode
-
-The runtime gameplay manager supports creator-mode interactions driven by UI buttons and input events:
-
-- Place prefabs from `prefab/`.
-- Create procedural mesh objects by placing and connecting vertices.
-- Edit existing generated meshes.
-- Place runtime vehicles.
-- Equip and fire weapons from `items/`.
-- Toggle grid snap and change toolbar slots.
-- Save placed runtime objects and generated meshes.
-
-Runtime creator assets are scanned from both the save-world folders and project-relative `World/` folders.
-
-```text
-prefab/  -> placeable `.glb` or `.gltf` prefabs
-items/   -> weapon/item `.glb` or `.gltf` files
-```
-
-Runtime scene saving writes:
-
-```text
-runtime_installed.json
-runtime_installed.gltf
-```
-
-The JSON manifest is used for reloading objects inside the simulator. The `.gltf` file is a lightweight export of generated meshes and placed-object metadata.
-
-## Default fallback controls
-
-Enhanced Input assets can override or extend controls, but the project keeps fallback key bindings so the simulator remains usable when input assets are not assigned.
-
-| Action | Fallback input |
-| --- | --- |
-| Move | `W`, `A`, `S`, `D` |
-| Look | Mouse X/Y |
-| Jump | `Space` |
-| Sprint | `Left Shift` |
-| Crouch | `Left Ctrl` |
-| Pause | `Esc` |
-| Runtime primary action / placement | Left mouse button press and release |
-| Runtime secondary action / finish vertex edit | Right mouse button |
-| Enter or exit vehicle | `F` |
-| Toggle first-person view | `V` |
-| Scroll toolbar | Mouse wheel |
-| Open or close item list | `E` |
-| Toggle snap | `G` |
-
-## Weapon item JSON
-
-Weapons can optionally use a JSON file beside the item glTF. The runtime weapon actor reads hold and muzzle settings from this file.
-
-Example:
+Dynamic entity model:
 
 ```json
 {
-  "Hold": {
-    "X": 45.0,
-    "Y": 18.0,
-    "Z": -18.0,
-    "Pitch": 0.0,
-    "Yaw": 0.0,
-    "Roll": 0.0,
+  "AssetType": "Model",
+  "UUID": "22222222-2222-2222-2222-222222222222",
+  "Name": "vehicle_a",
+  "DisplayName": "Vehicle A",
+  "ModelType": "Dynamic",
+  "EntityType": "Vehicle"
+}
+```
+
+For `ModelType: "Dynamic"`, `EntityType` and `ItemType` are mutually exclusive:
+
+- `EntityType`: `Vehicle`, `Prop`, `Animal`
+- `ItemType`: `Weapon`, `Tool`, `Misc`
+
+`EntityType` and `ItemType` are invalid for `Static` and `Character` models.
+
+Dynamic Weapon model example:
+
+```json
+{
+  "Version": "1.0.0",
+  "AssetType": "Model",
+  "UUID": "33333333-3333-3333-3333-333333333333",
+  "Name": "rifle_a",
+  "DisplayName": "Rifle A",
+  "ModelType": "Dynamic",
+  "ItemType": "Weapon",
+  "AttachSocketName": "rightHand",
+  "HoldTransform": {
+    "X": 45.0, "Y": 18.0, "Z": -18.0,
+    "Pitch": 0.0, "Yaw": 0.0, "Roll": 0.0,
+    "ScaleX": 1.0, "ScaleY": 1.0, "ScaleZ": 1.0
+  },
+  "RightHandIK": {
+    "X": 20.0, "Y": 8.0, "Z": -4.0,
+    "Pitch": 0.0, "Yaw": 0.0, "Roll": 0.0,
     "Scale": 1.0
   },
-  "Muzzle": {
-    "X": 70.0,
-    "Y": 0.0,
-    "Z": 0.0
+  "LeftHandIK": {
+    "X": 65.0, "Y": -9.0, "Z": -4.0,
+    "Pitch": 0.0, "Yaw": 0.0, "Roll": 0.0,
+    "Scale": 1.0
   },
+  "MuzzleOffset": { "X": 95.0, "Y": 0.0, "Z": 0.0 },
   "Range": 20000.0,
   "Damage": 20.0,
-  "FireInterval": 0.12
+  "ImpactImpulse": 24000.0,
+  "FireInterval": 0.12,
+  "TraceRadius": 0.0,
+  "bProjectile": false,
+  "ProjectileSpeed": 6500.0,
+  "ProjectileLifeSeconds": 5.0
 }
 ```
 
-## Notes for asset preparation
+A transform object supports `X`, `Y`, `Z`, `Pitch`, `Yaw`, `Roll`, and either uniform `Scale` or `ScaleX`/`ScaleY`/`ScaleZ`. `MuzzleOffset` accepts an `{X,Y,Z}` object or a three-number array.
 
-- Prefer `.glb` for world models in `model/`, because the world loader scans that folder for `.glb` files.
-- `.glb` and `.gltf` are both supported for runtime creator `prefab/` and `items/` folders.
-- External glTF resources are allowed by the runtime loader, but packaged `.glb` files are easier to move between world folders.
-- This repository's `.gitignore` ignores `*.glb`, so large runtime assets are expected to live outside normal source control unless the ignore rules are changed.
-- Keep model sidecar JSON files valid UTF-8 JSON.
+### Sound asset pair: `<name>.wav` + `<name>.json`
 
-## Troubleshooting
-
-### A world does not appear in the start menu
-
-Check that the folder exists under:
+A Sound is exactly one WAV and one JSON file with the same case-sensitive basename in the same directory. For example:
 
 ```text
-<UserDir>/glTFSimulator/SaveData/
+resources/audio/ambient_forest.wav
+resources/audio/ambient_forest.json
 ```
 
-and that it contains a readable `level.json` with a `WorldName` field.
+The JSON schema is:
 
-### A model does not stream in
+```json
+{
+  "AssetType": "Sound",
+  "UUID": "44444444-4444-4444-4444-444444444444",
+  "Name": "ambient_forest",
+  "DisplayName": "Ambient Forest"
+}
+```
 
-Check the following:
+`AssetType: "Sound"` is mandatory for Sound JSON. If a WAV has no sibling JSON, the builder may generate the JSON with a new UUID and the WAV basename as `Name`/`DisplayName`.
 
-- The file is a `.glb` inside `<WorldFolder>/model/`.
-- The primary mesh exists before using `;INST` nodes.
-- The sidecar JSON, if present, uses mesh keys that match the prefix before `;`.
-- The player is close enough to the node for the stream-distance check.
+The runtime decoder accepts RIFF/WAVE data containing PCM 8/16/24/32-bit or IEEE float32 samples, 1-8 channels, and an 8,000-384,000 Hz sample rate. Audio is decoded to PCM16 for `USoundWaveProcedural` at runtime.
 
-### Instanced meshes do not appear
+A GLB and WAV cannot share the same basename in the same directory because both would require the same sibling JSON file. Rename one of the assets before building.
 
-Make sure there is a primary mesh with the same prefix. For example, `Tree;INST.001` expects a primary mesh key named `Tree`.
+### Character model JSON
 
-### Character loading fails
+A Character model requires `ModelType: "Character"` and a `Bones` object containing exactly the 55 canonical keys listed below. Each JSON key is the canonical glTFSimulator bone name and each value is the source bone name in the imported GLB.
 
-Check the character sidecar JSON and ensure the important gameplay bones are present or mapped. If the custom mesh fails, the project falls back to the default character mesh so the world can continue loading.
+```json
+{
+  "AssetType": "Model",
+  "UUID": "55555555-5555-5555-5555-555555555555",
+  "Name": "character_a",
+  "DisplayName": "Character A",
+  "ModelType": "Character",
+  "Bones": {
+    "Root": "root",
+    "hips": "hips",
+    "spine": "spine",
+    "chest": "chest",
+    "upperChest": "upperChest",
+    "neck": "neck",
+    "head": "head",
+    "leftEye": "leftEye",
+    "rightEye": "rightEye",
+    "leftShoulder": "leftShoulder",
+    "leftUpperArm": "leftUpperArm",
+    "leftLowerArm": "leftLowerArm",
+    "leftHand": "leftHand",
+    "rightShoulder": "rightShoulder",
+    "rightUpperArm": "rightUpperArm",
+    "rightLowerArm": "rightLowerArm",
+    "rightHand": "rightHand",
+    "leftUpperLeg": "leftUpperLeg",
+    "leftLowerLeg": "leftLowerLeg",
+    "leftFoot": "leftFoot",
+    "leftToes": "leftToes",
+    "rightUpperLeg": "rightUpperLeg",
+    "rightLowerLeg": "rightLowerLeg",
+    "rightFoot": "rightFoot",
+    "rightToes": "rightToes",
+    "leftThumbProximal": "leftThumbProximal",
+    "leftThumbIntermediate": "leftThumbIntermediate",
+    "leftThumbDistal": "leftThumbDistal",
+    "leftIndexProximal": "leftIndexProximal",
+    "leftIndexIntermediate": "leftIndexIntermediate",
+    "leftIndexDistal": "leftIndexDistal",
+    "leftMiddleProximal": "leftMiddleProximal",
+    "leftMiddleIntermediate": "leftMiddleIntermediate",
+    "leftMiddleDistal": "leftMiddleDistal",
+    "leftRingProximal": "leftRingProximal",
+    "leftRingIntermediate": "leftRingIntermediate",
+    "leftRingDistal": "leftRingDistal",
+    "leftLittleProximal": "leftLittleProximal",
+    "leftLittleIntermediate": "leftLittleIntermediate",
+    "leftLittleDistal": "leftLittleDistal",
+    "rightThumbProximal": "rightThumbProximal",
+    "rightThumbIntermediate": "rightThumbIntermediate",
+    "rightThumbDistal": "rightThumbDistal",
+    "rightIndexProximal": "rightIndexProximal",
+    "rightIndexIntermediate": "rightIndexIntermediate",
+    "rightIndexDistal": "rightIndexDistal",
+    "rightMiddleProximal": "rightMiddleProximal",
+    "rightMiddleIntermediate": "rightMiddleIntermediate",
+    "rightMiddleDistal": "rightMiddleDistal",
+    "rightRingProximal": "rightRingProximal",
+    "rightRingIntermediate": "rightRingIntermediate",
+    "rightRingDistal": "rightRingDistal",
+    "rightLittleProximal": "rightLittleProximal",
+    "rightLittleIntermediate": "rightLittleIntermediate",
+    "rightLittleDistal": "rightLittleDistal"
+  }
+}
+```
 
-## License
+The 55 source-bone values must be non-empty and unique. Extra or missing canonical keys are rejected. After remapping, the canonical reference hierarchy and reference rotations must match the project's target character skeleton.
 
-This project is licensed under the MIT License. See [`LICENSE`](LICENSE) for details.
+Optional secondary-motion subtrees are not part of the required 55-key map. If present, they use the exact root names `hairRoot` and `dynRoot`. Chaos keeps those root bodies kinematic, simulates descendants, preserves authored colliders/constraints, and generates fallback bodies/constraints only where an authored entry is missing.
 
-## Acknowledgements
+### `glTFSimulator/settings.json`
 
-- `glTFRuntime` by Roberto De Ioris is used for runtime glTF loading.
-- Unreal Engine, Epic Games, and the built-in UE plugin ecosystem provide the underlying rendering, physics, input, UI, and procedural mesh systems.
+`settings.json` stores the current local rendering and streaming settings. The current schema is:
+
+```json
+{
+  "Version": "1.0.0",
+  "BloomIntensity": 0.675,
+  "BloomThreshold": -1.0,
+  "AmbientOcclusionIntensity": 0.5,
+  "Exposure": -11.0,
+  "ShadowQuality": 2,
+  "TextureQuality": 2,
+  "MaxTextureResolution": 768,
+  "ViewDistanceQuality": 2,
+  "StreamingDistanceMultiplier": 64.0,
+  "StreamingUnloadDistanceMultiplier": 1.1,
+  "ObjectStreamingRadiusMeters": 2048.0,
+  "StreamingSceneSpawnBudget": 32,
+  "StreamingNodeBudgetPerFrame": 256,
+  "AntiAliasingQuality": 2,
+  "PostProcessingQuality": 2,
+  "EffectsQuality": 2,
+  "FoliageQuality": 2,
+  "ShadingQuality": 2,
+  "GlobalIlluminationQuality": 2,
+  "ReflectionQuality": 2,
+  "DynamicGlobalIlluminationMethod": 1,
+  "ReflectionMethod": 1,
+  "bRayTracing": true,
+  "bHeightFog": true,
+  "bCloud": true,
+  "CelShadingMode": 1.0
+}
+```
+
+`ShadowQuality`, `TextureQuality`, `ViewDistanceQuality`, `AntiAliasingQuality`, `PostProcessingQuality`, `EffectsQuality`, `FoliageQuality`, `ShadingQuality`, `GlobalIlluminationQuality`, and `ReflectionQuality` use quality indices `0-3`. `CelShadingMode` is normalized to `0.0` or `1.0`.
+
+## Character bone structure
+
+The required canonical character schema contains exactly 55 bones:
+
+- Core: `Root`, `hips`, `spine`, `chest`, `upperChest`, `neck`, `head`
+- Eyes: `leftEye`, `rightEye`
+- Left arm: `leftShoulder`, `leftUpperArm`, `leftLowerArm`, `leftHand`
+- Right arm: `rightShoulder`, `rightUpperArm`, `rightLowerArm`, `rightHand`
+- Left leg: `leftUpperLeg`, `leftLowerLeg`, `leftFoot`, `leftToes`
+- Right leg: `rightUpperLeg`, `rightLowerLeg`, `rightFoot`, `rightToes`
+- Left thumb: `leftThumbProximal`, `leftThumbIntermediate`, `leftThumbDistal`
+- Left index: `leftIndexProximal`, `leftIndexIntermediate`, `leftIndexDistal`
+- Left middle: `leftMiddleProximal`, `leftMiddleIntermediate`, `leftMiddleDistal`
+- Left ring: `leftRingProximal`, `leftRingIntermediate`, `leftRingDistal`
+- Left little: `leftLittleProximal`, `leftLittleIntermediate`, `leftLittleDistal`
+- Right thumb: `rightThumbProximal`, `rightThumbIntermediate`, `rightThumbDistal`
+- Right index: `rightIndexProximal`, `rightIndexIntermediate`, `rightIndexDistal`
+- Right middle: `rightMiddleProximal`, `rightMiddleIntermediate`, `rightMiddleDistal`
+- Right ring: `rightRingProximal`, `rightRingIntermediate`, `rightRingDistal`
+- Right little: `rightLittleProximal`, `rightLittleIntermediate`, `rightLittleDistal`
+
+`Root` must be the single root of the canonical reference skeleton. Character JSON maps each canonical key to exactly one source bone. Secondary Chaos chains are optional additions rooted at `hairRoot` and/or `dynRoot`; these names are reserved and are not replacements for any of the 55 required humanoid keys.

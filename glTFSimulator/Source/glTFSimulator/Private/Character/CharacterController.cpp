@@ -1,26 +1,73 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
+/**
+ * @file CharacterController.cpp
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
+ */
+
 #include "Character/CharacterController.h"
+#include "Character/CharacterControllerMovementComponent.h"
 #include "Character/CharacterComponent.h"
 #include "Character/CharacterFunctionLibrary.h"
-#include "Character/InputFunctionLibrary.h"
+#include "Character/PlayerCharacterController.h"
 #include "GameFramework/SpringArmComponent.h"
 #include "System/GameManagerSubSystem.h"
+#include "System/GlTFSimulatorGameInstance.h"
+#include "System/GlTFSimulatorAssetRegistry.h"
+#include "System/GameUpdateSubSystem.h"
+#include "System/SafeFileIO.h"
 #include "Components/CapsuleComponent.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Camera/CameraComponent.h"
 #include "GameFramework/CharacterMovementComponent.h"
+#include "AI/Navigation/NavigationTypes.h"
+#include "GameFramework/PlayerController.h"
+#include "Kismet/GameplayStatics.h"
+#include "NiagaraFunctionLibrary.h"
 #include "Character/CharacterLoadAsyncAction.h"
 #include "World/WaterActor.h"
-#include "World/RuntimeBuoyancyComponent.h"
+#include "World/WaterQuerySubsystem.h"
+#include "World/BuoyancyComponent.h"
+#include "World/WorldData.h"
 #include "System/MacroLibrary.h"
 #include "Components/PrimitiveComponent.h"
+#include "Animation/Skeleton.h"
+#include "Engine/SkeletalMesh.h"
+#include "PhysicsEngine/PhysicsAsset.h"
 
-
-ACharacterController::ACharacterController()
+namespace CharacterControllerTuning
 {
-    PrimaryActorTick.bCanEverTick = true;
+    static const FVector MeshDefaultRelativeLocation(0.0f, 0.0f, -90.0f);
+    static const FRotator MeshDefaultRelativeRotation(0.0f, 270.0f, 0.0f);
+
+    constexpr float DefaultThirdPersonArmLength = 350.0f;
+    constexpr float WaterLevelChangeToleranceCm = 1.0f;
+
+    constexpr float DefaultCharacterMassKg = 80.0f;
+    constexpr float MinCharacterMassKg = 1.0f;
+    constexpr float MaxCharacterMassKg = 10000.0f;
+    constexpr float DefaultPushTractionCoefficient = 0.30f;
+    constexpr float MaxPushTractionCoefficient = 2.0f;
+    constexpr float DefaultGravityAccelerationCm = 980.0f;
+    constexpr float InitialPushMomentumTransferRatio = 0.01f;
+    constexpr float PushForcePointZOffsetFactor = -0.75f;
+    constexpr float PhysicsInteractionRefreshIntervalSeconds = 0.25f;
+
+    constexpr float MinPhysicsObjectImpactSpeed = 90.0f;
+    constexpr float PhysicsObjectImpactVelocityScale = 0.65f;
+    constexpr float MaxPhysicsObjectImpactVelocityChange = 1400.0f;
+    constexpr float PhysicsObjectImpactUpwardRatio = 0.10f;
+    constexpr float MaxPhysicsObjectImpactUpwardVelocity = 220.0f;
+    constexpr float PhysicsObjectImpactCooldownSeconds = 0.08f;
+}
+
+ACharacterController::ACharacterController(const FObjectInitializer& ObjectInitializer)
+    : Super(ObjectInitializer.SetDefaultSubobjectClass<UCharacterControllerMovementComponent>(ACharacter::CharacterMovementComponentName))
+{
+    PrimaryActorTick.bCanEverTick = false;
     // 1. Create gameplay components.
     Component = CreateDefaultSubobject<UCharacterComponent>(TEXT("CharacterComponent"));
     // Camera setup.
@@ -31,7 +78,54 @@ ACharacterController::ACharacterController()
     FollowCamera->SetupAttachment(SpringArm);
     FollowCamera->bUsePawnControlRotation = false;
 
-    SkeletalMeshBuoyancyComponent = CreateDefaultSubobject<URuntimeBuoyancyComponent>(TEXT("SkeletalMeshBuoyancy"));
+    // Match the movement defaults authored in the original BP_CharacterController.
+    // Keeping these native defaults aligned with the Blueprint makes dynamically created
+    // characters behave the same even when a Blueprint subclass does not override them.
+    bUseControllerRotationYaw = false;
+
+    if (UCapsuleComponent* Capsule = GetCapsuleComponent())
+    {
+        Capsule->InitCapsuleSize(35.0f, 90.0f);
+    }
+
+    if (UCharacterMovementComponent* MovementDefaults = GetCharacterMovement())
+    {
+        MovementDefaults->GravityScale = 1.75f;
+        MovementDefaults->JumpZVelocity = 700.0f;
+        MovementDefaults->SetWalkableFloorAngle(35.0f);
+        MovementDefaults->MaxWalkSpeed = 200.0f;
+        MovementDefaults->MaxWalkSpeedCrouched = 100.0f;
+        MovementDefaults->MaxAcceleration = 1000.0f;
+        MovementDefaults->MinAnalogWalkSpeed = 20.0f;
+        MovementDefaults->BrakingFrictionFactor = 1.0f;
+        MovementDefaults->BrakingFriction = 0.01f;
+        MovementDefaults->BrakingDecelerationWalking = 1000.0f;
+        MovementDefaults->BrakingDecelerationFalling = 2.0f;
+        MovementDefaults->BrakingDecelerationSwimming = 200.0f;
+        MovementDefaults->BrakingDecelerationFlying = 10000.0f;
+        MovementDefaults->AirControl = 0.35f;
+        MovementDefaults->FallingLateralFriction = 0.02f;
+        MovementDefaults->PerchRadiusThreshold = 15.0f;
+        MovementDefaults->RotationRate = FRotator(0.0f, 500.0f, 0.0f);
+        MovementDefaults->bOrientRotationToMovement = true;
+        MovementDefaults->bUseControllerDesiredRotation = false;
+        if (FNavMovementProperties* NavMovementProps = MovementDefaults->GetNavMovementProperties())
+        {
+            NavMovementProps->bUseAccelerationForPaths = true;
+            NavMovementProps->bUseFixedBrakingDistanceForPaths = true;
+            NavMovementProps->FixedPathBrakingDistance = 200.0f;
+        }
+
+        FNavAgentProperties& NavAgentProps = MovementDefaults->GetNavAgentPropertiesRef();
+        NavAgentProps.bCanCrouch = true;
+        NavAgentProps.bCanFly = true;
+        // Swimming is selected by UWaterQuerySubsystem rather than PhysicsVolume, but
+        // keep the engine capability bit enabled so no CharacterMovement workflow can
+        // reject MOVE_Swimming on capability grounds.
+        NavAgentProps.bCanSwim = true;
+    }
+
+    SkeletalMeshBuoyancyComponent = CreateDefaultSubobject<UBuoyancyComponent>(TEXT("SkeletalMeshBuoyancy"));
     if (SkeletalMeshBuoyancyComponent)
     {
         if (USkeletalMeshComponent* MeshComponent = GetMesh())
@@ -39,7 +133,7 @@ ACharacterController::ACharacterController()
             SkeletalMeshBuoyancyComponent->SetTargetComponentName(MeshComponent->GetFName());
         }
 
-        FRuntimeBuoyancyPhysicsSettings CharacterBuoyancyPhysics;
+        FBuoyancyPhysicsSettings CharacterBuoyancyPhysics;
         CharacterBuoyancyPhysics.BuoyancyAccelerationScale = 0.992f;
         CharacterBuoyancyPhysics.WaterLinearDragCoefficient = 2.35f;
         CharacterBuoyancyPhysics.WaterQuadraticDragCoefficient = 0.00175f;
@@ -64,8 +158,8 @@ ACharacterController::ACharacterController()
         CharacterBuoyancyPhysics.MaxAngularSpeed = 4.8f;
         SkeletalMeshBuoyancyComponent->SetCommonPhysicsSettings(CharacterBuoyancyPhysics);
 
-        FRuntimeSkeletalBuoyancySettings SkeletalBuoyancySettings = SkeletalMeshBuoyancyComponent->GetSkeletalMeshSettings();
-        for (FRuntimeSkeletalBuoyancyBoneRule& Rule : SkeletalBuoyancySettings.BoneRules)
+        FSkeletalBuoyancySettings SkeletalBuoyancySettings = SkeletalMeshBuoyancyComponent->GetSkeletalMeshSettings();
+        for (FSkeletalBuoyancyBoneRule& Rule : SkeletalBuoyancySettings.BoneRules)
         {
             if (Rule.RuleName == FName(TEXT("DistalLimbs")))
             {
@@ -99,71 +193,673 @@ ACharacterController::ACharacterController()
 void ACharacterController::BeginPlay()
 {
     Super::BeginPlay();
-    if (DefaultAsset.IMC)
+    if (UGlTFSimulatorAssetRegistry* Registry = UGlTFSimulatorGameInstance::GetAssetRegistryFromContext(this))
     {
-        UInputFunctionLibrary::AddInputMappingContext(this, DefaultAsset.IMC, 0);
+        DefaultPhysicsAsset = Registry->DefaultCharacterPhysicsAsset.IsNull()
+            ? nullptr : Registry->DefaultCharacterPhysicsAsset.LoadSynchronous();
+        DefaultSkeleton = Registry->DefaultCharacterSkeleton.IsNull()
+            ? nullptr : Registry->DefaultCharacterSkeleton.LoadSynchronous();
+        DefaultMaterial = Registry->DefaultCharacterMaterial.IsNull()
+            ? nullptr : Registry->DefaultCharacterMaterial.LoadSynchronous();
+        DefaultSkeletalMesh = Registry->DefaultCharacterSkeletalMesh.IsNull()
+            ? nullptr : Registry->DefaultCharacterSkeletalMesh.LoadSynchronous();
+
+        UClass* ResolvedAnimClass = Registry->DefaultCharacterAnimInstanceClass.IsNull()
+            ? nullptr : Registry->DefaultCharacterAnimInstanceClass.LoadSynchronous();
+        DefaultAnimInstanceClass = IsValid(ResolvedAnimClass)
+            && ResolvedAnimClass->IsChildOf(UAnimInstance::StaticClass())
+            && !ResolvedAnimClass->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists)
+            ? ResolvedAnimClass : nullptr;
     }
-    else
+
+    // The central registry is the authoritative default presentation. Apply it once before any
+    // asynchronous glTF character swap so PrepareForMeshReload captures the configured AnimBP.
+    if (USkeletalMeshComponent* MeshComp = GetMesh())
     {
-        UE_LOG(LogTemp, Warning, TEXT("Input Mapping Context is not assigned in the editor."));
+        if (IsValid(DefaultSkeletalMesh) && MeshComp->GetSkinnedAsset() != DefaultSkeletalMesh.Get())
+        {
+            MeshComp->SetSkinnedAssetAndUpdate(DefaultSkeletalMesh, true);
+        }
+        if (IsValid(DefaultPhysicsAsset) && MeshComp->GetPhysicsAsset() != DefaultPhysicsAsset.Get())
+        {
+            MeshComp->SetPhysicsAsset(DefaultPhysicsAsset, true);
+        }
+        if (IsValid(DefaultMaterial))
+        {
+            MeshComp->SetMaterial(0, DefaultMaterial);
+        }
+        if (DefaultAnimInstanceClass)
+        {
+            MeshComp->SetAnimationMode(EAnimationMode::AnimationBlueprint);
+            MeshComp->SetAnimInstanceClass(DefaultAnimInstanceClass);
+        }
+
+        // Default characters need the same secondary-body activation as runtime glTF characters.
+        // Otherwise hair physics is only enabled after OnLoadCompleted() and the startup mesh stays rigid.
+        UCharacterFunctionLibrary::DisableRagdollPhysicsButKeepSecondary(*MeshComp);
     }
     bIsLoaded = false;
-    SavedThirdPersonArmLength = SpringArm->TargetArmLength > 1.0f ? SpringArm->TargetArmLength : 350.0f;
+    SavedThirdPersonArmLength = SpringArm->TargetArmLength > 1.0f ? SpringArm->TargetArmLength : CharacterControllerTuning::DefaultThirdPersonArmLength;
     SavedThirdPersonSocketOffset = SpringArm->SocketOffset;
     // Initialize Component
+    SubSystem = UGameManagerSubSystem::GetSubSystem(this);
     Movement = GetCharacterMovement();
-    if (IsValid(Movement))
-    {
-        Movement->bEnablePhysicsInteraction = true;
-    }
+    RefreshMassAwarePhysicsInteraction(true);
     if (UCapsuleComponent* Capsule = GetCapsuleComponent())
     {
         Capsule->SetNotifyRigidBodyCollision(true);
         Capsule->OnComponentHit.RemoveDynamic(this, &ACharacterController::HandleCapsulePhysicsHit);
         Capsule->OnComponentHit.AddDynamic(this, &ACharacterController::HandleCapsulePhysicsHit);
     }
-    SubSystem = UGameManagerSubSystem::GetSubSystem(this);
-    if (!IsValid(SubSystem))
-        return;
-    SubSystem->SetPlayerActor(this);
-    SubSystem->SetCameraComponent(FollowCamera);
-    SetActorLocation(SubSystem->GetPlayerLocation(), false, nullptr, ETeleportType::TeleportPhysics);
+    // Initialize a usable stable water reference for the currently installed default mesh as well.
+    // If a runtime glTF load starts before the deferred sample executes, Load() invalidates this
+    // request and the final runtime mesh completion schedules a fresh sample. This prevents a
+    // default/no-load character from being permanently rejected by ShouldUseDirectWaterState().
+    if (IsValid(Component.Get()))
+    {
+        Component->RequestWaterReferenceRefreshForCurrentMesh();
+    }
+
+    // PlayerCharacterController::OnPossess performs primary-player registration. BeginPlay can run
+    // before possession, when this Pawn cannot yet be distinguished from remote or secondary Pawns.
     Activate(false);
+
+    if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
+    {
+        GameUpdateTickHandle = GameUpdate->RegisterUpdate(
+            this,
+            [WeakThis = TWeakObjectPtr<ACharacterController>(this)](const float DeltaSeconds)
+            {
+                if (ACharacterController* StrongThis = WeakThis.Get())
+                {
+                    StrongThis->UpdateFromGameUpdate(DeltaSeconds);
+                }
+            },
+            0);
+    }
+
 }
 
 void ACharacterController::Load(const FString &Path)
 {
-    // 1. Create the async load action and pass WorldContextObject, Owner, and Path.
+    if (!ensureMsgf(IsInGameThread(), TEXT("ACharacterController::Load must run on the game thread")))
+    {
+        TWeakObjectPtr<ACharacterController> WeakThis(this);
+        const FString DeferredPath = Path;
+        FSafeFileIO::DispatchTrackedGameThread([WeakThis, DeferredPath]()
+        {
+            if (ACharacterController* StrongThis = WeakThis.Get())
+            {
+                StrongThis->Load(DeferredPath);
+            }
+        });
+        return;
+    }
+
+    if (Path.IsEmpty())
+    {
+        UE_LOG(LogTemp, Warning, TEXT("Character load ignored because the GLB path is empty."));
+        bLastMeshLoadSucceeded = false;
+        LoadProgress = 1.0f;
+        bIsLoaded = true;
+        return;
+    }
+
+    bIsLoaded = false;
+    bLastMeshLoadSucceeded = false;
+    LoadProgress = 0.0f;
+
+    if (IsValid(ActiveLoadAction.Get()))
+    {
+        // glTFRuntime cannot be force-stopped once mesh construction/finalization is in flight.
+        // Keep only the latest requested path and start it after the cancelled action reports that
+        // its callback has drained. This guarantees at most one character build at a time.
+        QueuedCharacterPath = Path;
+        ActiveLoadAction->CancelAndRelease();
+        return;
+    }
+
+    QueuedCharacterPath.Reset();
+
+    // Only one generated character is kept resident. Detach the old runtime mesh before
+    // the next GLB is parsed, then keep the default character animated during the async load.
+    ReleaseRuntimeCharacterResources(true);
+
+    if (IsValid(Component.Get()))
+    {
+        Component->InvalidateWaterReferenceForPendingMeshLoad();
+    }
+
     UCharacterLoadAsyncAction *LoadAction = UCharacterLoadAsyncAction::LoadCharacterAsync(this, this, Path);
     if (LoadAction)
     {
-        // 2. Connect completed delegate (Optional)
-        // Optional hook for UI/state work after loading completes.
+        ActiveLoadAction = LoadAction;
         LoadAction->OnCompleted.AddDynamic(this, &ACharacterController::OnLoadCompleted);
-        // 3. Start async loading
-        // Activate() runs glTF loading, BoneMap loading, and mesh creation in order.
+        LoadAction->OnProgress.AddDynamic(this, &ACharacterController::OnLoadProgress);
         LoadAction->Activate();
     }
+    else
+    {
+        LoadProgress = 1.0f;
+        bLastMeshLoadSucceeded = false;
+        bIsLoaded = true;
+    }
+}
+
+void ACharacterController::CancelCharacterLoad(bool bRestoreDefaultMesh)
+{
+    if (!ensureMsgf(IsInGameThread(), TEXT("ACharacterController::CancelCharacterLoad must run on the game thread")))
+    {
+        TWeakObjectPtr<ACharacterController> WeakThis(this);
+        FSafeFileIO::DispatchTrackedGameThread([WeakThis, bRestoreDefaultMesh]()
+        {
+            if (ACharacterController* StrongThis = WeakThis.Get())
+            {
+                StrongThis->CancelCharacterLoad(bRestoreDefaultMesh);
+            }
+        });
+        return;
+    }
+
+    QueuedCharacterPath.Reset();
+    if (IsValid(ActiveLoadAction.Get()))
+    {
+        ActiveLoadAction->CancelAndRelease();
+    }
+
+    ReleaseRuntimeCharacterResources(bRestoreDefaultMesh);
+    bLastMeshLoadSucceeded = false;
+    LoadProgress = 1.0f;
+    bIsLoaded = true;
+}
+
+void ACharacterController::HandleCharacterLoadActionReleased(
+    UCharacterLoadAsyncAction* ReleasedAction)
+{
+    if (!ensureMsgf(IsInGameThread(), TEXT("Character load release notification must run on the game thread")))
+    {
+        return;
+    }
+
+    if (ActiveLoadAction.Get() != ReleasedAction)
+    {
+        return;
+    }
+
+    ActiveLoadAction = nullptr;
+    if (QueuedCharacterPath.IsEmpty() || IsActorBeingDestroyed())
+    {
+        QueuedCharacterPath.Reset();
+        return;
+    }
+
+    FString NextPath = MoveTemp(QueuedCharacterPath);
+    QueuedCharacterPath.Reset();
+    Load(NextPath);
+}
+
+bool ACharacterController::CommitRuntimeCharacterResources(
+    USkeletalMesh* SkeletalMesh,
+    UPhysicsAsset* PhysicsAsset,
+    USkeleton* InRuntimeSkeleton)
+{
+    if (!ensureMsgf(IsInGameThread(), TEXT("CommitRuntimeCharacterResources must run on the game thread")))
+    {
+        return false;
+    }
+
+    USkeletalMeshComponent* MeshComp = GetMesh();
+    if (!IsValid(MeshComp) || !IsValid(SkeletalMesh) || SkeletalMesh->GetRefSkeleton().GetNum() <= 0)
+    {
+        return false;
+    }
+
+    PrepareForMeshReload();
+
+    MeshComp->SetAllBodiesSimulatePhysics(false);
+    MeshComp->SetSimulatePhysics(false);
+    MeshComp->PutAllRigidBodiesToSleep();
+
+    // BeginPlay installs DefaultCharacterMaterial as a component override for the placeholder mesh.
+    // Component overrides survive SetSkinnedAssetAndUpdate(), so leaving it in place masks the
+    // texture-bearing MIDs reconstructed for the runtime glTF mesh and makes the whole character
+    // render with the plain/default material. The generated mesh already owns its correct MIDs.
+    MeshComp->EmptyOverrideMaterials();
+    MeshComp->SetSkinnedAssetAndUpdate(SkeletalMesh, true);
+
+    UPhysicsAsset* PhysicsToUse = IsValid(PhysicsAsset) ? PhysicsAsset : DefaultPhysicsAsset.Get();
+    if (IsValid(PhysicsToUse))
+    {
+        MeshComp->SetPhysicsAsset(PhysicsToUse, true);
+    }
+
+    MeshComp->SetCollisionProfileName(TEXT("CharacterMesh"));
+    MeshComp->SetGenerateOverlapEvents(false);
+
+    RuntimeSkeletalMesh = SkeletalMesh;
+    RuntimePhysicsAsset = IsValid(PhysicsAsset) ? PhysicsAsset : nullptr;
+    RuntimeSkeleton = IsValid(SkeletalMesh->GetSkeleton())
+        ? SkeletalMesh->GetSkeleton()
+        : InRuntimeSkeleton;
+
+    // OnLoadCompleted restores animation/physics exactly once after the async action broadcasts
+    // completion. Keeping the swap itself minimal reduces the game-thread spike.
+    return true;
+}
+
+void ACharacterController::ReleaseRuntimeCharacterResources(bool bRestoreDefaultMesh)
+{
+    if (!ensureMsgf(IsInGameThread(), TEXT("ReleaseRuntimeCharacterResources must run on the game thread")))
+    {
+        return;
+    }
+
+    USkeletalMeshComponent* MeshComp = GetMesh();
+    if (!IsValid(MeshComp))
+    {
+        RuntimeSkeletalMesh = nullptr;
+        RuntimePhysicsAsset = nullptr;
+        RuntimeSkeleton = nullptr;
+        return;
+    }
+
+    const bool bHasRuntimeResources =
+        IsValid(RuntimeSkeletalMesh) || IsValid(RuntimePhysicsAsset) || IsValid(RuntimeSkeleton);
+    const bool bDefaultMeshAlreadyInstalled =
+        !IsValid(DefaultSkeletalMesh) ||
+        MeshComp->GetSkinnedAsset() == DefaultSkeletalMesh.Get();
+    const bool bDefaultPhysicsAlreadyInstalled =
+        !IsValid(DefaultPhysicsAsset) ||
+        MeshComp->GetPhysicsAsset() == DefaultPhysicsAsset.Get();
+
+    // Initial world entry normally starts on the directly assigned default character. Avoid an
+    // unnecessary animation reset and physics-state recreation when there is nothing to release.
+    if (!bHasRuntimeResources && bDefaultMeshAlreadyInstalled && bDefaultPhysicsAlreadyInstalled)
+    {
+        return;
+    }
+
+    PrepareForMeshReload();
+
+    USkeletalMesh* OldRuntimeMesh = RuntimeSkeletalMesh.Get();
+    UPhysicsAsset* OldRuntimePhysics = RuntimePhysicsAsset.Get();
+    USkeleton* OldRuntimeSkeleton = RuntimeSkeleton.Get();
+
+    MeshComp->SetAllBodiesSimulatePhysics(false);
+    MeshComp->SetSimulatePhysics(false);
+    MeshComp->PutAllRigidBodiesToSleep();
+
+    // Never install a null skinned asset while an AnimBP/ControlRig may still own worker tasks.
+    // The directly assigned default mesh is the stable placeholder during the next async load.
+    if (IsValid(DefaultSkeletalMesh))
+    {
+        MeshComp->EmptyOverrideMaterials();
+        MeshComp->SetSkinnedAssetAndUpdate(DefaultSkeletalMesh, true);
+        if (IsValid(DefaultMaterial))
+        {
+            MeshComp->SetMaterial(0, DefaultMaterial);
+        }
+    }
+    if (IsValid(DefaultPhysicsAsset))
+    {
+        MeshComp->SetPhysicsAsset(DefaultPhysicsAsset, true);
+    }
+    RuntimeSkeletalMesh = nullptr;
+    RuntimePhysicsAsset = nullptr;
+    RuntimeSkeleton = nullptr;
+
+    auto ReleaseTransientObject = [](UObject* Object)
+    {
+        if (IsValid(Object) && !Object->IsAsset())
+        {
+            Object->ClearFlags(RF_Public | RF_Standalone);
+            Object->SetFlags(RF_Transient);
+        }
+    };
+    ReleaseTransientObject(OldRuntimePhysics);
+    ReleaseTransientObject(OldRuntimeSkeleton);
+    ReleaseTransientObject(OldRuntimeMesh);
+
+    // Do not call CollectGarbage here. Once references are detached, Unreal's normal incremental
+    // GC can reclaim the old mesh/material/texture graph without a character-switch hitch.
+    if (bRestoreDefaultMesh)
+    {
+        RestoreAfterMeshReload();
+    }
+}
+
+void ACharacterController::OnLoadProgress(float Progress)
+{
+    ensureMsgf(IsInGameThread(), TEXT("Character load progress must be delivered on the game thread"));
+    LoadProgress = FMath::Max(LoadProgress, FMath::Clamp(Progress, 0.0f, 1.0f));
 }
 
 void ACharacterController::OnLoadCompleted(bool Result)
 {
+    ensureMsgf(IsInGameThread(), TEXT("Character load completion must be delivered on the game thread"));
+    bLastMeshLoadSucceeded = Result;
+
     if (!Result)
     {
-        USkeletalMeshComponent *MeshComp = GetMesh();
-        if (IsValid(MeshComp) && IsValid(DefaultAsset.SkeletalMesh))
+        // The old runtime character was intentionally released before loading. Keep the directly
+        // assigned default mesh as the stable fallback rather than attempting to retain every GLB.
+        if (USkeletalMeshComponent* MeshComp = GetMesh())
         {
-            MeshComp->SetSkinnedAssetAndUpdate(DefaultAsset.SkeletalMesh, true);
+            if (IsValid(DefaultSkeletalMesh) &&
+                MeshComp->GetSkinnedAsset() != DefaultSkeletalMesh.Get())
+            {
+                MeshComp->EmptyOverrideMaterials();
+                MeshComp->SetSkinnedAssetAndUpdate(DefaultSkeletalMesh, true);
+            }
+            if (IsValid(DefaultMaterial))
+            {
+                MeshComp->SetMaterial(0, DefaultMaterial);
+            }
+            if (IsValid(DefaultPhysicsAsset))
+            {
+                MeshComp->SetPhysicsAsset(DefaultPhysicsAsset, true);
+            }
         }
-        UE_LOG(LogTemp, Warning, TEXT("Character glTF load failed. Falling back to the default mesh so world/runtime loading can continue."));
+        UE_LOG(LogTemp, Warning, TEXT("Character glTF load failed. The default character remains active."));
     }
 
-    // bIsLoaded is used by WorldManager as a load-completion gate. Treat the
-    // default-mesh fallback as a completed load; otherwise LoadPlayerAsync loops
-    // forever and RuntimeGameplayManager never starts.
+    RestoreAfterMeshReload();
+
+    if (Result)
+    {
+        if (USkeletalMeshComponent* MeshComp = GetMesh())
+        {
+            UCharacterFunctionLibrary::BlendRagdoll(*MeshComp, 0.0f);
+        }
+    }
+
+    if (IsValid(Component.Get()))
+    {
+        Component->RequestWaterReferenceRefreshForCurrentMesh();
+    }
+
+    LoadProgress = 1.0f;
     bIsLoaded = true;
 }
 
+void ACharacterController::PrepareForMeshReload()
+{
+    USkeletalMeshComponent* MeshComp = GetMesh();
+    if (!IsValid(MeshComp))
+    {
+        return;
+    }
+
+    // Dynamically loaded player meshes are generated from glTFRuntime and can temporarily have a
+    // different USkeleton/bone layout while the async load is still in progress. Disable
+    // the AnimBP/ControlRig graph before the swap so worker-thread CacheBones cannot build
+    // mappings against a half-replaced runtime mesh.
+    if (!bHasSavedAnimationState)
+    {
+        SavedAnimationMode = MeshComp->GetAnimationMode();
+        SavedAnimClass = MeshComp->GetAnimClass();
+        bHasSavedAnimationState = true;
+    }
+
+    MeshComp->bPauseAnims = true;
+    MeshComp->SetComponentTickEnabled(false);
+    MeshComp->SetAllBodiesSimulatePhysics(false);
+    MeshComp->SetSimulatePhysics(false);
+    MeshComp->PutAllRigidBodiesToSleep();
+    MeshComp->SetAnimationMode(EAnimationMode::AnimationSingleNode);
+}
+
+void ACharacterController::RestoreAfterMeshReload()
+{
+    USkeletalMeshComponent* MeshComp = GetMesh();
+    if (!IsValid(MeshComp))
+    {
+        return;
+    }
+
+    const bool bWasMeshReloadPrepared = bHasSavedAnimationState;
+    if (bHasSavedAnimationState)
+    {
+        if (SavedAnimationMode == EAnimationMode::AnimationBlueprint && SavedAnimClass)
+        {
+            MeshComp->SetAnimInstanceClass(SavedAnimClass);
+        }
+        else
+        {
+            MeshComp->SetAnimationMode(SavedAnimationMode.GetValue());
+        }
+        bHasSavedAnimationState = false;
+    }
+
+    MeshComp->SetComponentTickEnabled(true);
+    MeshComp->bPauseAnims = false;
+    if (bWasMeshReloadPrepared)
+    {
+        MeshComp->RecreatePhysicsState();
+    }
+
+    // Re-establish Chaos secondary-body simulation after every runtime mesh/PhysicsAsset swap.
+    UCharacterFunctionLibrary::DisableRagdollPhysicsButKeepSecondary(*MeshComp);
+    bNeedsPostRagdollCleanup = true;
+    PhysicsStateAuditAccumulator = 0.0f;
+}
+
+void ACharacterController::PrepareForPawnReplacement()
+{
+    QueuedCharacterPath.Reset();
+    if (IsValid(ActiveLoadAction.Get()))
+    {
+        ActiveLoadAction->CancelAndRelease();
+        ActiveLoadAction = nullptr;
+    }
+
+    Activate(false);
+    ReleaseRuntimeCharacterResources(false);
+
+    USkeletalMeshComponent* MeshComp = GetMesh();
+    if (IsValid(MeshComp))
+    {
+        // Do not restore the animation graph on a pawn that is about to be destroyed.
+        // This keeps ControlRig/PoseDriver from evaluating while the PlayerController is
+        // being moved to the freshly spawned runtime character.
+        MeshComp->bPauseAnims = true;
+        MeshComp->SetComponentTickEnabled(false);
+        MeshComp->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+        MeshComp->SetGenerateOverlapEvents(false);
+    }
+
+    if (UCapsuleComponent* Capsule = GetCapsuleComponent())
+    {
+        Capsule->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+        Capsule->SetGenerateOverlapEvents(false);
+    }
+}
+
+
+
+void ACharacterController::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+    QueuedCharacterPath.Reset();
+    if (IsValid(ActiveLoadAction.Get()))
+    {
+        ActiveLoadAction->CancelAndRelease();
+        ActiveLoadAction = nullptr;
+    }
+    ReleaseRuntimeCharacterResources(false);
+
+    if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
+    {
+        GameUpdate->UnregisterUpdate(GameUpdateTickHandle);
+    }
+    GameUpdateTickHandle = INDEX_NONE;
+
+    Super::EndPlay(EndPlayReason);
+}
+
+void ACharacterController::RestoreControlAfterRagdollRecovery()
+{
+    // Ragdoll recovery disables movement for several frames while the mesh is being reattached.
+    // Always restore the authoritative movement/input/collision state in one place so a missed
+    // animation frame, water-state transition, or repeated deactivate request cannot leave the pawn unresponsive.
+    bIsMoveable = true;
+    SetActorHiddenInGame(false);
+    SetActorEnableCollision(true);
+
+    if (UCapsuleComponent* Capsule = GetCapsuleComponent())
+    {
+        Capsule->SetActive(true);
+        Capsule->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+        Capsule->SetGenerateOverlapEvents(true);
+    }
+
+    if (USkeletalMeshComponent* MeshComp = GetMesh())
+    {
+        // This call disables ragdoll bodies, re-enables/wakes only the hair/dynamic chains, and
+        // leaves the component itself non-ragdoll. Do not call SetSimulatePhysics(false) or
+        // PutAllRigidBodiesToSleep() after it: either can immediately suppress secondary motion.
+        MeshComp->SetCollisionProfileName(TEXT("CharacterMesh"));
+        UCharacterFunctionLibrary::DisableRagdollPhysicsButKeepSecondary(*MeshComp);
+        MeshComp->SetGenerateOverlapEvents(false);
+        MeshComp->SetComponentTickEnabled(true);
+        MeshComp->bPauseAnims = false;
+        MeshComp->SetVisibility(true, true);
+
+        if (UCapsuleComponent* Capsule = GetCapsuleComponent())
+        {
+            if (MeshComp->GetAttachParent() != Capsule)
+            {
+                MeshComp->AttachToComponent(Capsule, FAttachmentTransformRules::KeepWorldTransform);
+            }
+            MeshComp->SetRelativeLocation(CharacterControllerTuning::MeshDefaultRelativeLocation);
+            MeshComp->SetRelativeRotation(CharacterControllerTuning::MeshDefaultRelativeRotation);
+        }
+    }
+
+    if (IsValid(Movement))
+    {
+        Movement->SetActive(true);
+        Movement->Activate(true);
+        Movement->ConsumeInputVector();
+        Movement->StopMovementImmediately();
+        Movement->bOrientRotationToMovement = false;
+
+        if (Movement->MovementMode == MOVE_None)
+        {
+            const bool bHasWalkableSupport = Movement->IsMovingOnGround()
+                || (IsValid(Component.Get()) && Component->IsCharacterSupportedByWalkableGround());
+            Movement->SetMovementMode(bHasWalkableSupport ? MOVE_Walking : MOVE_Falling);
+        }
+    }
+
+    CharacterStateBit &= ~(STATE_JUMPING | STATE_SPRINT | STATE_CROUCH);
+    RawMoveInput = FVector::ZeroVector;
+    StopJumping();
+    UnCrouch();
+
+    if (APlayerController* PlayerController = Cast<APlayerController>(GetController()))
+    {
+        // PlayerCharacterController::ApplyGameInputMode resets the complete ignore-input stack.
+        // Do not pop a single layer here; a partial pop can leave packaged builds with LMB-only input.
+        PlayerController->SetViewTarget(this);
+
+        if (APlayerCharacterController* PlayerCharacterController = Cast<APlayerCharacterController>(PlayerController))
+        {
+            PlayerCharacterController->ApplyGameInputMode();
+            PlayerCharacterController->ClearLatchedMovementInput();
+        }
+        else
+        {
+            // Generic controllers do not own the project recovery helper, so clear their complete
+            // ignore stacks directly instead of leaving ragdoll recovery input locked.
+            PlayerController->ResetIgnoreMoveInput();
+            PlayerController->ResetIgnoreLookInput();
+        }
+    }
+}
+
+void ACharacterController::RefreshMassAwarePhysicsInteraction(bool bForce)
+{
+    if (!IsValid(Movement))
+    {
+        Movement = GetCharacterMovement();
+    }
+    if (!IsValid(Movement))
+    {
+        return;
+    }
+
+    if (!IsValid(SubSystem))
+    {
+        SubSystem = UGameManagerSubSystem::GetSubSystem(this);
+    }
+
+    float NewMassKg = CharacterControllerTuning::DefaultCharacterMassKg;
+    float NewTractionCoefficient = CharacterControllerTuning::DefaultPushTractionCoefficient;
+    if (const UWorldData* WorldData = IsValid(SubSystem) ? SubSystem->GetActiveWorldData() : nullptr)
+    {
+        NewMassKg = WorldData->Gameplay.PlayerMassKg;
+        NewTractionCoefficient = WorldData->Gameplay.PlayerPushTractionCoefficient;
+    }
+
+    NewMassKg = FMath::Clamp(
+        FMath::IsFinite(NewMassKg) ? NewMassKg : CharacterControllerTuning::DefaultCharacterMassKg,
+        CharacterControllerTuning::MinCharacterMassKg,
+        CharacterControllerTuning::MaxCharacterMassKg);
+    NewTractionCoefficient = FMath::Clamp(
+        FMath::IsFinite(NewTractionCoefficient) ? NewTractionCoefficient : CharacterControllerTuning::DefaultPushTractionCoefficient,
+        0.0f,
+        CharacterControllerTuning::MaxPushTractionCoefficient);
+
+    const bool bSettingsChanged = !FMath::IsNearlyEqual(CharacterMassKg, NewMassKg, 0.01f)
+        || !FMath::IsNearlyEqual(CharacterPushTractionCoefficient, NewTractionCoefficient, 0.001f);
+    if (!bForce && !bSettingsChanged)
+    {
+        return;
+    }
+
+    CharacterMassKg = NewMassKg;
+    CharacterPushTractionCoefficient = NewTractionCoefficient;
+    const UWorld* World = GetWorld();
+    const float GravityAcceleration = World && FMath::IsFinite(World->GetGravityZ())
+        ? FMath::Max(1.0f, FMath::Abs(World->GetGravityZ()))
+        : CharacterControllerTuning::DefaultGravityAccelerationCm;
+
+    // A walking character is a kinematic controller, so the stock 750,000 push force is not tied
+    // to body mass and can accelerate a one-ton vehicle far too easily. Derive the sustained force
+    // from the character's available horizontal traction instead: F = mass * gravity * coefficient.
+    CharacterPushForceLimit = CharacterMassKg * GravityAcceleration * CharacterPushTractionCoefficient;
+
+    Movement->Mass = CharacterMassKg;
+    Movement->bEnablePhysicsInteraction = true;
+    // Never multiply push/touch force by the target body mass. A fixed applied force naturally
+    // gives a heavy body less acceleration through F = m*a.
+    Movement->bPushForceScaledToMass = false;
+    Movement->bTouchForceScaledToMass = false;
+    Movement->bScalePushForceToVelocity = true;
+    Movement->bPushForceUsingZOffset = true;
+    Movement->PushForcePointZOffsetFactor = CharacterControllerTuning::PushForcePointZOffsetFactor;
+
+    const float ReferencePushSpeed = FMath::Max(0.0f, Movement->MaxWalkSpeed);
+    Movement->InitialPushForceFactor = CharacterMassKg * ReferencePushSpeed
+        * CharacterControllerTuning::InitialPushMomentumTransferRatio;
+    Movement->PushForceFactor = CharacterPushForceLimit;
+
+    // Touch and overlap forces are non-directional and can keep creeping a parked heavy body even
+    // when the character is not actively walking into it. Blocking contact and the directional
+    // push force remain enabled; incidental touch/repulsion forces are disabled.
+    Movement->TouchForceFactor = 0.0f;
+    Movement->MinTouchForce = 0.0f;
+    Movement->MaxTouchForce = 0.0f;
+    Movement->RepulsionForce = 0.0f;
+    Movement->StandingDownwardForceScale = 1.0f;
+
+    UE_LOG(LogTemp, Log,
+        TEXT("Character physics interaction configured. MassKg=%.2f Traction=%.3f PushForce=%.2f InitialPushImpulse=%.2f"),
+        CharacterMassKg,
+        CharacterPushTractionCoefficient,
+        CharacterPushForceLimit,
+        Movement->InitialPushForceFactor);
+}
 
 void ACharacterController::HandleCapsulePhysicsHit(UPrimitiveComponent* HitComponent, AActor* OtherActor, UPrimitiveComponent* OtherComp, FVector NormalImpulse, const FHitResult& Hit)
 {
@@ -179,7 +875,7 @@ void ACharacterController::HandleCapsulePhysicsHit(UPrimitiveComponent* HitCompo
 
     UWorld* World = GetWorld();
     const double Now = World ? World->GetTimeSeconds() : 0.0;
-    if (LastPhysicsObjectImpactTime >= 0.0 && Now - LastPhysicsObjectImpactTime < PhysicsObjectImpactCooldownSeconds)
+    if (LastPhysicsObjectImpactTime >= 0.0 && Now - LastPhysicsObjectImpactTime < CharacterControllerTuning::PhysicsObjectImpactCooldownSeconds)
     {
         return;
     }
@@ -210,22 +906,52 @@ void ACharacterController::HandleCapsulePhysicsHit(UPrimitiveComponent* HitCompo
 
     const FVector ImpactPoint = HitImpactPoint.IsNearlyZero() ? OtherComp->GetComponentLocation() : HitImpactPoint;
     const FVector OtherVelocity = OtherComp->GetPhysicsLinearVelocityAtPoint(ImpactPoint);
-    const FVector RelativeVelocity = OtherVelocity - GetVelocity();
-    const float RelativeImpactSpeed = FVector::DotProduct(RelativeVelocity, HorizontalDirection);
+    const FVector CharacterVelocity = GetVelocity();
 
-    constexpr float ReferenceCharacterMassKg = 80.0f;
-    const float ImpulseSpeed = NormalImpulse.Size() / ReferenceCharacterMassKg;
-    float ImpactSpeed = FMath::Max(RelativeImpactSpeed, ImpulseSpeed);
-
-    if (ImpactSpeed < MinPhysicsObjectImpactSpeed)
+    // Only treat this as an incoming-object impact when the simulated body itself is moving into
+    // the character. Previously a stationary car also knocked the player backwards simply because
+    // the player walked into it, which mixed the push and impact responses.
+    const float ObjectTowardCharacterSpeed = FMath::Max(
+        0.0f,
+        FVector::DotProduct(OtherVelocity, HorizontalDirection));
+    if (ObjectTowardCharacterSpeed < CharacterControllerTuning::MinPhysicsObjectImpactSpeed)
     {
         return;
     }
 
-    ImpactSpeed = FMath::Clamp(ImpactSpeed * PhysicsObjectImpactVelocityScale, 0.0f, MaxPhysicsObjectImpactVelocityChange);
+    const float CharacterTowardObjectSpeed = FMath::Max(
+        0.0f,
+        FVector::DotProduct(CharacterVelocity, -HorizontalDirection));
+    const float ClosingSpeedDrivenByObject = ObjectTowardCharacterSpeed
+        + FMath::Min(ObjectTowardCharacterSpeed, CharacterTowardObjectSpeed);
+
+    const float SafeCharacterMassKg = FMath::Clamp(
+        CharacterMassKg,
+        CharacterControllerTuning::MinCharacterMassKg,
+        CharacterControllerTuning::MaxCharacterMassKg);
+    const float RawOtherMassKg = OtherComp->GetMass();
+    const float OtherMassKg = FMath::IsFinite(RawOtherMassKg) && RawOtherMassKg > UE_SMALL_NUMBER
+        ? RawOtherMassKg
+        : 1.0f;
+    // One-dimensional two-body momentum transfer. Light props impart only a small velocity change;
+    // a vehicle much heavier than the character transfers most of its incoming contact speed.
+    const float TwoBodyMassTransfer = OtherMassKg / (OtherMassKg + SafeCharacterMassKg);
+    const float RelativeImpactSpeed = ClosingSpeedDrivenByObject * TwoBodyMassTransfer;
+    const float ImpulseSpeed = NormalImpulse.Size() / SafeCharacterMassKg;
+    const float BoundedImpulseSpeed = FMath::Min(
+        ImpulseSpeed,
+        RelativeImpactSpeed * 1.5f + CharacterControllerTuning::MinPhysicsObjectImpactSpeed);
+    float ImpactSpeed = FMath::Max(RelativeImpactSpeed, BoundedImpulseSpeed);
+
+    if (ImpactSpeed < CharacterControllerTuning::MinPhysicsObjectImpactSpeed)
+    {
+        return;
+    }
+
+    ImpactSpeed = FMath::Clamp(ImpactSpeed * CharacterControllerTuning::PhysicsObjectImpactVelocityScale, 0.0f, CharacterControllerTuning::MaxPhysicsObjectImpactVelocityChange);
 
     FVector VelocityDelta = HorizontalDirection * ImpactSpeed;
-    const float UpwardVelocity = FMath::Clamp(ImpactSpeed * PhysicsObjectImpactUpwardRatio, 0.0f, MaxPhysicsObjectImpactUpwardVelocity);
+    const float UpwardVelocity = FMath::Clamp(ImpactSpeed * CharacterControllerTuning::PhysicsObjectImpactUpwardRatio, 0.0f, CharacterControllerTuning::MaxPhysicsObjectImpactUpwardVelocity);
     if (UpwardVelocity > 0.0f)
     {
         VelocityDelta.Z = UpwardVelocity;
@@ -238,58 +964,167 @@ void ACharacterController::HandleCapsulePhysicsHit(UPrimitiveComponent* HitCompo
     }
 }
 
-void ACharacterController::Tick(float DeltaSeconds)
+
+void ACharacterController::UpdateFromGameUpdate(float DeltaSeconds)
 {
-    Super::Tick(DeltaSeconds);
+    if (!IsValid(Component.Get()))
+    {
+        return;
+    }
+    if (!IsValid(SubSystem))
+    {
+        SubSystem = UGameManagerSubSystem::GetSubSystem(this);
+    }
+
+    PhysicsInteractionRefreshAccumulator += FMath::Max(0.0f, DeltaSeconds);
+    if (PhysicsInteractionRefreshAccumulator >= CharacterControllerTuning::PhysicsInteractionRefreshIntervalSeconds)
+    {
+        PhysicsInteractionRefreshAccumulator = 0.0f;
+        RefreshMassAwarePhysicsInteraction(false);
+    }
+
     if (GetVelocity().Z <= 0.0f)
     {
         CharacterStateBit &= ~STATE_JUMPING;
     }
+    // Global ocean has no overlap volume. Refresh ordinary character water state from the
+    // authoritative query service every gameplay update so walking/falling into the ocean enters
+    // Swimming even when no BeginOverlap can fire. Ragdoll uses its own per-body water probes.
+    if (!Component->IsRagdollTransitionInProgress())
+    {
+        RefreshWaterStateFromQuery();
+    }
     SyncRagdollWaterStateFromPhysics();
     Component->UpdateComponent(DeltaSeconds, RawMoveInput, CharacterStateBit, WaterLevel);
 
-    // Buoyancy is only allowed to touch simulated ragdoll bodies.  When the character is not ragdolled,
-    // keep the visual mesh attached/visible so stale physics state cannot make it vanish or drift away.
-    if (!Component->IsRagdollActive() && !Component->IsGettingUp())
+    const bool bRagdollTransitionInProgress = Component->IsRagdollTransitionInProgress();
+
+    // Buoyancy is only allowed to touch simulated ragdoll bodies. While ragdoll/get-up is
+    // transitioning, do not reattach or reset the mesh here; the animation snapshot blend
+    // owns the mesh transform until the component clears the ragdoll weight.
+    if (bRagdollTransitionInProgress)
     {
-        if (USkeletalMeshComponent* MeshComp = GetMesh())
+        bNeedsPostRagdollCleanup = true;
+        PhysicsStateAuditAccumulator = 0.0f;
+    }
+    else
+    {
+        constexpr float PhysicsStateAuditIntervalSeconds = 1.0f;
+        PhysicsStateAuditAccumulator += FMath::Max(0.0f, DeltaSeconds);
+        const bool bRunSafetyAudit = PhysicsStateAuditAccumulator >= PhysicsStateAuditIntervalSeconds;
+        if (bNeedsPostRagdollCleanup || bRunSafetyAudit)
         {
-            if (UCharacterFunctionLibrary::HasNonSecondarySimulatingPhysicsBodies(*MeshComp))
+            PhysicsStateAuditAccumulator = 0.0f;
+            if (USkeletalMeshComponent* MeshComp = GetMesh())
             {
-                UCharacterFunctionLibrary::DisableRagdollPhysicsButKeepSecondary(*MeshComp);
-            }
-            else
-            {
-                UCharacterFunctionLibrary::KeepSecondaryPhysicsBodies(*MeshComp);
-            }
-            MeshComp->SetVisibility(true, true);
-            if (!bFirstPersonMode)
-            {
-                MeshComp->SetOwnerNoSee(false);
-            }
-            if (UCapsuleComponent* Capsule = GetCapsuleComponent())
-            {
-                if (MeshComp->GetAttachParent() != Capsule)
+                const bool bUnexpectedRagdollPhysics =
+                    UCharacterFunctionLibrary::HasNonSecondarySimulatingPhysicsBodies(*MeshComp);
+                if (bUnexpectedRagdollPhysics)
                 {
-                    MeshComp->AttachToComponent(Capsule, FAttachmentTransformRules::KeepRelativeTransform);
+                    UCharacterFunctionLibrary::DisableRagdollPhysicsButKeepSecondary(*MeshComp);
                 }
-                MeshComp->SetRelativeLocation(FVector(0.0f, 0.0f, -90.0f));
-                MeshComp->SetRelativeRotation(FRotator(0.0f, 270.0f, 0.0f));
+                else
+                {
+                    // Secondary chains are an always-on partial-physics subsystem. Reasserting the
+                    // split during the low-frequency audit repairs any body state lost to async
+                    // physics-state recreation without waking settled bodies or resetting velocity.
+                    UCharacterFunctionLibrary::KeepSecondaryPhysicsBodies(*MeshComp);
+                }
+
+                // Full attachment/pose restoration is required once per transition. The periodic
+                // audit above only reasserts secondary body state and does not touch mesh attachment.
+                if (bNeedsPostRagdollCleanup)
+                {
+                    MeshComp->SetVisibility(true, true);
+                    if (!bFirstPersonMode)
+                    {
+                        MeshComp->SetOwnerNoSee(false);
+                    }
+                    if (UCapsuleComponent* Capsule = GetCapsuleComponent())
+                    {
+                        if (MeshComp->GetAttachParent() != Capsule)
+                        {
+                            MeshComp->AttachToComponent(Capsule, FAttachmentTransformRules::KeepRelativeTransform);
+                        }
+                        if (!bIsCrouched)
+                        {
+                            MeshComp->SetRelativeLocation(CharacterControllerTuning::MeshDefaultRelativeLocation);
+                            MeshComp->SetRelativeRotation(CharacterControllerTuning::MeshDefaultRelativeRotation);
+                        }
+                    }
+                }
             }
+            bNeedsPostRagdollCleanup = false;
         }
     }
 
-    if (!Component->IsRagdollActive() && Component->IsRagdollDamage())
+    if (!bRagdollTransitionInProgress && Component->IsRagdollDamage())
     {
+        float DirectWaterLevel = WaterLevel;
+        if (!FindDirectWaterLevel(DirectWaterLevel))
+        {
+            // Fall-damage ragdoll is starting from dry air/ground. Drop stale water state
+            // before ActiveRagdoll() snapshots bRagdollInWater.
+            ClearDryWaterState(DirectWaterLevel, false);
+        }
+        else
+        {
+            WaterLevel = DirectWaterLevel;
+        }
+
         Component->SetRagdollActive(true);
     }
-    SubSystem->SetPlayerLocation(GetActorLocation());
+
+    if (IsValid(SubSystem))
+    {
+        SubSystem->SetPlayerLocation(GetActorLocation(), this);
+    }
 }
 
 void ACharacterController::EnterWater(const float Level)
 {
+    // Component overlap can stay true while only the capsule radius touches the water box.
+    // For normal character swimming, the capsule center column must be inside the water
+    // BoxComponent.  Otherwise moving out through the side of the box can leave stale
+    // overlap/state bits that keep MOVE_Swimming alive.
+    float DirectWaterLevel = Level;
+    if (!FindDirectWaterLevel(DirectWaterLevel))
+    {
+        bWaterStateFromOverlap = false;
+        if (!bWaterStateForcedByRagdoll)
+        {
+            ClearDryWaterState(Level, true);
+        }
+        return;
+    }
+
     bWaterStateFromOverlap = true;
-    SetWaterState(true, Level);
+    WaterLevel = DirectWaterLevel;
+
+    if (IsValid(Movement) && Movement->IsFlying())
+    {
+        // Flying is an explicit player override.  Keep the latest water level for
+        // Fly-off rechecks, but do not re-enter STATE_WATER while the mode is Flying.
+        CharacterStateBit &= ~STATE_WATER;
+        bWaterStateForcedByRagdoll = false;
+        if (IsValid(Component.Get()))
+        {
+            Component->ClearSwimmingSurfaceConstraintState();
+        }
+        return;
+    }
+
+    const bool bCurrentlySwimming = IsValid(Movement) && Movement->MovementMode == MOVE_Swimming;
+    if (IsValid(Component.Get()) && !Component->ShouldUseDirectWaterState(DirectWaterLevel, bCurrentlySwimming))
+    {
+        // Touching only the top of the water volume is not enough to enter Swimming.
+        // Keep the overlap memory, because the next direct probe can still enable water
+        // once the capsule is actually immersed past the enter threshold.
+        CharacterStateBit &= ~STATE_WATER;
+        return;
+    }
+
+    SetWaterState(true, DirectWaterLevel);
 }
 
 void ACharacterController::ExitWater(const float Level)
@@ -305,19 +1140,160 @@ void ACharacterController::ExitWater(const float Level)
     }
 }
 
+bool ACharacterController::FindDirectWaterLevel(float& OutLevel) const
+{
+    // This is the authoritative non-ragdoll water check. Global ocean intentionally has no
+    // collision overlap, so both capsule reference points go through UWaterQuerySubsystem.
+    UWaterQuerySubsystem* WaterQuery = UWaterQuerySubsystem::Get(this);
+    if (!WaterQuery)
+    {
+        return false;
+    }
+
+    const FVector ActorLocation = GetActorLocation();
+    const float CapsuleHalfHeight = GetCapsuleComponent()
+        ? GetCapsuleComponent()->GetScaledCapsuleHalfHeight()
+        : 0.0f;
+    const FVector BottomLocation(ActorLocation.X, ActorLocation.Y, ActorLocation.Z - CapsuleHalfHeight);
+
+    FWaterQueryResult ActorResult;
+    FWaterQueryResult BottomResult;
+    const bool bActorPointInWater = WaterQuery->QueryWaterAtLocation(
+        ActorLocation,
+        EWaterQueryMode::Strict,
+        EWaterQueryPurpose::Interaction,
+        ActorResult);
+    const bool bBottomPointInWater = WaterQuery->QueryWaterAtLocation(
+        BottomLocation,
+        EWaterQueryMode::Strict,
+        EWaterQueryPurpose::Interaction,
+        BottomResult);
+
+    if (!bActorPointInWater && !bBottomPointInWater)
+    {
+        return false;
+    }
+
+    float DetectedLevel = -TNumericLimits<float>::Max();
+    if (bActorPointInWater)
+    {
+        DetectedLevel = FMath::Max(DetectedLevel, ActorResult.SurfaceZ);
+    }
+    if (bBottomPointInWater)
+    {
+        DetectedLevel = FMath::Max(DetectedLevel, BottomResult.SurfaceZ);
+    }
+
+    OutLevel = DetectedLevel;
+    const bool bCurrentlySwimming = IsValid(Movement)
+        && Movement->MovementMode == MOVE_Swimming
+        && !Movement->IsFlying();
+    return !IsValid(Component.Get()) || Component->ShouldUseDirectWaterState(DetectedLevel, bCurrentlySwimming);
+}
+
+void ACharacterController::RefreshWaterStateFromQuery()
+{
+    if (!IsValid(Movement) || Movement->IsFlying())
+    {
+        return;
+    }
+
+    float DirectWaterLevel = WaterLevel;
+    const bool bDirectlyInWater = FindDirectWaterLevel(DirectWaterLevel);
+    const bool bHasWaterState = UCharacterFunctionLibrary::IsStateActive(CharacterStateBit, STATE_WATER);
+    const bool bSwimming = Movement->MovementMode == MOVE_Swimming;
+
+    if (bDirectlyInWater)
+    {
+        // Keep this legacy flag as the ordinary/non-ragdoll water-state latch. It is now driven by
+        // common water queries as well as local overlap events.
+        bWaterStateFromOverlap = true;
+        const bool bLevelChanged = !FMath::IsNearlyEqual(
+            WaterLevel,
+            DirectWaterLevel,
+            CharacterControllerTuning::WaterLevelChangeToleranceCm);
+        if (!bHasWaterState || bLevelChanged)
+        {
+            SetWaterState(true, DirectWaterLevel);
+        }
+        else
+        {
+            WaterLevel = DirectWaterLevel;
+        }
+
+        // FindDirectWaterLevel() has already passed the CharacterComponent immersion/shore
+        // gate here. Synchronize the gameplay bit and movement mode in the same update instead
+        // of waiting for CharacterComponent::UpdateComponent() to notice it later. The custom
+        // movement component keeps MOVE_Swimming stable without a PhysicsVolume water flag.
+        if (!Component->IsRagdollTransitionInProgress() && Movement->MovementMode != MOVE_Swimming)
+        {
+            Movement->SetMovementMode(MOVE_Swimming);
+        }
+        return;
+    }
+
+    if (!bWaterStateForcedByRagdoll && (bWaterStateFromOverlap || bHasWaterState || bSwimming))
+    {
+        ClearDryWaterState(DirectWaterLevel, true);
+    }
+}
+
+
+void ACharacterController::ClearDryWaterState(float Level, bool bUpdateMovementMode)
+{
+    // A dry movement probe wins over stale overlap/state bits.  This is especially important
+    // before fall-damage ragdoll starts, because ActiveRagdoll() can otherwise preserve
+    // a previous swimming intent and classify a dry ground impact as water recovery.
+    bWaterStateFromOverlap = false;
+    bWaterStateForcedByRagdoll = false;
+    CharacterStateBit &= ~STATE_WATER;
+    WaterLevel = Level;
+
+    if (IsValid(Component.Get()))
+    {
+        Component->SetRagdollWaterState(false, true);
+    }
+
+    if (IsValid(SkeletalMeshBuoyancyComponent))
+    {
+        SkeletalMeshBuoyancyComponent->ExitWater(Level);
+    }
+
+    if (bUpdateMovementMode && IsValid(Movement) && Movement->MovementMode == MOVE_Swimming)
+    {
+        // Drying out at the surface should not zero horizontal momentum; otherwise Fly-off
+        // or surface exit feels like the character gets stuck in slow swimming for a frame.
+        const FVector PreservedVelocity = Movement->Velocity;
+        const bool bHasWalkableSupport = Movement->IsMovingOnGround()
+            || (IsValid(Component.Get()) && Component->IsCharacterSupportedByWalkableGround());
+        Movement->SetMovementMode(bHasWalkableSupport ? MOVE_Walking : MOVE_Falling);
+        Movement->Velocity = FVector(PreservedVelocity.X, PreservedVelocity.Y, FMath::Min(PreservedVelocity.Z, 0.0f));
+    }
+}
+
 void ACharacterController::Activate(bool bValue)
 {
     Movement->SetActive(bValue);
     GetCapsuleComponent()->SetActive(bValue);
     AWaterActor::CheckOverlappingWater(this);
+    if (bValue)
+    {
+        RefreshWaterStateFromQuery();
+    }
 }
 
 // --- Input handling ---
 
 void ACharacterController::MovementInput(const float X, const float Y)
 {
-    RawMoveInput.X = X;
-    RawMoveInput.Y = Y;
+    constexpr float MovementInputDeadZone = 0.01f;
+    const float ClampedX = FMath::Clamp(X, -1.0f, 1.0f);
+    const float ClampedY = FMath::Clamp(Y, -1.0f, 1.0f);
+    RawMoveInput.X = FMath::IsNearlyZero(ClampedX, MovementInputDeadZone) ? 0.0f : ClampedX;
+    RawMoveInput.Y = FMath::IsNearlyZero(ClampedY, MovementInputDeadZone) ? 0.0f : ClampedY;
+
+    // Do not zero CharacterMovement velocity when input is released. Ground movement uses the
+    // movement component's normal braking, while flying intentionally eases out over time.
 }
 
 void ACharacterController::ClearTransientInputState()
@@ -412,28 +1388,56 @@ void ACharacterController::Flying()
 
     const bool bWasFlying = Movement->IsFlying();
     Movement->StopMovementImmediately();
+    if (IsValid(Component.Get()))
+    {
+        Component->ClearSwimmingSurfaceConstraintState();
+    }
+
+    float DirectWaterLevel = WaterLevel;
+    const bool bDirectlyInWater = FindDirectWaterLevel(DirectWaterLevel);
+
     if (bWasFlying)
     {
-        float CurrentWaterLevel = WaterLevel;
-        const bool bStillInWater = UCharacterFunctionLibrary::IsStateActive(CharacterStateBit, STATE_WATER)
-            || AWaterActor::FindWaterLevelAtLocation(this, GetActorLocation(), CurrentWaterLevel)
-            || AWaterActor::FindWaterLevelAtLocation(this, GetBottomLocation(), CurrentWaterLevel);
+        CharacterStateBit &= ~STATE_FLYING;
 
-        if (bStillInWater)
+        if (bDirectlyInWater)
         {
-            WaterLevel = CurrentWaterLevel;
+            WaterLevel = DirectWaterLevel;
             CharacterStateBit |= STATE_WATER;
+            bWaterStateFromOverlap = true;
+            bWaterStateForcedByRagdoll = false;
+            if (IsValid(SkeletalMeshBuoyancyComponent))
+            {
+                SkeletalMeshBuoyancyComponent->EnterWater(WaterLevel);
+            }
             Movement->SetMovementMode(MOVE_Swimming);
         }
         else
         {
-            CharacterStateBit &= ~STATE_WATER;
-            Movement->SetMovementMode(MOVE_Falling);
+            // Leaving Fly over dry ground/air must not reuse an old STATE_WATER bit.
+            // If a raised self-ignored ground probe already sees support, land directly
+            // in Walking instead of spending a frame in slow water/fall control.
+            ClearDryWaterState(DirectWaterLevel, false);
+            const bool bHasWalkableSupport = Movement->IsMovingOnGround()
+                || (IsValid(Component.Get()) && Component->IsCharacterSupportedByWalkableGround());
+            Movement->SetMovementMode(bHasWalkableSupport ? MOVE_Walking : MOVE_Falling);
         }
-        CharacterStateBit &= ~STATE_FLYING;
     }
     else
     {
+        // Starting Fly always leaves swim control immediately.  The direct water
+        // probe is kept only to refresh WaterLevel; Fly-off performs a fresh check
+        // and will choose Swimming again only when the character is actually deep enough.
+        WaterLevel = DirectWaterLevel;
+
+        CharacterStateBit &= ~STATE_WATER;
+        bWaterStateFromOverlap = false;
+        bWaterStateForcedByRagdoll = false;
+        if (IsValid(SkeletalMeshBuoyancyComponent))
+        {
+            SkeletalMeshBuoyancyComponent->ExitWater(WaterLevel);
+        }
+
         Movement->SetMovementMode(MOVE_Flying);
         CharacterStateBit |= STATE_FLYING;
     }
@@ -442,6 +1446,20 @@ void ACharacterController::Flying()
 void ACharacterController::ToggleRagdoll()
 {
     const bool bNewState = !Component->IsRagdollActive();
+    if (bNewState)
+    {
+        float DirectWaterLevel = WaterLevel;
+        if (!FindDirectWaterLevel(DirectWaterLevel))
+        {
+            // Manual ragdoll uses the same dry guard as fall-damage ragdoll.
+            ClearDryWaterState(DirectWaterLevel, false);
+        }
+        else
+        {
+            WaterLevel = DirectWaterLevel;
+        }
+    }
+
     Component->SetRagdollActive(bNewState);
 }
 
@@ -449,7 +1467,7 @@ void ACharacterController::SetWaterState(bool bValue, float Level, bool bForceRa
 {
     const bool bWasInWater = UCharacterFunctionLibrary::IsStateActive(CharacterStateBit, STATE_WATER);
     const bool bStateChanged = bWasInWater != bValue;
-    const bool bLevelChanged = !FMath::IsNearlyEqual(WaterLevel, Level, 1.0f);
+    const bool bLevelChanged = !FMath::IsNearlyEqual(WaterLevel, Level, CharacterControllerTuning::WaterLevelChangeToleranceCm);
     WaterLevel = Level;
 
     if (bValue)
@@ -462,12 +1480,21 @@ void ACharacterController::SetWaterState(bool bValue, float Level, bool bForceRa
     }
 
     const bool bRagdollTransitionActive = IsValid(Component.Get()) && Component->IsRagdollTransitionInProgress();
+    const bool bRagdollAcceptsWater = !bRagdollTransitionActive
+        || (IsValid(Component.Get())
+            && !Component->ShouldTreatRagdollWaterAsGround()
+            && (Component->ShouldRecoverRagdollInWaterFromEnvironment() || Component->IsRecoveringRagdollInWater() || Component->ShouldKeepSwimmingAfterWaterRagdoll()));
+
     if (IsValid(Component.Get()) && (bStateChanged || bLevelChanged || bForceRagdollWaterState || bRagdollTransitionActive))
     {
-        Component->SetRagdollWaterState(bValue, bForceRagdollWaterState);
+        // During ragdoll, an overlap bit alone is not enough to enter water state.  The filtered
+        // ragdoll environment snapshot must agree first, otherwise SetRagdollWaterState(true)
+        // would immediately force MOVE_Swimming from a stale Fly/Fall water flag.
+        const bool bComponentInWater = bValue && bRagdollAcceptsWater;
+        Component->SetRagdollWaterState(bComponentInWater, bForceRagdollWaterState || (bValue && bRagdollTransitionActive && !bRagdollAcceptsWater));
     }
 
-    if (bValue && IsValid(Movement) && bRagdollTransitionActive)
+    if (bValue && IsValid(Movement) && bRagdollTransitionActive && bRagdollAcceptsWater)
     {
         Movement->StopMovementImmediately();
         if (Movement->MovementMode != MOVE_Swimming)
@@ -508,8 +1535,7 @@ bool ACharacterController::RefreshWaterStateForRagdollRecovery(bool bRagdollBody
 
     if (!bRagdollBodyInWater && !bUseRagdollProbeOnly)
     {
-        bActorPointInWater = AWaterActor::FindWaterLevelAtLocation(this, GetActorLocation(), EffectiveLevel)
-            || AWaterActor::FindWaterLevelAtLocation(this, GetBottomLocation(), EffectiveLevel);
+        bActorPointInWater = FindDirectWaterLevel(EffectiveLevel);
     }
 
     // Direct ragdoll recovery must be decided by the current ragdoll body/bone positions, not by
@@ -554,15 +1580,39 @@ void ACharacterController::SyncRagdollWaterStateFromPhysics()
 
     if (!bRagdollLikeState)
     {
-        if (bWaterStateFromOverlap && !UCharacterFunctionLibrary::IsStateActive(CharacterStateBit, STATE_WATER))
+        const bool bKeepPostRagdollSwimming = Component->ShouldKeepSwimmingAfterWaterRagdoll();
+        const bool bHasAnyWaterState = bWaterStateFromOverlap
+            || bWaterStateForcedByRagdoll
+            || UCharacterFunctionLibrary::IsStateActive(CharacterStateBit, STATE_WATER)
+            || (IsValid(Movement) && Movement->MovementMode == MOVE_Swimming);
+
+        if (!bKeepPostRagdollSwimming && (!IsValid(Movement) || !Movement->IsFlying()))
         {
-            SetWaterState(true, WaterLevel, true);
+            float DirectWaterLevel = WaterLevel;
+            const bool bDirectWaterIsDeepEnough = FindDirectWaterLevel(DirectWaterLevel);
+            if (bDirectWaterIsDeepEnough)
+            {
+                WaterLevel = DirectWaterLevel;
+                bWaterStateFromOverlap = true;
+                if (!UCharacterFunctionLibrary::IsStateActive(CharacterStateBit, STATE_WATER))
+                {
+                    SetWaterState(true, WaterLevel, true);
+                }
+            }
+            else if (bHasAnyWaterState)
+            {
+                // A shallow surface touch, including Fly-off with only the capsule bottom in water,
+                // is treated as dry movement.  Hysteresis inside FindDirectWaterLevel keeps real
+                // swimmers from flickering out at the surface.
+                ClearDryWaterState(DirectWaterLevel, true);
+                return;
+            }
         }
-        if (Component->ShouldKeepSwimmingAfterWaterRagdoll())
+
+        if (bKeepPostRagdollSwimming)
         {
             float LockWaterLevel = WaterLevel;
-            const bool bLockStillInWater = AWaterActor::FindWaterLevelAtLocation(this, GetActorLocation(), LockWaterLevel)
-                || AWaterActor::FindWaterLevelAtLocation(this, GetBottomLocation(), LockWaterLevel);
+            const bool bLockStillInWater = FindDirectWaterLevel(LockWaterLevel);
 
             if (bLockStillInWater)
             {
@@ -584,8 +1634,7 @@ void ACharacterController::SyncRagdollWaterStateFromPhysics()
         if (bWaterStateForcedByRagdoll)
         {
             float ActorWaterLevel = WaterLevel;
-            const bool bActorStillInWater = AWaterActor::FindWaterLevelAtLocation(this, GetActorLocation(), ActorWaterLevel)
-                || AWaterActor::FindWaterLevelAtLocation(this, GetBottomLocation(), ActorWaterLevel);
+            const bool bActorStillInWater = FindDirectWaterLevel(ActorWaterLevel);
 
             if (bActorStillInWater)
             {
@@ -612,7 +1661,7 @@ void ACharacterController::SyncRagdollWaterStateFromPhysics()
         const float DetectedWaterLevel = RagdollWaterState.WaterLevel;
         const bool bWasForcedByRagdoll = bWaterStateForcedByRagdoll;
         bWaterStateForcedByRagdoll = true;
-        if (!bWasForcedByRagdoll || !UCharacterFunctionLibrary::IsStateActive(CharacterStateBit, STATE_WATER) || !FMath::IsNearlyEqual(WaterLevel, DetectedWaterLevel, 1.0f))
+        if (!bWasForcedByRagdoll || !UCharacterFunctionLibrary::IsStateActive(CharacterStateBit, STATE_WATER) || !FMath::IsNearlyEqual(WaterLevel, DetectedWaterLevel, CharacterControllerTuning::WaterLevelChangeToleranceCm))
         {
             SetWaterState(true, DetectedWaterLevel);
         }
@@ -706,13 +1755,13 @@ void ACharacterController::TriggerFootstepTrace(EControllerHand FootSide)
     // 1. Pick the foot bone that should be traced.
     FName BoneName = (FootSide == EControllerHand::Left) ? BONE_LEFT_FOOT : BONE_RIGHT_FOOT;
     FVector Start = GetMesh()->GetBoneLocation(BoneName) + FVector(0.0f, 0.0f, 10.0f);
-    FVector End = Start - FVector(0.0f, 0.0f, 50.0f); 
+    FVector End = Start - FVector(0.0f, 0.0f, 50.0f);
 
     FCollisionQueryParams Params;
     // Use complex tracing so the hit result can return the physical material.
-    Params.bTraceComplex = true; 
+    Params.bTraceComplex = true;
     Params.bReturnPhysicalMaterial = true; // Required: ask the trace to return the physical material.
-    Params.AddIgnoredActor(this); 
+    Params.AddIgnoredActor(this);
 
     FTraceDelegate TraceDelegate;
     TraceDelegate.BindUObject(this, &ACharacterController::OnFootstepTraceCompleted);
@@ -735,42 +1784,47 @@ void ACharacterController::OnFootstepTraceCompleted(const FTraceHandle& TraceHan
     if (TraceDatum.OutHits.Num() == 0) return;
 
     const FHitResult& HitResult = TraceDatum.OutHits[0];
-    
+
     // 2. Resolve the physical material weak pointer from the hit result.
     if (HitResult.PhysMaterial.IsValid())
     {
         UPhysicalMaterial* HitPhysMat = HitResult.PhysMaterial.Get();
         if (HitPhysMat)
         {
-            // Use the physical material asset name, for example "PM_Concrete" or "PM_Wood".
-            FString PhysMatName = HitPhysMat->GetName();
-#if WITH_EDITOR
-            UE_LOG(LogTemp, Log, TEXT("Footstep raycast hit physical material: %s"), *PhysMatName);
-#endif
-            // 3. Branch by surface material to play matching sound/effects.
-            if (PhysMatName.Contains(TEXT("Concrete")))
+            UGlTFSimulatorAssetRegistry* Registry =
+                UGlTFSimulatorGameInstance::GetAssetRegistryFromContext(this);
+            if (!IsValid(Registry))
             {
-                // Concrete footstep playback hook, for example PlaySoundAtLocation.
+                return;
             }
-            else if (PhysMatName.Contains(TEXT("Grass")))
+
+            const FSoftObjectPath HitMaterialPath(HitPhysMat);
+            const FGlTFSimulatorFootstepBinding* Binding = Registry->FootstepBindings.FindByPredicate(
+                [&HitMaterialPath](const FGlTFSimulatorFootstepBinding& Candidate)
+                {
+                    return !Candidate.PhysicalMaterial.IsNull()
+                        && Candidate.PhysicalMaterial.ToSoftObjectPath() == HitMaterialPath;
+                });
+            if (!Binding)
             {
-                // Grass footstep playback hook.
+                return;
             }
-            else if (PhysMatName.Contains(TEXT("Wood")))
+
+            if (USoundBase* Sound = Binding->Sound.IsNull() ? nullptr : Binding->Sound.LoadSynchronous())
             {
-                // Wood footstep playback hook.
+                UGameplayStatics::PlaySoundAtLocation(this, Sound, HitResult.ImpactPoint);
             }
-            else if (PhysMatName.Contains(TEXT("Glass")))
+
+            if (UNiagaraSystem* Effect = Binding->Effect.IsNull() ? nullptr : Binding->Effect.LoadSynchronous())
             {
-                // Glass footstep playback hook.
+                UNiagaraFunctionLibrary::SpawnSystemAtLocation(
+                    this, Effect, HitResult.ImpactPoint, HitResult.ImpactNormal.Rotation());
             }
         }
     }
     else
     {
         // Fallback for surfaces that have collision but no physical material, such as default footsteps.
-#if WITH_EDITOR
-        UE_LOG(LogTemp, Warning, TEXT("Footstep trace hit a collider, but no PhysMaterial is assigned."));
-#endif
+        UE_LOG(LogTemp, Verbose, TEXT("Footstep trace hit a collider, but no PhysMaterial is assigned."));
     }
 }

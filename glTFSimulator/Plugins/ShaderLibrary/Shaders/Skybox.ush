@@ -1,0 +1,82 @@
+// Copyright © 2026 BxKangKi. Licensed under the MIT License.
+#ifndef SKYBOX_USH
+#define SKYBOX_USH
+#pragma once
+// /Plugin/ShaderLibrary/Skybox.ush
+
+float3 MoonUV(float3 viewDir, float3 lightDir, float size, float intensity)
+{
+    const float3 V = normalize(viewDir);
+    const float3 M = normalize(lightDir);
+
+    const float cosA = dot(V, M);
+    const float cosR = cos(size);
+
+    // 1. Branchless Check: If dot product is less than threshold, we exit early or zero out.
+    // However, to keep it lean, we only proceed if there's a chance of hitting the disk.
+    // Using an explicit branch here is actually okay for early-out on a large sky.
+    [branch] if (cosA >= cosR)
+    {
+        // 2. Optimized Orthonormal Basis (Branchless)
+        // Instead of cross(0,1,0), we use a stable method that doesn't flip at the poles.
+        const float sign_z = (M.z >= 0.0f) ? 1.0f : -1.0f;
+        const float a = -1.0f / (sign_z + M.z);
+        const float b = M.x * M.y * a;
+
+        const float3 right = float3(1.0f + sign_z * M.x * M.x * a, sign_z * b, -sign_z * M.x);
+        const float3 upDir = float3(b, sign_z + M.y * M.y * a, -M.y);
+
+        // 3. Projection & Scaling
+        // We can merge the division by sin(size) into the scale factor.
+        // Note: sin(size) is sqrt(1 - cosR^2) which might be cheaper if size is a constant.
+        const float invS = 1.0f / sqrt(1.0f - cosR * cosR);
+
+        // Project V onto the planes defined by Right and Up
+        // Since V is normalized and Right/Up are orthonormal to M,
+        // dot(V, Right) automatically handles the projection.
+        const float2 diskCoord = float2(dot(V, right), dot(V, upDir)) * invS;
+
+        // 4. Final Disk Check and UV Output
+        // Check if we are inside the circle (dist squared < 1)
+        if (dot(diskCoord, diskCoord) <= 1.0f)
+        {
+            return float3(diskCoord * 0.5f + 0.5f, intensity);
+        }
+    }
+
+    return (float3)0;
+}
+
+float2 StarUV(float3 ViewDir, float3 MoonDir)
+{
+    const float3 V = normalize(ViewDir);
+    const float3 M = normalize(MoonDir);
+
+    // 1. Basis Generation (Same as before)
+    const float s = (M.z >= 0.0f) ? 1.0f : -1.0f;
+    const float a = -1.0f / (s + M.z);
+    const float b = M.x * M.y * a;
+    const float3 east = float3(1.0f + s * M.x * M.x * a, s * b, -s * M.x);
+    const float3 north = float3(b, s + M.y * M.y * a, -M.y);
+
+    // 2. Project ViewDir onto the Moon-plane
+    // We use the raw local X and Y (Orthographic)
+    const float2 localXY = float2(dot(V, east), dot(V, north));
+
+    // 3. The "Anti-Shrink" Correction
+    // Instead of using acos or atan2, we treat the projection as a disk.
+    // To prevent the stars from stretching at the edges,
+    // we use the length of the projection.
+    const float dist = length(localXY);
+
+    // Normalize the XY to get the direction, then scale by a linear factor
+    // This keeps stars the same size regardless of how close they are to M
+    const float2 uv = (dist > 0.001) ? (localXY / dist) * asin(dist) : (float2)0;
+
+    // 4. Final Remap
+    // Scale this by your StarTiling factor
+    return uv * 0.5f + 0.5f;
+}
+
+
+#endif

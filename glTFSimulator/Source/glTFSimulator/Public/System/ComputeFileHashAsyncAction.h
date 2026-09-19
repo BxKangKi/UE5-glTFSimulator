@@ -1,6 +1,13 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
+/**
+ * @file ComputeFileHashAsyncAction.h
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * Declares interface, lifetime, and data-ownership contracts; see the matching implementation for behavior.
+ */
+
 #pragma once
 
 #include "CoreMinimal.h"
@@ -15,15 +22,15 @@ class GLTFSIMULATOR_API UComputeFileHashAsyncAction : public UBlueprintAsyncActi
     GENERATED_BODY()
 
 public:
-    // 블루프린트에서 호출할 정적 함수
+    // Static function callable from Blueprint.
     UFUNCTION(BlueprintCallable, meta = (BlueprintInternalUseOnly = "true"), Category = "File|Hash")
     static UComputeFileHashAsyncAction *ComputeFileHashAsync(UObject *WorldContextObject, const FString &FilePath);
 
-    // 블루프린트 이벤트 바인딩
+    // Blueprint event binding.
     UPROPERTY(BlueprintAssignable)
     FOnHashComputed OnCompleted;
 
-    // 비동기 실행 함수 오버라이드
+    // Asynchronous execution override.
     virtual void Activate() override;
 
 private:

@@ -1,190 +1,932 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
-#include "Character/CharacterLoadAsyncAction.h"
-#include "System/FileFunctionLibrary.h"
-#include "System/MacroLibrary.h"
-#include "Character/CharacterController.h"
-#include "Character/CharacterFunctionLibrary.h"
-#include "JsonObjectConverter.h"
-#include "glTFRuntimeFunctionLibrary.h"
+/**
+ * @file CharacterLoadAsyncAction.cpp
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
+ */
 
-UCharacterLoadAsyncAction *UCharacterLoadAsyncAction::LoadCharacterAsync(UObject *WorldContextObject, ACharacterController *InOwner, FString InPath)
+#include "Character/CharacterLoadAsyncAction.h"
+
+#include "Animation/Skeleton.h"
+#include "Character/CharacterController.h"
+#include "Character/CharacterBoneSchema.h"
+#include "Character/CharacterFunctionLibrary.h"
+#include "Engine/SkeletalMesh.h"
+#include "Engine/World.h"
+#include "Materials/MaterialInterface.h"
+#include "PhysicsEngine/PhysicsAsset.h"
+#include "Setting/GameSettings.h"
+#include "System/FileFunctionLibrary.h"
+#include "System/SafeFileIO.h"
+#include "System/glTFRuntimeSafety.h"
+#include "System/MacroLibrary.h"
+#include "Simulator/RuntimeModelResolver.h"
+#include "System/WorldBakedModelAsset.h"
+#include "TimerManager.h"
+#include "UObject/UObjectGlobals.h"
+
+namespace
 {
-    UCharacterLoadAsyncAction *Action = NewObject<UCharacterLoadAsyncAction>();
+    constexpr int32 MaxModelDatabaseResolveRetries = 120;
+    constexpr float ModelDatabaseResolveRetrySeconds = 0.05f;
+
+    // Unity builds concatenate multiple .cpp files into one translation unit. The file-specific
+    // prefix prevents this helper from colliding with similarly named model-loading validators.
+    bool IsFiniteCharacterLoadVector(const FVector& Vector)
+    {
+        return FMath::IsFinite(Vector.X) &&
+            FMath::IsFinite(Vector.Y) &&
+            FMath::IsFinite(Vector.Z);
+    }
+
+    bool IsFiniteCharacterLoadQuat(const FQuat& Rotation)
+    {
+        return FMath::IsFinite(Rotation.X) &&
+            FMath::IsFinite(Rotation.Y) &&
+            FMath::IsFinite(Rotation.Z) &&
+            FMath::IsFinite(Rotation.W);
+    }
+
+    bool IsFiniteCharacterLoadTransform(const FTransform& Transform)
+    {
+        const FQuat Rotation = Transform.GetRotation();
+        return !Transform.ContainsNaN() &&
+            IsFiniteCharacterLoadVector(Transform.GetLocation()) &&
+            IsFiniteCharacterLoadVector(Transform.GetScale3D()) &&
+            IsFiniteCharacterLoadQuat(Rotation) &&
+            Rotation.IsNormalized();
+    }
+
+    void ReleaseTransientRuntimeObject(UObject* Object)
+    {
+        if (IsValid(Object) && !Object->IsAsset())
+        {
+            Object->ClearFlags(RF_Public | RF_Standalone);
+            Object->SetFlags(RF_Transient);
+        }
+    }
+
+}
+
+UCharacterLoadAsyncAction* UCharacterLoadAsyncAction::LoadCharacterAsync(
+    UObject* WorldContextObject,
+    ACharacterController* InOwner,
+    FString InPath)
+{
+    if (!ensureMsgf(IsInGameThread(), TEXT("LoadCharacterAsync must create its UObject on the game thread")))
+    {
+        return nullptr;
+    }
+
+    UCharacterLoadAsyncAction* Action = NewObject<UCharacterLoadAsyncAction>();
     Action->OwnerCharacter = InOwner;
-    Action->FilePath = InPath;
+    Action->ReleaseObserver = InOwner;
+    Action->FilePath = MoveTemp(InPath);
     Action->RegisterWithGameInstance(WorldContextObject);
     return Action;
 }
 
 void UCharacterLoadAsyncAction::Activate()
 {
-    if (!OwnerCharacter.IsValid() || !UFileFunctionLibrary::CheckFile(FilePath))
+    if (!ensureMsgf(IsInGameThread(), TEXT("UCharacterLoadAsyncAction::Activate must run on the game thread")))
     {
-        OnCompleted.Broadcast(false);
-        SetReadyToDestroy();
-        return;
-    }
-    LoadAssetAsync();
-}
-
-void UCharacterLoadAsyncAction::LoadAssetAsync()
-{
-    FglTFRuntimeHttpResponse AssetLoadedDelegate;
-    AssetLoadedDelegate.BindDynamic(this, &UCharacterLoadAsyncAction::OnglTFAssetLoaded);
-    FglTFRuntimeConfig Config;
-    Config.TransformBaseType = EglTFRuntimeTransformBaseType::YForward;
-    Config.bAllowExternalFiles = true;
-    UglTFRuntimeFunctionLibrary::glTFLoadAssetFromFilenameAsync(FilePath, false, Config, AssetLoadedDelegate);
-}
-
-void UCharacterLoadAsyncAction::OnglTFAssetLoaded(UglTFRuntimeAsset *Asset)
-{
-    if (!Asset)
-    {
-        OnCompleted.Broadcast(false);
-        SetReadyToDestroy();
-        return;
-    }
-    CurrentLoadedAsset = Asset;
-    LoadBoneMapAsync();
-}
-
-void UCharacterLoadAsyncAction::LoadBoneMapAsync()
-{
-    TWeakObjectPtr<UCharacterLoadAsyncAction> WeakThis(this);
-    FString JsonPath = UFileFunctionLibrary::GetPathWithoutExtension(FilePath) + TEXT(".json");
-    AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [WeakThis, JsonPath]()
-              {
-        TMap<FString, FString> LocalBoneMap;
-        TSharedPtr<FJsonObject> Json = UFileFunctionLibrary::FromJson(JsonPath);
-        if (Json.IsValid())
-        {
-            for (auto& Pair : Json->Values)
-            {
-                FString BoneValue;
-                if (Pair.Value->TryGetString(BoneValue))
-                {
-                    LocalBoneMap.Add(BoneValue, Pair.Key);
-                }
-            }
-        }
-        AsyncTask(ENamedThreads::GameThread, [WeakThis, LocalBoneMap]()
+        TWeakObjectPtr<UCharacterLoadAsyncAction> WeakThis(this);
+        if (!FSafeFileIO::DispatchTrackedGameThread([WeakThis]()
         {
             if (UCharacterLoadAsyncAction* StrongThis = WeakThis.Get())
             {
-                if (!StrongThis->CurrentLoadedAsset || !StrongThis->OwnerCharacter.IsValid())
-                {
-                    StrongThis->OnCompleted.Broadcast(false);
-                    StrongThis->SetReadyToDestroy();
-                    return;
-                }
-                ACharacterController *Owner = StrongThis->OwnerCharacter.Get();
-                USkeleton *Skeleton = Owner->DefaultAsset.Skeleton;
-                UMaterialInterface *Material = Owner->DefaultAsset.Material;
-                if (!IsValid(Skeleton) || !IsValid(Material))
-                {
-                    StrongThis->OnCompleted.Broadcast(false);
-                    StrongThis->SetReadyToDestroy();
-                    return;
-                }
-                // Merge skeleton and set up mesh loading.
-                FglTFRuntimeSkeletalMeshConfig Config;
-                Config.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
-                Config.bOverwriteRefSkeleton = false;
-                Config.bMergeAllBonesToBoneTree = false;
-                Config.bIgnoreSkin = false;
-                Config.OverrideSkinIndex = -1;
-                Config.SkeletonConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
-                Config.SkeletonConfig.bAddRootBone = StrongThis->CheckRootBoneName(StrongThis->CurrentLoadedAsset);
-                Config.SkeletonConfig.RootBoneName = TEXT("Root");
-                Config.SkeletonConfig.BonesNameMap = LocalBoneMap;
-                Config.SkeletonConfig.RootNodeIndex = -1;
-                Config.SkeletonConfig.bClearRotations = true;
-                Config.SkeletonConfig.CopyRotationsFrom = Skeleton;
-                Config.SkeletonConfig.MaxNodesTreeDepth = -1;
-                Config.SkeletonConfig.bAddRootNodeIfMissing = true;
-                Config.MaterialsConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
-                TMap<EglTFRuntimeMaterialType, UMaterialInterface*> UberMaterialsOverrideMap;
-                UberMaterialsOverrideMap.Add(EglTFRuntimeMaterialType::Opaque, Material);
-                UberMaterialsOverrideMap.Add(EglTFRuntimeMaterialType::Translucent, Material);
-                UberMaterialsOverrideMap.Add(EglTFRuntimeMaterialType::TwoSided, Material);
-                UberMaterialsOverrideMap.Add(EglTFRuntimeMaterialType::TwoSidedTranslucent, Material);
-                UberMaterialsOverrideMap.Add(EglTFRuntimeMaterialType::Masked, Material);
-                UberMaterialsOverrideMap.Add(EglTFRuntimeMaterialType::TwoSidedMasked, Material);
-                Config.MaterialsConfig.UberMaterialsOverrideMap = UberMaterialsOverrideMap;
-                Config.MaterialsConfig.UnlitOverrideMap = UberMaterialsOverrideMap;
-                Config.MaterialsConfig.bGeneratesMipMaps = true;
-                Config.MaterialsConfig.SpecularFactor = 0.0f;
-                Config.MaterialsConfig.ImagesConfig.MaxWidth = 1024;
-                Config.MaterialsConfig.ImagesConfig.MaxHeight = 1024;
-                Config.MaterialsConfig.ImagesConfig.bCompressMips = true;
-                Config.MaterialsConfig.ImagesConfig.bStreaming = true;
-                Config.MaterialsConfig.bLoadMipMaps = true;
-                Config.bIgnoreMissingBones = true;
-                Config.Outer = Owner;
-                Config.bIgnoreEmptyMorphTargets = true;
-                Config.bAutoGeneratePhysicsAssetBodies = true;
-                Config.PhysicsAssetAutoBodyConfig.CollisionType = EglTFRuntimePhysicsAssetAutoBodyCollisionType::Sphere;
-                Config.PhysicsAssetAutoBodyConfig.MinBoneSize = 12.0;
-                Config.PhysicsAssetAutoBodyConfig.bDisableOverlappingCollisions = true;
-                Config.PhysicsAssetAutoBodyConfig.bDisableAllCollisions = true;
-                Config.PhysicsAssetAutoBodyConfig.bConsiderForBounds = true;
-                Config.PhysicsAssetAutoBodyConfig.CollisionScale = 1.01f;
-                Config.bAllowCPUAccess = true;
-                // Load skeleton and merge based on Owner's Asset information.
-                USkeleton *TargetSkel = StrongThis->CurrentLoadedAsset->LoadSkeleton(0, Config.SkeletonConfig);
-                USkeleton *MergedSkel = UCharacterFunctionLibrary::MergeSkeleton(Skeleton, TargetSkel);
-                Config.Skeleton = MergedSkel;
-                FglTFRuntimeSkeletalMeshAsync MeshDelegate;
-                MeshDelegate.BindDynamic(StrongThis, &UCharacterLoadAsyncAction::OnMeshLoaded);
-                StrongThis->CurrentLoadedAsset->LoadSkeletalMeshRecursiveAsync(TEXT(""), {}, MeshDelegate, Config, EglTFRuntimeRecursiveMode::Ignore);
+                StrongThis->Activate();
             }
-        }); });
+        }))
+        {
+            // Module shutdown suppresses late UObject callbacks; no off-thread cleanup is safe here.
+            return;
+        }
+        return;
+    }
+
+    bCancelled = false;
+    bFinished = false;
+    bMeshLoadInFlight = false;
+    DetectedMeshIndex = INDEX_NONE;
+    DetectedSkinIndex = INDEX_NONE;
+    ClearGameThreadStageTimer();
+    CurrentLoadedAsset = nullptr;
+    CurrentRuntimeSkeleton = nullptr;
+    PendingSkeletalMesh = nullptr;
+    PendingRuntimePhysicsAsset = nullptr;
+    PendingBoneMap.Empty();
+    ModelDatabaseRetryCount = 0;
+    OnProgress.Broadcast(0.0f);
+
+    if (!OwnerCharacter.IsValid())
+    {
+        FailLoad(TEXT("Character built-model preflight failed because the owner pawn is invalid"));
+        return;
+    }
+
+    ResolveAndLoadModel();
 }
 
-void UCharacterLoadAsyncAction::OnMeshLoaded(USkeletalMesh *SkeletalMesh)
+void UCharacterLoadAsyncAction::ResolveAndLoadModel()
 {
-    if (SkeletalMesh && OwnerCharacter.IsValid())
+    if (!ensureMsgf(IsInGameThread(), TEXT("ResolveAndLoadModel must run on the game thread")))
     {
-        FinalizePhysics(SkeletalMesh);
-        OnCompleted.Broadcast(true);
+        return;
+    }
+
+    GameThreadStageTimer.Invalidate();
+    if (bCancelled || bFinished)
+    {
+        TryFinishCancelledRequest();
+        return;
+    }
+    if (!OwnerCharacter.IsValid())
+    {
+        FailLoad(TEXT("Character owner became invalid while waiting for the built-model database"));
+        return;
+    }
+
+    FResolvedRuntimeModel Model;
+    FString ResolveError;
+    // Resolve through the owning gameplay character, not this transient async action.
+    // UBlueprintAsyncActionBase registration keeps the action alive but does not make the
+    // action itself a reliable runtime-world context. WorldSceneStreaming starts character
+    // loading only after the verified model database is open, so the owner pawn is the
+    // authoritative UWorld/UGameInstance source for the gworld:// lookup.
+    const ACharacterController* ResolveContext = OwnerCharacter.Get();
+    if (!FRuntimeModelResolver::Resolve(ResolveContext, FilePath, Model, ResolveError))
+    {
+        const bool bDatabaseNotReady = ResolveError.Equals(
+            TEXT("a verified .gworld model database is not open"), ESearchCase::IgnoreCase);
+        if (bDatabaseNotReady && ModelDatabaseRetryCount < MaxModelDatabaseResolveRetries)
+        {
+            ++ModelDatabaseRetryCount;
+            OnProgress.Broadcast(0.01f);
+            ScheduleModelDatabaseRetry();
+            return;
+        }
+
+        FailLoad(FString::Printf(
+            TEXT("Character built-model lookup failed. Reference=%s Reason=%s"),
+            *FilePath, *ResolveError));
+        return;
+    }
+
+    if (Model.Definition.ModelType != EModelDefinitionType::Character)
+    {
+        FailLoad(FString::Printf(
+            TEXT("Character built-model lookup resolved a non-character model. Reference=%s"),
+            *FilePath));
+        return;
+    }
+
+    FilePath = Model.Reference;
+    PendingBoneMap = MoveTemp(Model.Definition.Bones);
+    FString BoneMapError;
+    if (!CharacterBoneSchema::ValidateSourceToCanonicalMap(PendingBoneMap, BoneMapError))
+    {
+        FailLoad(FString::Printf(
+            TEXT("Character archive contains an invalid canonical bone map: %s"),
+            *BoneMapError));
+        return;
+    }
+
+    // This creates only the lightweight baked-world facade and reads its node/range tables.
+    // No source GLB bytes are opened, parsed, or retained on the gameplay path.
+    UWorldBakedModelAsset* Asset = FRuntimeModelResolver::LoadAssetSynchronously(Model, ResolveError);
+    if (!IsValid(Asset))
+    {
+        FailLoad(FString::Printf(
+            TEXT("Character baked-data initialization failed. Reference=%s Reason=%s"),
+            *FilePath, *ResolveError));
+        return;
+    }
+    OnBakedAssetLoaded(Asset);
+}
+
+void UCharacterLoadAsyncAction::ScheduleModelDatabaseRetry()
+{
+    ClearGameThreadStageTimer();
+    ACharacterController* Owner = OwnerCharacter.Get();
+    UWorld* World = IsValid(Owner) ? Owner->GetWorld() : nullptr;
+    if (!IsValid(World))
+    {
+        FailLoad(TEXT("Character owner world became invalid while waiting for the built-model database"));
+        return;
+    }
+
+    TWeakObjectPtr<UCharacterLoadAsyncAction> WeakThis(this);
+    FTimerDelegate Delegate = FTimerDelegate::CreateLambda([WeakThis]()
+    {
+        if (UCharacterLoadAsyncAction* StrongThis = WeakThis.Get())
+        {
+            StrongThis->ResolveAndLoadModel();
+        }
+    });
+    World->GetTimerManager().SetTimer(
+        GameThreadStageTimer, Delegate, ModelDatabaseResolveRetrySeconds, false);
+}
+
+void UCharacterLoadAsyncAction::OnBakedAssetLoaded(UWorldBakedModelAsset* Asset)
+{
+    if (!ensureMsgf(IsInGameThread(), TEXT("OnBakedAssetLoaded must run on the game thread")))
+    {
+        return;
+    }
+
+    if (bCancelled)
+    {
+        FinishAndRelease();
+        return;
+    }
+
+    if (!IsValid(Asset) || !OwnerCharacter.IsValid())
+    {
+        CurrentLoadedAsset = Asset;
+        FailLoad(FString::Printf(
+            TEXT("Character baked-data facade failed or owner became invalid. Path=%s"),
+            *FilePath));
+        return;
+    }
+
+    CurrentLoadedAsset = Asset;
+    if (!ResolveCharacterSkin(Asset))
+    {
+        FailLoad(FString::Printf(
+            TEXT("Character baked model has no valid skinned mesh node: %s"),
+            *FilePath));
+        return;
+    }
+
+    OnProgress.Broadcast(0.25f);
+    ContinueWithEmbeddedBoneMap();
+}
+
+void UCharacterLoadAsyncAction::ContinueWithEmbeddedBoneMap()
+{
+    if (!ensureMsgf(IsInGameThread(), TEXT("ContinueWithEmbeddedBoneMap must run on the game thread")))
+    {
+        return;
+    }
+
+    if (bCancelled || bFinished)
+    {
+        TryFinishCancelledRequest();
+        return;
+    }
+
+    if (!IsValid(CurrentLoadedAsset) || !OwnerCharacter.IsValid())
+    {
+        FailLoad(TEXT("Character asset or owner became invalid before mesh creation"));
+        return;
+    }
+    // Bone remapping was range-read and validated with this model's definition member. No source
+    // JSON file is touched here, and no redundant worker hop is needed.
+    OnProgress.Broadcast(0.40f);
+    ScheduleGameThreadStage(&UCharacterLoadAsyncAction::BeginSkeletalMeshLoad_GameThread);
+}
+
+void UCharacterLoadAsyncAction::BeginSkeletalMeshLoad_GameThread()
+{
+    if (!ensureMsgf(IsInGameThread(), TEXT("BeginSkeletalMeshLoad_GameThread must run on the game thread")))
+    {
+        return;
+    }
+
+    GameThreadStageTimer.Invalidate();
+    if (bCancelled || bFinished)
+    {
+        FinishAndRelease();
+        return;
+    }
+
+    ACharacterController* Owner = OwnerCharacter.Get();
+    if (!IsValid(Owner) || !IsValid(CurrentLoadedAsset) ||
+        DetectedMeshIndex == INDEX_NONE || DetectedSkinIndex == INDEX_NONE)
+    {
+        FailLoad(TEXT("Character asset, owner, or skin became invalid before asynchronous mesh creation"));
+        return;
+    }
+
+    USkeleton* DefaultSkeleton = Owner->DefaultSkeleton.Get();
+    UMaterialInterface* Material = Owner->DefaultMaterial.Get();
+    if (!IsValid(DefaultSkeleton) || !IsValid(Material))
+    {
+        FailLoad(TEXT("Character default skeleton or material is not assigned"));
+        return;
+    }
+    FString SkeletonError;
+    if (!CharacterBoneSchema::ValidateCanonicalSkeleton(DefaultSkeleton, SkeletonError))
+    {
+        FailLoad(FString::Printf(
+            TEXT("Default character skeleton does not match the canonical bone schema: %s"),
+            *SkeletonError));
+        return;
+    }
+
+    // FglTFRuntimeSkeletalMeshConfig stores raw UObject pointers. The owner is deliberately weak and
+    // may be destroyed during travel, so keep the source skeleton/material GC-safe on this action
+    // until the native terminal callback has acknowledged completion or cancellation.
+    SourceSkeletonReferenceGuard = DefaultSkeleton;
+    SourceMaterialReferenceGuard = Material;
+
+    // Creating/duplicating UObjects must remain on the game thread. Archive range I/O, decode and
+    // RuntimeLOD conversion run on workers; glTFRuntime also builds the native mesh asynchronously.
+    // Only UObject-bound attachment and the plugin's final Unreal resource commit return to GT.
+    CurrentRuntimeSkeleton = UCharacterFunctionLibrary::DuplicateSkeleton(DefaultSkeleton);
+    if (!IsValid(CurrentRuntimeSkeleton))
+    {
+        FailLoad(TEXT("Failed to create the transient runtime skeleton"));
+        return;
+    }
+
+    FglTFRuntimeSkeletalMeshConfig Config;
+    // These cache flags remain part of the finalizer configuration. The baked facade
+    // does not use a source parser cache and keeps only weak, reclaimable texture reuse entries.
+    Config.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
+    Config.Skeleton = CurrentRuntimeSkeleton;
+    Config.bOverwriteRefSkeleton = false;
+    Config.bMergeAllBonesToBoneTree = true;
+    Config.bIgnoreSkin = false;
+    Config.OverrideSkinIndex = DetectedSkinIndex;
+    Config.SkeletonConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
+    // The baked skin was already canonicalized while the archive was built. Applying the original
+    // source-to-canonical map a second time is unnecessary and can accidentally remap an already
+    // canonical bone when a source rig happens to reuse one of the canonical key names.
+    Config.SkeletonConfig.bAddRootBone = false;
+    Config.SkeletonConfig.RootBoneName = TEXT("Root");
+    Config.SkeletonConfig.BonesNameMap.Empty();
+    Config.SkeletonConfig.RootNodeIndex = -1;
+    // Character archives store the exact canonical reference pose produced with
+    // bClearRotations + CopyRotationsFrom during build. Repeating that operation here rotates the
+    // parent frame twice and subtly twists hands/limbs. Reconstruct the archived pose verbatim.
+    Config.SkeletonConfig.bClearRotations = false;
+    Config.SkeletonConfig.CopyRotationsFrom = nullptr;
+    Config.SkeletonConfig.MaxNodesTreeDepth = -1;
+    Config.SkeletonConfig.bAddRootNodeIfMissing = false;
+    Config.MaterialsConfig.CacheMode = EglTFRuntimeCacheMode::ReadWrite;
+
+    TMap<EglTFRuntimeMaterialType, UMaterialInterface*> MaterialMap;
+    MaterialMap.Add(EglTFRuntimeMaterialType::Opaque, Material);
+    MaterialMap.Add(EglTFRuntimeMaterialType::Translucent, Material);
+    MaterialMap.Add(EglTFRuntimeMaterialType::TwoSided, Material);
+    MaterialMap.Add(EglTFRuntimeMaterialType::TwoSidedTranslucent, Material);
+    MaterialMap.Add(EglTFRuntimeMaterialType::Masked, Material);
+    MaterialMap.Add(EglTFRuntimeMaterialType::TwoSidedMasked, Material);
+    Config.MaterialsConfig.UberMaterialsOverrideMap = MaterialMap;
+    Config.MaterialsConfig.UnlitOverrideMap = MaterialMap;
+    Config.MaterialsConfig.bGeneratesMipMaps = false;
+    Config.MaterialsConfig.SpecularFactor = 0.0f;
+
+    const int32 TextureDimensionLimit = UGameSettings::ResolveMaxTextureResolution(Owner);
+    Config.MaterialsConfig.ImagesConfig.MaxWidth = TextureDimensionLimit;
+    Config.MaterialsConfig.ImagesConfig.MaxHeight = TextureDimensionLimit;
+    Config.MaterialsConfig.ImagesConfig.bCompressMips = false;
+    Config.MaterialsConfig.ImagesConfig.bStreaming = false;
+    Config.MaterialsConfig.bLoadMipMaps = false;
+    // Missing weighted bones are a corrupt/incompatible archive, not something to repair by
+    // assigning the remaining weight to bone 0.  The permissive path is exactly what turns a
+    // subtle joint-map mismatch into visibly stretched arms/legs.
+    Config.bIgnoreMissingBones = false;
+    Config.Outer = GetTransientPackage();
+    Config.bIgnoreEmptyMorphTargets = true;
+
+    // Physics bodies are built in a separate game-thread stage from the directly assigned
+    // physics template. Avoid asking the glTF worker/finalizer to generate a second asset.
+    Config.bAutoGeneratePhysicsAssetBodies = false;
+    Config.bAllowCPUAccess = false;
+
+    OnProgress.Broadcast(0.55f);
+    bMeshLoadInFlight = true;
+
+    FglTFRuntimeSkeletalMeshAsync MeshDelegate;
+    MeshDelegate.BindDynamic(this, &UCharacterLoadAsyncAction::OnMeshLoaded);
+    // The facade range-reads only this mesh, its selected skin, and directly referenced
+    // material/texture .dat members on a worker, prepares RuntimeLODs there, then uses
+    // glTFRuntime's asynchronous RuntimeLOD finalizer.
+    CurrentLoadedAsset->LoadSkeletalMeshAsync(
+        DetectedMeshIndex,
+        DetectedSkinIndex,
+        MeshDelegate,
+        Config);
+}
+
+void UCharacterLoadAsyncAction::OnMeshLoaded(USkeletalMesh* SkeletalMesh)
+{
+    if (!ensureMsgf(IsInGameThread(), TEXT("glTFRuntime skeletal-mesh callback must run on the game thread")))
+    {
+        return;
+    }
+
+    bMeshLoadInFlight = false;
+
+    if (bCancelled || bFinished)
+    {
+        ReleaseTransientRuntimeObject(SkeletalMesh);
+        FinishAndRelease();
+        return;
+    }
+
+    if (!IsValid(SkeletalMesh) || !OwnerCharacter.IsValid() ||
+        SkeletalMesh->GetRefSkeleton().GetNum() <= 0)
+    {
+        ReleaseTransientRuntimeObject(SkeletalMesh);
+        FglTFRuntimeSafety::ReportRecoverableFailure(
+            FilePath,
+            TEXT("glTFRuntime returned a null or structurally invalid skeletal mesh"));
+        FailLoad(FString::Printf(
+            TEXT("glTFRuntime returned an invalid character mesh. Path=%s"),
+            *FilePath));
+        return;
+    }
+
+    const USkeleton* TargetSkeleton = SourceSkeletonReferenceGuard.Get();
+    FString HierarchyError;
+    if (!IsValid(TargetSkeleton)
+        || !CharacterBoneSchema::ValidateCanonicalHierarchyMatches(
+            SkeletalMesh->GetRefSkeleton(),
+            TargetSkeleton->GetReferenceSkeleton(),
+            HierarchyError))
+    {
+        ReleaseTransientRuntimeObject(SkeletalMesh);
+        FglTFRuntimeSafety::ReportRecoverableFailure(
+            FilePath,
+            FString::Printf(TEXT("canonical character skeleton hierarchy mismatch: %s"), *HierarchyError));
+        FailLoad(FString::Printf(
+            TEXT("Character mesh skeleton does not match the canonical target hierarchy: %s"),
+            *HierarchyError));
+        return;
+    }
+
+    FString ReferencePoseError;
+    if (!CharacterBoneSchema::ValidateCanonicalReferenceRotationsMatch(
+            SkeletalMesh->GetRefSkeleton(),
+            TargetSkeleton->GetReferenceSkeleton(),
+            1.0f,
+            ReferencePoseError))
+    {
+        ReleaseTransientRuntimeObject(SkeletalMesh);
+        FglTFRuntimeSafety::ReportRecoverableFailure(
+            FilePath,
+            FString::Printf(TEXT("canonical character reference-pose mismatch: %s"), *ReferencePoseError));
+        FailLoad(FString::Printf(
+            TEXT("Character archive reference pose is stale or incompatible; rebuild the .gworld archive. %s"),
+            *ReferencePoseError));
+        return;
+    }
+
+    PendingSkeletalMesh = SkeletalMesh;
+    ReleaseTransientRuntimeObject(PendingSkeletalMesh);
+
+    OnProgress.Broadcast(0.80f);
+
+    // Split finalization across frames so the mesh finalizer, physics setup, and component swap
+    // never stack in one game-thread frame.
+    ScheduleGameThreadStage(&UCharacterLoadAsyncAction::BuildRuntimePhysics_GameThread);
+}
+
+void UCharacterLoadAsyncAction::BuildRuntimePhysics_GameThread()
+{
+    if (!ensureMsgf(IsInGameThread(), TEXT("BuildRuntimePhysics_GameThread must run on the game thread")))
+    {
+        return;
+    }
+
+    GameThreadStageTimer.Invalidate();
+    if (bCancelled || bFinished)
+    {
+        FinishAndRelease();
+        return;
+    }
+
+    if (!IsValid(PendingSkeletalMesh) || !OwnerCharacter.IsValid())
+    {
+        FailLoad(TEXT("Character mesh or owner became invalid before physics finalization"));
+        return;
+    }
+
+    ACharacterController* Owner = OwnerCharacter.Get();
+    UPhysicsAsset* PhysicsSource = IsValid(Owner) ? Owner->DefaultPhysicsAsset.Get() : nullptr;
+    if (IsValid(PhysicsSource))
+    {
+        PendingRuntimePhysicsAsset = DuplicateObject<UPhysicsAsset>(
+            PhysicsSource,
+            Owner,
+            MakeUniqueObjectName(
+                Owner,
+                UPhysicsAsset::StaticClass(),
+                FName(TEXT("RuntimeCharacterPhysicsAsset"))));
+    }
+    else if (IsValid(Owner))
+    {
+        // Secondary motion must not depend on a separately assigned default ragdoll asset. A private
+        // empty PhysicsAsset is enough for the staged hairRoot/dynRoot body+constraint builders.
+        PendingRuntimePhysicsAsset = NewObject<UPhysicsAsset>(
+            Owner,
+            MakeUniqueObjectName(
+                Owner,
+                UPhysicsAsset::StaticClass(),
+                FName(TEXT("RuntimeCharacterSecondaryPhysicsAsset"))),
+            RF_Transient);
+    }
+
+    if (IsValid(PendingRuntimePhysicsAsset))
+    {
+        ReleaseTransientRuntimeObject(PendingRuntimePhysicsAsset);
+        if (IsValid(PhysicsSource)
+            && !UCharacterFunctionLibrary::SanitizeRuntimePhysicsAsset(
+                PendingRuntimePhysicsAsset, PendingSkeletalMesh))
+        {
+            ReleaseTransientRuntimeObject(PendingRuntimePhysicsAsset);
+            PendingRuntimePhysicsAsset = nullptr;
+        }
+    }
+
+    OnProgress.Broadcast(0.84f);
+    ScheduleGameThreadStage(&UCharacterLoadAsyncAction::BuildHairPhysics_GameThread);
+}
+
+void UCharacterLoadAsyncAction::BuildHairPhysics_GameThread()
+{
+    if (!ensureMsgf(IsInGameThread(), TEXT("BuildHairPhysics_GameThread must run on the game thread")))
+    {
+        return;
+    }
+
+    GameThreadStageTimer.Invalidate();
+    if (bCancelled || bFinished)
+    {
+        FinishAndRelease();
+        return;
+    }
+
+    if (!IsValid(PendingSkeletalMesh) || !OwnerCharacter.IsValid())
+    {
+        FailLoad(TEXT("Character mesh or owner became invalid during staged hair physics setup"));
+        return;
+    }
+
+    if (IsValid(PendingRuntimePhysicsAsset))
+    {
+        UCharacterFunctionLibrary::SetupAllBodiesBelowCollidersAndConstraints(
+            PendingRuntimePhysicsAsset, PendingSkeletalMesh, FName(BONE_HAIR_ROOT));
+    }
+
+    OnProgress.Broadcast(0.88f);
+    ScheduleGameThreadStage(&UCharacterLoadAsyncAction::BuildDynamicPhysics_GameThread);
+}
+
+void UCharacterLoadAsyncAction::BuildDynamicPhysics_GameThread()
+{
+    if (!ensureMsgf(IsInGameThread(), TEXT("BuildDynamicPhysics_GameThread must run on the game thread")))
+    {
+        return;
+    }
+
+    GameThreadStageTimer.Invalidate();
+    if (bCancelled || bFinished)
+    {
+        FinishAndRelease();
+        return;
+    }
+
+    if (!IsValid(PendingSkeletalMesh) || !OwnerCharacter.IsValid())
+    {
+        FailLoad(TEXT("Character mesh or owner became invalid during staged dynamic physics setup"));
+        return;
+    }
+
+    if (IsValid(PendingRuntimePhysicsAsset))
+    {
+        UCharacterFunctionLibrary::SetupAllBodiesBelowCollidersAndConstraints(
+            PendingRuntimePhysicsAsset, PendingSkeletalMesh, FName(BONE_DYN_ROOT));
+    }
+
+    OnProgress.Broadcast(0.92f);
+    ScheduleGameThreadStage(&UCharacterLoadAsyncAction::FinalizeRuntimePhysics_GameThread);
+}
+
+void UCharacterLoadAsyncAction::FinalizeRuntimePhysics_GameThread()
+{
+    if (!ensureMsgf(IsInGameThread(), TEXT("FinalizeRuntimePhysics_GameThread must run on the game thread")))
+    {
+        return;
+    }
+
+    GameThreadStageTimer.Invalidate();
+    if (bCancelled || bFinished)
+    {
+        FinishAndRelease();
+        return;
+    }
+
+    ACharacterController* Owner = OwnerCharacter.Get();
+    if (!IsValid(Owner) || !IsValid(PendingSkeletalMesh))
+    {
+        FailLoad(TEXT("Character mesh or owner became invalid before physics finalization"));
+        return;
+    }
+
+    if (IsValid(PendingRuntimePhysicsAsset))
+    {
+        // Both secondary subtrees have already been generated in their staged frames. Rebuild
+        // derived/cooked state once instead of replacing source bodies and generating both chains
+        // a second time during finalization.
+        UCharacterFunctionLibrary::FinalizeRuntimePhysicsAsset(PendingRuntimePhysicsAsset);
+    }
+
+    OnProgress.Broadcast(0.96f);
+    ScheduleGameThreadStage(&UCharacterLoadAsyncAction::CommitRuntimeMesh_GameThread);
+}
+
+void UCharacterLoadAsyncAction::CommitRuntimeMesh_GameThread()
+{
+    if (!ensureMsgf(IsInGameThread(), TEXT("CommitRuntimeMesh_GameThread must run on the game thread")))
+    {
+        return;
+    }
+
+    GameThreadStageTimer.Invalidate();
+    if (bCancelled || bFinished)
+    {
+        FinishAndRelease();
+        return;
+    }
+
+    ACharacterController* Owner = OwnerCharacter.Get();
+    USkeletalMesh* MeshToCommit = PendingSkeletalMesh.Get();
+    UPhysicsAsset* PhysicsToCommit = PendingRuntimePhysicsAsset.Get();
+    USkeleton* SkeletonToCommit = CurrentRuntimeSkeleton.Get();
+
+    const bool bSuccess =
+        IsValid(Owner) && IsValid(MeshToCommit) &&
+        Owner->CommitRuntimeCharacterResources(
+            MeshToCommit,
+            PhysicsToCommit,
+            SkeletonToCommit);
+
+    if (bSuccess)
+    {
+        // Ownership has moved to ACharacterController. Do not clear these committed resources in
+        // FinishAndRelease; resetting the action's refs is enough.
+        PendingSkeletalMesh = nullptr;
+        PendingRuntimePhysicsAsset = nullptr;
+        CurrentRuntimeSkeleton = nullptr;
     }
     else
     {
-        OnCompleted.Broadcast(false);
+        ReleaseTransientRuntimeObject(PendingRuntimePhysicsAsset);
+        ReleaseTransientRuntimeObject(PendingSkeletalMesh);
     }
 
-    SetReadyToDestroy();
+    OnProgress.Broadcast(1.0f);
+    OnCompleted.Broadcast(bSuccess);
+    FinishAndRelease();
 }
 
-void UCharacterLoadAsyncAction::FinalizePhysics(USkeletalMesh *SkeletalMesh)
+void UCharacterLoadAsyncAction::ScheduleGameThreadStage(
+    void (UCharacterLoadAsyncAction::*StageFunction)())
 {
-    auto Owner = OwnerCharacter.Get();
-    USkeletalMeshComponent *MeshComp = Owner->GetMesh();
-    MeshComp->SetSkinnedAssetAndUpdate(SkeletalMesh, true);
-    UPhysicsAsset *TargetPA = MeshComp->GetPhysicsAsset();
-    if (TargetPA)
+    if (!ensureMsgf(IsInGameThread(), TEXT("Character load stage scheduling must run on the game thread")))
     {
-        UCharacterFunctionLibrary::SetupAllBodiesBelowCollidersAndConstraints(TargetPA, MeshComp, BONE_HAIR_ROOT);
-        UCharacterFunctionLibrary::SetupAllBodiesBelowCollidersAndConstraints(TargetPA, MeshComp, BONE_DYN_ROOT);
-        UPhysicsAsset *MergedPA = UCharacterFunctionLibrary::MergePhysicsAsset(TargetPA, Owner->DefaultAsset.PhysicsAsset);
-        MeshComp->SetPhysicsAsset(MergedPA, true);
-        MeshComp->SetCollisionProfileName(RAGDOLL);
-        MeshComp->RecreatePhysicsState();
-        UCharacterFunctionLibrary::BlendRagdoll(*MeshComp, 0.0f);
+        return;
+    }
+
+    if (bCancelled || bFinished || StageFunction == nullptr)
+    {
+        FinishAndRelease();
+        return;
+    }
+
+    ClearGameThreadStageTimer();
+    ACharacterController* Owner = OwnerCharacter.Get();
+    UWorld* World = IsValid(Owner) ? Owner->GetWorld() : nullptr;
+    if (!World)
+    {
+        FailLoad(TEXT("Character owner world became invalid while scheduling a game-thread stage"));
+        return;
+    }
+
+    TWeakObjectPtr<UCharacterLoadAsyncAction> WeakThis(this);
+    FTimerDelegate Delegate = FTimerDelegate::CreateLambda([WeakThis, StageFunction]()
+    {
+        if (UCharacterLoadAsyncAction* StrongThis = WeakThis.Get())
+        {
+            (StrongThis->*StageFunction)();
+        }
+    });
+    GameThreadStageTimer = World->GetTimerManager().SetTimerForNextTick(Delegate);
+}
+
+void UCharacterLoadAsyncAction::ClearGameThreadStageTimer()
+{
+    if (!ensureMsgf(IsInGameThread(), TEXT("Character load timer mutation must run on the game thread")))
+    {
+        return;
+    }
+
+    if (!GameThreadStageTimer.IsValid())
+    {
+        return;
+    }
+
+    if (ACharacterController* Owner = OwnerCharacter.Get())
+    {
+        if (UWorld* World = Owner->GetWorld())
+        {
+            World->GetTimerManager().ClearTimer(GameThreadStageTimer);
+        }
+    }
+    GameThreadStageTimer.Invalidate();
+}
+
+bool UCharacterLoadAsyncAction::ResolveCharacterSkin(UWorldBakedModelAsset* Asset)
+{
+    if (!ensureMsgf(IsInGameThread(), TEXT("ResolveCharacterSkin must run on the game thread")))
+    {
+        return false;
+    }
+
+    DetectedMeshIndex = INDEX_NONE;
+    DetectedSkinIndex = INDEX_NONE;
+    if (!IsValid(Asset))
+    {
+        return false;
+    }
+
+    const int32 MeshCount = Asset->GetNumMeshes();
+    const TArray<FglTFRuntimeNode>& Nodes = Asset->GetNodes();
+    constexpr int32 MaxSafeCharacterNodeCount = 65536;
+    if (MeshCount <= 0 || Nodes.Num() <= 0 || Nodes.Num() > MaxSafeCharacterNodeCount)
+    {
+        return false;
+    }
+
+    for (const FglTFRuntimeNode& Node : Nodes)
+    {
+        if (Node.Index >= 0 && Node.Index < Nodes.Num() &&
+            Node.MeshIndex >= 0 && Node.MeshIndex < MeshCount &&
+            Node.SkinIndex >= 0 && Asset->HasSkin(Node.SkinIndex)
+            && IsFiniteCharacterLoadTransform(Node.Transform))
+        {
+            DetectedMeshIndex = Node.MeshIndex;
+            DetectedSkinIndex = Node.SkinIndex;
+            return true;
+        }
+    }
+    return false;
+}
+
+void UCharacterLoadAsyncAction::FailLoad(const FString& Reason)
+{
+    if (!ensureMsgf(IsInGameThread(), TEXT("FailLoad must run on the game thread")))
+    {
+        return;
+    }
+
+    if (bFinished)
+    {
+        return;
+    }
+
+    UE_LOG(LogTemp, Warning, TEXT("%s"), *Reason);
+    UFileFunctionLibrary::WriteSimulatorLogAsync(TEXT("CharacterLoadAsyncAction"), Reason);
+    OnProgress.Broadcast(1.0f);
+    OnCompleted.Broadcast(false);
+    FinishAndRelease();
+}
+
+void UCharacterLoadAsyncAction::ReleaseCurrentAsset()
+{
+    if (!ensureMsgf(IsInGameThread(), TEXT("ReleaseCurrentAsset must run on the game thread")))
+    {
+        return;
+    }
+
+    CurrentLoadedAsset = nullptr;
+
+    ReleaseTransientRuntimeObject(PendingRuntimePhysicsAsset);
+    ReleaseTransientRuntimeObject(PendingSkeletalMesh);
+    ReleaseTransientRuntimeObject(CurrentRuntimeSkeleton);
+    PendingRuntimePhysicsAsset = nullptr;
+    PendingSkeletalMesh = nullptr;
+    CurrentRuntimeSkeleton = nullptr;
+    SourceSkeletonReferenceGuard = nullptr;
+    SourceMaterialReferenceGuard = nullptr;
+    PendingBoneMap.Empty();
+}
+
+void UCharacterLoadAsyncAction::CancelAndRelease()
+{
+    if (!IsInGameThread())
+    {
+        TWeakObjectPtr<UCharacterLoadAsyncAction> WeakThis(this);
+        if (!FSafeFileIO::DispatchTrackedGameThread([WeakThis]()
+        {
+            if (UCharacterLoadAsyncAction* StrongThis = WeakThis.Get())
+            {
+                StrongThis->CancelAndRelease();
+            }
+        }))
+        {
+            // Shutdown owns final UObject teardown once new game-thread continuations are rejected.
+            return;
+        }
+        return;
+    }
+
+    bCancelled = true;
+    ClearGameThreadStageTimer();
+    OnCompleted.Clear();
+    OnProgress.Clear();
+    OwnerCharacter.Reset();
+    FilePath.Reset();
+
+    // Keep the action alive until the outstanding range read/finalizer callback has drained.
+    TryFinishCancelledRequest();
+}
+
+bool UCharacterLoadAsyncAction::HasAsyncWorkInFlight() const
+{
+    return bMeshLoadInFlight;
+}
+
+void UCharacterLoadAsyncAction::TryFinishCancelledRequest()
+{
+    if (!ensureMsgf(IsInGameThread(), TEXT("Cancelled character-load finalization must run on the game thread")))
+    {
+        return;
+    }
+
+    if (bCancelled && !bFinished && !HasAsyncWorkInFlight())
+    {
+        FinishAndRelease();
     }
 }
 
-bool UCharacterLoadAsyncAction::CheckRootBoneName(UglTFRuntimeAsset *Asset)
+void UCharacterLoadAsyncAction::FinishAndRelease()
 {
-    if (!Asset)
+    if (!ensureMsgf(IsInGameThread(), TEXT("FinishAndRelease must run on the game thread")))
+    {
+        return;
+    }
+
+    if (bFinished)
+    {
+        return;
+    }
+
+    if (HasAsyncWorkInFlight())
+    {
+        // Cancellation may arrive while parser/JSON/glTFRuntime work is still running. Keep this
+        // action registered and its UObject references alive until every GT drain callback fires.
+        bCancelled = true;
+        return;
+    }
+
+    bFinished = true;
+    bCancelled = true;
+    bMeshLoadInFlight = false;
+    ClearGameThreadStageTimer();
+    ReleaseCurrentAsset();
+    OnCompleted.Clear();
+    OnProgress.Clear();
+    OwnerCharacter.Reset();
+    FilePath.Reset();
+    SetReadyToDestroy();
+
+    // The owner may have queued a newer character while this request's worker/finalizer was
+    // draining. Notify it only after all parser/generated-object references have been released.
+    TWeakObjectPtr<ACharacterController> Observer = ReleaseObserver;
+    ReleaseObserver.Reset();
+    if (ACharacterController* Character = Observer.Get())
+    {
+        Character->HandleCharacterLoadActionReleased(this);
+    }
+}
+
+bool UCharacterLoadAsyncAction::CheckRootBoneName(UWorldBakedModelAsset* Asset)
+{
+    if (!ensureMsgf(IsInGameThread(), TEXT("CheckRootBoneName must run on the game thread")))
+    {
         return true;
-    for (const FglTFRuntimeNode &Node : Asset->GetNodes())
+    }
+
+    if (!IsValid(Asset))
+    {
+        return true;
+    }
+
+    for (const FglTFRuntimeNode& Node : Asset->GetNodes())
     {
         if (Node.Name.Equals(BONE_ROOT))
+        {
             return false;
+        }
     }
     return true;
 }

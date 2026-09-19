@@ -1,14 +1,26 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
+/**
+ * @file ActorHelper.cpp
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
+ */
+
 #include "System/ActorHelper.h"
 #include "GameFramework/Actor.h"
 #include "Components/InstancedStaticMeshComponent.h"
-#include "Components/HierarchicalInstancedStaticMeshComponent.h"
 #include "Components/BoxComponent.h"
 
 void FActorHelper::DestroyComponent(AActor *Actor, UActorComponent *Comp)
 {
+    if (!IsValid(Actor) || !IsValid(Comp))
+    {
+        return;
+    }
+
+    // Remove, unregister, and destroy in one guarded helper so callers do not duplicate lifecycle checks.
     Actor->RemoveInstanceComponent(Comp);
     Comp->UnregisterComponent();
     Comp->DestroyComponent();
@@ -16,16 +28,21 @@ void FActorHelper::DestroyComponent(AActor *Actor, UActorComponent *Comp)
 
 UBoxComponent *FActorHelper::AddBoxComponent(AActor *Actor, const FTransform &Transform, const FVector &Size, const FName &Profile)
 {
-    if (!IsValid(Actor))
+    if (!IsValid(Actor) || !IsValid(Actor->GetRootComponent()))
+    {
         return nullptr;
+    }
+
     UBoxComponent *BoxCollider = NewObject<UBoxComponent>(Actor);
+    if (!IsValid(BoxCollider))
+    {
+        return nullptr;
+    }
+
     Actor->AddInstanceComponent(BoxCollider);
-    // 박스 콜라이더를 루트 컴포넌트에 붙임
     BoxCollider->SetupAttachment(Actor->GetRootComponent());
     BoxCollider->SetWorldTransform(Transform);
-    // 콜라이더 크기 설정 (예: 100x100x100)
     BoxCollider->InitBoxExtent(Size);
-    // 콜라이더 활성화 설정
     BoxCollider->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
     BoxCollider->SetCollisionProfileName(Profile);
     BoxCollider->RegisterComponent();
@@ -37,12 +54,22 @@ void FActorHelper::ChangeParent(USceneComponent *Child,
                                              const FDetachmentTransformRules &DetachRules,
                                              const FAttachmentTransformRules &AttachRules)
 {
+    if (!IsValid(Child) || !IsValid(Parent))
+    {
+        return;
+    }
+
     Child->DetachFromComponent(DetachRules);
     Child->AttachToComponent(Parent, AttachRules, NAME_None);
 }
 
 void FActorHelper::DetachParent(USceneComponent *Child, const FDetachmentTransformRules &DetachRules)
 {
+    if (!IsValid(Child))
+    {
+        return;
+    }
+
     Child->DetachFromComponent(DetachRules);
 }
 
@@ -50,5 +77,10 @@ void FActorHelper::AttachParent(USceneComponent *Child,
                                              USceneComponent *Parent,
                                              const FAttachmentTransformRules &AttachRules)
 {
+    if (!IsValid(Child) || !IsValid(Parent))
+    {
+        return;
+    }
+
     Child->AttachToComponent(Parent, AttachRules, NAME_None);
 }

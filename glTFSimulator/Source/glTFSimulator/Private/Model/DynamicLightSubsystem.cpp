@@ -1,13 +1,43 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
+/**
+ * @file DynamicLightSubsystem.cpp
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
+ */
+
 #include "Model/DynamicLightSubsystem.h"
 #include "Model/DynamicPointLightComponent.h"
-#include "Async/ParallelFor.h"
 #include "Engine/World.h"
-#include "System/ActorHelper.h"
+#include "Subsystems/SubsystemCollection.h"
+#include "System/GameUpdateSubSystem.h"
+#include "GameFramework/Actor.h"
 #include "GameFramework/PlayerController.h"
 #include "Kismet/GameplayStatics.h"
+
+
+namespace
+{
+    void DestroyManagedDecal(UDecalComponent* Decal)
+    {
+        if (!IsValid(Decal))
+        {
+            return;
+        }
+
+        // The decal is dynamically added to the light owner's InstanceComponents array. Clear the
+        // material first, remove the ownership entry, and only then destroy the component.
+        Decal->SetDecalMaterial(nullptr);
+        if (AActor* Owner = Decal->GetOwner(); IsValid(Owner))
+        {
+            Owner->RemoveInstanceComponent(Decal);
+        }
+        Decal->UnregisterComponent();
+        Decal->DestroyComponent();
+    }
+}
 
 void UDynamicLightSubsystem::Initialize(FSubsystemCollectionBase &Collection)
 {
@@ -16,6 +46,13 @@ void UDynamicLightSubsystem::Initialize(FSubsystemCollectionBase &Collection)
 
 void UDynamicLightSubsystem::Deinitialize()
 {
+    UnregisterGameUpdate();
+    for (FLightOptimizationData& Data : ManagedLights)
+    {
+        DestroyManagedDecal(Data.DecalComponent.Get());
+        Data.DecalComponent.Reset();
+        Data.TargetDecalMaterial.Reset();
+    }
     ManagedLights.Empty();
     Super::Deinitialize();
 }
@@ -23,7 +60,20 @@ void UDynamicLightSubsystem::Deinitialize()
 void UDynamicLightSubsystem::RegisterLight(UDynamicPointLightComponent *InLight)
 {
     if (!IsValid(InLight))
+    {
         return;
+    }
+
+    CompactManagedLights();
+
+    // Component re-registration must not create duplicate work or duplicate fallback decals.
+    if (ManagedLights.ContainsByPredicate([InLight](const FLightOptimizationData& Data)
+        {
+            return Data.LightComponent.Get() == InLight;
+        }))
+    {
+        return;
+    }
 
     FLightOptimizationData NewData;
     NewData.Position = InLight->GetComponentLocation();
@@ -35,10 +85,11 @@ void UDynamicLightSubsystem::RegisterLight(UDynamicPointLightComponent *InLight)
     NewData.LightComponent = InLight;
     NewData.TargetDecalMaterial = bCanUseDecalFallback ? InLight->GetLightDecal() : nullptr;
 
-    // 초기 상태 반영
+    // Apply the initial state.
     NewData.bCurrentLightVisibility = InLight->IsVisible();
 
     ManagedLights.Add(NewData);
+    RegisterGameUpdate();
 }
 
 void UDynamicLightSubsystem::UnregisterLight(UDynamicPointLightComponent *InLight)
@@ -47,89 +98,141 @@ void UDynamicLightSubsystem::UnregisterLight(UDynamicPointLightComponent *InLigh
     {
         if (ManagedLights[i].LightComponent.Get() == InLight)
         {
-            // 동적 스폰된 디칼 컴포넌트가 있다면 소멸 처리
-            if (UDecalComponent *Decal = ManagedLights[i].DecalComponent.Get())
-            {
-                Decal->UnregisterComponent();
-                Decal->DestroyComponent();
-            }
-            ManagedLights.RemoveAtSwap(i);
+            // Destroy dynamically spawned decal components, if any.
+            DestroyManagedDecal(ManagedLights[i].DecalComponent.Get());
+            ManagedLights[i].DecalComponent.Reset();
+            ManagedLights[i].TargetDecalMaterial.Reset();
+            ManagedLights.RemoveAtSwap(i, 1, EAllowShrinking::No);
             break;
         }
     }
+
+    CompactManagedLights();
 }
 
-void UDynamicLightSubsystem::Tick(float DeltaTime)
+void UDynamicLightSubsystem::RegisterGameUpdate()
 {
-    if (ManagedLights.Num() == 0)
+    check(IsInGameThread());
+    if (GameUpdateHandle != INDEX_NONE)
+    {
         return;
+    }
 
-    // 1. 카메라 위치 획득 (메인 스레드에서 1번만 안전하게 수행)
+    if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
+    {
+        TWeakObjectPtr<UDynamicLightSubsystem> WeakThis(this);
+        GameUpdateHandle = GameUpdate->RegisterUpdate(
+            this,
+            [WeakThis](const float DeltaSeconds)
+            {
+                if (UDynamicLightSubsystem* StrongThis = WeakThis.Get())
+                {
+                    StrongThis->UpdateLightsFromGameUpdate(DeltaSeconds);
+                }
+            },
+            40);
+    }
+}
+
+void UDynamicLightSubsystem::UnregisterGameUpdate()
+{
+    check(IsInGameThread());
+    if (GameUpdateHandle == INDEX_NONE)
+    {
+        return;
+    }
+
+    if (UGameUpdateSubSystem* GameUpdate = UGameUpdateSubSystem::Get(this))
+    {
+        GameUpdate->UnregisterUpdate(GameUpdateHandle);
+    }
+    GameUpdateHandle = INDEX_NONE;
+}
+
+void UDynamicLightSubsystem::CompactManagedLights()
+{
+    check(IsInGameThread());
+    int32 RemovedCount = 0;
+    for (int32 Index = ManagedLights.Num() - 1; Index >= 0; --Index)
+    {
+        if (ManagedLights[Index].LightComponent.IsValid())
+        {
+            continue;
+        }
+
+        DestroyManagedDecal(ManagedLights[Index].DecalComponent.Get());
+        ManagedLights[Index].DecalComponent.Reset();
+        ManagedLights[Index].TargetDecalMaterial.Reset();
+        ManagedLights.RemoveAtSwap(Index, 1, EAllowShrinking::No);
+        ++RemovedCount;
+    }
+
+    if (ManagedLights.Num() == 0)
+    {
+        ManagedLights.Empty();
+        UnregisterGameUpdate();
+    }
+    else if (RemovedCount > 0 && ManagedLights.Max() > FMath::Max(32, ManagedLights.Num() * 2))
+    {
+        ManagedLights.Shrink();
+    }
+}
+
+void UDynamicLightSubsystem::UpdateLightsFromGameUpdate(float /*DeltaTime*/)
+{
+    CompactManagedLights();
+    if (ManagedLights.Num() == 0)
+    {
+        return;
+    }
+
+    // Read the camera location once for the whole batch.
     APlayerController *PC = UGameplayStatics::GetPlayerController(GetWorld(), 0);
     if (!IsValid(PC))
+    {
         return;
+    }
 
     FVector CameraLocation;
     FRotator CameraRotation;
     PC->GetPlayerViewPoint(CameraLocation, CameraRotation);
 
-    // 2. 가시성 플래그 연산 병렬 처리 (ParallelFor)
-    // 연산 데이터가 연속적인 TArray 구조이므로 CPU 캐시 효율이 극대화됩니다.
-    ParallelFor(ManagedLights.Num(), [this, &CameraLocation](int32 Index)
-                {
-        FLightOptimizationData& Data = ManagedLights[Index];
-        
-        // 유효하지 않은 약참조 컴포넌트 스킵
-        if (!Data.LightComponent.IsValid()) return;
-
-        // 제곱근 연산이 없는 DistSquared로 계산 비용 최소화
-        float DistSq = FVector::DistSquared(CameraLocation, Data.Position);
-
-        if (DistSq < Data.CullingDistanceSq)
-        {
-            // 카메라와 가까움: 라이트 ON, 디칼 OFF
-            Data.bTargetLightVisibility = true;
-            Data.bTargetDecalVisibility = false;
-        }
-        else if (Data.TargetDecalMaterial.IsValid() && Data.DecalTransitionDistanceSq > Data.CullingDistanceSq && DistSq < Data.DecalTransitionDistanceSq)
-        {
-            // 중간 거리: 라이트 OFF, optional decal fallback ON.
-            Data.bTargetLightVisibility = false;
-            Data.bTargetDecalVisibility = true;
-        }
-        else
-        {
-            // 너무 멀리 있음: 둘 다 컬링 (OFF)
-            Data.bTargetLightVisibility = false;
-            Data.bTargetDecalVisibility = false;
-        } });
-
-    // 3. 메인 스레드 순차 처리 (상태 렌더링 동기화)
-    // UObject의 상태 조작 및 컴포넌트 생성은 스레드 안전하지 않으므로 여기서 몰아서 처리합니다.
+    // Each light needs only one squared-distance comparison. A sequential contiguous pass is
+    // cheaper than dispatching worker tasks and keeps every weak UObject access thread-safe.
     for (FLightOptimizationData &Data : ManagedLights)
     {
         UDynamicPointLightComponent *LightComp = Data.LightComponent.Get();
         if (!IsValid(LightComp))
+        {
             continue;
+        }
 
-        // 동적으로 변화된 컴포넌트의 최신 갱신 위치 반영
+        // Dynamic components may move, so refresh their position before calculating visibility.
         Data.Position = LightComp->GetComponentLocation();
+        const float DistanceSquared = FVector::DistSquared(CameraLocation, Data.Position);
+        const bool bUseLight = DistanceSquared < Data.CullingDistanceSq;
+        const bool bUseDecal = !bUseLight &&
+            Data.TargetDecalMaterial.IsValid() &&
+            Data.DecalTransitionDistanceSq > Data.CullingDistanceSq &&
+            DistanceSquared < Data.DecalTransitionDistanceSq;
+        Data.bTargetLightVisibility = bUseLight;
+        Data.bTargetDecalVisibility = bUseDecal;
 
-        // [라이트 상태 적용]
+        // Apply light state.
         if (Data.bTargetLightVisibility != Data.bCurrentLightVisibility)
         {
             Data.bCurrentLightVisibility = Data.bTargetLightVisibility;
             LightComp->SetVisibility(Data.bCurrentLightVisibility);
         }
 
-        // [디칼 상태 적용]
+        // Apply decal state.
         if (Data.bTargetDecalVisibility != Data.bCurrentDecalVisibility)
         {
             Data.bCurrentDecalVisibility = Data.bTargetDecalVisibility;
 
             if (Data.bCurrentDecalVisibility)
             {
-                // 디칼이 켜져야 하는데 아직 할당이 안 되었다면 런타임에 지연 생성(Lazy Initialization)
+                // Lazily create the decal when it is needed but not yet allocated.
                 UDecalComponent *DecalComp = Data.DecalComponent.Get();
                 if (!IsValid(DecalComp) && Data.TargetDecalMaterial.IsValid())
                 {
@@ -146,10 +249,6 @@ void UDynamicLightSubsystem::Tick(float DeltaTime)
             {
                 if (UDecalComponent *DecalComp = Data.DecalComponent.Get())
                 {
-                    //AActor *Owner = LightComp->GetOwner();
-                    //if (!Owner)
-                    //    return;
-                    //FActorHelper::DestroyComponent(Owner, DecalComp);
                     DecalComp->SetVisibility(false);
                 }
             }
@@ -159,18 +258,28 @@ void UDynamicLightSubsystem::Tick(float DeltaTime)
 
 UDecalComponent *UDynamicLightSubsystem::CreateDecalComponent(UDynamicPointLightComponent *LightComp, UMaterialInterface *Material)
 {
-    AActor *Owner = LightComp->GetOwner();
-    if (!Owner)
+    if (!IsValid(LightComp) || !IsValid(Material))
+    {
         return nullptr;
+    }
+
+    AActor *Owner = LightComp->GetOwner();
+    USceneComponent* RootComponent = IsValid(Owner) ? Owner->GetRootComponent() : nullptr;
+    if (!IsValid(Owner) || !IsValid(RootComponent))
+    {
+        return nullptr;
+    }
 
     UDecalComponent *NewDecal = NewObject<UDecalComponent>(Owner);
-    if (!NewDecal)
+    if (!IsValid(NewDecal))
+    {
         return nullptr;
+    }
 
     Owner->AddInstanceComponent(NewDecal);
-    // 디칼을 라이트의 오너 액터 루트에 부착하고 위치 일치화
-    NewDecal->AttachToComponent(Owner->GetRootComponent(), FAttachmentTransformRules::KeepRelativeTransform);
-    NewDecal->SetWorldLocationAndRotation(LightComp->GetComponentLocation(), FRotator(-90.0f, 0.0f, 0.0f)); // 아래 방향 투영 기본값
+    // Attach the decal to the light owner root and match its location.
+    NewDecal->AttachToComponent(RootComponent, FAttachmentTransformRules::KeepRelativeTransform);
+    NewDecal->SetWorldLocationAndRotation(LightComp->GetComponentLocation(), FRotator(-90.0f, 0.0f, 0.0f)); // Default downward projection.
     // Clamp fallback decals so they cannot cover the whole scene with a white wash.
     const float LightRadius = FMath::Clamp(LightComp->AttenuationRadius, 1.0f, LightComp->GetMaxLightDecalSize());
     NewDecal->DecalSize = FVector(LightRadius, LightRadius, LightRadius);

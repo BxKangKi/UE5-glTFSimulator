@@ -1,6 +1,11 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
+/**
+ * @file glTFSimulator.Build.cs
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ */
 
 using UnrealBuildTool;
 
@@ -9,37 +14,33 @@ public class glTFSimulator : ModuleRules
     public glTFSimulator(ReadOnlyTargetRules Target) : base(Target)
     {
         PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
+
         PublicDependencyModuleNames.AddRange(
             new string[]
             {
                 "Core",
-                "EnhancedInput"
+                "CoreUObject",
+                "Engine",
+                "EnhancedInput",
+                "InputCore",
+                "Json",
+                "glTFRuntime",
+                "Slate",
+                "UMG",
+                "SlateCore"
             });
 
         PrivateDependencyModuleNames.AddRange(
             new string[]
             {
-                "CoreUObject",
-                "Engine",
-                "InputCore",
-                "Json",
-                "IKRig",
                 "Niagara",
-                "UMG",
+                "JsonUtilities",
                 "RHI",
-                "Slate",
-                "SlateCore",
                 "ProceduralMeshComponent",
                 "PhysicsCore",
-                "ImageWrapper",
-                "RenderCore",
-                "glTFRuntime"
+                // MoviePlayer renders a pure-Slate loading screen while blocking map loads run.
+                "MoviePlayer"
             });
-        
 
-        // Uncomment if you are using online features
-        // PrivateDependencyModuleNames.Add("OnlineSubsystem");
-
-        // To include OnlineSubsystemSteam, add it to the plugins section in your uproject file with the Enabled attribute set to true
     }
 }

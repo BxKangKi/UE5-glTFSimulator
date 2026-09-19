@@ -1,11 +1,18 @@
 // Copyright © 2026 BxKangKi. Licensed under the MIT License.
 // Copyright © 2026 Epic Games, Inc. All rights reserved.
 
+/**
+ * @file JsonHelper.cpp
+ * Role: Defines this source unit's responsibility within glTFSimulator.
+ * Key responsibilities: Implements the behavior exposed by this source unit's public API.
+ * UObject and Actor access stays on the game thread; worker tasks receive detached native data only.
+ */
+
 #include "System/JsonHelper.h"
 
 void FJsonHelper::SetVector(const TSharedRef<FJsonObject> &Json, const FVector &Vector, const FString &KeyPrefix)
 {
-    // 원본 코드의 규칙(X, Y, Z 단독 명시)을 따르되, 필요 시 Prefix(예: "Center")를 붙일 수 있도록 설계
+    // Follows the original X/Y/Z naming rule while allowing an optional prefix such as "Center".
     FString PX = KeyPrefix.IsEmpty() ? TEXT("X") : KeyPrefix + TEXT("X");
     FString PY = KeyPrefix.IsEmpty() ? TEXT("Y") : KeyPrefix + TEXT("Y");
     FString PZ = KeyPrefix.IsEmpty() ? TEXT("Z") : KeyPrefix + TEXT("Z");
@@ -15,7 +22,7 @@ void FJsonHelper::SetVector(const TSharedRef<FJsonObject> &Json, const FVector &
     Json->SetNumberField(PZ, Vector.Z);
 }
 
-// 2. JSON Object -> FVector 추출
+// 2. Read an FVector from a JSON object.
 void FJsonHelper::TryGetVector(const TSharedPtr<FJsonObject> &Json, FVector &OutVector, const FString &KeyPrefix)
 {
     if (!Json.IsValid()) return;
@@ -29,13 +36,17 @@ void FJsonHelper::TryGetVector(const TSharedPtr<FJsonObject> &Json, FVector &Out
     Json->TryGetNumberField(PZ, OutVector.Z);
 }
 
-// FJsonObject에서 모든 최상위 키를 가져오는 함수
+// Returns every top-level key from an FJsonObject.
 TArray<FString> FJsonHelper::GetAllKeysFromJsonObject(const TSharedPtr<FJsonObject> &JsonObject)
 {
     TArray<FString> Keys;
     if (JsonObject.IsValid())
     {
-        JsonObject->Values.GetKeys(Keys);
+        Keys.Reserve(JsonObject->Values.Num());
+        for (const auto& Pair : JsonObject->Values)
+        {
+            Keys.Add(FString(Pair.Key));
+        }
     }
     return Keys;
 }
